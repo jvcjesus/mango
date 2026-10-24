@@ -59,6 +59,7 @@ pub struct AppState {
     pub importer: Importer,
     pub trackers: Trackers,
     pub pipeline: Arc<crate::pipeline::Pipeline>,
+    pub sync: Arc<crate::sync::service::SyncService>,
     /// The local source's folder, shown in Settings so the owner knows where to put files.
     pub local_dir: String,
 }
@@ -153,6 +154,12 @@ pub fn router(state: Spaces) -> Router {
         .route("/pipeline/discover-komga-libraries", post(discover_pipeline_komga_libraries))
         .route("/pipeline/retry-komga/{chapter}", post(retry_komga_download))
         .route("/pipeline/events", get(get_pipeline_events))
+        .route("/sync/dry-run", post(sync_dry_run))
+        .route("/sync/run", post(sync_run))
+        .route("/sync/status", get(sync_status))
+        .route("/sync/history", get(sync_history))
+        .route("/sync/mappings", get(get_sync_mappings).put(put_sync_mapping))
+        .route("/sync/mappings/{series_id}/{tracker}", delete(delete_sync_mapping))
         .layer(middleware::from_fn_with_state(state.clone(), auth::require));
     let api = Router::new()
         .nest("/auth", auth::routes())
@@ -1092,6 +1099,89 @@ async fn discover_pipeline_komga_libraries(
 async fn get_pipeline_events(Me(app): Me) -> Result<Json<Vec<crate::pipeline::PipelineEvent>>> {
     app.me.admin()?;
     Ok(Json(app.pipeline.recent_events()))
+}
+
+#[derive(Deserialize, Default)]
+struct SyncRunPayload {
+    #[serde(default)]
+    target: Option<String>,
+    #[serde(default)]
+    library_id: Option<String>,
+}
+
+async fn sync_dry_run(
+    Me(app): Me,
+    Json(payload): Json<Option<SyncRunPayload>>,
+) -> Result<Json<crate::sync::model::SyncSummary>> {
+    let payload = payload.unwrap_or_default();
+    let target = payload.target.as_deref().and_then(crate::sync::model::SyncTarget::parse);
+    let summary = app.sync.run_sync(true, target, payload.library_id).await?;
+    Ok(Json(summary))
+}
+
+async fn sync_run(
+    Me(app): Me,
+    Json(payload): Json<Option<SyncRunPayload>>,
+) -> Result<Json<crate::sync::model::SyncSummary>> {
+    app.me.admin()?;
+    let payload = payload.unwrap_or_default();
+    let target = payload.target.as_deref().and_then(crate::sync::model::SyncTarget::parse);
+    let summary = app.sync.run_sync(false, target, payload.library_id).await?;
+    Ok(Json(summary))
+}
+
+async fn sync_status(Me(app): Me) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "running": app.sync.is_running()
+    }))
+}
+
+#[derive(Deserialize)]
+struct LimitQuery {
+    limit: Option<usize>,
+}
+
+async fn sync_history(
+    Me(app): Me,
+    Query(query): Query<LimitQuery>,
+) -> Result<Json<Vec<crate::sync::model::SyncRecord>>> {
+    let limit = query.limit.unwrap_or(100);
+    let records = app.sync.history(limit).await?;
+    Ok(Json(records))
+}
+
+#[derive(Deserialize)]
+struct MappingsQuery {
+    tracker: Option<String>,
+}
+
+async fn get_sync_mappings(
+    Me(app): Me,
+    Query(query): Query<MappingsQuery>,
+) -> Result<Json<Vec<crate::sync::model::TrackerMapping>>> {
+    let trk = query.tracker.as_deref().and_then(crate::sync::model::SyncTarget::parse);
+    let mappings = app.db.call(move |conn| crate::sync::mapping::list_mappings(conn, trk)).await?;
+    Ok(Json(mappings))
+}
+
+async fn put_sync_mapping(
+    Me(app): Me,
+    Json(mapping): Json<crate::sync::model::TrackerMapping>,
+) -> Result<Json<bool>> {
+    app.me.admin()?;
+    app.db.call(move |conn| crate::sync::mapping::save_mapping(conn, &mapping)).await?;
+    Ok(Json(true))
+}
+
+async fn delete_sync_mapping(
+    Me(app): Me,
+    Path((series_id, tracker_str)): Path<(String, String)>,
+) -> Result<Json<bool>> {
+    app.me.admin()?;
+    let trk = crate::sync::model::SyncTarget::parse(&tracker_str)
+        .ok_or_else(|| AppError::bad_request(format!("Invalid tracker: {tracker_str}")))?;
+    let deleted = app.db.call(move |conn| crate::sync::mapping::delete_mapping(conn, &series_id, trk)).await?;
+    Ok(Json(deleted))
 }
 
 #[cfg(test)]

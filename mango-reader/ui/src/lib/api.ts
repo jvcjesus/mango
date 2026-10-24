@@ -466,3 +466,74 @@ export interface KomgaLibrary {
   root: string;
   unavailable: boolean;
 }
+
+export type SyncTarget = 'anilist' | 'mangabaka';
+
+export type SyncResultCategory =
+  | 'updated'
+  | 'no_change'
+  | 'dry_run_would_update'
+  | 'skipped_no_mapping'
+  | 'skipped_ambiguous_mapping'
+  | 'skipped_unsafe_progress'
+  | 'tracker_ahead'
+  | 'auth_error'
+  | 'network_error'
+  | 'rate_limited'
+  | 'remote_error';
+
+export interface SyncRecord {
+  id: string;
+  timestamp: number;
+  komgaSeriesId: string;
+  komgaSeriesTitle: string;
+  tracker: SyncTarget;
+  trackerMediaId?: string | null;
+  oldProgress?: number | null;
+  newProgress?: number | null;
+  statusChange?: string | null;
+  category: SyncResultCategory;
+  message: string;
+  isDryRun: boolean;
+}
+
+export interface SyncSummary {
+  totalSeries: number;
+  updated: number;
+  noChange: number;
+  dryRunUpdates: number;
+  skipped: number;
+  errors: number;
+  isDryRun: boolean;
+  records: SyncRecord[];
+}
+
+export interface TrackerMapping {
+  komgaSeriesId: string;
+  tracker: SyncTarget;
+  trackerId: string;
+  trackerTitle?: string | null;
+  manualOverride: boolean;
+  updatedAt: number;
+}
+
+export const runSyncDryRun = (target?: string, libraryId?: string) =>
+  send<SyncSummary>('POST', '/sync/dry-run', { target, libraryId });
+
+export const runSync = (target?: string, libraryId?: string) =>
+  send<SyncSummary>('POST', '/sync/run', { target, libraryId });
+
+export const getSyncStatus = () =>
+  get<{ running: boolean }>('/sync/status');
+
+export const getSyncHistory = (limit: number = 100) =>
+  get<SyncRecord[]>(`/sync/history?limit=${limit}`);
+
+export const getSyncMappings = (tracker?: string) =>
+  get<TrackerMapping[]>(tracker ? `/sync/mappings?tracker=${tracker}` : '/sync/mappings');
+
+export const saveSyncMapping = (mapping: TrackerMapping) =>
+  send<boolean>('PUT', '/sync/mappings', mapping);
+
+export const deleteSyncMapping = (seriesId: string, tracker: string) =>
+  send<boolean>('DELETE', `/sync/mappings/${encodeURIComponent(seriesId)}/${encodeURIComponent(tracker)}`);

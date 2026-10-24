@@ -5,10 +5,12 @@
 //! and complete audit logging.
 
 pub mod anilist;
+pub mod audit;
 pub mod komga_reader;
 pub mod mangabaka;
 pub mod mapping;
 pub mod model;
+pub mod service;
 
 #[cfg(test)]
 mod tests;

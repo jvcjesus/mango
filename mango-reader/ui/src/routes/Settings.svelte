@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { get, message, send, type Category, type KomgaLibrary, type PipelineConfig, type PipelineEvent, type PathValidationResult, type OptimizerValidationResult, type ValidatePathsResponse, type Tracker } from '../lib/api';
+  import { get, message, send, runSyncDryRun, runSync, getSyncStatus, getSyncHistory, type Category, type KomgaLibrary, type PipelineConfig, type PipelineEvent, type PathValidationResult, type OptimizerValidationResult, type ValidatePathsResponse, type Tracker, type SyncRecord, type SyncSummary } from '../lib/api';
   import { confirm } from '../lib/confirm.svelte';
   import { COVERS, display, MENUS, setDisplay, SIZES } from '../lib/display.svelte';
   import Icon, { type IconName } from '../lib/Icon.svelte';
@@ -703,6 +703,67 @@
       discoveringKomgaLibraries = false;
     }
   }
+
+  // ---------- reading progress sync ----------
+  let syncRunning = $state(false);
+  let syncLoading = $state(false);
+  let syncSummary = $state<SyncSummary | null>(null);
+  let syncHistory = $state<SyncRecord[]>([]);
+  let syncError = $state<string | null>(null);
+  let askedSyncHistory = false;
+
+  async function loadSyncHistory() {
+    try {
+      syncHistory = await getSyncHistory(50);
+      const status = await getSyncStatus();
+      syncRunning = status.running;
+    } catch (e) {
+      syncError = message(e);
+    }
+  }
+
+  async function triggerDryRun() {
+    syncLoading = true;
+    syncError = null;
+    try {
+      syncSummary = await runSyncDryRun();
+      await loadSyncHistory();
+      toast.success('Dry run evaluation completed');
+    } catch (e) {
+      syncError = message(e);
+      toast.error(syncError);
+    } finally {
+      syncLoading = false;
+    }
+  }
+
+  async function triggerLiveSync() {
+    const ok = await confirm({
+      title: 'Synchronize Reading Progress?',
+      message: 'This will update your reading progress on external trackers (AniList, MangaBaka) to match your completed books in Komga. Progress only moves forward and never decreases.',
+      confirmText: 'Sync Now',
+    });
+    if (!ok) return;
+
+    syncLoading = true;
+    syncError = null;
+    try {
+      syncSummary = await runSync();
+      await loadSyncHistory();
+      toast.success('Reading progress synchronization completed');
+    } catch (e) {
+      syncError = message(e);
+      toast.error(syncError);
+    } finally {
+      syncLoading = false;
+    }
+  }
+
+  $effect(() => {
+    if (tab.id !== 'trackers' || askedSyncHistory) return;
+    askedSyncHistory = true;
+    void loadSyncHistory();
+  });
 
   // ---------- version ----------
 
@@ -1591,6 +1652,97 @@
             {/if}
           </section>
         {/each}
+        <section class="card">
+          <div class="card-header-row">
+            <h3>Komga Reading Progress Synchronization</h3>
+            <div class="sync-actions">
+              <button class="btn" onclick={triggerDryRun} disabled={syncRunning || syncLoading}>
+                <Icon name="eye" size={16} /> {syncLoading ? 'Running…' : 'Run Dry Run'}
+              </button>
+              {#if session.admin}
+                <button class="btn spot" onclick={triggerLiveSync} disabled={syncRunning || syncLoading}>
+                  <Icon name="upload" size={16} /> Sync Now
+                </button>
+              {/if}
+            </div>
+          </div>
+
+          <p class="muted">
+            Synchronizes authoritative reading progress from Komga to AniList and MangaBaka.
+            Komga is the single source of truth for completed volumes and chapters.
+            Progress only moves forward; dry runs perform zero tracker writes.
+          </p>
+
+          <div class="path-status-row" style="margin-bottom: 12px;">
+            <span class="status-badge {pipeline.komga_enabled ? 'status-valid' : 'status-not_configured'}">
+              Komga: {pipeline.komga_enabled ? 'Connected' : 'Disabled'}
+            </span>
+            <span class="status-badge {trackers.find(x => x.name === 'AniList')?.signedIn ? 'status-valid' : 'status-not_configured'}">
+              AniList: {trackers.find(x => x.name === 'AniList')?.signedIn ? 'Signed In' : 'Not Signed In'}
+            </span>
+            <span class="status-badge {pipeline.has_mangabaka_token ? 'status-valid' : 'status-not_configured'}">
+              MangaBaka: {pipeline.has_mangabaka_token ? 'Token Configured' : 'No Token'}
+            </span>
+            {#if syncRunning}
+              <span class="status-badge status-valid">Sync in progress…</span>
+            {/if}
+          </div>
+
+          {#if syncError}
+            <Notice error={syncError} />
+          {/if}
+
+          {#if syncSummary}
+            <div class="sync-summary-box">
+              <div class="sync-summary-header">
+                <strong>{syncSummary.isDryRun ? 'Dry Run Evaluation Result' : 'Sync Run Completed'}</strong>
+                <span class="badge {syncSummary.errors > 0 ? 'badge-error' : 'badge-ok'}">
+                  {syncSummary.totalSeries} series processed
+                </span>
+              </div>
+              <div class="sync-summary-counts">
+                <span><strong>{syncSummary.isDryRun ? syncSummary.dryRunUpdates : syncSummary.updated}</strong> {syncSummary.isDryRun ? 'would update' : 'updated'}</span>
+                <span><strong>{syncSummary.noChange}</strong> unchanged</span>
+                <span><strong>{syncSummary.skipped}</strong> skipped</span>
+                <span><strong>{syncSummary.errors}</strong> errors</span>
+              </div>
+            </div>
+          {/if}
+
+          {#if syncHistory.length > 0}
+            <div class="sync-history-container">
+              <div class="sync-history-header">
+                <h4>Recent Sync Audit Records</h4>
+                <button class="btn" onclick={loadSyncHistory} style="font-size: 11px; padding: 2px 8px;">Refresh</button>
+              </div>
+              <div class="sync-records-list">
+                {#each syncHistory as rec (rec.id)}
+                  <div class="sync-record-item">
+                    <div class="rec-top">
+                      <span class="rec-title">{rec.komgaSeriesTitle}</span>
+                      <span class="rec-tracker badge">{rec.tracker.toUpperCase()}</span>
+                      <span class="status-badge {rec.category === 'updated' || rec.category === 'dry_run_would_update' ? 'status-valid' : rec.category.startsWith('skipped') ? 'status-not_configured' : rec.category.includes('error') ? 'status-failed' : 'status-not_configured'}">
+                        {rec.category.replace(/_/g, ' ')}
+                      </span>
+                      <span class="rec-time">{ago(rec.timestamp)}</span>
+                    </div>
+                    <div class="rec-body">
+                      {#if rec.oldProgress != null || rec.newProgress != null}
+                        <span class="rec-progress">
+                          Progress: {rec.oldProgress ?? 0} &rarr; {rec.newProgress ?? rec.oldProgress}
+                          {#if rec.statusChange}
+                            <em>({rec.statusChange})</em>
+                          {/if}
+                        </span>
+                      {/if}
+                      <span class="rec-msg">{rec.message}</span>
+                    </div>
+                  </div>
+                {/each}
+              </div>
+            </div>
+          {/if}
+        </section>
       {:else if tab.id === 'account'}
         {#if session.account}
           <section class="card">
@@ -2387,5 +2539,108 @@
   .text-spot {
     color: var(--spot);
     font-weight: 700;
+  }
+
+  .sync-actions {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+
+  .sync-summary-box {
+    margin-top: 12px;
+    padding: 12px;
+    background: var(--surface);
+    border: 2px solid var(--ink);
+  }
+
+  .sync-summary-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 8px;
+  }
+
+  .sync-summary-counts {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 16px;
+    font-size: 13px;
+  }
+
+  .sync-history-container {
+    margin-top: 16px;
+    border-top: 1px solid var(--ink);
+    padding-top: 12px;
+  }
+
+  .sync-history-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 8px;
+  }
+
+  .sync-history-header h4 {
+    margin: 0;
+  }
+
+  .sync-records-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    max-height: 400px;
+    overflow-y: auto;
+  }
+
+  .sync-record-item {
+    background: var(--surface);
+    border: 1px solid var(--ink);
+    padding: 8px 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 12px;
+  }
+
+  .rec-top {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .rec-title {
+    font-weight: 700;
+  }
+
+  .rec-tracker {
+    font-size: 10px;
+    padding: 1px 6px;
+    background: var(--paper);
+    border: 1px solid var(--ink);
+  }
+
+  .rec-time {
+    margin-left: auto;
+    color: var(--muted);
+    font-size: 11px;
+  }
+
+  .rec-body {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    color: var(--muted);
+  }
+
+  .rec-progress {
+    font-weight: 600;
+    color: var(--ink);
+  }
+
+  .rec-msg {
+    font-size: 11px;
   }
 </style>

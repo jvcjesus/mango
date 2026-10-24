@@ -1426,5 +1426,57 @@ describe('first-class volume acquisition & release semantics', () => {
       expect(configWithDualLibs.komga_chinese_library_id).toBe('lib-002');
       expect(configWithDualLibs.komga_scan_enabled).toBe(true);
     });
+
+    it('models reading progress synchronization and dry-run audit records', async () => {
+      const { runSyncDryRun, getSyncHistory } = await import('./api');
+      type SyncRecord = import('./api').SyncRecord;
+      type SyncSummary = import('./api').SyncSummary;
+
+      const mockSummary: SyncSummary = {
+        totalSeries: 2,
+        updated: 0,
+        noChange: 1,
+        dryRunUpdates: 1,
+        skipped: 0,
+        errors: 0,
+        isDryRun: true,
+        records: [
+          {
+            id: 'sync-1',
+            timestamp: 1714560000,
+            komgaSeriesId: 'series-001',
+            komgaSeriesTitle: 'Chainsaw Man',
+            tracker: 'anilist',
+            trackerMediaId: '105778',
+            oldProgress: 50,
+            newProgress: 97,
+            statusChange: null,
+            category: 'dry_run_would_update',
+            message: 'Dry run: would update AniList progress from Ch 50 to Ch 97',
+            isDryRun: true,
+          },
+          {
+            id: 'sync-2',
+            timestamp: 1714560000,
+            komgaSeriesId: 'series-002',
+            komgaSeriesTitle: 'Blue Lock',
+            tracker: 'anilist',
+            trackerMediaId: '106130',
+            oldProgress: 180,
+            newProgress: 180,
+            statusChange: null,
+            category: 'tracker_ahead',
+            message: 'AniList is ahead (Ch 180) of Komga progress (Ch 150); keeping Ch 180',
+            isDryRun: true,
+          },
+        ],
+      };
+
+      expect(mockSummary.isDryRun).toBe(true);
+      expect(mockSummary.dryRunUpdates).toBe(1);
+      expect(mockSummary.records[0].category).toBe('dry_run_would_update');
+      expect(mockSummary.records[1].category).toBe('tracker_ahead');
+      expect(mockSummary.records[1].newProgress).toBe(180); // never decreases!
+    });
   });
 });

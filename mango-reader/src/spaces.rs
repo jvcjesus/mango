@@ -124,10 +124,13 @@ impl Spaces {
             tokio::spawn(stores.clone().refresh_on_schedule(shared.stores_refresh_hours)),
             tokio::spawn(stores.clone().keep_blocked_out()),
         ];
+        let trackers_inst = Trackers::new(db.clone())?;
+        let sync = Arc::new(crate::sync::service::SyncService::new(db.clone(), trackers_inst.clone(), pipeline.clone()));
         let app = AppState {
             me: Who::default(),
             importer: Importer::new(db.clone()),
-            trackers: Trackers::new(db.clone())?,
+            trackers: trackers_inst,
+            sync,
             auth: self.auth.clone(),
             releases: shared.releases.clone(),
             host: shared.host.clone(),
