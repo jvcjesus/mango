@@ -9,8 +9,23 @@ export type Toast = {
   duration: number;
 };
 
+export type ToastOptions = {
+  action?: { label: string; run: () => void };
+  duration?: number;
+};
+
 class ToastStore {
   toasts = $state<Toast[]>([]);
+
+  private parseOptions(
+    opt?: { label: string; run: () => void } | ToastOptions,
+  ): ToastOptions {
+    if (!opt) return {};
+    if ('label' in opt && typeof opt.label === 'string' && 'run' in opt) {
+      return { action: opt as { label: string; run: () => void } };
+    }
+    return opt as ToastOptions;
+  }
 
   show(
     text: string,
@@ -39,16 +54,19 @@ class ToastStore {
     return id;
   }
 
-  success(text: string, action?: { label: string; run: () => void }) {
-    return this.show(text, { kind: 'success', action });
+  success(text: string, actionOrOptions?: { label: string; run: () => void } | ToastOptions) {
+    const opts = this.parseOptions(actionOrOptions);
+    return this.show(text, { kind: 'success', ...opts });
   }
 
-  error(text: string, action?: { label: string; run: () => void }) {
-    return this.show(text, { kind: 'error', action });
+  error(text: string, actionOrOptions?: { label: string; run: () => void } | ToastOptions) {
+    const opts = this.parseOptions(actionOrOptions);
+    return this.show(text, { kind: 'error', ...opts });
   }
 
-  info(text: string, action?: { label: string; run: () => void }) {
-    return this.show(text, { kind: 'info', action });
+  info(text: string, actionOrOptions?: { label: string; run: () => void } | ToastOptions) {
+    const opts = this.parseOptions(actionOrOptions);
+    return this.show(text, { kind: 'info', ...opts });
   }
 
   dismiss(id: string) {

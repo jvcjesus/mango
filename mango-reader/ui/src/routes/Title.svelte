@@ -1,11 +1,13 @@
 <script lang="ts">
   import { get, message, send, type Category, type Chapter, type Title } from '../lib/api';
+  import { confirm } from '../lib/confirm.svelte';
   import Cover from '../lib/Cover.svelte';
   import Icon from '../lib/Icon.svelte';
   import { keep, recall } from '../lib/keep';
   import Notice from '../lib/Notice.svelte';
   import { pref, setPref } from '../lib/prefs.svelte';
   import { back } from '../lib/router.svelte';
+  import { toast } from '../lib/toast.svelte';
   import Tracking from '../lib/Tracking.svelte';
   import { ago, chapterShort, langName, STATUS } from '../lib/util';
 
@@ -95,14 +97,20 @@
   }
   load();
 
+  let savingLibrary = $state(false);
+  let downloading = $state(false);
+  let busyChapter = $state<Record<number, boolean>>({});
+
   async function refresh() {
     menu = false;
     refreshing = true;
     refreshError = null;
     try {
       title = await send<Title>('POST', `/manga/${id}/refresh`);
+      toast.success('Updated title from source');
     } catch (e) {
       refreshError = message(e);
+      toast.error(refreshError);
     }
     refreshing = false;
   }
@@ -121,16 +129,41 @@
 
   let note = $state('');
 
-  function download(list: Chapter[]) {
-    change(async () => {
+  async function download(list: Chapter[]) {
+    if (!list.length || downloading) return;
+    downloading = true;
+    for (const c of list) busyChapter[c.id] = true;
+    try {
       const answer = await send<{ queued: number }>('POST', '/downloads', { chapters: list.map((c) => c.id) });
-      note = answer.queued ? `${answer.queued} ${answer.queued === 1 ? 'chapter' : 'chapters'} queued for download.` : 'Already saved or queued.';
-    });
+      const queuedCount = answer.queued;
+      const text = queuedCount ? `${queuedCount} ${queuedCount === 1 ? 'chapter' : 'chapters'} queued for download.` : 'Already saved or queued.';
+      note = text;
+      toast.info(text, { action: { label: 'See downloads', run: () => (location.hash = '#/downloads') } });
+    } catch (e) {
+      refreshError = message(e);
+      toast.error(refreshError);
+    } finally {
+      downloading = false;
+      for (const c of list) busyChapter[c.id] = false;
+    }
   }
 
-  function deleteFile(chapter: Chapter) {
+  async function deleteFile(chapter: Chapter) {
+    const ok = await confirm({
+      title: 'Delete Download?',
+      message: `Delete the saved file for ${chapter.name}? You will need to download it again to read offline.`,
+      confirmText: 'Delete',
+      danger: true,
+    });
+    if (!ok) return;
+    busyChapter[chapter.id] = true;
     chapter.downloaded = false;
-    change(() => send('DELETE', `/chapters/${chapter.id}/download`));
+    try {
+      await change(() => send('DELETE', `/chapters/${chapter.id}/download`));
+      toast.info(`Deleted saved file for ${chapter.name}`);
+    } finally {
+      busyChapter[chapter.id] = false;
+    }
   }
 
   function toggleAuto() {
@@ -148,15 +181,26 @@
       await work();
     } catch (e) {
       refreshError = message(e);
+      toast.error(refreshError);
       title = await get<Title>(`/manga/${id}`).catch(() => title);
     }
   }
 
-  function toggleLibrary() {
-    if (!title) return;
-    const t = title;
-    t.inLibrary = !t.inLibrary;
-    change(() => send('PUT', `/manga/${id}/library`, { inLibrary: t.inLibrary }));
+  async function toggleLibrary() {
+    if (!title || savingLibrary) return;
+    savingLibrary = true;
+    const nextState = !title.inLibrary;
+    title.inLibrary = nextState;
+    try {
+      await send('PUT', `/manga/${id}/library`, { inLibrary: nextState });
+      toast.success(nextState ? `Added "${title.title}" to library` : `Removed "${title.title}" from library`);
+    } catch (e) {
+      title.inLibrary = !nextState;
+      refreshError = message(e);
+      toast.error(refreshError);
+    } finally {
+      savingLibrary = false;
+    }
   }
 
   function mark(list: Chapter[], read: boolean) {
@@ -213,9 +257,15 @@
         <button
           class="btn lift spot-on"
           aria-pressed={title.inLibrary}
+          disabled={savingLibrary}
           onclick={toggleLibrary}
         >
-          <Icon name="bookmark" fill={title.inLibrary} />{title.inLibrary ? 'In library' : 'Add to library'}
+          {#if savingLibrary}
+            <span class="spin"><Icon name="spinner" size={18} stroke={3} /></span>
+          {:else}
+            <Icon name="bookmark" fill={title.inLibrary} />
+          {/if}
+          {title.inLibrary ? 'In library' : 'Add to library'}
         </button>
         <div class="menu">
           <button class="btn icon lift" aria-label="More actions" aria-expanded={menu} onclick={() => (menu = !menu)}><Icon name="more" fill /></button>
@@ -297,12 +347,27 @@
             <button
               class="btn icon"
               aria-label="Download the unread chapters"
-              disabled={!chapters.some((c) => !c.read && !c.downloaded)}
+              disabled={downloading || !chapters.some((c) => !c.read && !c.downloaded)}
               onclick={() => download(chapters.filter((c) => !c.read && !c.downloaded))}
             >
-              <Icon name="download" />
+              {#if downloading}
+                <span class="spin"><Icon name="spinner" size={18} stroke={3} /></span>
+              {:else}
+                <Icon name="download" />
+              {/if}
             </button>
-            <button class="btn icon" aria-label="Refresh from the source" disabled={refreshing} onclick={refresh}><Icon name="refresh" /></button>
+            <button
+              class="btn icon"
+              aria-label="Refresh from the source"
+              disabled={refreshing}
+              onclick={refresh}
+            >
+              {#if refreshing}
+                <span class="spin"><Icon name="spinner" size={18} stroke={3} /></span>
+              {:else}
+                <Icon name="refresh" />
+              {/if}
+            </button>
           </div>
         </div>
 
@@ -354,9 +419,31 @@
                 <span class="meter" aria-hidden="true"><span style:width="{Math.round(((chapter.lastPageRead + 1) / chapter.pageCount) * 100)}%"></span></span>
               {/if}
               {#if chapter.downloaded}
-                <button class="btn icon" aria-label="Delete the saved file of {chapter.name}" onclick={() => deleteFile(chapter)}><Icon name="trash" /></button>
+                <button
+                  class="btn icon"
+                  aria-label="Delete the saved file of {chapter.name}"
+                  disabled={busyChapter[chapter.id]}
+                  onclick={() => deleteFile(chapter)}
+                >
+                  {#if busyChapter[chapter.id]}
+                    <span class="spin"><Icon name="spinner" size={18} stroke={3} /></span>
+                  {:else}
+                    <Icon name="trash" />
+                  {/if}
+                </button>
               {:else}
-                <button class="btn icon" aria-label="Download {chapter.name}" onclick={() => download([chapter])}><Icon name="download" /></button>
+                <button
+                  class="btn icon"
+                  aria-label="Download {chapter.name}"
+                  disabled={busyChapter[chapter.id]}
+                  onclick={() => download([chapter])}
+                >
+                  {#if busyChapter[chapter.id]}
+                    <span class="spin"><Icon name="spinner" size={18} stroke={3} /></span>
+                  {:else}
+                    <Icon name="download" />
+                  {/if}
+                </button>
               {/if}
               <!-- What is seldom wanted waits behind one button, so a row keeps to two. -->
               <div class="menu own">
