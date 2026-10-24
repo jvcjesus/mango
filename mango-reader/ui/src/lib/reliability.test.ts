@@ -382,3 +382,141 @@ describe('reader page lifecycle and decode verification', () => {
     mgr.destroy();
   });
 });
+
+describe('duplicate chapter ID tolerance', () => {
+  it('groups and retains chapters when multiple chapters share the same ID', async () => {
+    const { parseVolume, volumeHeading } = await import('./util');
+
+    // Extension returning duplicate chapter IDs (e.g., re-upload or source anomaly)
+    const duplicateIdChapters = [
+      { id: 42, name: 'Vol. 1 Ch. 1 - Part 1', number: 1 },
+      { id: 42, name: 'Vol. 1 Ch. 1 - Part 2', number: 1 },
+      { id: 43, name: 'Vol. 1 Ch. 2', number: 2 },
+      { id: 44, name: 'Vol. 2 Ch. 3', number: 3 },
+    ];
+
+    // Grouping by volume
+    const map = new Map<number | null, typeof duplicateIdChapters>();
+    for (const c of duplicateIdChapters) {
+      const vol = parseVolume(c.name);
+      const list = map.get(vol) ?? [];
+      list.push(c);
+      map.set(vol, list);
+    }
+
+    const volumeGroups = Array.from(map.entries()).map(([vol, chs]) => ({
+      volume: vol,
+      label: volumeHeading(vol),
+      chapters: chs,
+    }));
+
+    // Volume 1 should contain all 3 chapters, including both chapters with id: 42
+    const vol1Group = volumeGroups.find((g) => g.volume === 1);
+    expect(vol1Group).toBeDefined();
+    expect(vol1Group?.chapters.length).toBe(3);
+    expect(vol1Group?.chapters.filter((c) => c.id === 42).length).toBe(2);
+
+    // Structural key (grp.volume ?? 'unassigned') is unique per group
+    const structuralKeys = volumeGroups.map((g) => g.volume ?? 'unassigned');
+    expect(new Set(structuralKeys).size).toBe(volumeGroups.length);
+
+    // Unkeyed chapter iteration retains both entries without duplicate key conflict
+    const renderedChapters = vol1Group?.chapters.map((c) => c.name);
+    expect(renderedChapters).toEqual([
+      'Vol. 1 Ch. 1 - Part 1',
+      'Vol. 1 Ch. 1 - Part 2',
+      'Vol. 1 Ch. 2',
+    ]);
+  });
+
+  it('renders Title component with duplicate chapter IDs without Svelte each_key_duplicate error', async () => {
+    // Provide minimal browser shims for component rendering in Node test environment
+    if (typeof (globalThis as any).history === 'undefined') {
+      (globalThis as any).history = {
+        scrollRestoration: 'manual',
+        state: {},
+        replaceState: () => {},
+        pushState: () => {},
+        back: () => {},
+      };
+    }
+    if (typeof (globalThis as any).location === 'undefined') {
+      (globalThis as any).location = { hash: '#/title/9999' };
+    }
+    if (typeof (globalThis as any).window === 'undefined') {
+      (globalThis as any).window = globalThis;
+    }
+    if (typeof (globalThis as any).scrollTo === 'undefined') {
+      (globalThis as any).scrollTo = () => {};
+      (globalThis as any).scrollY = 0;
+    }
+    if (typeof (globalThis as any).addEventListener === 'undefined') {
+      (globalThis as any).addEventListener = () => {};
+      (globalThis as any).removeEventListener = () => {};
+    }
+
+    const { keep } = await import('./keep');
+    const { render } = await import('svelte/server');
+    const Title = (await import('../routes/Title.svelte')).default;
+
+    const mockTitle = {
+      id: 9999,
+      sourceId: '1',
+      sourceName: 'Demo Source',
+      sourceLang: 'en',
+      webUrl: 'https://example.com/manga/test',
+      title: 'Duplicate ID Test Manga',
+      artist: 'Artist',
+      author: 'Author',
+      description: 'Testing duplicate chapter IDs',
+      genres: ['Action'],
+      status: 1,
+      cover: null,
+      inLibrary: false,
+      addedAt: null,
+      initialized: true,
+      readerMode: null,
+      readerFit: null,
+      autoDownload: false,
+      chaptersAt: 1000,
+      releaseDays: null,
+      categories: [],
+      chapters: [
+        {
+          id: 555,
+          name: 'Vol. 1 Ch. 1 - Release A',
+          number: 1,
+          scanlator: 'Group A',
+          dateUpload: 1000,
+          fetchedAt: 1000,
+          read: false,
+          lastPageRead: 0,
+          pageCount: 20,
+          downloaded: false,
+          bookmark: false,
+        },
+        {
+          id: 555, // Duplicate chapter ID from source
+          name: 'Vol. 1 Ch. 1 - Release B',
+          number: 1,
+          scanlator: 'Group B',
+          dateUpload: 2000,
+          fetchedAt: 2000,
+          read: false,
+          lastPageRead: 0,
+          pageCount: 20,
+          downloaded: false,
+          bookmark: false,
+        },
+      ],
+    };
+
+    // Synchronously preload title into recall cache
+    keep('title', mockTitle);
+
+    // Rendering Title with duplicate chapter IDs should NOT throw each_key_duplicate
+    const result = render(Title, { props: { id: 9999 } });
+    expect(result.html).toContain('Vol. 1 Ch. 1 - Release A');
+    expect(result.html).toContain('Vol. 1 Ch. 1 - Release B');
+  });
+});

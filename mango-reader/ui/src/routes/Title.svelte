@@ -468,7 +468,7 @@
         <Notice loading={refreshing} error={refreshError} retry={refresh} />
         {#if note}<p role="status"><strong>{note}</strong> <a class="link" href="#/downloads">See downloads</a></p>{/if}
 
-        {#each volumeGroups as grp (grp.label || 'all')}
+        {#each volumeGroups as grp (grp.volume ?? 'unassigned')}
           {#if grp.label}
             <div class="volume-header">
               <h3 class="display">{grp.label}</h3>
@@ -476,7 +476,7 @@
             </div>
           {/if}
           <ul class="rows">
-            {#each grp.chapters as chapter (chapter.id)}
+            {#each grp.chapters as chapter}
               <li class:done={chapter.read}>
                 <a class="main" href="#/read/{chapter.id}">
                   <strong>
