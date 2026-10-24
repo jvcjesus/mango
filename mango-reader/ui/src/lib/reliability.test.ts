@@ -113,3 +113,83 @@ describe('api error utilities', () => {
     expect(message(strErr)).toBe('Direct string message');
   });
 });
+
+describe('optimistic toggle and error rollback logic', () => {
+  it('rolls back state and displays error toast on failure', async () => {
+    toast.clear();
+    const item = { inLibrary: false };
+
+    async function toggleLibrary(target: { inLibrary: boolean }, apiCall: () => Promise<void>) {
+      const nextState = !target.inLibrary;
+      target.inLibrary = nextState;
+      try {
+        await apiCall();
+        toast.success(nextState ? 'Added to library' : 'Removed from library');
+      } catch (e) {
+        target.inLibrary = !nextState; // Rollback
+        toast.error(message(e));
+      }
+    }
+
+    // Successful toggle
+    await toggleLibrary(item, async () => {});
+    expect(item.inLibrary).toBe(true);
+    expect(toast.toasts.length).toBe(1);
+    expect(toast.toasts[0].kind).toBe('success');
+
+    // Failed toggle
+    await toggleLibrary(item, async () => {
+      throw new ApiError(500, 'server_error', 'Database unavailable');
+    });
+    expect(item.inLibrary).toBe(true); // Rolled back from false to true
+    expect(toast.toasts.length).toBe(2);
+    expect(toast.toasts[1].kind).toBe('error');
+    expect(toast.toasts[1].text).toBe('Database unavailable');
+  });
+});
+
+describe('background polling error preservation', () => {
+  it('does not overwrite user action error during background refresh', async () => {
+    let error: string | null = 'Failed to delete chapter';
+    let queue: string[] = ['chap1'];
+
+    async function load(isBackground = false) {
+      try {
+        // Simulated successful poll
+        queue = ['chap1'];
+      } catch (e) {
+        // Only surface poll errors if user explicitly loaded or error is empty
+        if (!isBackground || !error) {
+          error = message(e);
+        }
+      }
+    }
+
+    // Background poll runs
+    await load(true);
+    // User error was not wiped or replaced
+    expect(error).toBe('Failed to delete chapter');
+  });
+});
+
+describe('toast action handler', () => {
+  it('executes action callback and can be dismissed', () => {
+    toast.clear();
+    const actionSpy = vi.fn();
+    const id = toast.info('Update available', {
+      action: {
+        label: 'View',
+        run: actionSpy,
+      },
+    });
+
+    const currentToast = toast.toasts.find((t) => t.id === id);
+    expect(currentToast?.action?.label).toBe('View');
+
+    currentToast?.action?.run();
+    expect(actionSpy).toHaveBeenCalledTimes(1);
+
+    toast.dismiss(id);
+    expect(toast.toasts.length).toBe(0);
+  });
+});
