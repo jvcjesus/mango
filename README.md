@@ -425,9 +425,17 @@ Audit Log & Acquisition History
   - Strictly never equates Volume 12 = Chapter 12.
   - Never-decrease rule: `target = max(existing_tracker_progress, safely_derived_komga_progress)`.
   - Completion rule: Only marks series as `COMPLETED` on AniList if an authoritative total is known and reached.
-- **Audited MangaBaka Progress Semantics**:
-  - MangaBaka REST API v1 provides public catalog, edition, and metadata endpoints, but does NOT provide a remote user library mutation endpoint.
-  - Live progress synchronization fails closed honestly with `Unsupported` (`SyncResultCategory::Unsupported`), while MangaBaka is actively utilized for exact edition resolution and authoritative volume totals.
+- **Proven MangaBaka Live Progress Synchronization**:
+  - Authenticates using `x-api-key: <token>` (and `Authorization: Bearer <token>`).
+  - Cross-references AniList IDs to MangaBaka IDs via `GET /v1/source/anilist/{anilist_id}`.
+  - Queries user's existing library entry via `GET /v1/my/library/{mangabaka_id}`.
+  - Safe 404 skipping: if a title is absent from the user's MangaBaka library, skips safely (`not_in_tracker_library`) with ZERO POST/creation requests (never automatically adds titles).
+  - Dimension-specific fields: `progress_volume` for volume series, `progress_chapter` for chapter series.
+  - Never-decrease rule: if Komga progress &le; MangaBaka progress, performs zero mutations (`NoChange` or `TrackerAhead`).
+  - Zero-mutation dry runs: returns `WouldUpdate` with ZERO PATCH calls.
+  - Live progress synchronization via `PATCH /v1/my/library/{mangabaka_id}` with `{"progress_volume": N}` or `{"progress_chapter": N}`.
+  - Immediate post-mutation verification: reads back `GET /v1/my/library/{mangabaka_id}` to confirm `verified_progress == requested_progress`, reporting `VerificationFailed` on mismatch.
+  - Contiguous completed progress: uninterrupted completed releases starting at 1.0 (gaps stop progression; Chapter 0 does not shift Chapter 1-based progress).
 - **Decoupled Tracked / Owned / Reading / Auto-Acquire Model**:
   - Fully decouples `Tracked` (on wishlist/reading list), `Owned` (physically in Komga), `Reading` (active reading progress), `Acquiring` (in download/publish pipeline), and `Auto-acquire enabled`.
   - Tracking a title NEVER implies downloading or auto-acquiring it. Auto-acquisition strictly defaults to false.

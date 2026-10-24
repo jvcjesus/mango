@@ -1,11 +1,29 @@
 use super::{
-    komga_reader::{evaluate_series_progress, parse_chapter_number},
-    mapping::{delete_mapping, get_mapping, list_mappings, resolve_mapping, save_mapping},
-    model::{SyncTarget, TrackerMapping},
+    identity::resolve_mangabaka_identity,
+    komga_reader::{calculate_contiguous_progress, evaluate_series_progress, parse_chapter_number},
+    mapping::{
+        delete_mapping, get_mapping, list_mappings, resolve_mapping, save_mapping,
+        set_manual_override,
+    },
+    model::{MappingConfidence, MappingSource, SyncResultCategory, SyncTarget, TrackerMapping},
 };
 use crate::{
     db::Db,
-    pipeline::komga::{KomgaBook, KomgaBookMetadata, KomgaReadProgress, KomgaSeries},
+    pipeline::{
+        komga::{KomgaBook, KomgaBookMetadata, KomgaReadProgress, KomgaSeries},
+        mangabaka::MangaBakaClient,
+    },
+};
+use axum::{
+    Json, Router,
+    extract::Path,
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
+    routing::get,
+};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicUsize, Ordering},
 };
 
 #[test]
@@ -303,12 +321,345 @@ async fn test_sync_skips_untouched_series() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+#[derive(Clone)]
+struct MockMangaBakaState {
+    library: Arc<Mutex<std::collections::HashMap<i64, (Option<f64>, Option<f64>, String)>>>,
+    patch_calls: Arc<AtomicUsize>,
+    post_calls: Arc<AtomicUsize>,
+    last_patch_body: Arc<Mutex<Option<serde_json::Value>>>,
+}
+
+async fn start_mock_mangabaka(
+    initial_entries: Vec<(i64, Option<f64>, Option<f64>, String)>,
+) -> (String, MockMangaBakaState) {
+    let mut map = std::collections::HashMap::new();
+    for (id, vol, ch, st) in initial_entries {
+        map.insert(id, (vol, ch, st));
+    }
+    let state = MockMangaBakaState {
+        library: Arc::new(Mutex::new(map)),
+        patch_calls: Arc::new(AtomicUsize::new(0)),
+        post_calls: Arc::new(AtomicUsize::new(0)),
+        last_patch_body: Arc::new(Mutex::new(None)),
+    };
+
+    let app = Router::new()
+        .route(
+            "/source/anilist/{id}",
+            get(|Path(id): Path<String>| async move {
+                if id == "101" {
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "data": {
+                                "id": 202,
+                                "title": "Berserk"
+                            }
+                        })),
+                    )
+                        .into_response()
+                } else {
+                    StatusCode::NOT_FOUND.into_response()
+                }
+            }),
+        )
+        .route(
+            "/my/library/{id}",
+            get({
+                let state = state.clone();
+                move |headers: HeaderMap, Path(id): Path<String>| {
+                    let state = state.clone();
+                    async move {
+                        let token = headers.get("x-api-key").and_then(|v| v.to_str().ok());
+                        if token == Some("invalid-token") {
+                            return StatusCode::UNAUTHORIZED.into_response();
+                        }
+                        if id == "404" || id == "999" {
+                            return StatusCode::NOT_FOUND.into_response();
+                        }
+                        if id == "502" {
+                            return StatusCode::BAD_GATEWAY.into_response();
+                        }
+                        let num_id = id.parse::<i64>().unwrap_or(0);
+                        let lib = state.library.lock().unwrap();
+                        if let Some((vol, ch, st)) = lib.get(&num_id) {
+                            (
+                                StatusCode::OK,
+                                Json(serde_json::json!({
+                                    "data": {
+                                        "id": num_id,
+                                        "series_id": num_id,
+                                        "progress_volume": vol,
+                                        "progress_chapter": ch,
+                                        "status": st
+                                    }
+                                })),
+                            )
+                                .into_response()
+                        } else {
+                            StatusCode::NOT_FOUND.into_response()
+                        }
+                    }
+                }
+            })
+            .patch({
+                let state = state.clone();
+                move |headers: HeaderMap,
+                      Path(id): Path<String>,
+                      Json(body): Json<serde_json::Value>| {
+                    let state = state.clone();
+                    async move {
+                        state.patch_calls.fetch_add(1, Ordering::SeqCst);
+                        *state.last_patch_body.lock().unwrap() = Some(body.clone());
+
+                        let token = headers.get("x-api-key").and_then(|v| v.to_str().ok());
+                        if token == Some("invalid-token") {
+                            return StatusCode::UNAUTHORIZED.into_response();
+                        }
+                        if id == "502" || id == "503" {
+                            return StatusCode::BAD_GATEWAY.into_response();
+                        }
+                        if id == "777" {
+                            // Simulation of verification mismatch: return OK without updating state.library
+                            return StatusCode::OK.into_response();
+                        }
+                        if id == "888" {
+                            // Simulation of disappeared entry: remove from library
+                            state.library.lock().unwrap().remove(&888);
+                            return StatusCode::OK.into_response();
+                        }
+
+                        let num_id = id.parse::<i64>().unwrap_or(0);
+                        let vol = body.get("progress_volume").and_then(|v| v.as_f64());
+                        let ch = body.get("progress_chapter").and_then(|v| v.as_f64());
+
+                        let mut lib = state.library.lock().unwrap();
+                        if let Some(entry) = lib.get_mut(&num_id) {
+                            if vol.is_some() {
+                                entry.0 = vol;
+                            }
+                            if ch.is_some() {
+                                entry.1 = ch;
+                            }
+                        } else {
+                            lib.insert(num_id, (vol, ch, "CURRENT".to_string()));
+                        }
+                        StatusCode::OK.into_response()
+                    }
+                }
+            })
+            .post({
+                let state = state.clone();
+                move || {
+                    let state = state.clone();
+                    async move {
+                        state.post_calls.fetch_add(1, Ordering::SeqCst);
+                        StatusCode::METHOD_NOT_ALLOWED.into_response()
+                    }
+                }
+            }),
+        )
+        .route(
+            "/series/search",
+            get(
+                |axum::extract::Query(params): axum::extract::Query<
+                    std::collections::HashMap<String, String>,
+                >| async move {
+                    let q = params.get("q").map(|s| s.as_str()).unwrap_or("");
+                    if q == "Berserk" {
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "data": [{ "id": 202, "title": "Berserk" }]
+                            })),
+                        )
+                            .into_response()
+                    } else if q == "Ambiguous Title" {
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "data": [
+                                    { "id": 1, "title": "Ambiguous Title 1" },
+                                    { "id": 2, "title": "Ambiguous Title 2" }
+                                ]
+                            })),
+                        )
+                            .into_response()
+                    } else {
+                        (StatusCode::OK, Json(serde_json::json!({ "data": [] }))).into_response()
+                    }
+                },
+            ),
+        )
+        .route(
+            "/series/{id}/collections",
+            get(|Path(_id): Path<String>| async move {
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "data": [{
+                            "id": "col-std",
+                            "edition": "Standard Edition",
+                            "language": "en"
+                        }]
+                    })),
+                )
+                    .into_response()
+            }),
+        );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    (format!("http://127.0.0.1:{port}"), state)
+}
+
 #[tokio::test]
-async fn test_mangabaka_sync_dry_run_and_auth() {
-    let mb_client = crate::pipeline::mangabaka::MangaBakaClient::new(
+async fn test_mangabaka_cross_reference_success_and_not_found() {
+    let (url, _) = start_mock_mangabaka(vec![]).await;
+    let client = MangaBakaClient::new(
         reqwest::Client::new(),
+        Some(url),
+        Some("valid-token".into()),
+    );
+
+    // 1. Success cross-reference
+    let xref = client.resolve_from_anilist(101).await.unwrap();
+    assert!(xref.is_some());
+    let x = xref.unwrap();
+    assert_eq!(x.mangabaka_id, 202);
+    assert_eq!(x.title.as_deref(), Some("Berserk"));
+
+    // 2. Not found cross-reference
+    let not_found = client.resolve_from_anilist(99999).await.unwrap();
+    assert!(not_found.is_none());
+}
+
+#[tokio::test]
+async fn test_mangabaka_identity_precedence_and_cross_ref() {
+    let (url, _) = start_mock_mangabaka(vec![]).await;
+    let client = MangaBakaClient::new(
+        reqwest::Client::new(),
+        Some(url),
+        Some("valid-token".into()),
+    );
+
+    let dir = std::env::temp_dir().join(format!("mango-mb-id-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = Db::open(&dir.join("test.db")).expect("test db");
+    let conn = db.second().expect("connection");
+
+    // Tier 1: Manual override takes precedence over everything
+    set_manual_override(
+        &conn,
+        "series-manual",
+        SyncTarget::MangaBaka,
+        "777",
         None,
-        Some("dummy-token".into()),
+        Some("Manual Title"),
+    )
+    .unwrap();
+    let res1 = resolve_mangabaka_identity(&conn, &client, "series-manual", "Berserk")
+        .await
+        .unwrap();
+    assert!(res1.is_some());
+    let m1 = res1.unwrap();
+    assert_eq!(m1.tracker_id, "777");
+    assert!(m1.manual_override);
+
+    // Tier 2: Persisted resolved cross-reference mapping is preserved
+    let persisted_xref = TrackerMapping {
+        komga_series_id: "series-persisted".into(),
+        tracker: SyncTarget::MangaBaka,
+        tracker_id: "202".into(),
+        tracker_title: Some("Berserk".into()),
+        edition_id: None,
+        mapping_source: MappingSource::CrossReference,
+        confidence: MappingConfidence::Resolved,
+        manual_override: false,
+        last_validated: Some(1700000000),
+        updated_at: 1700000000,
+    };
+    save_mapping(&conn, &persisted_xref).unwrap();
+    let res2 = resolve_mangabaka_identity(&conn, &client, "series-persisted", "Berserk")
+        .await
+        .unwrap();
+    assert_eq!(res2.unwrap().mapping_source, MappingSource::CrossReference);
+
+    // Tier 3: Automatic cross-reference lookup via known AniList mapping
+    let anilist_map = TrackerMapping {
+        komga_series_id: "series-auto-xref".into(),
+        tracker: SyncTarget::AniList,
+        tracker_id: "101".into(),
+        tracker_title: Some("Berserk".into()),
+        edition_id: None,
+        mapping_source: MappingSource::ExactTitle,
+        confidence: MappingConfidence::Resolved,
+        manual_override: false,
+        last_validated: Some(1700000000),
+        updated_at: 1700000000,
+    };
+    save_mapping(&conn, &anilist_map).unwrap();
+    let res3 = resolve_mangabaka_identity(
+        &conn,
+        &client,
+        "series-auto-xref",
+        "Different Title In Komga",
+    )
+    .await
+    .unwrap();
+    assert!(res3.is_some());
+    let m3 = res3.unwrap();
+    assert_eq!(m3.tracker_id, "202");
+    assert_eq!(m3.mapping_source, MappingSource::CrossReference);
+
+    // Tier 4: Exact title matcher fallback when no AniList mapping exists
+    let res4 = resolve_mangabaka_identity(&conn, &client, "series-title-only", "Berserk")
+        .await
+        .unwrap();
+    assert!(res4.is_some());
+    let m4 = res4.unwrap();
+    assert_eq!(m4.tracker_id, "202");
+    assert_eq!(m4.mapping_source, MappingSource::ExactTitle);
+
+    // Tier 5: Ambiguous series fails closed
+    let res5 = resolve_mangabaka_identity(&conn, &client, "series-ambig", "Ambiguous Title")
+        .await
+        .unwrap();
+    assert!(res5.is_none());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn test_mangabaka_get_volume_and_chapter_progress() {
+    let (url, _) =
+        start_mock_mangabaka(vec![(202, Some(4.0), Some(35.0), "CURRENT".to_string())]).await;
+    let client = MangaBakaClient::new(
+        reqwest::Client::new(),
+        Some(url),
+        Some("valid-token".into()),
+    );
+
+    let entry = client.get_my_library_entry(202).await.unwrap();
+    assert!(entry.is_some());
+    let e = entry.unwrap();
+    assert_eq!(e.progress_volume, Some(4.0));
+    assert_eq!(e.progress_chapter, Some(35.0));
+    assert_eq!(e.status.as_deref(), Some("CURRENT"));
+}
+
+#[tokio::test]
+async fn test_mangabaka_absent_from_library_skips_without_auto_add() {
+    let (url, state) = start_mock_mangabaka(vec![]).await;
+    let client = MangaBakaClient::new(
+        reqwest::Client::new(),
+        Some(url),
+        Some("valid-token".into()),
     );
 
     let progress = super::model::KomgaSeriesProgress {
@@ -328,60 +679,570 @@ async fn test_mangabaka_sync_dry_run_and_auth() {
     let mapping = TrackerMapping {
         komga_series_id: "series-vol".into(),
         tracker: SyncTarget::MangaBaka,
-        tracker_id: "mb-123".into(),
+        tracker_id: "404".into(), // Not in library
         tracker_title: Some("Sample Manga".into()),
-        edition_id: Some("col-standard".into()),
-        mapping_source: super::model::MappingSource::ExactTitle,
-        confidence: super::model::MappingConfidence::Resolved,
+        edition_id: None,
+        mapping_source: MappingSource::ExactTitle,
+        confidence: MappingConfidence::Resolved,
         manual_override: false,
         last_validated: Some(1700000000),
         updated_at: 1700000000,
     };
 
-    // 1. Without token: AuthError
-    let unauth_record = super::mangabaka::sync_series_to_mangabaka(
-        &mb_client,
+    let record =
+        super::mangabaka::sync_series_to_mangabaka(&client, true, &progress, Some(&mapping), false)
+            .await;
+    assert_eq!(record.category, SyncResultCategory::NotInTrackerLibrary);
+    assert!(
+        record
+            .message
+            .contains("skipping without automatically adding")
+    );
+    assert_eq!(state.patch_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(state.post_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn test_mangabaka_volume_equal_no_change() {
+    let (url, state) =
+        start_mock_mangabaka(vec![(202, Some(4.0), None, "CURRENT".to_string())]).await;
+    let client = MangaBakaClient::new(
+        reqwest::Client::new(),
+        Some(url),
+        Some("valid-token".into()),
+    );
+
+    let progress = super::model::KomgaSeriesProgress {
+        series_id: "series-vol".into(),
+        series_title: "Sample Manga".into(),
+        library_id: "lib-en".into(),
+        total_books: 10,
+        completed_books: 4,
+        highest_completed_book: Some(4.0),
+        highest_completed_volume: Some(4.0),
+        highest_completed_chapter: None,
+        is_series_completed: false,
+        last_read_date: None,
+        books: vec![],
+    };
+
+    let mapping = TrackerMapping {
+        komga_series_id: "series-vol".into(),
+        tracker: SyncTarget::MangaBaka,
+        tracker_id: "202".into(),
+        tracker_title: Some("Sample Manga".into()),
+        edition_id: None,
+        mapping_source: MappingSource::ExactTitle,
+        confidence: MappingConfidence::Resolved,
+        manual_override: false,
+        last_validated: Some(1700000000),
+        updated_at: 1700000000,
+    };
+
+    let record =
+        super::mangabaka::sync_series_to_mangabaka(&client, true, &progress, Some(&mapping), false)
+            .await;
+    assert_eq!(record.category, SyncResultCategory::NoChange);
+    assert_eq!(state.patch_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn test_mangabaka_tracker_ahead_preserves_progress() {
+    let (url, state) =
+        start_mock_mangabaka(vec![(202, Some(10.0), None, "CURRENT".to_string())]).await;
+    let client = MangaBakaClient::new(
+        reqwest::Client::new(),
+        Some(url),
+        Some("valid-token".into()),
+    );
+
+    let progress = super::model::KomgaSeriesProgress {
+        series_id: "series-vol".into(),
+        series_title: "Sample Manga".into(),
+        library_id: "lib-en".into(),
+        total_books: 10,
+        completed_books: 4,
+        highest_completed_book: Some(4.0),
+        highest_completed_volume: Some(4.0),
+        highest_completed_chapter: None,
+        is_series_completed: false,
+        last_read_date: None,
+        books: vec![],
+    };
+
+    let mapping = TrackerMapping {
+        komga_series_id: "series-vol".into(),
+        tracker: SyncTarget::MangaBaka,
+        tracker_id: "202".into(),
+        tracker_title: Some("Sample Manga".into()),
+        edition_id: None,
+        mapping_source: MappingSource::ExactTitle,
+        confidence: MappingConfidence::Resolved,
+        manual_override: false,
+        last_validated: Some(1700000000),
+        updated_at: 1700000000,
+    };
+
+    let record =
+        super::mangabaka::sync_series_to_mangabaka(&client, true, &progress, Some(&mapping), false)
+            .await;
+    assert_eq!(record.category, SyncResultCategory::TrackerAhead);
+    assert!(record.message.contains("keeping current progress"));
+    assert_eq!(state.patch_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn test_mangabaka_dry_run_volume_zero_patches() {
+    let (url, state) =
+        start_mock_mangabaka(vec![(202, Some(2.0), None, "CURRENT".to_string())]).await;
+    let client = MangaBakaClient::new(
+        reqwest::Client::new(),
+        Some(url),
+        Some("valid-token".into()),
+    );
+
+    let progress = super::model::KomgaSeriesProgress {
+        series_id: "series-vol".into(),
+        series_title: "Sample Manga".into(),
+        library_id: "lib-en".into(),
+        total_books: 10,
+        completed_books: 4,
+        highest_completed_book: Some(4.0),
+        highest_completed_volume: Some(4.0),
+        highest_completed_chapter: None,
+        is_series_completed: false,
+        last_read_date: None,
+        books: vec![],
+    };
+
+    let mapping = TrackerMapping {
+        komga_series_id: "series-vol".into(),
+        tracker: SyncTarget::MangaBaka,
+        tracker_id: "202".into(),
+        tracker_title: Some("Sample Manga".into()),
+        edition_id: None,
+        mapping_source: MappingSource::ExactTitle,
+        confidence: MappingConfidence::Resolved,
+        manual_override: false,
+        last_validated: Some(1700000000),
+        updated_at: 1700000000,
+    };
+
+    let record =
+        super::mangabaka::sync_series_to_mangabaka(&client, true, &progress, Some(&mapping), true)
+            .await;
+    assert_eq!(record.category, SyncResultCategory::WouldUpdate);
+    assert_eq!(record.new_progress, Some(4.0));
+    assert_eq!(state.patch_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn test_mangabaka_dry_run_chapter_zero_patches() {
+    let (url, state) =
+        start_mock_mangabaka(vec![(202, None, Some(10.0), "CURRENT".to_string())]).await;
+    let client = MangaBakaClient::new(
+        reqwest::Client::new(),
+        Some(url),
+        Some("valid-token".into()),
+    );
+
+    let progress = super::model::KomgaSeriesProgress {
+        series_id: "series-ch".into(),
+        series_title: "Solo Leveling".into(),
+        library_id: "lib-en".into(),
+        total_books: 50,
+        completed_books: 25,
+        highest_completed_book: Some(25.0),
+        highest_completed_volume: None,
+        highest_completed_chapter: Some(25.0),
+        is_series_completed: false,
+        last_read_date: None,
+        books: vec![],
+    };
+
+    let mapping = TrackerMapping {
+        komga_series_id: "series-ch".into(),
+        tracker: SyncTarget::MangaBaka,
+        tracker_id: "202".into(),
+        tracker_title: Some("Solo Leveling".into()),
+        edition_id: None,
+        mapping_source: MappingSource::ExactTitle,
+        confidence: MappingConfidence::Resolved,
+        manual_override: false,
+        last_validated: Some(1700000000),
+        updated_at: 1700000000,
+    };
+
+    let record =
+        super::mangabaka::sync_series_to_mangabaka(&client, true, &progress, Some(&mapping), true)
+            .await;
+    assert_eq!(record.category, SyncResultCategory::WouldUpdate);
+    assert_eq!(record.new_progress, Some(25.0));
+    assert_eq!(record.dimension, Some("chapter".to_string()));
+    assert_eq!(state.patch_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn test_mangabaka_live_volume_patch_and_verification() {
+    let (url, state) =
+        start_mock_mangabaka(vec![(202, Some(2.0), None, "CURRENT".to_string())]).await;
+    let client = MangaBakaClient::new(
+        reqwest::Client::new(),
+        Some(url),
+        Some("valid-token".into()),
+    );
+
+    let progress = super::model::KomgaSeriesProgress {
+        series_id: "series-vol".into(),
+        series_title: "Sample Manga".into(),
+        library_id: "lib-en".into(),
+        total_books: 10,
+        completed_books: 4,
+        highest_completed_book: Some(4.0),
+        highest_completed_volume: Some(4.0),
+        highest_completed_chapter: None,
+        is_series_completed: false,
+        last_read_date: None,
+        books: vec![],
+    };
+
+    let mapping = TrackerMapping {
+        komga_series_id: "series-vol".into(),
+        tracker: SyncTarget::MangaBaka,
+        tracker_id: "202".into(),
+        tracker_title: Some("Sample Manga".into()),
+        edition_id: None,
+        mapping_source: MappingSource::ExactTitle,
+        confidence: MappingConfidence::Resolved,
+        manual_override: false,
+        last_validated: Some(1700000000),
+        updated_at: 1700000000,
+    };
+
+    let record =
+        super::mangabaka::sync_series_to_mangabaka(&client, true, &progress, Some(&mapping), false)
+            .await;
+    assert_eq!(record.category, SyncResultCategory::Updated);
+    assert_eq!(record.new_progress, Some(4.0));
+    assert_eq!(state.patch_calls.load(Ordering::SeqCst), 1);
+
+    // Verify dimension separation: only progress_volume was sent
+    let last_body = state.last_patch_body.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        last_body.get("progress_volume"),
+        Some(&serde_json::json!(4.0))
+    );
+    assert!(last_body.get("progress_chapter").is_none());
+
+    // Verify stored state in mock server
+    let lib = state.library.lock().unwrap();
+    assert_eq!(lib.get(&202).unwrap().0, Some(4.0));
+}
+
+#[tokio::test]
+async fn test_mangabaka_live_chapter_patch_and_verification() {
+    let (url, state) =
+        start_mock_mangabaka(vec![(202, None, Some(10.0), "CURRENT".to_string())]).await;
+    let client = MangaBakaClient::new(
+        reqwest::Client::new(),
+        Some(url),
+        Some("valid-token".into()),
+    );
+
+    let progress = super::model::KomgaSeriesProgress {
+        series_id: "series-ch".into(),
+        series_title: "Solo Leveling".into(),
+        library_id: "lib-en".into(),
+        total_books: 50,
+        completed_books: 25,
+        highest_completed_book: Some(25.0),
+        highest_completed_volume: None,
+        highest_completed_chapter: Some(25.0),
+        is_series_completed: false,
+        last_read_date: None,
+        books: vec![],
+    };
+
+    let mapping = TrackerMapping {
+        komga_series_id: "series-ch".into(),
+        tracker: SyncTarget::MangaBaka,
+        tracker_id: "202".into(),
+        tracker_title: Some("Solo Leveling".into()),
+        edition_id: None,
+        mapping_source: MappingSource::ExactTitle,
+        confidence: MappingConfidence::Resolved,
+        manual_override: false,
+        last_validated: Some(1700000000),
+        updated_at: 1700000000,
+    };
+
+    let record =
+        super::mangabaka::sync_series_to_mangabaka(&client, true, &progress, Some(&mapping), false)
+            .await;
+    assert_eq!(record.category, SyncResultCategory::Updated);
+    assert_eq!(record.new_progress, Some(25.0));
+    assert_eq!(state.patch_calls.load(Ordering::SeqCst), 1);
+
+    // Verify dimension separation: only progress_chapter was sent
+    let last_body = state.last_patch_body.lock().unwrap().clone().unwrap();
+    assert_eq!(
+        last_body.get("progress_chapter"),
+        Some(&serde_json::json!(25.0))
+    );
+    assert!(last_body.get("progress_volume").is_none());
+
+    // Verify stored state in mock server
+    let lib = state.library.lock().unwrap();
+    assert_eq!(lib.get(&202).unwrap().1, Some(25.0));
+}
+
+#[tokio::test]
+async fn test_mangabaka_post_update_verification_mismatch() {
+    let (url, state) =
+        start_mock_mangabaka(vec![(777, Some(2.0), None, "CURRENT".to_string())]).await;
+    let client = MangaBakaClient::new(
+        reqwest::Client::new(),
+        Some(url),
+        Some("valid-token".into()),
+    );
+
+    let progress = super::model::KomgaSeriesProgress {
+        series_id: "series-vol".into(),
+        series_title: "Sample Manga".into(),
+        library_id: "lib-en".into(),
+        total_books: 10,
+        completed_books: 4,
+        highest_completed_book: Some(4.0),
+        highest_completed_volume: Some(4.0),
+        highest_completed_chapter: None,
+        is_series_completed: false,
+        last_read_date: None,
+        books: vec![],
+    };
+
+    let mapping = TrackerMapping {
+        komga_series_id: "series-vol".into(),
+        tracker: SyncTarget::MangaBaka,
+        tracker_id: "777".into(),
+        tracker_title: Some("Sample Manga".into()),
+        edition_id: None,
+        mapping_source: MappingSource::ExactTitle,
+        confidence: MappingConfidence::Resolved,
+        manual_override: false,
+        last_validated: Some(1700000000),
+        updated_at: 1700000000,
+    };
+
+    let record =
+        super::mangabaka::sync_series_to_mangabaka(&client, true, &progress, Some(&mapping), false)
+            .await;
+    assert_eq!(record.category, SyncResultCategory::VerificationFailed);
+    assert!(record.message.contains("Post-update verification mismatch"));
+    assert_eq!(state.patch_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn test_mangabaka_post_update_verification_entry_disappeared() {
+    let (url, state) =
+        start_mock_mangabaka(vec![(888, Some(2.0), None, "CURRENT".to_string())]).await;
+    let client = MangaBakaClient::new(
+        reqwest::Client::new(),
+        Some(url),
+        Some("valid-token".into()),
+    );
+
+    let progress = super::model::KomgaSeriesProgress {
+        series_id: "series-vol".into(),
+        series_title: "Sample Manga".into(),
+        library_id: "lib-en".into(),
+        total_books: 10,
+        completed_books: 4,
+        highest_completed_book: Some(4.0),
+        highest_completed_volume: Some(4.0),
+        highest_completed_chapter: None,
+        is_series_completed: false,
+        last_read_date: None,
+        books: vec![],
+    };
+
+    let mapping = TrackerMapping {
+        komga_series_id: "series-vol".into(),
+        tracker: SyncTarget::MangaBaka,
+        tracker_id: "888".into(),
+        tracker_title: Some("Sample Manga".into()),
+        edition_id: None,
+        mapping_source: MappingSource::ExactTitle,
+        confidence: MappingConfidence::Resolved,
+        manual_override: false,
+        last_validated: Some(1700000000),
+        updated_at: 1700000000,
+    };
+
+    let record =
+        super::mangabaka::sync_series_to_mangabaka(&client, true, &progress, Some(&mapping), false)
+            .await;
+    assert_eq!(record.category, SyncResultCategory::VerificationFailed);
+    assert!(record.message.contains("disappeared after update"));
+    assert_eq!(state.patch_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn test_mangabaka_patch_network_error() {
+    let (url, state) =
+        start_mock_mangabaka(vec![(503, Some(2.0), None, "CURRENT".to_string())]).await;
+    let client = MangaBakaClient::new(
+        reqwest::Client::new(),
+        Some(url),
+        Some("valid-token".into()),
+    );
+
+    let progress = super::model::KomgaSeriesProgress {
+        series_id: "series-vol".into(),
+        series_title: "Sample Manga".into(),
+        library_id: "lib-en".into(),
+        total_books: 10,
+        completed_books: 4,
+        highest_completed_book: Some(4.0),
+        highest_completed_volume: Some(4.0),
+        highest_completed_chapter: None,
+        is_series_completed: false,
+        last_read_date: None,
+        books: vec![],
+    };
+
+    let mapping = TrackerMapping {
+        komga_series_id: "series-vol".into(),
+        tracker: SyncTarget::MangaBaka,
+        tracker_id: "503".into(),
+        tracker_title: Some("Sample Manga".into()),
+        edition_id: None,
+        mapping_source: MappingSource::ExactTitle,
+        confidence: MappingConfidence::Resolved,
+        manual_override: false,
+        last_validated: Some(1700000000),
+        updated_at: 1700000000,
+    };
+
+    let record =
+        super::mangabaka::sync_series_to_mangabaka(&client, true, &progress, Some(&mapping), false)
+            .await;
+    assert_eq!(record.category, SyncResultCategory::NetworkError);
+    assert_eq!(state.patch_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn test_mangabaka_auth_failure_reported() {
+    let (url, _) = start_mock_mangabaka(vec![(202, Some(2.0), None, "CURRENT".to_string())]).await;
+
+    // 1. Client has no token configured
+    let client_no_token = MangaBakaClient::new(reqwest::Client::new(), Some(url.clone()), None);
+    let progress = super::model::KomgaSeriesProgress {
+        series_id: "series-vol".into(),
+        series_title: "Sample Manga".into(),
+        library_id: "lib-en".into(),
+        total_books: 10,
+        completed_books: 4,
+        highest_completed_book: Some(4.0),
+        highest_completed_volume: Some(4.0),
+        highest_completed_chapter: None,
+        is_series_completed: false,
+        last_read_date: None,
+        books: vec![],
+    };
+    let mapping = TrackerMapping {
+        komga_series_id: "series-vol".into(),
+        tracker: SyncTarget::MangaBaka,
+        tracker_id: "202".into(),
+        tracker_title: Some("Sample Manga".into()),
+        edition_id: None,
+        mapping_source: MappingSource::ExactTitle,
+        confidence: MappingConfidence::Resolved,
+        manual_override: false,
+        last_validated: Some(1700000000),
+        updated_at: 1700000000,
+    };
+    let rec1 = super::mangabaka::sync_series_to_mangabaka(
+        &client_no_token,
         false,
         &progress,
         Some(&mapping),
         true,
     )
     .await;
-    assert_eq!(
-        unauth_record.category,
-        super::model::SyncResultCategory::AuthError
-    );
+    assert_eq!(rec1.category, SyncResultCategory::AuthError);
+    assert_eq!(rec1.message, "MangaBaka API token is not configured");
 
-    // 2. With token in Dry Run: WouldUpdate
-    let dry_record = super::mangabaka::sync_series_to_mangabaka(
-        &mb_client,
-        true,
-        &progress,
-        Some(&mapping),
-        true,
-    )
-    .await;
-    assert_eq!(
-        dry_record.category,
-        super::model::SyncResultCategory::WouldUpdate
+    // 2. Client token is rejected (returns 401)
+    let client_bad_token = MangaBakaClient::new(
+        reqwest::Client::new(),
+        Some(url),
+        Some("invalid-token".into()),
     );
-    assert_eq!(dry_record.new_progress, Some(4.0));
-    assert_eq!(dry_record.dimension, Some("volume".to_string()));
-    assert!(dry_record.message.contains("Vol 4"));
-
-    // 3. Live update: fails closed as Unsupported (MangaBaka REST API v1 has no user mutation endpoint)
-    let live_record = super::mangabaka::sync_series_to_mangabaka(
-        &mb_client,
+    let rec2 = super::mangabaka::sync_series_to_mangabaka(
+        &client_bad_token,
         true,
         &progress,
         Some(&mapping),
         false,
     )
     .await;
-    assert_eq!(
-        live_record.category,
-        super::model::SyncResultCategory::Unsupported
+    assert_eq!(rec2.category, SyncResultCategory::AuthError);
+    assert!(
+        rec2.message.contains("rejected")
+            || rec2.message.contains("invalid")
+            || rec2.message.contains("failed")
     );
+}
+
+#[test]
+fn test_contiguous_volume_progress_gap_and_order() {
+    // 1. Uninterrupted: 1, 2, 3 complete, 4 incomplete, 5 complete -> safe progress is 3.0
+    let releases1 = vec![
+        (1.0, true),
+        (2.0, true),
+        (3.0, true),
+        (4.0, false),
+        (5.0, true),
+    ];
+    assert_eq!(calculate_contiguous_progress(&releases1), Some(3.0));
+
+    // 2. Missing release (gap): 1, 2, 3 complete, 5 complete (4 missing) -> safe progress is 3.0
+    let releases2 = vec![(1.0, true), (2.0, true), (3.0, true), (5.0, true)];
+    assert_eq!(calculate_contiguous_progress(&releases2), Some(3.0));
+
+    // 3. Must start at 1.0: only 2 and 3 complete -> None
+    let releases3 = vec![(2.0, true), (3.0, true)];
+    assert_eq!(calculate_contiguous_progress(&releases3), None);
+
+    // 4. Multiple entries for same release: all must be complete
+    let releases4 = vec![(1.0, true), (1.0, false), (2.0, true)];
+    assert_eq!(calculate_contiguous_progress(&releases4), None);
+
+    // 5. Empty
+    assert_eq!(calculate_contiguous_progress(&[]), None);
+}
+
+#[test]
+fn test_contiguous_chapter_prologue_behavior() {
+    // 1. Incomplete Chapter 0 does NOT block Chapter 1 streak
+    let ch1 = vec![(0.0, false), (1.0, true), (2.0, true), (3.0, true)];
+    assert_eq!(calculate_contiguous_progress(&ch1), Some(3.0));
+
+    // 2. Completed Chapter 0 does NOT shift Chapter 1-based progress
+    let ch2 = vec![(0.0, true), (1.0, true), (2.0, true)];
+    assert_eq!(calculate_contiguous_progress(&ch2), Some(2.0));
+
+    // 3. Completed Chapter 0 with incomplete Chapter 1 reports Some(0.0)
+    let ch3 = vec![(0.0, true), (1.0, false)];
+    assert_eq!(calculate_contiguous_progress(&ch3), Some(0.0));
+
+    // 4. Incomplete Chapter 0 with incomplete Chapter 1 reports None
+    let ch4 = vec![(0.0, false), (1.0, false)];
+    assert_eq!(calculate_contiguous_progress(&ch4), None);
+
+    // 5. Fractional sub-chapters: 1, 1.5, 2, 3 complete -> 3.0
+    let ch5 = vec![(1.0, true), (1.5, true), (2.0, true), (3.0, true)];
+    assert_eq!(calculate_contiguous_progress(&ch5), Some(3.0));
 }
 
 #[test]

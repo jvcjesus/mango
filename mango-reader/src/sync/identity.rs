@@ -112,7 +112,7 @@ pub async fn resolve_mangabaka_identity(
     komga_series_id: &str,
     komga_title: &str,
 ) -> Result<Option<TrackerMapping>> {
-    // 1. Check existing mapping table
+    // 1. Check existing mapping table (manual override or resolved mapping)
     if let Some(existing) = get_mapping(conn, komga_series_id, SyncTarget::MangaBaka)? {
         if existing.manual_override {
             return Ok(Some(existing));
@@ -122,7 +122,39 @@ pub async fn resolve_mangabaka_identity(
         }
     }
 
-    // 2. Query MangaBaka series matching
+    // 2. Known AniList media ID -> MangaBaka cross-reference (`GET /v1/source/anilist/{id}`)
+    let anilist_id_opt: Option<i64> = get_mapping(conn, komga_series_id, SyncTarget::AniList)
+        .ok()
+        .flatten()
+        .filter(|m| m.confidence == MappingConfidence::Resolved || m.manual_override)
+        .and_then(|m| m.tracker_id.parse::<i64>().ok())
+        .or_else(|| {
+            resolve_local_mapping(conn, komga_series_id, komga_title, SyncTarget::AniList)
+                .ok()
+                .flatten()
+                .and_then(|m| m.tracker_id.parse::<i64>().ok())
+        });
+
+    if let Some(anilist_id) = anilist_id_opt {
+        if let Ok(Some(xref)) = mb_client.resolve_from_anilist(anilist_id).await {
+            let mapping = TrackerMapping {
+                komga_series_id: komga_series_id.to_string(),
+                tracker: SyncTarget::MangaBaka,
+                tracker_id: xref.mangabaka_id.to_string(),
+                tracker_title: xref.title.or_else(|| Some(komga_title.to_string())),
+                edition_id: None,
+                mapping_source: MappingSource::CrossReference,
+                confidence: MappingConfidence::Resolved,
+                manual_override: false,
+                last_validated: Some(now()),
+                updated_at: now(),
+            };
+            save_mapping(conn, &mapping)?;
+            return Ok(Some(mapping));
+        }
+    }
+
+    // 3. Query MangaBaka series matching by exact title
     let series_match = match mb_client.match_series(komga_title).await? {
         MangaBakaSeriesMatch::Found { id, title } => (id, title),
         MangaBakaSeriesMatch::Ambiguous(candidates) => {
@@ -157,7 +189,7 @@ pub async fn resolve_mangabaka_identity(
 
     let (series_id, series_title) = series_match;
 
-    // 3. Query MangaBaka collection matching for the exact English standard digital edition
+    // 4. Query MangaBaka collection matching for the exact English standard digital edition (best effort)
     let collection_match = match mb_client.match_collection(series_id).await? {
         MangaBakaCollectionMatch::Found {
             id,
@@ -172,31 +204,21 @@ pub async fn resolve_mangabaka_identity(
         MangaBakaCollectionMatch::AuthError(_) | MangaBakaCollectionMatch::NetworkError(_) => None,
     };
 
-    let (confidence, edition_id) = match collection_match {
-        Some(col_id) => (MappingConfidence::Resolved, Some(col_id)),
-        None => (MappingConfidence::NeedsMapping, None),
-    };
-
     let mapping = TrackerMapping {
         komga_series_id: komga_series_id.to_string(),
         tracker: SyncTarget::MangaBaka,
         tracker_id: series_id.to_string(),
         tracker_title: Some(series_title),
-        edition_id,
+        edition_id: collection_match,
         mapping_source: MappingSource::ExactTitle,
-        confidence,
+        confidence: MappingConfidence::Resolved,
         manual_override: false,
         last_validated: Some(now()),
         updated_at: now(),
     };
 
     save_mapping(conn, &mapping)?;
-
-    if confidence == MappingConfidence::Resolved {
-        Ok(Some(mapping))
-    } else {
-        Ok(None)
-    }
+    Ok(Some(mapping))
 }
 
 /// Diagnoses unresolved or ambiguous titles.

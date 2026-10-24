@@ -267,7 +267,9 @@ impl SyncService {
                 summary.ambiguous_mappings += 1;
                 summary.skipped += 1;
             }
-            SyncResultCategory::SkippedUnsafeProgress | SyncResultCategory::Unsupported => {
+            SyncResultCategory::SkippedUnsafeProgress
+            | SyncResultCategory::NotInTrackerLibrary
+            | SyncResultCategory::Unsupported => {
                 summary.skipped += 1;
             }
             SyncResultCategory::AuthError

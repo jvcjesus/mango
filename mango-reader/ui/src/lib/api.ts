@@ -482,6 +482,8 @@ export type SyncResultCategory =
   | 'ambiguous_mapping'
   | 'skipped_ambiguous_mapping'
   | 'skipped_unsafe_progress'
+  | 'not_in_tracker_library'
+  | 'skipped_not_in_tracker_library'
   | 'auth_error'
   | 'network_error'
   | 'unsupported'

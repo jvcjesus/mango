@@ -123,6 +123,7 @@ pub enum SyncResultCategory {
     SkippedNoMapping,
     AmbiguousMapping,
     SkippedUnsafeProgress,
+    NotInTrackerLibrary,
     AuthError,
     NetworkError,
     Unsupported,
@@ -142,6 +143,7 @@ impl SyncResultCategory {
             Self::SkippedNoMapping => "skipped_no_mapping",
             Self::AmbiguousMapping => "ambiguous_mapping",
             Self::SkippedUnsafeProgress => "skipped_unsafe_progress",
+            Self::NotInTrackerLibrary => "not_in_tracker_library",
             Self::AuthError => "auth_error",
             Self::NetworkError => "network_error",
             Self::Unsupported => "unsupported",
@@ -161,6 +163,9 @@ impl SyncResultCategory {
             "skipped_no_mapping" => Some(Self::SkippedNoMapping),
             "ambiguous_mapping" | "skipped_ambiguous_mapping" => Some(Self::AmbiguousMapping),
             "skipped_unsafe_progress" => Some(Self::SkippedUnsafeProgress),
+            "not_in_tracker_library" | "skipped_not_in_tracker_library" => {
+                Some(Self::NotInTrackerLibrary)
+            }
             "auth_error" => Some(Self::AuthError),
             "network_error" => Some(Self::NetworkError),
             "unsupported" => Some(Self::Unsupported),

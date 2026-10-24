@@ -38,6 +38,21 @@ pub enum MangaBakaCollectionMatch {
     NetworkError(String),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MangaBakaCrossReference {
+    pub mangabaka_id: i64,
+    pub title: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MangaBakaLibraryEntry {
+    pub id: Option<i64>,
+    pub series_id: Option<i64>,
+    pub progress_volume: Option<f64>,
+    pub progress_chapter: Option<f64>,
+    pub status: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MangaBakaEnrichment {
     pub series_id: i64,
@@ -105,11 +120,13 @@ impl MangaBakaClient {
         let url = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
             endpoint.to_string()
         } else {
-            format!(
-                "{}/{}",
-                self.base_url.trim_end_matches('/'),
-                endpoint.trim_start_matches('/')
-            )
+            let base = self.base_url.trim_end_matches('/');
+            let clean = endpoint.trim_start_matches('/');
+            if base.ends_with("/v1") && clean.starts_with("v1/") {
+                format!("{base}/{}", &clean[3..])
+            } else {
+                format!("{base}/{clean}")
+            }
         };
 
         let mut req = self
@@ -120,9 +137,264 @@ impl MangaBakaClient {
 
         if let Some(token) = &self.token {
             req = req.header("Authorization", format!("Bearer {token}"));
+            req = req.header("x-api-key", token);
         }
 
         req
+    }
+
+    /// Resolves MangaBaka series ID and title from an AniList media ID.
+    ///
+    /// Calls `GET /v1/source/anilist/{anilist_id}`.
+    /// Returns `Ok(None)` if MangaBaka returns 404 (no cross-reference).
+    pub async fn resolve_from_anilist(
+        &self,
+        anilist_id: i64,
+    ) -> Result<Option<MangaBakaCrossReference>> {
+        let endpoint = format!("/source/anilist/{anilist_id}");
+        let resp = match self
+            .request_builder(reqwest::Method::GET, &endpoint)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                return Err(AppError::new(
+                    502,
+                    "mangabaka_network_error",
+                    format!("Failed to query MangaBaka AniList cross-reference: {e}"),
+                ));
+            }
+        };
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+            || resp.status() == reqwest::StatusCode::FORBIDDEN
+        {
+            return Err(AppError::new(
+                401,
+                "mangabaka_unauthorized",
+                "MangaBaka API token invalid or rejected",
+            ));
+        }
+
+        if !resp.status().is_success() {
+            return Err(AppError::new(
+                resp.status().as_u16(),
+                "mangabaka_error",
+                format!(
+                    "MangaBaka returned HTTP {} for AniList cross-reference",
+                    resp.status()
+                ),
+            ));
+        }
+
+        let raw: serde_json::Value = resp.json().await.map_err(|e| {
+            AppError::internal(format!(
+                "Failed to parse MangaBaka cross-reference JSON: {e}"
+            ))
+        })?;
+
+        // Support top-level and data-nested structures
+        let data_node = raw.get("data").unwrap_or(&raw);
+        let id_val = data_node
+            .get("id")
+            .or_else(|| data_node.get("series_id"))
+            .or_else(|| data_node.get("mangabaka_id"))
+            .or_else(|| raw.get("id"))
+            .or_else(|| raw.get("series_id"))
+            .or_else(|| raw.get("mangabaka_id"));
+
+        let mb_id = match id_val {
+            Some(v) => {
+                if let Some(n) = v.as_i64() {
+                    n
+                } else if let Some(s) = v.as_str() {
+                    s.parse::<i64>().map_err(|_| {
+                        AppError::internal(format!("Invalid MangaBaka ID in cross-reference: {s}"))
+                    })?
+                } else {
+                    return Ok(None);
+                }
+            }
+            None => return Ok(None),
+        };
+
+        let title = data_node
+            .get("title")
+            .or_else(|| data_node.get("name"))
+            .or_else(|| raw.get("title"))
+            .or_else(|| raw.get("name"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        Ok(Some(MangaBakaCrossReference {
+            mangabaka_id: mb_id,
+            title,
+        }))
+    }
+
+    /// Fetches the authenticated user's library entry for a specific MangaBaka series ID.
+    ///
+    /// Calls `GET /v1/my/library/{mangabaka_id}`.
+    /// Returns `Ok(None)` if MangaBaka returns 404 (series is not in the user's library).
+    pub async fn get_my_library_entry(
+        &self,
+        mangabaka_id: i64,
+    ) -> Result<Option<MangaBakaLibraryEntry>> {
+        let endpoint = format!("/my/library/{mangabaka_id}");
+        let resp = match self
+            .request_builder(reqwest::Method::GET, &endpoint)
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                return Err(AppError::new(
+                    502,
+                    "mangabaka_network_error",
+                    format!("Failed to reach MangaBaka library endpoint: {e}"),
+                ));
+            }
+        };
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+            || resp.status() == reqwest::StatusCode::FORBIDDEN
+        {
+            return Err(AppError::new(
+                401,
+                "mangabaka_unauthorized",
+                "MangaBaka API token invalid or rejected",
+            ));
+        }
+
+        if !resp.status().is_success() {
+            return Err(AppError::new(
+                resp.status().as_u16(),
+                "mangabaka_error",
+                format!(
+                    "MangaBaka returned HTTP {} for library entry",
+                    resp.status()
+                ),
+            ));
+        }
+
+        let raw: serde_json::Value = resp.json().await.map_err(|e| {
+            AppError::internal(format!("Failed to parse MangaBaka library JSON: {e}"))
+        })?;
+
+        let data_node = raw.get("data").unwrap_or(&raw);
+
+        let parse_f64_opt = |val: Option<&serde_json::Value>| -> Option<f64> {
+            val.and_then(|v| {
+                if let Some(f) = v.as_f64() {
+                    Some(f)
+                } else if let Some(i) = v.as_i64() {
+                    Some(i as f64)
+                } else if let Some(s) = v.as_str() {
+                    s.parse::<f64>().ok()
+                } else {
+                    None
+                }
+            })
+        };
+
+        let progress_volume = parse_f64_opt(
+            data_node
+                .get("progress_volume")
+                .or_else(|| raw.get("progress_volume")),
+        );
+        let progress_chapter = parse_f64_opt(
+            data_node
+                .get("progress_chapter")
+                .or_else(|| raw.get("progress_chapter")),
+        );
+        let status = data_node
+            .get("status")
+            .or_else(|| raw.get("status"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+
+        let id = data_node
+            .get("id")
+            .or_else(|| raw.get("id"))
+            .and_then(|v| v.as_i64());
+
+        let series_id = data_node
+            .get("series_id")
+            .or_else(|| raw.get("series_id"))
+            .and_then(|v| v.as_i64());
+
+        Ok(Some(MangaBakaLibraryEntry {
+            id,
+            series_id,
+            progress_volume,
+            progress_chapter,
+            status,
+        }))
+    }
+
+    /// Mutates the authenticated user's library progress on MangaBaka.
+    ///
+    /// Calls `PATCH /v1/my/library/{mangabaka_id}` with dimension-specific payload:
+    /// `{"progress_volume": completed}` or `{"progress_chapter": completed}`.
+    pub async fn update_my_library_progress(
+        &self,
+        mangabaka_id: i64,
+        progress_volume: Option<f64>,
+        progress_chapter: Option<f64>,
+    ) -> Result<()> {
+        let endpoint = format!("/my/library/{mangabaka_id}");
+        let mut body = serde_json::Map::new();
+        if let Some(vol) = progress_volume {
+            body.insert("progress_volume".to_string(), serde_json::json!(vol));
+        }
+        if let Some(ch) = progress_chapter {
+            body.insert("progress_chapter".to_string(), serde_json::json!(ch));
+        }
+
+        let resp = match self
+            .request_builder(reqwest::Method::PATCH, &endpoint)
+            .json(&serde_json::Value::Object(body))
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                return Err(AppError::new(
+                    502,
+                    "mangabaka_network_error",
+                    format!("Failed to send update to MangaBaka: {e}"),
+                ));
+            }
+        };
+
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+            || resp.status() == reqwest::StatusCode::FORBIDDEN
+        {
+            return Err(AppError::new(
+                401,
+                "mangabaka_unauthorized",
+                "MangaBaka API token invalid or rejected",
+            ));
+        }
+
+        if !resp.status().is_success() {
+            return Err(AppError::new(
+                resp.status().as_u16(),
+                "mangabaka_error",
+                format!("MangaBaka returned HTTP {}", resp.status()),
+            ));
+        }
+
+        Ok(())
     }
 
     /// Tests whether MangaBaka is reachable and answering.
@@ -448,10 +720,10 @@ impl MangaBakaClient {
                     ));
                 }
                 MangaBakaCollectionMatch::AuthError(e) => {
-                    return Ok(MangaBakaOutcome::AuthError(e))
+                    return Ok(MangaBakaOutcome::AuthError(e));
                 }
                 MangaBakaCollectionMatch::NetworkError(e) => {
-                    return Ok(MangaBakaOutcome::NetworkError(e))
+                    return Ok(MangaBakaOutcome::NetworkError(e));
                 }
             },
             MangaBakaSeriesMatch::Ambiguous(candidates) => {
@@ -901,7 +1173,7 @@ mod tests {
 
     #[tokio::test]
     async fn mangabaka_precision_matching_and_enrichment_flow() {
-        use axum::{routing::get, Json, Router};
+        use axum::{Json, Router, routing::get};
         use serde_json::json;
 
         let app = Router::new()
