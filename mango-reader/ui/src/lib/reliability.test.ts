@@ -1286,6 +1286,8 @@ describe('first-class volume acquisition & release semantics', () => {
         done: 0,
         total: 20,
         attempts: 0,
+        retryAt: null,
+        error: null,
         canRetryKomga: false,
       };
 
@@ -1302,6 +1304,8 @@ describe('first-class volume acquisition & release semantics', () => {
         done: 20,
         total: 20,
         attempts: 0,
+        retryAt: null,
+        error: null,
         canRetryKomga: false,
       };
 
@@ -1318,6 +1322,7 @@ describe('first-class volume acquisition & release semantics', () => {
         done: 20,
         total: 20,
         attempts: 1,
+        retryAt: null,
         canRetryKomga: true,
         failureStage: 'komga',
       };
@@ -1330,8 +1335,8 @@ describe('first-class volume acquisition & release semantics', () => {
 
     it('validates Komga library discovery selection and dual library ID targeting', () => {
       const discoveredLibraries: import('./api').KomgaLibrary[] = [
-        { id: 'lib-001', name: 'Manga', path: '/srv/media/manga' },
-        { id: 'lib-002', name: 'Manga (Chinese)', path: '/srv/media/manga-chinese' },
+        { id: 'lib-001', name: 'Manga', root: '/srv/media/manga', unavailable: false },
+        { id: 'lib-002', name: 'Manga (Chinese)', root: '/srv/media/manga-chinese', unavailable: false },
       ];
 
       expect(discoveredLibraries).toHaveLength(2);

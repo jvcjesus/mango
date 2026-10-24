@@ -379,7 +379,7 @@ Audit Log & Acquisition History
 - **Secret Protection**: API tokens are never exposed in GET responses, audit logs, or frontend payloads.
 
 #### 3. Komga Server Integration & Discovery
-- **Safe Read-Only Validation**: Connection validation queries `/api/v1/users/me` and strictly never triggers unauthorized library scans during testing.
+- **Safe Read-Only Validation**: Connection validation queries `/api/v1/libraries` and strictly never triggers unauthorized library scans during testing.
 - **Dynamic Library Discovery**: Discovers libraries directly from Komga via REST API and populates library selection dropdowns with fallback to manual ID entry.
 - **Dual Library Routing**: Separate target libraries for canonical English manga and Chinese-translated manga (e.g. Bilibili).
 - **Targeted Library Rescans**: Triggers rescans only for the specific library receiving the published release. Can be toggled on/off independently in Settings.

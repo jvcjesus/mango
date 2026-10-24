@@ -9,20 +9,13 @@ use serde::{Deserialize, Serialize};
 
 pub const DEFAULT_KOMGA_URL: &str = "http://127.0.0.1:25600";
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct KomgaUser {
-    pub id: Option<String>,
-    pub email: Option<String>,
-    #[allow(dead_code)]
-    pub roles: Option<Vec<String>>,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KomgaLibrary {
     pub id: String,
     pub name: String,
     pub root: String,
+    #[serde(default)]
     pub unavailable: bool,
 }
 
@@ -93,20 +86,35 @@ impl KomgaClient {
 
     /// Read-only connection verification.
     ///
-    /// Never mutates Komga state or triggers scans.
+    /// Never mutates Komga state or triggers scans. Validates connectivity and credentials
+    /// against `/api/v1/libraries`, ensuring compatibility with API key authentication.
     pub async fn test_connection(&self) -> Result<String> {
         let resp = self
-            .request_builder(reqwest::Method::GET, "/api/v1/users/me")
+            .request_builder(reqwest::Method::GET, "/api/v1/libraries")
             .send()
             .await
             .map_err(|e| AppError::new(502, "komga_offline", format!("Cannot reach Komga at {}: {e}", self.base_url)))?;
 
         let status = resp.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        if status == reqwest::StatusCode::UNAUTHORIZED {
             return Err(AppError::new(
-                status.as_u16(),
+                401,
                 "komga_unauthorized",
-                "Komga authentication failed: invalid API key or credentials",
+                "Komga authentication failed: invalid or missing API key",
+            ));
+        }
+        if status == reqwest::StatusCode::FORBIDDEN {
+            return Err(AppError::new(
+                403,
+                "komga_forbidden",
+                "Komga authorization failed: API key does not have permission",
+            ));
+        }
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(AppError::new(
+                404,
+                "komga_not_found",
+                format!("Komga endpoint /api/v1/libraries not found at {}", self.base_url),
             ));
         }
 
@@ -119,13 +127,22 @@ impl KomgaClient {
             ));
         }
 
-        let user: Option<KomgaUser> = resp.json().await.ok();
-        let user_id = user
-            .as_ref()
-            .and_then(|u| u.email.as_deref().or(u.id.as_deref()))
-            .unwrap_or("authenticated user");
+        let library_count = resp
+            .json::<Vec<KomgaLibrary>>()
+            .await
+            .map(|l| l.len())
+            .ok();
 
-        Ok(format!("Successfully connected to Komga as {user_id}"))
+        let msg = match library_count {
+            Some(count) => format!(
+                "Successfully connected to Komga ({} {} accessible)",
+                count,
+                if count == 1 { "library" } else { "libraries" }
+            ),
+            None => "Successfully connected to Komga".to_string(),
+        };
+
+        Ok(msg)
     }
 
     /// Discovers existing libraries in Komga without triggering scans.
@@ -137,8 +154,26 @@ impl KomgaClient {
             .map_err(|e| AppError::new(502, "komga_offline", format!("Cannot fetch Komga libraries: {e}")))?;
 
         let status = resp.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            return Err(AppError::new(status.as_u16(), "komga_unauthorized", "Komga authentication failed"));
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(AppError::new(
+                401,
+                "komga_unauthorized",
+                "Komga authentication failed: invalid or missing API key",
+            ));
+        }
+        if status == reqwest::StatusCode::FORBIDDEN {
+            return Err(AppError::new(
+                403,
+                "komga_forbidden",
+                "Komga authorization failed: API key does not have permission",
+            ));
+        }
+        if status == reqwest::StatusCode::NOT_FOUND {
+            return Err(AppError::new(
+                404,
+                "komga_not_found",
+                format!("Komga endpoint /api/v1/libraries not found at {}", self.base_url),
+            ));
         }
 
         if !status.is_success() {
@@ -247,15 +282,20 @@ mod tests {
     #[test]
     fn komga_client_url_formatting() {
         let client = KomgaClient::new(Client::new(), Some("http://localhost:25600/".into()), Some("secret".into()));
-        let req = client.request_builder(reqwest::Method::GET, "/api/v1/users/me").build().unwrap();
-        assert_eq!(req.url().as_str(), "http://localhost:25600/api/v1/users/me");
+        let req = client.request_builder(reqwest::Method::GET, "/api/v1/libraries").build().unwrap();
+        assert_eq!(req.url().as_str(), "http://localhost:25600/api/v1/libraries");
         assert_eq!(req.headers().get("X-API-Key").unwrap(), "secret");
         assert_eq!(req.headers().get("X-Auth-Token").unwrap(), "secret");
     }
 
     #[tokio::test]
     async fn komga_client_mock_api_tests() {
-        use axum::{routing::{get, post}, Json, Router};
+        use axum::{
+            http::{HeaderMap, StatusCode},
+            response::IntoResponse,
+            routing::{get, post},
+            Json, Router,
+        };
         use serde_json::json;
         use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
@@ -265,32 +305,38 @@ mod tests {
 
         let app = Router::new()
             .route(
-                "/api/v1/users/me",
-                get(|| async {
-                    Json(json!({
-                        "id": "user-1",
-                        "email": "manga@example.com",
-                        "roles": ["ROLE_ADMIN"]
-                    }))
-                }),
-            )
-            .route(
                 "/api/v1/libraries",
-                get(|| async {
-                    Json(json!([
-                        {
-                            "id": "lib-en",
-                            "name": "Manga English",
-                            "root": "/data/manga",
-                            "unavailable": false
-                        },
-                        {
-                            "id": "lib-zh",
-                            "name": "Manga Chinese",
-                            "root": "/data/manga-chinese",
-                            "unavailable": false
-                        }
-                    ]))
+                get(|headers: HeaderMap| async move {
+                    match headers.get("X-API-Key").and_then(|v| v.to_str().ok()) {
+                        Some("test-token") => (
+                            StatusCode::OK,
+                            Json(json!([
+                                {
+                                    "id": "lib-en",
+                                    "name": "Manga English",
+                                    "root": "/data/manga",
+                                    "unavailable": false
+                                },
+                                {
+                                    "id": "lib-zh",
+                                    "name": "Manga Chinese",
+                                    "root": "/data/manga-chinese",
+                                    "unavailable": false
+                                }
+                            ])),
+                        )
+                            .into_response(),
+                        Some("forbidden-token") => (
+                            StatusCode::FORBIDDEN,
+                            Json(json!({ "message": "Forbidden access" })),
+                        )
+                            .into_response(),
+                        _ => (
+                            StatusCode::UNAUTHORIZED,
+                            Json(json!({ "message": "Authentication required" })),
+                        )
+                            .into_response(),
+                    }
                 }),
             )
             .route(
@@ -301,7 +347,7 @@ mod tests {
                         let scan_flag = scan_flag.clone();
                         async move {
                             scan_flag.store(true, Ordering::SeqCst);
-                            axum::http::StatusCode::NO_CONTENT
+                            StatusCode::NO_CONTENT
                         }
                     }
                 }),
@@ -348,38 +394,87 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
 
-        let client = KomgaClient::new(
+        let base_url = format!("http://127.0.0.1:{port}");
+
+        // 1. Valid API key + 200 validation
+        let valid_client = KomgaClient::new(
             Client::new(),
-            Some(format!("http://127.0.0.1:{port}")),
+            Some(base_url.clone()),
             Some("test-token".into()),
         );
-
-        // 1. Read-only connection check
-        let conn_res = client.test_connection().await;
+        let conn_res = valid_client.test_connection().await;
         assert!(conn_res.is_ok());
-        assert!(conn_res.unwrap().contains("manga@example.com"));
+        assert_eq!(
+            conn_res.unwrap(),
+            "Successfully connected to Komga (2 libraries accessible)"
+        );
         assert!(!scan_triggered.load(Ordering::SeqCst), "Validation must NEVER trigger scan");
 
-        // 2. Discover libraries
-        let libs = client.list_libraries().await.unwrap();
+        // 2. Missing credentials + 401
+        let no_auth_client = KomgaClient::new(Client::new(), Some(base_url.clone()), None);
+        let err_no_auth = no_auth_client.test_connection().await.unwrap_err();
+        assert_eq!(err_no_auth.status, 401);
+        assert_eq!(err_no_auth.code, "komga_unauthorized");
+
+        // 3. Invalid credentials + 401
+        let invalid_client = KomgaClient::new(
+            Client::new(),
+            Some(base_url.clone()),
+            Some("wrong-key".into()),
+        );
+        let err_invalid = invalid_client.test_connection().await.unwrap_err();
+        assert_eq!(err_invalid.status, 401);
+        assert_eq!(err_invalid.code, "komga_unauthorized");
+
+        // 4. Forbidden + 403
+        let forbidden_client = KomgaClient::new(
+            Client::new(),
+            Some(base_url.clone()),
+            Some("forbidden-token".into()),
+        );
+        let err_forbidden = forbidden_client.test_connection().await.unwrap_err();
+        assert_eq!(err_forbidden.status, 403);
+        assert_eq!(err_forbidden.code, "komga_forbidden");
+
+        // 5. Unsupported / 404 behavior (must not report as invalid credentials)
+        let not_found_client = KomgaClient::new(
+            Client::new(),
+            Some(format!("{base_url}/invalid-subpath")),
+            Some("test-token".into()),
+        );
+        let err_not_found = not_found_client.test_connection().await.unwrap_err();
+        assert_eq!(err_not_found.status, 404);
+        assert_eq!(err_not_found.code, "komga_not_found");
+        assert_ne!(err_not_found.code, "komga_unauthorized");
+
+        // 6. Network failure / offline port
+        let dead_client = KomgaClient::new(
+            Client::new(),
+            Some("http://127.0.0.1:1".into()),
+            Some("test-token".into()),
+        );
+        let err_dead = dead_client.test_connection().await.unwrap_err();
+        assert_eq!(err_dead.status, 502);
+        assert_eq!(err_dead.code, "komga_offline");
+
+        // 7. Verify functional API behavior (libraries, series, books, scan)
+        let libs = valid_client.list_libraries().await.unwrap();
         assert_eq!(libs.len(), 2);
         assert_eq!(libs[0].id, "lib-en");
         assert_eq!(libs[0].name, "Manga English");
         assert_eq!(libs[1].id, "lib-zh");
         assert_eq!(libs[1].name, "Manga Chinese");
 
-        // 3. Query series & books
-        let series = client.search_series("Blue Lock", Some("lib-en")).await.unwrap();
+        let series = valid_client.search_series("Blue Lock", Some("lib-en")).await.unwrap();
         assert_eq!(series.len(), 1);
         assert_eq!(series[0].id, "series-100");
 
-        let books = client.get_books_in_series("series-100").await.unwrap();
+        let books = valid_client.get_books_in_series("series-100").await.unwrap();
         assert_eq!(books.len(), 1);
         assert_eq!(books[0].name, "Blue Lock v01");
         assert_eq!(books[0].number, 1.0);
 
-        // 4. Trigger scan
-        assert!(client.trigger_scan(Some("lib-en")).await.is_ok());
+        assert!(valid_client.trigger_scan(Some("lib-en")).await.is_ok());
         assert!(scan_triggered.load(Ordering::SeqCst), "Targeted scan must fire");
     }
 }
