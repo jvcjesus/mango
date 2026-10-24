@@ -46,6 +46,10 @@ pub struct OwnershipSummary {
     pub owned_chapters_count: usize,
     pub total_source_chapters: Option<usize>,
     pub source_release_type: String, // "volume", "chapter", "mixed", "empty"
+    #[serde(default)]
+    pub authoritative_total_volumes: Option<u32>,
+    #[serde(default)]
+    pub authoritative_total_chapters: Option<u32>,
     pub explanation: Option<String>,
 }
 
@@ -125,73 +129,76 @@ impl OwnershipService {
         let now = crate::db::now();
 
         // Load pipeline config & secrets and source releases from db
-        let (komga_enabled, komga_url, komga_key, lib_id, active_downloads, source_releases) = match self
-            .db
-            .call(move |conn| {
-                let enabled = crate::settings::get::<bool>(conn, "pipeline.komga_enabled").unwrap_or(false);
-                let url = crate::settings::get::<String>(conn, "pipeline.komga_url");
-                let key = crate::db::state(conn, "pipeline.komga_api_key")?;
-                let lib_id = crate::settings::get::<String>(conn, "pipeline.komga_library_id");
+        let (komga_enabled, komga_url, komga_key, lib_id, active_downloads, source_releases) =
+            match self
+                .db
+                .call(move |conn| {
+                    let enabled = crate::settings::get::<bool>(conn, "pipeline.komga_enabled")
+                        .unwrap_or(false);
+                    let url = crate::settings::get::<String>(conn, "pipeline.komga_url");
+                    let key = crate::db::state(conn, "pipeline.komga_api_key")?;
+                    let lib_id = crate::settings::get::<String>(conn, "pipeline.komga_library_id");
 
-                // Get active downloads for this manga
-                let mut stmt = conn.prepare(
-                    "SELECT c.id, c.name, c.chapter_number, d.state
+                    // Get active downloads for this manga
+                    let mut stmt = conn.prepare(
+                        "SELECT c.id, c.name, c.chapter_number, d.state
                      FROM downloads d
                      JOIN chapters c ON c.id = d.chapter_id
                      WHERE c.manga_id = ?1",
-                )?;
-                let downloads = stmt
-                    .query_map([manga_id], |row| {
-                        let id: i64 = row.get(0)?;
-                        let name: String = row.get(1)?;
-                        let chapter_number: f64 = row.get(2)?;
-                        let state: String = row.get(3)?;
-                        Ok((id, name, chapter_number, state))
-                    })?
-                    .filter_map(std::result::Result::ok)
-                    .collect::<Vec<_>>();
+                    )?;
+                    let downloads = stmt
+                        .query_map([manga_id], |row| {
+                            let id: i64 = row.get(0)?;
+                            let name: String = row.get(1)?;
+                            let chapter_number: f64 = row.get(2)?;
+                            let state: String = row.get(3)?;
+                            Ok((id, name, chapter_number, state))
+                        })?
+                        .filter_map(std::result::Result::ok)
+                        .collect::<Vec<_>>();
 
-                // Query all source releases for this manga
-                let mut ch_stmt = conn.prepare(
-                    "SELECT name, chapter_number FROM chapters WHERE manga_id = ?1"
-                )?;
-                let releases = ch_stmt
-                    .query_map([manga_id], |row| {
-                        let name: String = row.get(0)?;
-                        let num: f64 = row.get(1)?;
-                        Ok((name, num))
-                    })?
-                    .filter_map(std::result::Result::ok)
-                    .collect::<Vec<_>>();
+                    // Query all source releases for this manga
+                    let mut ch_stmt = conn
+                        .prepare("SELECT name, chapter_number FROM chapters WHERE manga_id = ?1")?;
+                    let releases = ch_stmt
+                        .query_map([manga_id], |row| {
+                            let name: String = row.get(0)?;
+                            let num: f64 = row.get(1)?;
+                            Ok((name, num))
+                        })?
+                        .filter_map(std::result::Result::ok)
+                        .collect::<Vec<_>>();
 
-                Ok((enabled, url, key, lib_id, downloads, releases))
-            })
-            .await
-        {
-            Ok(res) => res,
-            Err(e) => {
-                tracing::warn!("OWNERSHIP: failed to read configuration from DB: {e}");
-                return TitleOwnership {
-                    komga_connected: false,
-                    error: Some(format!("Database query failed: {e}")),
-                    series_id: None,
-                    series_name: None,
-                    library_id: None,
-                    library_name: None,
-                    volumes: Vec::new(),
-                    chapters: Vec::new(),
-                    summary: OwnershipSummary {
-                        owned_volumes_count: 0,
-                        total_source_volumes: None,
-                        owned_chapters_count: 0,
-                        total_source_chapters: None,
-                        source_release_type: "empty".to_string(),
-                        explanation: None,
-                    },
-                    last_refreshed: now,
-                };
-            }
-        };
+                    Ok((enabled, url, key, lib_id, downloads, releases))
+                })
+                .await
+            {
+                Ok(res) => res,
+                Err(e) => {
+                    tracing::warn!("OWNERSHIP: failed to read configuration from DB: {e}");
+                    return TitleOwnership {
+                        komga_connected: false,
+                        error: Some(format!("Database query failed: {e}")),
+                        series_id: None,
+                        series_name: None,
+                        library_id: None,
+                        library_name: None,
+                        volumes: Vec::new(),
+                        chapters: Vec::new(),
+                        summary: OwnershipSummary {
+                            owned_volumes_count: 0,
+                            total_source_volumes: None,
+                            owned_chapters_count: 0,
+                            total_source_chapters: None,
+                            source_release_type: "empty".to_string(),
+                            authoritative_total_volumes: None,
+                            authoritative_total_chapters: None,
+                            explanation: None,
+                        },
+                        last_refreshed: now,
+                    };
+                }
+            };
 
         // Classify source releases
         let mut src_volumes = std::collections::HashSet::new();
@@ -218,7 +225,8 @@ impl OwnershipService {
             (false, true) => "chapter",
             (true, true) => "mixed",
             (false, false) => "empty",
-        }.to_string();
+        }
+        .to_string();
 
         if !komga_enabled {
             return TitleOwnership {
@@ -232,10 +240,16 @@ impl OwnershipService {
                 chapters: Vec::new(),
                 summary: OwnershipSummary {
                     owned_volumes_count: 0,
-                    total_source_volumes: (source_release_type == "volume" || source_release_type == "mixed").then_some(source_volumes_count),
+                    total_source_volumes: (source_release_type == "volume"
+                        || source_release_type == "mixed")
+                        .then_some(source_volumes_count),
                     owned_chapters_count: 0,
-                    total_source_chapters: (source_release_type == "chapter" || source_release_type == "mixed").then_some(source_chapters_count),
+                    total_source_chapters: (source_release_type == "chapter"
+                        || source_release_type == "mixed")
+                        .then_some(source_chapters_count),
                     source_release_type,
+                    authoritative_total_volumes: None,
+                    authoritative_total_chapters: None,
                     explanation: None,
                 },
                 last_refreshed: now,
@@ -260,10 +274,16 @@ impl OwnershipService {
                     chapters: Vec::new(),
                     summary: OwnershipSummary {
                         owned_volumes_count: 0,
-                        total_source_volumes: (source_release_type == "volume" || source_release_type == "mixed").then_some(source_volumes_count),
+                        total_source_volumes: (source_release_type == "volume"
+                            || source_release_type == "mixed")
+                            .then_some(source_volumes_count),
                         owned_chapters_count: 0,
-                        total_source_chapters: (source_release_type == "chapter" || source_release_type == "mixed").then_some(source_chapters_count),
+                        total_source_chapters: (source_release_type == "chapter"
+                            || source_release_type == "mixed")
+                            .then_some(source_chapters_count),
                         source_release_type,
+                        authoritative_total_volumes: None,
+                        authoritative_total_chapters: None,
                         explanation: None,
                     },
                     last_refreshed: now,
@@ -292,10 +312,16 @@ impl OwnershipService {
                 chapters: Vec::new(),
                 summary: OwnershipSummary {
                     owned_volumes_count: 0,
-                    total_source_volumes: (source_release_type == "volume" || source_release_type == "mixed").then_some(source_volumes_count),
+                    total_source_volumes: (source_release_type == "volume"
+                        || source_release_type == "mixed")
+                        .then_some(source_volumes_count),
                     owned_chapters_count: 0,
-                    total_source_chapters: (source_release_type == "chapter" || source_release_type == "mixed").then_some(source_chapters_count),
+                    total_source_chapters: (source_release_type == "chapter"
+                        || source_release_type == "mixed")
+                        .then_some(source_chapters_count),
                     source_release_type,
+                    authoritative_total_volumes: None,
+                    authoritative_total_chapters: None,
                     explanation: None,
                 },
                 last_refreshed: now,
@@ -315,10 +341,16 @@ impl OwnershipService {
                 chapters: Vec::new(),
                 summary: OwnershipSummary {
                     owned_volumes_count: 0,
-                    total_source_volumes: (source_release_type == "volume" || source_release_type == "mixed").then_some(source_volumes_count),
+                    total_source_volumes: (source_release_type == "volume"
+                        || source_release_type == "mixed")
+                        .then_some(source_volumes_count),
                     owned_chapters_count: 0,
-                    total_source_chapters: (source_release_type == "chapter" || source_release_type == "mixed").then_some(source_chapters_count),
+                    total_source_chapters: (source_release_type == "chapter"
+                        || source_release_type == "mixed")
+                        .then_some(source_chapters_count),
                     source_release_type,
+                    authoritative_total_volumes: None,
+                    authoritative_total_chapters: None,
                     explanation: None,
                 },
                 last_refreshed: now,
@@ -329,7 +361,10 @@ impl OwnershipService {
         let books = match client.get_books_in_series(&matched_series.id).await {
             Ok(b) => b,
             Err(e) => {
-                tracing::warn!("OWNERSHIP: failed to fetch books for series {}: {e}", matched_series.id);
+                tracing::warn!(
+                    "OWNERSHIP: failed to fetch books for series {}: {e}",
+                    matched_series.id
+                );
                 return TitleOwnership {
                     komga_connected: true,
                     error: Some(format!("Failed to fetch books: {e}")),
@@ -341,10 +376,16 @@ impl OwnershipService {
                     chapters: Vec::new(),
                     summary: OwnershipSummary {
                         owned_volumes_count: 0,
-                        total_source_volumes: (source_release_type == "volume" || source_release_type == "mixed").then_some(source_volumes_count),
+                        total_source_volumes: (source_release_type == "volume"
+                            || source_release_type == "mixed")
+                            .then_some(source_volumes_count),
                         owned_chapters_count: 0,
-                        total_source_chapters: (source_release_type == "chapter" || source_release_type == "mixed").then_some(source_chapters_count),
+                        total_source_chapters: (source_release_type == "chapter"
+                            || source_release_type == "mixed")
+                            .then_some(source_chapters_count),
                         source_release_type,
+                        authoritative_total_volumes: None,
+                        authoritative_total_chapters: None,
                         explanation: None,
                     },
                     last_refreshed: now,
@@ -354,7 +395,10 @@ impl OwnershipService {
 
         // Determine library name
         let libraries = client.list_libraries().await.unwrap_or_default();
-        let library_name = libraries.iter().find(|l| l.id == matched_series.library_id).map(|l| l.name.clone());
+        let library_name = libraries
+            .iter()
+            .find(|l| l.id == matched_series.library_id)
+            .map(|l| l.name.clone());
 
         // Extract owned volumes and chapters from Komga books
         let mut owned_volumes = HashMap::new();
@@ -364,19 +408,29 @@ impl OwnershipService {
             let vol_from_name = crate::release::parse_volume(&b.name);
             let rel_info = crate::release::parse_release(&b.name, b.number);
 
-            if rel_info.release_type == crate::release::ReleaseType::Volume || vol_from_name.is_some() {
-                let vol_num = vol_from_name.or(rel_info.volume).or_else(|| {
-                    b.metadata
-                        .as_ref()
-                        .and_then(|m| m.number_sort.or_else(|| m.number.as_deref().and_then(|n| n.parse::<f64>().ok())))
-                }).unwrap_or(b.number);
+            if rel_info.release_type == crate::release::ReleaseType::Volume
+                || vol_from_name.is_some()
+            {
+                let vol_num = vol_from_name
+                    .or(rel_info.volume)
+                    .or_else(|| {
+                        b.metadata.as_ref().and_then(|m| {
+                            m.number_sort
+                                .or_else(|| m.number.as_deref().and_then(|n| n.parse::<f64>().ok()))
+                        })
+                    })
+                    .unwrap_or(b.number);
                 owned_volumes.insert(vol_num.to_bits(), (b.id.clone(), b.name.clone()));
             } else {
-                let ch_num = rel_info.chapter_number.or_else(|| {
-                    b.metadata
-                        .as_ref()
-                        .and_then(|m| m.number_sort.or_else(|| m.number.as_deref().and_then(|n| n.parse::<f64>().ok())))
-                }).unwrap_or(b.number);
+                let ch_num = rel_info
+                    .chapter_number
+                    .or_else(|| {
+                        b.metadata.as_ref().and_then(|m| {
+                            m.number_sort
+                                .or_else(|| m.number.as_deref().and_then(|n| n.parse::<f64>().ok()))
+                        })
+                    })
+                    .unwrap_or(b.number);
                 owned_chapters.insert(ch_num.to_bits(), (b.id.clone(), b.name.clone()));
             }
         }
@@ -414,7 +468,11 @@ impl OwnershipService {
                 }
             }
         }
-        volumes.sort_by(|a, b| a.volume.partial_cmp(&b.volume).unwrap_or(std::cmp::Ordering::Equal));
+        volumes.sort_by(|a, b| {
+            a.volume
+                .partial_cmp(&b.volume)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         // Build chapter ownership list
         let mut chapters = Vec::new();
@@ -445,22 +503,28 @@ impl OwnershipService {
                 }
             }
         }
-        chapters.sort_by(|a, b| a.chapter.partial_cmp(&b.chapter).unwrap_or(std::cmp::Ordering::Equal));
+        chapters.sort_by(|a, b| {
+            a.chapter
+                .partial_cmp(&b.chapter)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         let owned_volumes_count = owned_volumes.len();
         let owned_chapters_count = owned_chapters.len();
 
-        let total_source_volumes = if source_release_type == "volume" || source_release_type == "mixed" {
-            Some(source_volumes_count)
-        } else {
-            None
-        };
+        let total_source_volumes =
+            if source_release_type == "volume" || source_release_type == "mixed" {
+                Some(source_volumes_count)
+            } else {
+                None
+            };
 
-        let total_source_chapters = if source_release_type == "chapter" || source_release_type == "mixed" {
-            Some(source_chapters_count)
-        } else {
-            None
-        };
+        let total_source_chapters =
+            if source_release_type == "chapter" || source_release_type == "mixed" {
+                Some(source_chapters_count)
+            } else {
+                None
+            };
 
         let explanation = if owned_volumes_count > 0 && source_release_type == "chapter" {
             Some("Source provides chapters".to_string())
@@ -485,6 +549,8 @@ impl OwnershipService {
                 owned_chapters_count,
                 total_source_chapters,
                 source_release_type,
+                authoritative_total_volumes: None,
+                authoritative_total_chapters: None,
                 explanation,
             },
             last_refreshed: now,
@@ -608,7 +674,9 @@ mod tests {
         assert_eq!(v3.status, OwnershipStatus::Acquiring);
 
         // 2. Query ownership for ambiguous series
-        let ambig = ownership_svc.get_title_ownership(20, "Ambiguous Title").await;
+        let ambig = ownership_svc
+            .get_title_ownership(20, "Ambiguous Title")
+            .await;
         assert!(ambig.komga_connected);
         assert_eq!(ambig.series_id, None, "Ambiguous matches must fail closed");
         assert!(ambig.volumes.is_empty());
