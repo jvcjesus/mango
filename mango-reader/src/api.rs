@@ -105,6 +105,8 @@ pub fn router(state: Spaces) -> Router {
         .route("/manga/{id}", get(title))
         .route("/manga/{id}/refresh", post(refresh_title))
         .route("/manga/{id}/ownership", get(manga_ownership))
+        .route("/manga/{id}/ownership/refresh", post(refresh_manga_ownership))
+        .route("/manga/{id}/refresh-ownership", post(refresh_manga_ownership))
         .route("/manga/{id}/cover", get(cover))
         .route("/manga/{id}/library", put(set_library))
         .route("/manga/{id}/reader", put(set_reader))
@@ -603,6 +605,12 @@ async fn refresh_title(Me(app): Me, Path(id): Path<i64>) -> Result<Json<TitleVie
 async fn manga_ownership(Me(app): Me, Path(id): Path<i64>) -> Result<Json<crate::pipeline::ownership::TitleOwnership>> {
     let title_view = app.titles.get(id).await?;
     let ownership = app.pipeline.ownership.get_title_ownership(id, &title_view.title).await;
+    Ok(Json(ownership))
+}
+
+async fn refresh_manga_ownership(Me(app): Me, Path(id): Path<i64>) -> Result<Json<crate::pipeline::ownership::TitleOwnership>> {
+    let title_view = app.titles.get(id).await?;
+    let ownership = app.pipeline.ownership.refresh_title(id, &title_view.title).await;
     Ok(Json(ownership))
 }
 

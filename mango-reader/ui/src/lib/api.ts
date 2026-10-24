@@ -431,12 +431,33 @@ export interface VolumeOwnership {
   bookName?: string | null;
 }
 
+export interface ChapterOwnership {
+  chapter: number;
+  status: OwnershipStatus;
+  bookId?: string | null;
+  bookName?: string | null;
+}
+
+export interface OwnershipSummary {
+  ownedVolumesCount: number;
+  totalSourceVolumes?: number | null;
+  ownedChaptersCount: number;
+  totalSourceChapters?: number | null;
+  sourceReleaseType: 'volume' | 'chapter' | 'mixed' | 'empty';
+  explanation?: string | null;
+}
+
 export interface TitleOwnership {
   komgaConnected: boolean;
+  error?: string | null;
   seriesId?: string | null;
   seriesName?: string | null;
   libraryId?: string | null;
+  libraryName?: string | null;
   volumes: VolumeOwnership[];
+  chapters?: ChapterOwnership[];
+  summary: OwnershipSummary;
+  lastRefreshed: number;
 }
 
 export interface KomgaLibrary {

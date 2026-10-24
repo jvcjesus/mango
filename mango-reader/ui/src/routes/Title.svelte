@@ -128,6 +128,8 @@
   });
   const filteredUnread = $derived(listed.filter((c) => !c.read && !c.downloaded));
   let ownership = $state<TitleOwnership | null>(null);
+  let refreshingOwnership = $state(false);
+  let showOwnershipDetails = $state(false);
 
   async function loadOwnership() {
     try {
@@ -135,6 +137,51 @@
     } catch {
       ownership = null;
     }
+  }
+
+  async function refreshOwnership() {
+    refreshingOwnership = true;
+    try {
+      ownership = await send<TitleOwnership>('POST', `/manga/${id}/refresh-ownership`);
+      toast.success('Ownership refreshed from Komga');
+    } catch (e) {
+      toast.error(`Ownership refresh failed: ${message(e)}`);
+    } finally {
+      refreshingOwnership = false;
+    }
+  }
+
+  const ownedVolumeNumbers = $derived.by<number[]>(() => {
+    if (!ownership?.volumes) return [];
+    return ownership.volumes.filter((v) => v.status === 'owned').map((v) => v.volume).sort((a, b) => a - b);
+  });
+
+  const missingVolumeNumbers = $derived.by<number[]>(() => {
+    if (!ownership?.summary?.totalSourceVolumes || !ownership.volumes) return [];
+    const ownedSet = new Set(ownership.volumes.filter((v) => v.status === 'owned').map((v) => Math.round(v.volume)));
+    const missing: number[] = [];
+    for (let i = 1; i <= ownership.summary.totalSourceVolumes; i++) {
+      if (!ownedSet.has(i)) missing.push(i);
+    }
+    return missing;
+  });
+
+  function formatVolumeRanges(nums: number[]): string {
+    if (!nums.length) return 'None';
+    const sorted = [...nums].sort((a, b) => a - b);
+    const ranges: string[] = [];
+    let start = sorted[0];
+    let end = sorted[0];
+    for (let i = 1; i < sorted.length; i++) {
+      if (sorted[i] === end + 1) {
+        end = sorted[i];
+      } else {
+        ranges.push(start === end ? `v${start}` : `v${start}–${end}`);
+        start = end = sorted[i];
+      }
+    }
+    ranges.push(start === end ? `v${start}` : `v${start}–${end}`);
+    return ranges.join(', ');
   }
 
   type VolumeGroup = {
@@ -534,6 +581,117 @@
           <div class:hot={unread > 0}><span class="display">{unread}</span><span>Unread</span></div>
           <div><span class="display">{saved}</span><span>Saved</span></div>
         </div>
+
+        {#if ownership}
+          <div class="ownership-summary" class:unavailable={!ownership.komgaConnected} class:has-err={!!ownership.error}>
+            <div class="ownership-top">
+              <div class="ownership-badge-title">
+                <Icon name="book" size={16} />
+                <span class="ownership-heading">KOMGA OWNED</span>
+              </div>
+              <div class="ownership-actions">
+                <button
+                  class="btn icon mini"
+                  title="Refresh ownership from Komga"
+                  disabled={refreshingOwnership}
+                  onclick={refreshOwnership}
+                  aria-label="Refresh Komga ownership"
+                >
+                  {#if refreshingOwnership}
+                    <span class="spin"><Icon name="spinner" size={14} stroke={3} /></span>
+                  {:else}
+                    <Icon name="refresh" size={14} />
+                  {/if}
+                </button>
+                {#if ownership.komgaConnected && ownership.seriesId}
+                  <button class="btn mini" onclick={() => (showOwnershipDetails = !showOwnershipDetails)}>
+                    {showOwnershipDetails ? 'Hide details' : 'Details'}
+                  </button>
+                {/if}
+              </div>
+            </div>
+
+            <div class="ownership-body">
+              {#if !ownership.komgaConnected}
+                <div class="ownership-line">
+                  <span class="tag warn">Unavailable</span>
+                  <span class="ownership-expl">{ownership.error ?? 'Komga is offline or unreachable'}</span>
+                </div>
+              {:else if ownership.error}
+                <div class="ownership-line">
+                  <span class="tag error">Unknown</span>
+                  <span class="ownership-expl">{ownership.error}</span>
+                </div>
+              {:else if ownership.summary.ownedVolumesCount === 0 && ownership.summary.ownedChaptersCount === 0}
+                <div class="ownership-line">
+                  <span class="ownership-metric">None owned in Komga</span>
+                  {#if ownership.summary.explanation}
+                    <span class="ownership-expl">{ownership.summary.explanation}</span>
+                  {/if}
+                </div>
+              {:else}
+                <div class="ownership-metrics-row">
+                  {#if ownership.summary.ownedVolumesCount > 0}
+                    <div class="ownership-metric-col">
+                      <span class="ownership-metric">
+                        VOLUMES <strong>{ownership.summary.ownedVolumesCount}{#if ownership.summary.totalSourceVolumes} / {ownership.summary.totalSourceVolumes}{/if}</strong>
+                      </span>
+                      {#if ownership.summary.explanation}
+                        <span class="ownership-expl">{ownership.summary.explanation}</span>
+                      {/if}
+                    </div>
+                  {/if}
+                  {#if ownership.summary.ownedChaptersCount > 0}
+                    <div class="ownership-metric-col">
+                      <span class="ownership-metric">
+                        CHAPTERS <strong>{ownership.summary.ownedChaptersCount}{#if ownership.summary.totalSourceChapters} / {ownership.summary.totalSourceChapters}{/if}</strong>
+                      </span>
+                    </div>
+                  {/if}
+                </div>
+              {/if}
+            </div>
+
+            {#if showOwnershipDetails && ownership.komgaConnected}
+              <div class="ownership-details-box">
+                {#if ownership.seriesName}
+                  <div class="detail-row">
+                    <span class="detail-k">Matched Series:</span>
+                    <span class="detail-v"><strong>{ownership.seriesName}</strong> <code class="detail-id">{ownership.seriesId}</code></span>
+                  </div>
+                {/if}
+                {#if ownership.libraryName || ownership.libraryId}
+                  <div class="detail-row">
+                    <span class="detail-k">Komga Library:</span>
+                    <span class="detail-v">{ownership.libraryName ?? ownership.libraryId}</span>
+                  </div>
+                {/if}
+                {#if ownedVolumeNumbers.length > 0}
+                  <div class="detail-row">
+                    <span class="detail-k">Owned Volumes:</span>
+                    <span class="detail-v">{formatVolumeRanges(ownedVolumeNumbers)}</span>
+                  </div>
+                {/if}
+                {#if missingVolumeNumbers.length > 0}
+                  <div class="detail-row">
+                    <span class="detail-k">Missing Volumes:</span>
+                    <span class="detail-v">{formatVolumeRanges(missingVolumeNumbers)}</span>
+                  </div>
+                {/if}
+                <div class="detail-row">
+                  <span class="detail-k">Source Releases:</span>
+                  <span class="detail-v capitalize">{ownership.summary.sourceReleaseType} ({chapters.length} releases)</span>
+                </div>
+                {#if ownership.lastRefreshed}
+                  <div class="detail-row">
+                    <span class="detail-k">Last Checked:</span>
+                    <span class="detail-v">{ago(ownership.lastRefreshed)}</span>
+                  </div>
+                {/if}
+              </div>
+            {/if}
+          </div>
+        {/if}
 
         {#if title.description}
           <p class="text" class:clamp={!wholeText}>{title.description}</p>
@@ -958,6 +1116,127 @@
     font-weight: 900;
     letter-spacing: 0.1em;
     text-transform: uppercase;
+  }
+
+  .ownership-summary {
+    border: 3px solid var(--ink);
+    background: var(--surface);
+    padding: 10px 14px;
+    margin-top: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    box-shadow: var(--sh-4);
+  }
+
+  .ownership-summary.unavailable {
+    background: var(--paper-warm, var(--surface));
+  }
+
+  .ownership-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+
+  .ownership-badge-title {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 11px;
+    font-weight: 900;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--ink);
+  }
+
+  .ownership-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .btn.mini {
+    padding: 2px 8px;
+    min-height: 26px;
+    font-size: 11px;
+    font-weight: 800;
+    border-width: 2px;
+  }
+
+  .ownership-body {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 12px;
+  }
+
+  .ownership-metrics-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 16px;
+  }
+
+  .ownership-metric-col {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .ownership-metric {
+    font-size: 14px;
+    font-weight: 800;
+    letter-spacing: 0.05em;
+  }
+
+  .ownership-metric strong {
+    font-size: 18px;
+    font-family: var(--display, inherit);
+  }
+
+  .ownership-expl {
+    font-size: 12px;
+    font-weight: 700;
+    opacity: 0.75;
+  }
+
+  .ownership-details-box {
+    margin-top: 6px;
+    padding-top: 8px;
+    border-top: 2px dashed var(--ink);
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 12px;
+  }
+
+  .detail-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  .detail-k {
+    font-weight: 800;
+    min-width: 110px;
+    opacity: 0.7;
+  }
+
+  .detail-v {
+    font-weight: 700;
+  }
+
+  .detail-id {
+    font-size: 11px;
+    opacity: 0.75;
+    background: var(--paper, #f5f5f5);
+    padding: 1px 4px;
+  }
+
+  .capitalize {
+    text-transform: capitalize;
   }
 
   .text {

@@ -1256,10 +1256,21 @@ describe('first-class volume acquisition & release semantics', () => {
         seriesId: 'series-123',
         seriesName: 'Blue Lock',
         libraryId: 'lib-en',
+        libraryName: 'Manga',
         volumes: [
           { volume: 1, status: 'owned', bookId: 'b-1', bookName: 'Blue Lock v01' },
           { volume: 2, status: 'acquiring', bookId: null, bookName: null },
         ],
+        chapters: [],
+        summary: {
+          ownedVolumesCount: 1,
+          totalSourceVolumes: null,
+          ownedChaptersCount: 0,
+          totalSourceChapters: 368,
+          sourceReleaseType: 'chapter',
+          explanation: 'Source provides chapters',
+        },
+        lastRefreshed: 1700000000,
       };
 
       const v1 = ownership.volumes.find((v) => v.volume === 1);
@@ -1271,6 +1282,54 @@ describe('first-class volume acquisition & release semantics', () => {
 
       const v3 = ownership.volumes.find((v) => v.volume === 3);
       expect(v3).toBeUndefined(); // Unowned/available
+
+      // Blue Lock regression semantics:
+      // When source has chapters and Komga has volumes, totalSourceVolumes must be null
+      // so UI does NOT fabricate a fake 1/368 denominator!
+      expect(ownership.summary.totalSourceVolumes).toBeNull();
+      expect(ownership.summary.explanation).toBe('Source provides chapters');
+    });
+
+    it('verifies honest ownership summary denominators for volume and mixed sources', () => {
+      // Volume source + Volume Komga (38 / 39)
+      const volOwnership: import('./api').OwnershipSummary = {
+        ownedVolumesCount: 38,
+        totalSourceVolumes: 39,
+        ownedChaptersCount: 0,
+        totalSourceChapters: null,
+        sourceReleaseType: 'volume',
+        explanation: null,
+      };
+      expect(volOwnership.ownedVolumesCount).toBe(38);
+      expect(volOwnership.totalSourceVolumes).toBe(39);
+      expect(volOwnership.explanation).toBeNull();
+
+      // Chapter source + Chapter Komga (184 / 201)
+      const chOwnership: import('./api').OwnershipSummary = {
+        ownedVolumesCount: 0,
+        totalSourceVolumes: null,
+        ownedChaptersCount: 184,
+        totalSourceChapters: 201,
+        sourceReleaseType: 'chapter',
+        explanation: null,
+      };
+      expect(chOwnership.ownedChaptersCount).toBe(184);
+      expect(chOwnership.totalSourceChapters).toBe(201);
+
+      // Mixed releases (Volumes 12/14, Chapters 3/3)
+      const mixedOwnership: import('./api').OwnershipSummary = {
+        ownedVolumesCount: 12,
+        totalSourceVolumes: 14,
+        ownedChaptersCount: 3,
+        totalSourceChapters: 3,
+        sourceReleaseType: 'mixed',
+        explanation: null,
+      };
+      expect(mixedOwnership.sourceReleaseType).toBe('mixed');
+      expect(mixedOwnership.ownedVolumesCount).toBe(12);
+      expect(mixedOwnership.totalSourceVolumes).toBe(14);
+      expect(mixedOwnership.ownedChaptersCount).toBe(3);
+      expect(mixedOwnership.totalSourceChapters).toBe(3);
     });
 
     it('formats acquisition queue lifecycle stages and detects komga retry availability', () => {
