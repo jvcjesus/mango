@@ -393,16 +393,51 @@ Audit Log & Acquisition History
 - **High-Performance Caching**: 60-second TTL in-memory cache per title, invalidated automatically upon publication or manual title refresh.
 - **Duplicate Protection**: Title pages display "Owned in Komga" badges and prompt for confirmation before re-acquiring already-owned volumes.
 
-#### 5. Native Reading-Progress Synchronization (Komga &rarr; Mango &rarr; AniList / MangaBaka)
-- **Komga Authoritative Progress**: Komga is the single source of truth for reading progress (`completed`, `page`, `readDate`).
-- **Safe Tracker Derivation**:
-  - **AniList (Chapter-Based)**: Compares chapter progress safely. For volume-only Komga series without verified chapter mapping, synchronization fails closed (`SkippedUnsafeProgress`) to prevent dangerous volume-as-chapter corruption (e.g. never equates Vol 12 = Ch 12).
-  - **MangaBaka (Volume-Based)**: Synchronizes volume collection progress.
-- **Never-Decrease Safety**: Tracker progress strictly never moves backward: `tracker_progress = max(existing_tracker_progress, safely_derived_komga_progress)`.
-- **Dry-Run Evaluation**: Zero tracker writes and zero Komga mutations, producing detailed diagnostic audit records and update proposals.
-- **Manual Controls & Audit Trail**: Settings provides `[Run Dry Run]` and `[Sync Now]` with explicit confirmation, backed by a persistent SQLite audit log (`sync_records`).
-- **Disabled-By-Default Scheduler**: Background sync scheduler defaults strictly to OFF (`sync.enabled = false`), ensuring zero unattended external writes until manually enabled.
-- **Tracked Library Decoupling**: Explicitly separates `Tracked`, `Owned`, `Acquiring`, `Read progress`, and `Auto-acquire enabled`. Tracking a title never implies downloading or auto-acquiring it. Auto-acquire strictly defaults to false.
+#### 5. Native Reading-Progress Synchronization & Tracker Identity Layer (Komga &rarr; Mango &rarr; AniList / MangaBaka)
+
+- **Sources of Truth**:
+  - **Canonical Library & Owned Files**: Komga is the permanent authority on owned files and library organization.
+  - **Canonical Reading Progress**: Komga is the sole source of truth for reading progress (`completed`, `page`, `readDate`).
+  - **External Trackers**: AniList and MangaBaka are downstream tracking/metadata services; they are NEVER authoritative for whether a file is physically owned.
+- **Tracker Identity Resolution & Provenance**:
+  - **Typed Identity Evidence**: Mappings store `mapping_source` (`manual`, `existing_mapping`, `mango_tracker`, `comic_info`, `cross_reference`, `exact_title`, `metadata`), `edition_id` (for specific MangaBaka editions), `confidence` (`resolved`, `ambiguous`, `needs_mapping`, `not_found`), and `last_validated`.
+  - **Reused Matching Engine**: Sync reuses the robust fail-closed series and collection matcher from the acquisition pipeline (`MangaBakaClient::match_series`, `match_collection`).
+  - **Fail-Closed Ambiguity**: When multiple candidate series or collections match a title, resolution strictly fails closed (`AmbiguousMapping`) rather than guessing.
+- **Mapping Diagnostics & Manual Override**:
+  - **Unresolved & Ambiguous Titles UI**: Settings exposes unresolved/ambiguous titles with candidate lists and failure reasons.
+  - **Permanent Manual Override**: Users can set an explicit Tracker ID / Edition ID via `POST /sync/mappings/manual`, which permanently overrides automatic resolution without leaking tokens. Mappings can be reset via `POST /sync/mappings/reset`.
+- **Authoritative Release Totals Hierarchy**:
+  - **Total Volumes**:
+    1. MangaBaka edition collection total works count (`fetch_collection_total_works`).
+    2. AniList `media.volumes` (if > 0).
+    3. Unknown (`None`) — NEVER use source chapter counts as a volume denominator!
+  - **Total Chapters**:
+    1. AniList `media.chapters` (if > 0).
+    2. Unknown (`None`).
+  - **Regression Safety**: Preserves the *Blue Lock* canonical behavior (`VOLUMES 38` with `Source provides chapters`, never `38/368`).
+- **Sync Eligibility & Untouched Series**:
+  - Series with zero completed reading progress in Komga are classified as `SkippedUntouched` without hitting external tracker APIs, conserving rate limits.
+  - Partial book reading (page > 0 on an incomplete book) does not mark a book completed.
+- **Dimension-Aware AniList Progress**:
+  - AniList GraphQL natively supports both `progressVolumes` and `progress`.
+  - Volume-based Komga series synchronizes `progressVolumes` directly (not `SkippedUnsafeProgress`).
+  - Chapter-based Komga series synchronizes `progress`.
+  - Strictly never equates Volume 12 = Chapter 12.
+  - Never-decrease rule: `target = max(existing_tracker_progress, safely_derived_komga_progress)`.
+  - Completion rule: Only marks series as `COMPLETED` on AniList if an authoritative total is known and reached.
+- **Audited MangaBaka Progress Semantics**:
+  - MangaBaka REST API v1 provides public catalog, edition, and metadata endpoints, but does NOT provide a remote user library mutation endpoint.
+  - Live progress synchronization fails closed honestly with `Unsupported` (`SyncResultCategory::Unsupported`), while MangaBaka is actively utilized for exact edition resolution and authoritative volume totals.
+- **Decoupled Tracked / Owned / Reading / Auto-Acquire Model**:
+  - Fully decouples `Tracked` (on wishlist/reading list), `Owned` (physically in Komga), `Reading` (active reading progress), `Acquiring` (in download/publish pipeline), and `Auto-acquire enabled`.
+  - Tracking a title NEVER implies downloading or auto-acquiring it. Auto-acquisition strictly defaults to false.
+- **Dry-Run Evaluation & Audit Trail**:
+  - Full dry-run evaluation with zero external writes.
+  - Persistent SQLite audit history (`sync_records`) recording `dimension` (`VOL` / `CH`), old/new progress, status changes, and categorized results (`Updated`, `WouldUpdate`, `NoChange`, `TrackerAhead`, `SkippedUntouched`, `SkippedNoMapping`, `AmbiguousMapping`, `Unsupported`, `AuthError`, etc.).
+- **Disabled-By-Default Scheduler**:
+  - Background scheduler strictly defaults to OFF (`sync.enabled = false`), ensuring zero unattended external writes until manually enabled.
+- **Non-Interference with Legacy Infrastructure**:
+  - Existing external scripts (`komga-anilist-sync`, `manga-itagger`, `mangabaka-refresh`, `suwayomi-volume-watch`) remain untouched and operational during development.
 
 #### 6. Downloads Queue & Lifecycle Visibility
 - **Live Pipeline Stages**: Real-time status indicators in the Downloads tab: `Queued`, `Downloading`, `Identifying`, `Metadata`, `Optimizing`, `Validating`, `Publishing`, `Komga`, `Complete`, and `Failed`.
