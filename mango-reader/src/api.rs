@@ -146,6 +146,7 @@ pub fn router(state: Spaces) -> Router {
         .route("/pipeline/validate-paths", post(validate_pipeline_paths))
         .route("/pipeline/test-mangabaka", post(test_pipeline_mangabaka))
         .route("/pipeline/test-komga", post(test_pipeline_komga))
+        .route("/pipeline/discover-komga-libraries", post(discover_pipeline_komga_libraries))
         .route("/pipeline/events", get(get_pipeline_events))
         .layer(middleware::from_fn_with_state(state.clone(), auth::require));
     let api = Router::new()
@@ -1054,6 +1055,15 @@ async fn test_pipeline_komga(
     app.me.admin()?;
     let msg = app.pipeline.test_komga(payload.url, payload.token).await?;
     Ok(Json(json!({ "message": msg })))
+}
+
+async fn discover_pipeline_komga_libraries(
+    Me(app): Me,
+    Json(payload): Json<TestPipelinePayload>,
+) -> Result<Json<Vec<crate::pipeline::komga::KomgaLibrary>>> {
+    app.me.admin()?;
+    let libs = app.pipeline.discover_komga_libraries(payload.url, payload.token).await?;
+    Ok(Json(libs))
 }
 
 async fn get_pipeline_events(Me(app): Me) -> Result<Json<Vec<crate::pipeline::PipelineEvent>>> {

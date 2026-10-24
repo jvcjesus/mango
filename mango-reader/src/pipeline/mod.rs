@@ -55,6 +55,10 @@ fn default_min_savings_percent() -> u32 {
     optimizer::DEFAULT_MIN_SAVINGS_PERCENT
 }
 
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineConfig {
     pub enabled: bool,
@@ -71,6 +75,9 @@ pub struct PipelineConfig {
     pub komga_api_key: Option<String>,
     pub has_komga_api_key: bool,
     pub komga_library_id: Option<String>,
+    pub komga_chinese_library_id: Option<String>,
+    #[serde(default = "default_true")]
+    pub komga_scan_enabled: bool,
     pub optimize_enabled: bool,
     pub optimizer_bin: Option<String>,
     #[serde(default = "default_target_height")]
@@ -108,6 +115,8 @@ impl Default for PipelineConfig {
             komga_api_key: None,
             has_komga_api_key: false,
             komga_library_id: None,
+            komga_chinese_library_id: None,
+            komga_scan_enabled: true,
             optimize_enabled: false,
             optimizer_bin: None,
             target_height: optimizer::DEFAULT_TARGET_HEIGHT,
@@ -192,6 +201,8 @@ impl Pipeline {
             komga_api_key: None, // Secret redacted in config view
             has_komga_api_key: komga_api_key.is_some_and(|k| !k.trim().is_empty()),
             komga_library_id: raw_cfg.komga_library_id,
+            komga_chinese_library_id: raw_cfg.komga_chinese_library_id,
+            komga_scan_enabled: raw_cfg.komga_scan_enabled,
             optimize_enabled: raw_cfg.optimize_enabled,
             optimizer_bin: raw_cfg.optimizer_bin,
             target_height: raw_cfg.target_height,
@@ -241,6 +252,8 @@ impl Pipeline {
                 let komga_url = crate::settings::get::<String>(conn, "pipeline.komga_url")
                     .or_else(|| Some(komga::DEFAULT_KOMGA_URL.to_string()));
                 let komga_library_id = crate::settings::get::<String>(conn, "pipeline.komga_library_id");
+                let komga_chinese_library_id = crate::settings::get::<String>(conn, "pipeline.komga_chinese_library_id");
+                let komga_scan_enabled = crate::settings::get::<bool>(conn, "pipeline.komga_scan_enabled").unwrap_or(true);
                 let optimize_enabled = crate::settings::get::<bool>(conn, "pipeline.optimize_enabled").unwrap_or(false);
 
                 // Migration semantics: untouched legacy default path is migrated to None (using bundled path)
@@ -274,6 +287,8 @@ impl Pipeline {
                     komga_api_key: None,
                     has_komga_api_key: komga_api_key.is_some(),
                     komga_library_id,
+                    komga_chinese_library_id,
+                    komga_scan_enabled,
                     optimize_enabled,
                     optimizer_bin,
                     target_height,
@@ -369,6 +384,8 @@ impl Pipeline {
                 map.insert("pipeline.komga_enabled".into(), serde_json::json!(patch.komga_enabled));
                 map.insert("pipeline.komga_url".into(), serde_json::json!(patch.komga_url));
                 map.insert("pipeline.komga_library_id".into(), serde_json::json!(patch.komga_library_id));
+                map.insert("pipeline.komga_chinese_library_id".into(), serde_json::json!(patch.komga_chinese_library_id));
+                map.insert("pipeline.komga_scan_enabled".into(), serde_json::json!(patch.komga_scan_enabled));
                 map.insert("pipeline.optimize_enabled".into(), serde_json::json!(patch.optimize_enabled));
                 map.insert("pipeline.optimizer_bin".into(), serde_json::json!(patch.optimizer_bin));
                 map.insert("pipeline.target_height".into(), serde_json::json!(patch.target_height));
@@ -427,6 +444,24 @@ impl Pipeline {
 
         let client = KomgaClient::new(self.http.clone(), url, actual_key);
         client.test_connection().await
+    }
+
+    /// Discovers libraries configured in Komga without triggering scans.
+    pub async fn discover_komga_libraries(
+        &self,
+        url: Option<String>,
+        api_key: Option<String>,
+    ) -> Result<Vec<komga::KomgaLibrary>> {
+        let (raw_cfg, _, saved_key) = self.load_internal_config().await?;
+        let target_url = url.filter(|s| !s.trim().is_empty()).or(raw_cfg.komga_url);
+        let actual_key = match api_key {
+            Some(k) if k.trim() == "********" || k.trim().is_empty() => saved_key,
+            Some(k) => Some(k),
+            None => saved_key,
+        };
+
+        let client = KomgaClient::new(self.http.clone(), target_url, actual_key);
+        client.list_libraries().await
     }
 
     /// Returns the audit history of recent pipeline runs.
@@ -603,10 +638,20 @@ impl Pipeline {
 
         // 5. Automatic Komga Library Rescan Trigger
         let mut komga_status = "skipped".to_string();
-        if config.komga_enabled && pub_res.is_ok() {
+        if config.komga_enabled && config.komga_scan_enabled && pub_res.is_ok() {
+            let target_library_id = if is_chinese {
+                config.komga_chinese_library_id.as_deref().or(config.komga_library_id.as_deref())
+            } else {
+                config.komga_library_id.as_deref()
+            };
             let komga_client = KomgaClient::new(self.http.clone(), config.komga_url.clone(), komga_key);
-            match komga_client.trigger_scan(config.komga_library_id.as_deref()).await {
-                Ok(()) => komga_status = "scan triggered".to_string(),
+            match komga_client.trigger_scan(target_library_id).await {
+                Ok(()) => {
+                    komga_status = match target_library_id {
+                        Some(id) => format!("scan triggered ({id})"),
+                        None => "scan triggered (all)".to_string(),
+                    };
+                }
                 Err(e) => komga_status = format!("scan trigger failed: {e}"),
             }
         }
@@ -799,6 +844,9 @@ mod tests {
         config.enabled = true;
         config.library_dir = Some(temp_lib.path().to_string_lossy().to_string());
         config.komga_enabled = true;
+        config.komga_library_id = Some("lib-en-123".into());
+        config.komga_chinese_library_id = Some("lib-zh-456".into());
+        config.komga_scan_enabled = true;
         config.komga_api_key = Some("super_secret_komga_key".into());
 
         pipeline.save_config(config).await.unwrap();
@@ -807,6 +855,9 @@ mod tests {
         assert!(loaded.enabled);
         assert_eq!(loaded.library_dir.as_deref(), Some(temp_lib.path().to_str().unwrap()));
         assert!(loaded.komga_enabled);
+        assert_eq!(loaded.komga_library_id.as_deref(), Some("lib-en-123"));
+        assert_eq!(loaded.komga_chinese_library_id.as_deref(), Some("lib-zh-456"));
+        assert!(loaded.komga_scan_enabled);
         assert!(loaded.has_komga_api_key);
         // Secret must not be exposed in user-facing config
         assert_eq!(loaded.komga_api_key, None);
