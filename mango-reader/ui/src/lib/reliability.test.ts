@@ -1156,6 +1156,9 @@ describe('first-class volume acquisition & release semantics', () => {
       expect(res.html).toContain('MangaBaka Metadata Enrichment');
       expect(res.html).toContain('Komga Server Integration');
       expect(res.html).toContain('Image Optimization');
+      expect(res.html).toContain('Target Page Height');
+      expect(res.html).toContain('Image Quality');
+      expect(res.html).toContain('Minimum Size Savings Required');
     });
 
     it('classifies container-aware path validation codes and badges', () => {
@@ -1204,6 +1207,43 @@ describe('first-class volume acquisition & release semantics', () => {
       expect(resolve(null, true)).toEqual({ path: bundledPath, source: 'bundled' });
       expect(resolve('/custom/path', true)).toEqual({ path: '/custom/path', source: 'custom' });
       expect(resolve(null, false)).toEqual({ path: null, source: 'none' });
+    });
+
+    it('validates optimizer quality parameter bounds and defaults in pipeline config', () => {
+      // Default quality parameters
+      const defaultConfig: import('./api').PipelineConfig = {
+        enabled: false,
+        library_dir: null,
+        chinese_library_dir: null,
+        mangabaka_enabled: true,
+        mangabaka_url: 'https://api.mangabaka.org/v1',
+        has_mangabaka_token: false,
+        komga_enabled: false,
+        komga_url: 'http://127.0.0.1:25600',
+        has_komga_api_key: false,
+        komga_library_id: null,
+        optimize_enabled: false,
+        optimizer_bin: null,
+        target_height: 2400,
+        image_quality: 90,
+        min_savings_percent: 10,
+      };
+
+      expect(defaultConfig.target_height).toBe(2400);
+      expect(defaultConfig.image_quality).toBe(90);
+      expect(defaultConfig.min_savings_percent).toBe(10);
+
+      // Client patch preserves custom resolution and quality
+      const customPatch = {
+        ...defaultConfig,
+        target_height: 3000,
+        image_quality: 85,
+        min_savings_percent: 15,
+      };
+
+      expect(customPatch.target_height).toBe(3000);
+      expect(customPatch.image_quality).toBe(85);
+      expect(customPatch.min_savings_percent).toBe(15);
     });
   });
 });

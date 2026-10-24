@@ -21,8 +21,10 @@ use std::fs;
 #[allow(unused_imports)]
 pub use optimizer::{
     check_executable_invocable, count_cbz_pages, is_executable, optimize_cbz, resolve_optimizer_binary,
-    validate_optimizer, BUNDLED_OPTIMIZER_PATH, DEFAULT_MIN_SAVINGS_PERCENT, LEGACY_DEFAULT_OPTIMIZER_BIN,
-    OptimizationResult, OptimizerValidationCode, OptimizerValidationResult,
+    validate_optimizer, BUNDLED_OPTIMIZER_PATH, DEFAULT_IMAGE_QUALITY, DEFAULT_MIN_SAVINGS_PERCENT,
+    DEFAULT_TARGET_HEIGHT, LEGACY_DEFAULT_OPTIMIZER_BIN, MAX_IMAGE_QUALITY, MAX_MIN_SAVINGS_PERCENT,
+    MAX_TARGET_HEIGHT, MIN_IMAGE_QUALITY, MIN_SAVINGS_PERCENT, MIN_TARGET_HEIGHT, OptimizationResult,
+    OptimizerValidationCode, OptimizerValidationResult,
 };
 #[allow(unused_imports)]
 pub use publisher::{canonical_release_name, publish_cbz, PublishOutcome};
@@ -40,6 +42,18 @@ use std::{
 };
 
 const MAX_RECENT_EVENTS: usize = 50;
+
+fn default_target_height() -> u32 {
+    optimizer::DEFAULT_TARGET_HEIGHT
+}
+
+fn default_image_quality() -> u32 {
+    optimizer::DEFAULT_IMAGE_QUALITY
+}
+
+fn default_min_savings_percent() -> u32 {
+    optimizer::DEFAULT_MIN_SAVINGS_PERCENT
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PipelineConfig {
@@ -59,6 +73,11 @@ pub struct PipelineConfig {
     pub komga_library_id: Option<String>,
     pub optimize_enabled: bool,
     pub optimizer_bin: Option<String>,
+    #[serde(default = "default_target_height")]
+    pub target_height: u32,
+    #[serde(default = "default_image_quality")]
+    pub image_quality: u32,
+    #[serde(default = "default_min_savings_percent")]
     pub min_savings_percent: u32,
 
     // Container-aware validation status fields (populated on load/validate)
@@ -91,7 +110,9 @@ impl Default for PipelineConfig {
             komga_library_id: None,
             optimize_enabled: false,
             optimizer_bin: None,
-            min_savings_percent: DEFAULT_MIN_SAVINGS_PERCENT,
+            target_height: optimizer::DEFAULT_TARGET_HEIGHT,
+            image_quality: optimizer::DEFAULT_IMAGE_QUALITY,
+            min_savings_percent: optimizer::DEFAULT_MIN_SAVINGS_PERCENT,
             library_status: None,
             chinese_library_status: None,
             optimizer_status: None,
@@ -173,6 +194,8 @@ impl Pipeline {
             komga_library_id: raw_cfg.komga_library_id,
             optimize_enabled: raw_cfg.optimize_enabled,
             optimizer_bin: raw_cfg.optimizer_bin,
+            target_height: raw_cfg.target_height,
+            image_quality: raw_cfg.image_quality,
             min_savings_percent: raw_cfg.min_savings_percent,
             library_status: Some(library_status),
             chinese_library_status: Some(chinese_library_status),
@@ -228,8 +251,12 @@ impl Pipeline {
                     None => None,
                 };
 
+                let target_height = crate::settings::get::<u32>(conn, "pipeline.target_height")
+                    .unwrap_or(optimizer::DEFAULT_TARGET_HEIGHT);
+                let image_quality = crate::settings::get::<u32>(conn, "pipeline.image_quality")
+                    .unwrap_or(optimizer::DEFAULT_IMAGE_QUALITY);
                 let min_savings_percent = crate::settings::get::<u32>(conn, "pipeline.min_savings_percent")
-                    .unwrap_or(DEFAULT_MIN_SAVINGS_PERCENT);
+                    .unwrap_or(optimizer::DEFAULT_MIN_SAVINGS_PERCENT);
 
                 let mangabaka_token = crate::db::state(conn, "pipeline.mangabaka_token")?;
                 let komga_api_key = crate::db::state(conn, "pipeline.komga_api_key")?;
@@ -249,6 +276,8 @@ impl Pipeline {
                     komga_library_id,
                     optimize_enabled,
                     optimizer_bin,
+                    target_height,
+                    image_quality,
                     min_savings_percent,
                     library_status: None,
                     chinese_library_status: None,
@@ -273,6 +302,29 @@ impl Pipeline {
             Some(s) => Some(s.to_string()),
             None => None,
         };
+
+        // Range validation for optimizer quality settings
+        if patch.target_height < optimizer::MIN_TARGET_HEIGHT || patch.target_height > optimizer::MAX_TARGET_HEIGHT {
+            return Err(AppError::bad_request(format!(
+                "Target page height must be between {} and {} px",
+                optimizer::MIN_TARGET_HEIGHT,
+                optimizer::MAX_TARGET_HEIGHT
+            )));
+        }
+        if patch.image_quality < optimizer::MIN_IMAGE_QUALITY || patch.image_quality > optimizer::MAX_IMAGE_QUALITY {
+            return Err(AppError::bad_request(format!(
+                "Image quality must be between {} and {}",
+                optimizer::MIN_IMAGE_QUALITY,
+                optimizer::MAX_IMAGE_QUALITY
+            )));
+        }
+        if patch.min_savings_percent > optimizer::MAX_MIN_SAVINGS_PERCENT {
+            return Err(AppError::bad_request(format!(
+                "Minimum size savings percentage must be between {} and {}%",
+                optimizer::MIN_SAVINGS_PERCENT,
+                optimizer::MAX_MIN_SAVINGS_PERCENT
+            )));
+        }
 
         // Strict authoritative server-side validation when enabling the pipeline
         if patch.enabled {
@@ -319,6 +371,8 @@ impl Pipeline {
                 map.insert("pipeline.komga_library_id".into(), serde_json::json!(patch.komga_library_id));
                 map.insert("pipeline.optimize_enabled".into(), serde_json::json!(patch.optimize_enabled));
                 map.insert("pipeline.optimizer_bin".into(), serde_json::json!(patch.optimizer_bin));
+                map.insert("pipeline.target_height".into(), serde_json::json!(patch.target_height));
+                map.insert("pipeline.image_quality".into(), serde_json::json!(patch.image_quality));
                 map.insert("pipeline.min_savings_percent".into(), serde_json::json!(patch.min_savings_percent));
 
                 crate::settings::put(conn, &map)?;
@@ -497,13 +551,21 @@ impl Pipeline {
                 Some(ref bin) => {
                     let orig_size = fs::metadata(source_cbz).map(|m| m.len()).unwrap_or(0);
                     tracing::info!(
-                        "OPTIMIZER: starting {} ({bin_source}) for candidate {} ({} bytes, min savings {}%)",
+                        "OPTIMIZER: starting {} ({bin_source}) for candidate {} ({} bytes, target height {}px, quality {}, min savings {}%)",
                         bin.display(),
                         source_cbz.display(),
                         orig_size,
+                        config.target_height,
+                        config.image_quality,
                         config.min_savings_percent
                     );
-                    match optimizer::optimize_cbz(source_cbz, config.optimizer_bin.as_deref(), config.min_savings_percent).await {
+                    match optimizer::optimize_cbz(
+                        source_cbz,
+                        config.optimizer_bin.as_deref(),
+                        config.target_height,
+                        config.image_quality,
+                        config.min_savings_percent,
+                    ).await {
                         Ok(res) => {
                             optimizer_status = res.reason.clone();
                             if res.applied {
@@ -901,6 +963,8 @@ exit 0
         config.library_dir = Some(library_dir.to_string_lossy().to_string());
         config.optimize_enabled = true;
         config.optimizer_bin = Some(script.to_string_lossy().to_string());
+        config.target_height = 2400;
+        config.image_quality = 90;
         config.min_savings_percent = 5;
         config.mangabaka_enabled = false;
         config.komga_enabled = false;
@@ -910,6 +974,8 @@ exit 0
         // Verify config loaded dynamically from DB
         let loaded = pipeline.load_config().await.unwrap();
         assert!(loaded.optimize_enabled);
+        assert_eq!(loaded.target_height, 2400);
+        assert_eq!(loaded.image_quality, 90);
         assert_eq!(loaded.min_savings_percent, 5);
 
         // 3. Process download
@@ -973,5 +1039,94 @@ exit 0
         assert_eq!(events2[0].optimizer_status, "skipped: disabled");
 
         let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn pipeline_optimizer_config_persists_round_trip() {
+        let db = test_db();
+        let pipeline = Pipeline::new(db);
+
+        let mut config = PipelineConfig::default();
+        config.enabled = false;
+        config.optimize_enabled = true;
+        config.target_height = 2800;
+        config.image_quality = 85;
+        config.min_savings_percent = 15;
+
+        pipeline.save_config(config).await.unwrap();
+
+        let loaded = pipeline.load_config().await.unwrap();
+        assert_eq!(loaded.target_height, 2800);
+        assert_eq!(loaded.image_quality, 85);
+        assert_eq!(loaded.min_savings_percent, 15);
+    }
+
+    #[tokio::test]
+    async fn pipeline_rejects_invalid_optimizer_values() {
+        let db = test_db();
+        let pipeline = Pipeline::new(db);
+
+        // Height too low (< 500)
+        let mut cfg = PipelineConfig::default();
+        cfg.target_height = 400;
+        let err = pipeline.save_config(cfg).await.unwrap_err();
+        assert!(err.message.contains("Target page height must be between 500 and 10000 px"));
+
+        // Height too high (> 10000)
+        let mut cfg = PipelineConfig::default();
+        cfg.target_height = 15000;
+        let err = pipeline.save_config(cfg).await.unwrap_err();
+        assert!(err.message.contains("Target page height must be between 500 and 10000 px"));
+
+        // Quality too low (< 1)
+        let mut cfg = PipelineConfig::default();
+        cfg.image_quality = 0;
+        let err = pipeline.save_config(cfg).await.unwrap_err();
+        assert!(err.message.contains("Image quality must be between 1 and 100"));
+
+        // Quality too high (> 100)
+        let mut cfg = PipelineConfig::default();
+        cfg.image_quality = 101;
+        let err = pipeline.save_config(cfg).await.unwrap_err();
+        assert!(err.message.contains("Image quality must be between 1 and 100"));
+
+        // Min savings too high (> 99)
+        let mut cfg = PipelineConfig::default();
+        cfg.min_savings_percent = 100;
+        let err = pipeline.save_config(cfg).await.unwrap_err();
+        assert!(err.message.contains("Minimum size savings percentage must be between 0 and 99%"));
+    }
+
+    #[tokio::test]
+    async fn pipeline_migrates_missing_optimizer_config_to_defaults() {
+        let db = test_db();
+        let pipeline = Pipeline::new(db);
+
+        // Fresh database with no settings produces default values
+        let loaded = pipeline.load_config().await.unwrap();
+        assert_eq!(loaded.target_height, 2400);
+        assert_eq!(loaded.image_quality, 90);
+        assert_eq!(loaded.min_savings_percent, 10);
+
+        // Serde deserialization from JSON without new fields (representing older config payload) receives defaults safely
+        let old_json = r#"{
+            "enabled": false,
+            "library_dir": null,
+            "chinese_library_dir": null,
+            "mangabaka_enabled": true,
+            "mangabaka_url": "https://api.mangabaka.org/v1",
+            "has_mangabaka_token": false,
+            "komga_enabled": false,
+            "komga_url": "http://127.0.0.1:25600",
+            "has_komga_api_key": false,
+            "komga_library_id": null,
+            "optimize_enabled": false,
+            "optimizer_bin": null,
+            "min_savings_percent": 10
+        }"#;
+        let parsed: PipelineConfig = serde_json::from_str(old_json).unwrap();
+        assert_eq!(parsed.target_height, 2400);
+        assert_eq!(parsed.image_quality, 90);
+        assert_eq!(parsed.min_savings_percent, 10);
     }
 }

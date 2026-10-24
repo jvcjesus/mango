@@ -514,6 +514,8 @@
     komga_library_id: null,
     optimize_enabled: false,
     optimizer_bin: null,
+    target_height: 2400,
+    image_quality: 90,
     min_savings_percent: 10,
   });
   let pipelineEvents = $state<PipelineEvent[]>([]);
@@ -534,6 +536,8 @@
   let komgaApiKeyInput = $state('');
   let komgaLibraryIdInput = $state('');
   let optimizerBinInput = $state('');
+  let targetHeightInput = $state(2400);
+  let imageQualityInput = $state(90);
   let minSavingsPercentInput = $state(10);
 
   let libraryStatus = $state<PathValidationResult | null>(null);
@@ -567,6 +571,8 @@
       komgaApiKeyInput = cfg.has_komga_api_key ? '********' : '';
       komgaLibraryIdInput = cfg.komga_library_id ?? '';
       optimizerBinInput = cfg.optimizer_bin ?? '';
+      targetHeightInput = cfg.target_height ?? 2400;
+      imageQualityInput = cfg.image_quality ?? 90;
       minSavingsPercentInput = cfg.min_savings_percent ?? 10;
       libraryStatus = cfg.library_status ?? null;
       chineseLibraryStatus = cfg.chinese_library_status ?? null;
@@ -620,7 +626,9 @@
         komga_api_key: komgaApiKeyInput.trim() || null,
         komga_library_id: komgaLibraryIdInput.trim() || null,
         optimizer_bin: optimizerBinInput.trim() || null,
-        min_savings_percent: Number(minSavingsPercentInput) || 10,
+        target_height: Number(targetHeightInput) || 2400,
+        image_quality: Number(imageQualityInput) || 90,
+        min_savings_percent: Number(minSavingsPercentInput) >= 0 ? Number(minSavingsPercentInput) : 10,
       };
       await send('PUT', '/pipeline/config', patch);
       toast.success('Acquisition pipeline settings saved');
@@ -1222,6 +1230,42 @@
                 })}
               </div>
             </div>
+            <div class="set">
+              <div class="what">
+                <strong>Target Page Height (px)</strong>
+                <span>Maximum/target vertical resolution used during optimization. Default is 2400 px.</span>
+              </div>
+              <div class="how">
+                <label class="field seconds">
+                  <span class="sr">Target page height in pixels</span>
+                  <input type="number" bind:value={targetHeightInput} min="500" max="10000" step="100" />
+                </label>
+              </div>
+            </div>
+            <div class="set">
+              <div class="what">
+                <strong>Image Quality (1–100)</strong>
+                <span>Encoder quality controlling visual fidelity vs file size. Default is 90.</span>
+              </div>
+              <div class="how">
+                <label class="field seconds">
+                  <span class="sr">Image quality from 1 to 100</span>
+                  <input type="number" bind:value={imageQualityInput} min="1" max="100" />
+                </label>
+              </div>
+            </div>
+            <div class="set">
+              <div class="what">
+                <strong>Minimum Size Savings Required (%)</strong>
+                <span>Reject an optimized result if it does not save at least this percentage; preserve/use the original instead. Default is 10%.</span>
+              </div>
+              <div class="how">
+                <label class="field seconds">
+                  <span class="sr">Minimum size savings percentage</span>
+                  <input type="number" bind:value={minSavingsPercentInput} min="0" max="99" />
+                </label>
+              </div>
+            </div>
             <div class="set stack">
               <div class="what">
                 <strong>Optimizer Executable Path (Optional Override)</strong>
@@ -1264,17 +1308,6 @@
                   {/if}
                 </div>
               {/if}
-            </div>
-            <div class="set">
-              <div class="what">
-                <strong>Minimum Size Savings Required (%)</strong>
-                <span>Optimized CBZs that achieve less savings than this threshold or change page count are rejected; original archive is kept untouched.</span>
-              </div>
-              <div class="how">
-                <label class="field seconds">
-                  <input type="number" bind:value={minSavingsPercentInput} min="1" max="90" />
-                </label>
-              </div>
             </div>
           </section>
 

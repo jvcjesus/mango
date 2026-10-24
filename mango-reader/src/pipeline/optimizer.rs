@@ -15,7 +15,18 @@ use std::{
     time::Duration,
 };
 
+pub const DEFAULT_TARGET_HEIGHT: u32 = 2400;
+pub const MIN_TARGET_HEIGHT: u32 = 500;
+pub const MAX_TARGET_HEIGHT: u32 = 10000;
+
+pub const DEFAULT_IMAGE_QUALITY: u32 = 90;
+pub const MIN_IMAGE_QUALITY: u32 = 1;
+pub const MAX_IMAGE_QUALITY: u32 = 100;
+
 pub const DEFAULT_MIN_SAVINGS_PERCENT: u32 = 10;
+pub const MIN_SAVINGS_PERCENT: u32 = 0;
+pub const MAX_MIN_SAVINGS_PERCENT: u32 = 99;
+
 pub const BUNDLED_OPTIMIZER_PATH: &str = "/opt/mango/bin/RustyLibraryShrinker";
 pub const LEGACY_DEFAULT_OPTIMIZER_BIN: &str = "/srv/apps/manga/manga-itagger/RustyLibraryShrinker";
 
@@ -313,6 +324,8 @@ impl Drop for IsolatedWorkspace {
 pub async fn optimize_cbz(
     source_path: &Path,
     shrinker_bin: Option<&str>,
+    target_height: u32,
+    image_quality: u32,
     min_savings_percent: u32,
 ) -> Result<OptimizationResult> {
     let (resolved_bin, _source) = resolve_optimizer_binary(shrinker_bin);
@@ -364,7 +377,7 @@ pub async fn optimize_cbz(
     let candidate_path = workspace.path().join(format!("{stem}.cbz"));
     fs::copy(source_path, &candidate_path)?;
 
-    // 2. Prepare process command with argument array (no shell interpolation)
+    // 2. Prepare process command with explicit quality and resolution options
     let bin_str = bin_path.to_string_lossy();
     let mut cmd = tokio::process::Command::new(&bin_path);
     if bin_str.ends_with("RustyLibraryShrinker") || bin_str.contains("RustyLibraryShrinker") {
@@ -372,12 +385,22 @@ pub async fn optimize_cbz(
             .arg("en")
             .arg("-r")
             .arg("replace")
+            .arg("--target-height")
+            .arg(format!("{target_height}"))
+            .arg("--quality")
+            .arg(format!("{image_quality}"))
             .arg("--min-savings")
             .arg(format!("{min_savings_percent}"))
             .arg("--force-shrink")
             .arg(&candidate_path);
     } else {
-        cmd.arg(&candidate_path);
+        cmd.arg("--target-height")
+            .arg(format!("{target_height}"))
+            .arg("--quality")
+            .arg(format!("{image_quality}"))
+            .arg("--min-savings")
+            .arg(format!("{min_savings_percent}"))
+            .arg(&candidate_path);
     }
 
     let command_fut = cmd.output();
@@ -505,7 +528,27 @@ pub async fn optimize_cbz(
     }
 
     // 4. Atomic replacement into source location
-    fs::copy(&candidate_path, source_path)?;
+    // Write candidate to a sibling temporary file in source directory, then rename atomically.
+    let parent = source_path.parent().unwrap_or_else(|| Path::new("."));
+    let pid = std::process::id();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp_replace_path = parent.join(format!(".{stem}.opt-replace-{pid}-{now}.tmp"));
+
+    struct TempReplaceGuard<'a>(&'a Path);
+    impl<'a> Drop for TempReplaceGuard<'a> {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(self.0);
+        }
+    }
+    let guard = TempReplaceGuard(&temp_replace_path);
+
+    fs::copy(&candidate_path, &temp_replace_path)?;
+    verify_cbz_integrity(&temp_replace_path)?;
+    fs::rename(&temp_replace_path, source_path)?;
+    std::mem::forget(guard);
 
     Ok(OptimizationResult {
         original_bytes: orig_size,
@@ -573,7 +616,7 @@ mod tests {
         make_test_archive(&cbz, 3);
         let orig_size = fs::metadata(&cbz).unwrap().len();
 
-        let res = optimize_cbz(&cbz, Some("/nonexistent/binary"), 10).await.unwrap();
+        let res = optimize_cbz(&cbz, Some("/nonexistent/binary"), DEFAULT_TARGET_HEIGHT, DEFAULT_IMAGE_QUALITY, 10).await.unwrap();
         assert!(!res.applied);
         assert!(res.reason.contains("not found") || res.reason.contains("not configured"));
         // Source file preserved
@@ -702,7 +745,7 @@ mod tests {
             fs::set_permissions(&script, perms).unwrap();
         }
 
-        let res = optimize_cbz(&cbz, Some(script.to_str().unwrap()), 10).await.unwrap();
+        let res = optimize_cbz(&cbz, Some(script.to_str().unwrap()), DEFAULT_TARGET_HEIGHT, DEFAULT_IMAGE_QUALITY, 10).await.unwrap();
         assert!(!res.applied);
         assert!(res.reason.contains("no files found"));
         // Original file must remain untouched
@@ -716,7 +759,7 @@ mod tests {
         make_test_archive(&cbz, 2);
         let orig_size = fs::metadata(&cbz).unwrap().len();
 
-        // Script that shrinks by only 1 byte (less than 10%)
+        // Script that shrinks by only 1 byte (less than 50%)
         let script = dir.path().join("fake_small_shrink.sh");
         let script_content = r#"#!/bin/sh
 for arg in "$@"; do
@@ -740,7 +783,7 @@ exit 0
             fs::set_permissions(&script, perms).unwrap();
         }
 
-        let res = optimize_cbz(&cbz, Some(script.to_str().unwrap()), 50).await.unwrap();
+        let res = optimize_cbz(&cbz, Some(script.to_str().unwrap()), DEFAULT_TARGET_HEIGHT, DEFAULT_IMAGE_QUALITY, 50).await.unwrap();
         assert!(!res.applied);
         // Source file preserved
         assert_eq!(fs::metadata(&cbz).unwrap().len(), orig_size);
@@ -780,11 +823,224 @@ exit 0
             fs::set_permissions(&script, perms).unwrap();
         }
 
-        let res = optimize_cbz(&cbz, Some(script.to_str().unwrap()), 10).await.unwrap();
+        let res = optimize_cbz(&cbz, Some(script.to_str().unwrap()), DEFAULT_TARGET_HEIGHT, DEFAULT_IMAGE_QUALITY, 10).await.unwrap();
         assert!(!res.applied);
         assert!(res.reason.contains("ComicInfo.xml"));
         // Source file preserved
         assert_eq!(fs::metadata(&cbz).unwrap().len(), orig_size);
+    }
+
+    #[tokio::test]
+    async fn optimizer_command_receives_configured_target_height_and_quality() {
+        let dir = TempDir::new("opt-flags");
+        let cbz = dir.path().join("test.cbz");
+        make_test_archive(&cbz, 2);
+
+        let args_file = dir.path().join("args.txt");
+        let script = dir.path().join("record_args.sh");
+        let script_content = format!(
+            r#"#!/bin/sh
+echo "$@" > "{}"
+for arg in "$@"; do
+    case "$arg" in
+        *.cbz) target="$arg" ;;
+    esac
+done
+exit 0
+"#,
+            args_file.display()
+        );
+        fs::write(&script, script_content.as_bytes()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script, perms).unwrap();
+        }
+
+        // Test with custom height 3200 and quality 85
+        let _ = optimize_cbz(&cbz, Some(script.to_str().unwrap()), 3200, 85, 15).await.unwrap();
+        let recorded = fs::read_to_string(&args_file).unwrap();
+        assert!(recorded.contains("--target-height 3200"), "Script received configured target height: {recorded}");
+        assert!(recorded.contains("--quality 85"), "Script received configured quality: {recorded}");
+        assert!(recorded.contains("--min-savings 15"), "Script received configured min savings: {recorded}");
+
+        // Test with default height 2400 and quality 90
+        let _ = optimize_cbz(&cbz, Some(script.to_str().unwrap()), 2400, 90, 10).await.unwrap();
+        let recorded_def = fs::read_to_string(&args_file).unwrap();
+        assert!(recorded_def.contains("--target-height 2400"));
+        assert!(recorded_def.contains("--quality 90"));
+        assert!(recorded_def.contains("--min-savings 10"));
+    }
+
+    #[tokio::test]
+    async fn failed_optimization_leaves_original_unchanged() {
+        let dir = TempDir::new("opt-failed");
+        let cbz = dir.path().join("test.cbz");
+        make_test_archive(&cbz, 2);
+        let orig_bytes = fs::read(&cbz).unwrap();
+
+        // Script that exits with error code 1
+        let script = dir.path().join("fake_failing.sh");
+        fs::write(&script, b"#!/bin/sh\necho 'error processing'\nexit 1\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script, perms).unwrap();
+        }
+
+        let res = optimize_cbz(&cbz, Some(script.to_str().unwrap()), 2400, 90, 10).await.unwrap();
+        assert!(!res.applied);
+        assert!(res.reason.contains("failed"));
+        let after_bytes = fs::read(&cbz).unwrap();
+        assert_eq!(orig_bytes, after_bytes, "Original archive bytes must remain 100% unchanged on failure");
+    }
+
+    #[tokio::test]
+    async fn failed_validation_leaves_original_unchanged() {
+        let dir = TempDir::new("opt-corrupt-val");
+        let cbz = dir.path().join("test.cbz");
+        make_test_archive(&cbz, 2);
+        let orig_bytes = fs::read(&cbz).unwrap();
+
+        // Script that writes garbage bytes instead of valid ZIP
+        let script = dir.path().join("fake_corrupt.sh");
+        let script_content = r#"#!/bin/sh
+for arg in "$@"; do
+    case "$arg" in
+        *.cbz) target="$arg" ;;
+    esac
+done
+if [ -n "$target" ]; then
+    echo "THIS IS CORRUPT GARBAGE NOT A ZIP" > "$target"
+fi
+exit 0
+"#;
+        fs::write(&script, script_content.as_bytes()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script, perms).unwrap();
+        }
+
+        let res = optimize_cbz(&cbz, Some(script.to_str().unwrap()), 2400, 90, 10).await.unwrap();
+        assert!(!res.applied);
+        assert!(res.reason.contains("failed integrity verification"));
+        let after_bytes = fs::read(&cbz).unwrap();
+        assert_eq!(orig_bytes, after_bytes, "Original archive bytes must remain 100% untouched on invalid ZIP output");
+    }
+
+    #[tokio::test]
+    async fn page_count_mismatch_leaves_original_unchanged() {
+        let dir = TempDir::new("opt-page-mismatch");
+        let cbz = dir.path().join("test.cbz");
+        make_test_archive(&cbz, 3); // 3 pages
+        let orig_bytes = fs::read(&cbz).unwrap();
+
+        // Replacement with only 1 page
+        let replacement_cbz = dir.path().join("mismatch.cbz");
+        make_test_archive(&replacement_cbz, 1);
+
+        let script = dir.path().join("fake_page_drop.sh");
+        let script_content = format!(
+            "#!/bin/sh\nfor arg in \"$@\"; do case \"$arg\" in *.cbz) cp \"{}\" \"$arg\" ;; esac; done\nexit 0\n",
+            replacement_cbz.display()
+        );
+        fs::write(&script, script_content.as_bytes()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script, perms).unwrap();
+        }
+
+        let res = optimize_cbz(&cbz, Some(script.to_str().unwrap()), 2400, 90, 10).await.unwrap();
+        assert!(!res.applied);
+        assert!(res.reason.contains("Page count mismatch"));
+        let after_bytes = fs::read(&cbz).unwrap();
+        assert_eq!(orig_bytes, after_bytes, "Original archive bytes must remain 100% untouched on page count mismatch");
+    }
+
+    #[tokio::test]
+    async fn successful_validated_optimization_replaces_download_safely() {
+        let dir = TempDir::new("opt-replace-success");
+        let cbz = dir.path().join("Chapter 1 [STICK].cbz");
+
+        // Create substantial source archive
+        {
+            let file = File::create(&cbz).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+            zip.start_file("ComicInfo.xml", options).unwrap();
+            zip.write_all(b"<ComicInfo><Series>Blue Lock</Series><Number>6</Number></ComicInfo>").unwrap();
+            let large_data = vec![42u8; 50000];
+            zip.start_file("001.webp", options).unwrap();
+            zip.write_all(&large_data).unwrap();
+            zip.start_file("002.webp", options).unwrap();
+            zip.write_all(&large_data).unwrap();
+            zip.finish().unwrap();
+        }
+        let orig_size = fs::metadata(&cbz).unwrap().len();
+        assert!(orig_size > 100000);
+
+        // Script that shrinks the candidate archive by 50% while preserving ComicInfo and 2 pages
+        let script = dir.path().join("fake_successful_shrink.sh");
+        let script_content = r#"#!/bin/sh
+for arg in "$@"; do
+    case "$arg" in
+        *.cbz) target="$arg" ;;
+    esac
+done
+if [ -n "$target" ]; then
+    tmp="$target.small.zip"
+    python3 -c "
+import zipfile
+with zipfile.ZipFile('$tmp', 'w') as z:
+    z.writestr('ComicInfo.xml', '<ComicInfo><Series>Blue Lock</Series><Number>6</Number></ComicInfo>')
+    z.writestr('001.webp', b'small compressed data 1')
+    z.writestr('002.webp', b'small compressed data 2')
+" 2>/dev/null
+    if [ -f "$tmp" ]; then
+        mv "$tmp" "$target"
+    fi
+fi
+exit 0
+"#;
+        fs::write(&script, script_content.as_bytes()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script, perms).unwrap();
+        }
+
+        let res = optimize_cbz(&cbz, Some(script.to_str().unwrap()), 2400, 90, 10).await.unwrap();
+        assert!(res.applied, "Optimization should be applied: {}", res.reason);
+        assert!(res.savings_percent > 50.0);
+
+        // Invariant: original download file was replaced atomically with optimized candidate
+        let replaced_size = fs::metadata(&cbz).unwrap().len();
+        assert_eq!(replaced_size, res.optimized_bytes);
+        assert!(replaced_size < orig_size);
+        assert_eq!(count_cbz_pages(&cbz).unwrap(), 2);
+        assert!(cbz_has_comic_info(&cbz).unwrap());
+        verify_cbz_integrity(&cbz).unwrap();
+
+        // Check that no temporary replacement artifacts linger in the download directory
+        let entries: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .filter(|n| n.contains("opt-replace") || n.contains(".tmp"))
+            .collect();
+        assert!(entries.is_empty(), "No temporary replacement files should linger: {entries:?}");
     }
 
     #[tokio::test]
@@ -806,7 +1062,7 @@ exit 0
                 let cbz = dir.path().join("test.cbz");
                 make_realistic_cbz(&cbz, 2);
                 let orig_size = fs::metadata(&cbz).unwrap().len();
-                let res = optimize_cbz(&cbz, None, 10).await.unwrap();
+                let res = optimize_cbz(&cbz, None, DEFAULT_TARGET_HEIGHT, DEFAULT_IMAGE_QUALITY, 10).await.unwrap();
                 assert!(!res.applied);
                 assert_eq!(fs::metadata(&cbz).unwrap().len(), orig_size);
                 return;
@@ -819,8 +1075,8 @@ exit 0
         let orig_size = fs::metadata(&cbz).unwrap().len();
         assert!(orig_size > 50000, "Synthetic CBZ has substantial image content");
 
-        // 1. Run optimization with 10% min savings
-        let res = optimize_cbz(&cbz, Some(bin_str), 10).await.unwrap();
+        // 1. Run optimization with 2400 target height, 90 quality, 10% min savings
+        let res = optimize_cbz(&cbz, Some(bin_str), 2400, 90, 10).await.unwrap();
         if res.applied {
             assert!(res.savings_percent >= 10.0);
             let opt_size = fs::metadata(&cbz).unwrap().len();
@@ -835,7 +1091,7 @@ exit 0
         }
 
         // 2. Run with impossible 99% savings threshold -> must NOT apply
-        let res_high = optimize_cbz(&cbz, Some(bin_str), 99).await.unwrap();
+        let res_high = optimize_cbz(&cbz, Some(bin_str), 2400, 90, 99).await.unwrap();
         assert!(!res_high.applied);
         assert!(res_high.reason.contains("below required threshold"));
     }

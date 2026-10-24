@@ -385,6 +385,8 @@ export interface PipelineConfig {
   komga_library_id: string | null;
   optimize_enabled: boolean;
   optimizer_bin: string | null;
+  target_height: number;
+  image_quality: number;
   min_savings_percent: number;
   library_status?: PathValidationResult | null;
   chinese_library_status?: PathValidationResult | null;

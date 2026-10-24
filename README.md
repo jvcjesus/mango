@@ -349,7 +349,7 @@ Mango knows how many pages it has.
 Mango includes a native acquisition and publishing pipeline to automatically process completed downloads into your permanent manga library (such as Komga):
 
 1. **Volume Metadata Enrichment**: Automatically fetches official publication dates, volume summaries, writers, artists, and publishers from MangaBaka and embeds them into `ComicInfo.xml`.
-2. **Non-destructive Image Optimization**: The `mango:full` image bundles `RustyLibraryShrinker` (`/opt/mango/bin/RustyLibraryShrinker`) to shrink CBZ archives down to efficient WebP formats while strictly verifying page count parity, ZIP integrity, and minimum size savings.
+2. **Non-destructive Image Optimization**: The `mango:full` image bundles `RustyLibraryShrinker` (`/opt/mango/bin/RustyLibraryShrinker`) to shrink CBZ archives down to efficient WebP formats while strictly verifying page count parity, ComicInfo.xml metadata retention, ZIP integrity, and minimum size savings. Configurable controls in Settings allow fine-tuning target page height (default 2400 px), WebP encoder quality (default 90), and minimum savings threshold (default 10%).
 3. **Canonical Atomic Publication**: Moves files safely into canonical series folder hierarchies with byte-for-byte duplicate deduplication and refusal of conflicting overwrites.
 4. **Komga Scan Triggers**: Automatically triggers library rescans via Komga REST API.
 
