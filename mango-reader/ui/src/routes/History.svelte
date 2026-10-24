@@ -1,8 +1,10 @@
 <script lang="ts">
   import { get, message, send, type HistoryEntry } from '../lib/api';
+  import { confirm } from '../lib/confirm.svelte';
   import Icon from '../lib/Icon.svelte';
   import { keep, recall } from '../lib/keep';
   import Notice from '../lib/Notice.svelte';
+  import { toast } from '../lib/toast.svelte';
   import { dayKey, dayLabel, whenVisible } from '../lib/util';
 
   const PAGE = 100;
@@ -15,7 +17,8 @@
   let more = $state(kept?.more ?? false);
   let loading = $state(true);
   let error = $state<string | null>(null);
-  let sure = $state(false);
+  let clearing = $state(false);
+  let busyEntry = $state<Record<number, boolean>>({});
 
   // Entries arrive newest first, so each new day starts a new group.
   const days = $derived.by(() => {
@@ -46,28 +49,49 @@
   load(true);
 
   async function forget(entry: HistoryEntry) {
+    const ok = await confirm({
+      title: 'Remove from History?',
+      message: `Remove "${entry.chapterName}" of "${entry.title}" from your reading history?`,
+      confirmText: 'Remove',
+      danger: true,
+    });
+    if (!ok) return;
+    busyEntry[entry.chapterId] = true;
     entries = entries.filter((e) => e.chapterId !== entry.chapterId);
     try {
       await send('DELETE', `/history/${entry.chapterId}`);
+      toast.info(`Removed ${entry.chapterName} from history`);
     } catch (e) {
-      error = message(e);
+      const msg = message(e);
+      error = msg;
+      toast.error(msg);
       load(true);
+    } finally {
+      busyEntry[entry.chapterId] = false;
     }
   }
 
   async function clear() {
-    if (!sure) {
-      sure = true;
-      return;
-    }
-    sure = false;
+    const ok = await confirm({
+      title: 'Clear Reading History?',
+      message: 'All your reading history will be cleared. This cannot be undone.',
+      confirmText: 'Clear history',
+      danger: true,
+    });
+    if (!ok) return;
+    clearing = true;
     try {
       await send('DELETE', '/history');
       entries = [];
       more = false;
       keep('history', { entries, more });
+      toast.info('Reading history cleared');
     } catch (e) {
-      error = message(e);
+      const msg = message(e);
+      error = msg;
+      toast.error(msg);
+    } finally {
+      clearing = false;
     }
   }
 
@@ -83,7 +107,14 @@
   <div class="page-head">
     <h1 class="display">HISTORY</h1>
     {#if entries.length}
-      <button class="btn" onclick={clear}><Icon name="trash" size={18} />{sure ? 'Really clear all of it?' : 'Clear history'}</button>
+      <button class="btn" disabled={clearing} onclick={clear}>
+        {#if clearing}
+          <span class="spin"><Icon name="spinner" size={18} stroke={3} /></span>
+        {:else}
+          <Icon name="trash" size={18} />
+        {/if}
+        Clear history
+      </button>
     {/if}
   </div>
 
@@ -99,8 +130,17 @@
             </a>
             <span class="tools">
               <a class="btn" href="#/read/{entry.chapterId}">{entry.read ? 'Read again' : 'Resume'}<Icon name="arrow" size={18} stroke={3} /></a>
-              <button class="btn icon" aria-label="Remove {entry.chapterName} of {entry.title} from the history" onclick={() => forget(entry)}>
-                <Icon name="close" />
+              <button
+                class="btn icon"
+                aria-label="Remove {entry.chapterName} of {entry.title} from the history"
+                disabled={busyEntry[entry.chapterId]}
+                onclick={() => forget(entry)}
+              >
+                {#if busyEntry[entry.chapterId]}
+                  <span class="spin"><Icon name="spinner" size={16} stroke={3} /></span>
+                {:else}
+                  <Icon name="close" />
+                {/if}
               </button>
             </span>
           </li>
