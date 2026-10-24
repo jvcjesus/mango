@@ -23,12 +23,14 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/010_versions.sql"),
     include_str!("../migrations/011_invites.sql"),
     include_str!("../migrations/012_sync_and_catalog.sql"),
+    include_str!("../migrations/013_tracker_provenance.sql"),
 ];
-
 
 /// Now, in epoch seconds: the unit of every time the database stores.
 pub fn now() -> i64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs() as i64)
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs() as i64)
 }
 
 #[derive(Clone)]
@@ -39,7 +41,10 @@ impl Db {
         // The file is made before SQLite opens it, so that it is closed to other users
         // from the first moment; the write-ahead log takes its permissions from it.
         if path.to_str() != Some(":memory:") {
-            let _ = std::fs::OpenOptions::new().write(true).create_new(true).open(path);
+            let _ = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path);
             for beside in ["", "-wal", "-shm"] {
                 owner_only(Path::new(&format!("{}{beside}", path.display())));
             }
@@ -47,9 +52,14 @@ impl Db {
         let mut conn = Connection::open(path)?;
         // Long enough to sit out an import, which writes from a connection of its own.
         conn.busy_timeout(Duration::from_secs(30))?;
-        conn.execute_batch("PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;")?;
+        conn.execute_batch(
+            "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;",
+        )?;
         migrate(&mut conn)?;
-        Ok(Self(Arc::new(Mutex::new(conn)), Arc::new(path.to_path_buf())))
+        Ok(Self(
+            Arc::new(Mutex::new(conn)),
+            Arc::new(path.to_path_buf()),
+        ))
     }
 
     /// Another connection to the same database, for long work that must not hold up the
@@ -63,7 +73,12 @@ impl Db {
 
     /// Runs `work` on the connection, on this thread. For start-up, before anything is served.
     pub fn now<T>(&self, work: impl FnOnce(&mut Connection) -> Result<T>) -> Result<T> {
-        work(&mut self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner()))
+        work(
+            &mut self
+                .0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
     }
 
     pub async fn call<T, F>(&self, work: F) -> Result<T>
@@ -88,10 +103,13 @@ pub fn owner_only(path: &Path) {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let Ok(found) = std::fs::metadata(path) else { return };
+        let Ok(found) = std::fs::metadata(path) else {
+            return;
+        };
         let mode = if found.is_dir() { 0o700 } else { 0o600 };
         if found.permissions().mode() & 0o777 != mode {
-            if let Err(why) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)) {
+            if let Err(why) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            {
                 tracing::warn!("could not close {} to other users: {why}", path.display());
             }
         }
@@ -109,7 +127,11 @@ pub fn write_private(path: &Path, text: &str) -> std::io::Result<()> {
 
 /// One value the server keeps to itself; see the `state` table.
 pub fn state(conn: &Connection, key: &str) -> Result<Option<String>> {
-    Ok(conn.query_row("SELECT value FROM state WHERE key = ?1", [key], |r| r.get(0)).optional()?)
+    Ok(conn
+        .query_row("SELECT value FROM state WHERE key = ?1", [key], |r| {
+            r.get(0)
+        })
+        .optional()?)
 }
 
 pub fn set_state(conn: &Connection, key: &str, value: &str) -> Result<()> {
@@ -125,7 +147,9 @@ pub fn forget_state(conn: &Connection, key: &str) -> Result<()> {
 pub(crate) fn migrate(conn: &mut Connection) -> Result<()> {
     let seen = conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0))? as usize;
     if seen > MIGRATIONS.len() {
-        return Err(AppError::internal("the database was written by a newer Mango"));
+        return Err(AppError::internal(
+            "the database was written by a newer Mango",
+        ));
     }
     for (done, sql) in MIGRATIONS.iter().enumerate().skip(seen) {
         let tx = conn.transaction()?;
@@ -145,7 +169,9 @@ mod tests {
         let mut conn = Connection::open_in_memory().unwrap();
         migrate(&mut conn).unwrap();
         migrate(&mut conn).unwrap();
-        let version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0)).unwrap();
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(version as usize, MIGRATIONS.len());
         conn.execute("INSERT INTO stores (url, index_url, name, signing_key, added_at) VALUES ('u', 'i', 'n', 'k', 0)", [])
             .unwrap();
@@ -155,9 +181,16 @@ mod tests {
     fn an_old_password_becomes_the_first_account() {
         let mut conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(&MIGRATIONS[..7].concat()).unwrap();
-        conn.execute_batch("PRAGMA user_version = 7; INSERT INTO state VALUES ('auth.password', 'hash')").unwrap();
+        conn.execute_batch(
+            "PRAGMA user_version = 7; INSERT INTO state VALUES ('auth.password', 'hash')",
+        )
+        .unwrap();
         migrate(&mut conn).unwrap();
-        let owner: (i64, String, i64) = conn.query_row("SELECT id, password, admin FROM users", [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+        let owner: (i64, String, i64) = conn
+            .query_row("SELECT id, password, admin FROM users", [], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+            })
+            .unwrap();
         assert_eq!(owner, (1, "hash".into(), 1));
         assert_eq!(state(&conn, "auth.password").unwrap(), None);
     }

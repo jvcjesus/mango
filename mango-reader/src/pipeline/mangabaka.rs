@@ -14,6 +14,30 @@ use std::{
 
 pub const DEFAULT_MANGABAKA_API: &str = "https://api.mangabaka.org/v1";
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "details")]
+pub enum MangaBakaSeriesMatch {
+    Found { id: i64, title: String },
+    Ambiguous(Vec<String>),
+    NotFound,
+    AuthError(String),
+    NetworkError(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", content = "details")]
+pub enum MangaBakaCollectionMatch {
+    Found {
+        id: String,
+        edition: String,
+        total_works: Option<u32>,
+    },
+    Ambiguous(Vec<String>),
+    NotFound,
+    AuthError(String),
+    NetworkError(String),
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MangaBakaEnrichment {
     pub series_id: i64,
@@ -81,7 +105,11 @@ impl MangaBakaClient {
         let url = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
             endpoint.to_string()
         } else {
-            format!("{}/{}", self.base_url.trim_end_matches('/'), endpoint.trim_start_matches('/'))
+            format!(
+                "{}/{}",
+                self.base_url.trim_end_matches('/'),
+                endpoint.trim_start_matches('/')
+            )
         };
 
         let mut req = self
@@ -103,10 +131,22 @@ impl MangaBakaClient {
             .request_builder(reqwest::Method::GET, "/series/search?q=test")
             .send()
             .await
-            .map_err(|e| AppError::new(502, "mangabaka_offline", format!("Cannot reach MangaBaka: {e}")))?;
+            .map_err(|e| {
+                AppError::new(
+                    502,
+                    "mangabaka_offline",
+                    format!("Cannot reach MangaBaka: {e}"),
+                )
+            })?;
 
-        if resp.status() == reqwest::StatusCode::UNAUTHORIZED || resp.status() == reqwest::StatusCode::FORBIDDEN {
-            return Err(AppError::new(401, "mangabaka_unauthorized", "MangaBaka API token invalid or rejected"));
+        if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+            || resp.status() == reqwest::StatusCode::FORBIDDEN
+        {
+            return Err(AppError::new(
+                401,
+                "mangabaka_unauthorized",
+                "MangaBaka API token invalid or rejected",
+            ));
         }
 
         if !resp.status().is_success() {
@@ -120,16 +160,15 @@ impl MangaBakaClient {
         Ok("MangaBaka API connection successful".to_string())
     }
 
-    /// Fetches volume enrichment data for a series and volume number with fail-closed precision.
-    pub async fn fetch_volume_enrichment(&self, series: &str, volume: f64) -> Result<MangaBakaOutcome> {
-        let trimmed_series = series.trim();
+    /// Resolves an exact series match on MangaBaka, failing closed if ambiguous or missing.
+    pub async fn match_series(&self, query: &str) -> Result<MangaBakaSeriesMatch> {
+        let trimmed_series = query.trim();
         if trimmed_series.is_empty() {
-            return Ok(MangaBakaOutcome::SeriesNotFound("empty".into()));
+            return Ok(MangaBakaSeriesMatch::NotFound);
         }
 
         let wanted_norm = normalize_title(trimmed_series);
 
-        // 1. Search series by query
         let resp = match self
             .request_builder(reqwest::Method::GET, "/series/search")
             .query(&[("q", trimmed_series)])
@@ -137,21 +176,37 @@ impl MangaBakaClient {
             .await
         {
             Ok(r) if r.status().is_success() => r,
-            Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED || r.status() == reqwest::StatusCode::FORBIDDEN => {
-                return Ok(MangaBakaOutcome::AuthError(format!("HTTP {}", r.status())));
+            Ok(r)
+                if r.status() == reqwest::StatusCode::UNAUTHORIZED
+                    || r.status() == reqwest::StatusCode::FORBIDDEN =>
+            {
+                return Ok(MangaBakaSeriesMatch::AuthError(format!(
+                    "HTTP {}",
+                    r.status()
+                )));
             }
             Ok(r) => {
                 tracing::warn!("MANGABAKA: search returned HTTP {}", r.status());
-                return Ok(MangaBakaOutcome::NetworkError(format!("HTTP {}", r.status())));
+                return Ok(MangaBakaSeriesMatch::NetworkError(format!(
+                    "HTTP {}",
+                    r.status()
+                )));
             }
             Err(e) => {
                 tracing::warn!("MANGABAKA: search failed: {e}");
-                return Ok(MangaBakaOutcome::NetworkError(e.to_string()));
+                return Ok(MangaBakaSeriesMatch::NetworkError(e.to_string()));
             }
         };
 
-        let body: serde_json::Value = resp.json().await.map_err(|e| AppError::internal(e.to_string()))?;
-        let candidates = body.get("data").and_then(|d| d.as_array()).cloned().unwrap_or_default();
+        let body: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| AppError::internal(e.to_string()))?;
+        let candidates = body
+            .get("data")
+            .and_then(|d| d.as_array())
+            .cloned()
+            .unwrap_or_default();
 
         let mut exact_matches = Vec::new();
         for item in &candidates {
@@ -160,8 +215,21 @@ impl MangaBakaClient {
                 None => continue,
             };
 
+            let primary_title = item
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+
             let mut titles = Vec::new();
-            for key in ["title", "title_english", "title_romaji", "title_native", "romanized_title", "native_title"] {
+            for key in [
+                "title",
+                "title_english",
+                "title_romaji",
+                "title_native",
+                "romanized_title",
+                "native_title",
+            ] {
                 if let Some(t) = item.get(key).and_then(|v| v.as_str()) {
                     titles.push(t);
                 }
@@ -177,44 +245,69 @@ impl MangaBakaClient {
             }
 
             if titles.iter().any(|t| normalize_title(t) == wanted_norm) {
-                exact_matches.push((id, item.clone()));
+                exact_matches.push((
+                    id,
+                    if primary_title.is_empty() {
+                        titles.first().copied().unwrap_or("").to_string()
+                    } else {
+                        primary_title
+                    },
+                ));
             }
         }
 
         if exact_matches.is_empty() {
-            tracing::info!("MANGABAKA: no exact title match for {series:?}");
-            return Ok(MangaBakaOutcome::SeriesNotFound(series.to_string()));
+            return Ok(MangaBakaSeriesMatch::NotFound);
         }
 
         if exact_matches.len() > 1 {
-            tracing::warn!("MANGABAKA: found {} exact matches for {series:?}; refusing ambiguous match", exact_matches.len());
-            return Ok(MangaBakaOutcome::AmbiguousSeries(exact_matches.len()));
+            let candidate_names: Vec<String> = exact_matches.into_iter().map(|(_, t)| t).collect();
+            return Ok(MangaBakaSeriesMatch::Ambiguous(candidate_names));
         }
 
-        let (matched_series_id, _) = &exact_matches[0];
-        let matched_series_id = *matched_series_id;
+        let (id, title) = exact_matches.remove(0);
+        Ok(MangaBakaSeriesMatch::Found { id, title })
+    }
 
-        // 2. Fetch collections for the exact matching series
-        let collections_url = format!("/series/{matched_series_id}/collections");
-        let c_resp = match self.request_builder(reqwest::Method::GET, &collections_url).send().await {
+    /// Resolves an exact English standard digital collection for a series on MangaBaka.
+    pub async fn match_collection(&self, series_id: i64) -> Result<MangaBakaCollectionMatch> {
+        let collections_url = format!("/series/{series_id}/collections");
+        let c_resp = match self
+            .request_builder(reqwest::Method::GET, &collections_url)
+            .send()
+            .await
+        {
             Ok(r) if r.status().is_success() => r,
-            Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED || r.status() == reqwest::StatusCode::FORBIDDEN => {
-                return Ok(MangaBakaOutcome::AuthError(format!("HTTP {}", r.status())));
+            Ok(r)
+                if r.status() == reqwest::StatusCode::UNAUTHORIZED
+                    || r.status() == reqwest::StatusCode::FORBIDDEN =>
+            {
+                return Ok(MangaBakaCollectionMatch::AuthError(format!(
+                    "HTTP {}",
+                    r.status()
+                )));
             }
             Ok(r) => {
-                return Ok(MangaBakaOutcome::NetworkError(format!("HTTP {}", r.status())));
+                return Ok(MangaBakaCollectionMatch::NetworkError(format!(
+                    "HTTP {}",
+                    r.status()
+                )));
             }
             Err(e) => {
-                return Ok(MangaBakaOutcome::NetworkError(e.to_string()));
+                return Ok(MangaBakaCollectionMatch::NetworkError(e.to_string()));
             }
         };
 
         let c_body: serde_json::Value = match c_resp.json().await {
             Ok(v) => v,
-            Err(e) => return Ok(MangaBakaOutcome::NetworkError(e.to_string())),
+            Err(e) => return Ok(MangaBakaCollectionMatch::NetworkError(e.to_string())),
         };
 
-        let collections = c_body.get("data").and_then(|d| d.as_array()).cloned().unwrap_or_default();
+        let collections = c_body
+            .get("data")
+            .and_then(|d| d.as_array())
+            .cloned()
+            .unwrap_or_default();
         let mut collection_matches = Vec::new();
         for col in collections {
             let language = col
@@ -231,35 +324,153 @@ impl MangaBakaClient {
 
             let edition = col
                 .get("edition")
-                .and_then(|e| e.get("name").or_else(|| e.get("title")).and_then(|v| v.as_str()).or_else(|| e.as_str()))
+                .and_then(|e| {
+                    e.get("name")
+                        .or_else(|| e.get("title"))
+                        .and_then(|v| v.as_str())
+                        .or_else(|| e.as_str())
+                })
                 .or_else(|| col.get("edition").and_then(|v| v.as_str()))
                 .unwrap_or("")
                 .to_lowercase();
 
-            let medium = col.get("medium").and_then(|m| m.as_str()).unwrap_or("").to_lowercase();
+            let medium = col
+                .get("medium")
+                .and_then(|m| m.as_str())
+                .unwrap_or("")
+                .to_lowercase();
+            let total_works = col
+                .get("total_works")
+                .or_else(|| col.get("works_count"))
+                .or_else(|| col.get("count"))
+                .and_then(|v| v.as_u64())
+                .map(|u| u as u32);
 
-            if (language == "en" || language.starts_with("en")) && edition == "standard edition" && medium == "digital" {
+            if (language == "en" || language.starts_with("en"))
+                && edition == "standard edition"
+                && medium == "digital"
+            {
                 if let Some(col_id) = col.get("id").and_then(|v| v.as_str()) {
-                    collection_matches.push(col_id.to_string());
+                    collection_matches.push((col_id.to_string(), edition, total_works));
                 }
             }
         }
 
         if collection_matches.is_empty() {
-            tracing::info!("MANGABAKA: no English digital Standard Edition found for {series:?}");
-            return Ok(MangaBakaOutcome::CollectionNotFound("No English digital Standard Edition found".to_string()));
+            return Ok(MangaBakaCollectionMatch::NotFound);
         }
 
         if collection_matches.len() > 1 {
-            tracing::warn!("MANGABAKA: found {} matching collections for {series:?}; ambiguous", collection_matches.len());
-            return Ok(MangaBakaOutcome::CollectionNotFound(format!("Found {} matching collections; ambiguous", collection_matches.len())));
+            let candidates = collection_matches
+                .into_iter()
+                .map(|(id, ed, _)| format!("{id} ({ed})"))
+                .collect();
+            return Ok(MangaBakaCollectionMatch::Ambiguous(candidates));
         }
 
-        let matched_collection_id = collection_matches.remove(0);
+        let (id, edition, total_works) = collection_matches.remove(0);
+        Ok(MangaBakaCollectionMatch::Found {
+            id,
+            edition,
+            total_works,
+        })
+    }
 
-        // 3. Fetch normalized series metadata for authors/artists/genres/publishers
+    /// Fetches the authoritative total works/volumes count for a MangaBaka collection.
+    pub async fn fetch_collection_total_works(&self, collection_id: &str) -> Result<Option<u32>> {
+        let works_url = format!("/collections/{collection_id}/works?page=1&per_page=1");
+        let resp = match self
+            .request_builder(reqwest::Method::GET, &works_url)
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => r,
+            _ => return Ok(None),
+        };
+
+        let body: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+
+        if let Some(total) = body
+            .get("pagination")
+            .and_then(|p| p.get("total"))
+            .and_then(|t| t.as_u64())
+        {
+            return Ok(Some(total as u32));
+        }
+        if let Some(total) = body
+            .get("meta")
+            .and_then(|m| m.get("total"))
+            .and_then(|t| t.as_u64())
+        {
+            return Ok(Some(total as u32));
+        }
+        if let Some(total) = body.get("total").and_then(|t| t.as_u64()) {
+            return Ok(Some(total as u32));
+        }
+        if let Some(arr) = body.get("data").and_then(|d| d.as_array()) {
+            if !arr.is_empty() && body.get("pagination").is_none() {
+                return Ok(Some(arr.len() as u32));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Fetches volume enrichment data for a series and volume number with fail-closed precision.
+    pub async fn fetch_volume_enrichment(
+        &self,
+        series: &str,
+        volume: f64,
+    ) -> Result<MangaBakaOutcome> {
+        let trimmed_series = series.trim();
+        if trimmed_series.is_empty() {
+            return Ok(MangaBakaOutcome::SeriesNotFound("empty".into()));
+        }
+
+        // 1. Search series with fail-closed ambiguity check
+        let (matched_series_id, matched_collection_id) = match self
+            .match_series(trimmed_series)
+            .await?
+        {
+            MangaBakaSeriesMatch::Found { id, .. } => match self.match_collection(id).await? {
+                MangaBakaCollectionMatch::Found { id: col_id, .. } => (id, col_id),
+                MangaBakaCollectionMatch::Ambiguous(candidates) => {
+                    return Ok(MangaBakaOutcome::CollectionNotFound(format!(
+                        "Found {} matching collections; ambiguous",
+                        candidates.len()
+                    )));
+                }
+                MangaBakaCollectionMatch::NotFound => {
+                    return Ok(MangaBakaOutcome::CollectionNotFound(
+                        "No English digital Standard Edition found".to_string(),
+                    ));
+                }
+                MangaBakaCollectionMatch::AuthError(e) => {
+                    return Ok(MangaBakaOutcome::AuthError(e))
+                }
+                MangaBakaCollectionMatch::NetworkError(e) => {
+                    return Ok(MangaBakaOutcome::NetworkError(e))
+                }
+            },
+            MangaBakaSeriesMatch::Ambiguous(candidates) => {
+                return Ok(MangaBakaOutcome::AmbiguousSeries(candidates.len()));
+            }
+            MangaBakaSeriesMatch::NotFound => {
+                return Ok(MangaBakaOutcome::SeriesNotFound(series.to_string()));
+            }
+            MangaBakaSeriesMatch::AuthError(e) => return Ok(MangaBakaOutcome::AuthError(e)),
+            MangaBakaSeriesMatch::NetworkError(e) => return Ok(MangaBakaOutcome::NetworkError(e)),
+        };
+
+        // 2. Fetch normalized series metadata for authors/artists/genres/publishers
         let series_url = format!("/series/{matched_series_id}");
-        let (writers, pencillers, genres, publisher) = match self.request_builder(reqwest::Method::GET, &series_url).send().await {
+        let (writers, pencillers, genres, publisher) = match self
+            .request_builder(reqwest::Method::GET, &series_url)
+            .send()
+            .await
+        {
             Ok(r) if r.status().is_success() => {
                 let s_body: serde_json::Value = r.json().await.unwrap_or_default();
                 let s_data = s_body.get("data").unwrap_or(&s_body);
@@ -267,13 +478,21 @@ impl MangaBakaClient {
                 let writers: Vec<String> = s_data
                     .get("authors")
                     .and_then(|v| v.as_array())
-                    .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.trim().to_string())).collect())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|x| x.as_str().map(|s| s.trim().to_string()))
+                            .collect()
+                    })
                     .unwrap_or_default();
 
                 let pencillers: Vec<String> = s_data
                     .get("artists")
                     .and_then(|v| v.as_array())
-                    .map(|arr| arr.iter().filter_map(|x| x.as_str().map(|s| s.trim().to_string())).collect())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|x| x.as_str().map(|s| s.trim().to_string()))
+                            .collect()
+                    })
                     .unwrap_or_default();
 
                 let genres: Vec<String> = s_data
@@ -286,7 +505,10 @@ impl MangaBakaClient {
                                     let mut chars = s.trim().chars();
                                     match chars.next() {
                                         None => String::new(),
-                                        Some(first) => first.to_uppercase().collect::<String>() + chars.as_str(),
+                                        Some(first) => {
+                                            first.to_uppercase().collect::<String>()
+                                                + chars.as_str()
+                                        }
                                     }
                                 })
                             })
@@ -298,13 +520,22 @@ impl MangaBakaClient {
                 if let Some(pubs) = s_data.get("publishers").and_then(|v| v.as_array()) {
                     for p in pubs {
                         let name = p.get("name").and_then(|v| v.as_str()).unwrap_or("").trim();
-                        let pub_type = p.get("type").and_then(|v| v.as_str()).unwrap_or("").trim().to_lowercase();
-                        if !name.is_empty() && (pub_type == "english" || pub_type.is_empty()) && !english_publishers.contains(&name.to_string()) {
+                        let pub_type = p
+                            .get("type")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .trim()
+                            .to_lowercase();
+                        if !name.is_empty()
+                            && (pub_type == "english" || pub_type.is_empty())
+                            && !english_publishers.contains(&name.to_string())
+                        {
                             english_publishers.push(name.to_string());
                         }
                     }
                 }
-                let publisher = (!english_publishers.is_empty()).then(|| english_publishers.join(", "));
+                let publisher =
+                    (!english_publishers.is_empty()).then(|| english_publishers.join(", "));
                 (writers, pencillers, genres, publisher)
             }
             _ => (Vec::new(), Vec::new(), Vec::new(), None),
@@ -320,7 +551,11 @@ impl MangaBakaClient {
             }
             pages_checked += 1;
 
-            let w_resp = match self.request_builder(reqwest::Method::GET, &url).send().await {
+            let w_resp = match self
+                .request_builder(reqwest::Method::GET, &url)
+                .send()
+                .await
+            {
                 Ok(r) if r.status().is_success() => r,
                 _ => break,
             };
@@ -330,7 +565,11 @@ impl MangaBakaClient {
                 Err(_) => break,
             };
 
-            let works = w_body.get("data").and_then(|d| d.as_array()).cloned().unwrap_or_default();
+            let works = w_body
+                .get("data")
+                .and_then(|d| d.as_array())
+                .cloned()
+                .unwrap_or_default();
             for work in works {
                 let sequence = work
                     .get("sequence_numeric")
@@ -343,7 +582,10 @@ impl MangaBakaClient {
 
                 if let Some(seq) = sequence {
                     if (seq - volume).abs() < 0.001 {
-                        let release_date = work.get("release_date").and_then(|v| v.as_str()).map(|s| s.trim().to_string());
+                        let release_date = work
+                            .get("release_date")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.trim().to_string());
                         let summary = work.get("description").and_then(|v| {
                             if let Some(s) = v.as_str() {
                                 Some(s.trim().to_string())
@@ -353,7 +595,10 @@ impl MangaBakaClient {
                                 None
                             }
                         });
-                        let pages = work.get("pages").and_then(|v| v.as_i64()).filter(|p| *p > 0);
+                        let pages = work
+                            .get("pages")
+                            .and_then(|v| v.as_i64())
+                            .filter(|p| *p > 0);
 
                         return Ok(MangaBakaOutcome::Success(MangaBakaEnrichment {
                             series_id: matched_series_id,
@@ -386,12 +631,21 @@ impl MangaBakaClient {
     /// Enriches ComicInfo.xml inside an existing CBZ file with MangaBaka metadata.
     pub fn enrich_cbz_archive(cbz_path: &Path, enrichment: &MangaBakaEnrichment) -> Result<bool> {
         let file = File::open(cbz_path)?;
-        let mut source = zip::ZipArchive::new(file).map_err(|e| AppError::bad_request(format!("Invalid CBZ {}: {e}", cbz_path.display())))?;
+        let mut source = zip::ZipArchive::new(file).map_err(|e| {
+            AppError::bad_request(format!("Invalid CBZ {}: {e}", cbz_path.display()))
+        })?;
 
         let mut comicinfo_idx = None;
         for i in 0..source.len() {
-            let entry = source.by_index(i).map_err(|e| AppError::bad_request(e.to_string()))?;
-            if Path::new(entry.name()).file_name().and_then(|n| n.to_str()).map(|s| s.eq_ignore_ascii_case("ComicInfo.xml")).unwrap_or(false) {
+            let entry = source
+                .by_index(i)
+                .map_err(|e| AppError::bad_request(e.to_string()))?;
+            if Path::new(entry.name())
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|s| s.eq_ignore_ascii_case("ComicInfo.xml"))
+                .unwrap_or(false)
+            {
                 comicinfo_idx = Some(i);
                 break;
             }
@@ -400,20 +654,28 @@ impl MangaBakaClient {
         let comicinfo_idx = match comicinfo_idx {
             Some(idx) => idx,
             None => {
-                tracing::warn!("MANGABAKA: ComicInfo.xml not found in {}", cbz_path.display());
+                tracing::warn!(
+                    "MANGABAKA: ComicInfo.xml not found in {}",
+                    cbz_path.display()
+                );
                 return Ok(false);
             }
         };
 
         let mut existing_xml = String::new();
-        source.by_index(comicinfo_idx)?.read_to_string(&mut existing_xml)?;
+        source
+            .by_index(comicinfo_idx)?
+            .read_to_string(&mut existing_xml)?;
 
         let updated_xml = enrich_comic_info_xml(&existing_xml, enrichment)?;
 
         // Write to temporary file and atomically replace
         let parent = cbz_path.parent().unwrap_or_else(|| Path::new("."));
         let pid = std::process::id();
-        let temp_path = parent.join(format!(".{}.mangabaka-{pid}.tmp", cbz_path.file_name().unwrap().to_string_lossy()));
+        let temp_path = parent.join(format!(
+            ".{}.mangabaka-{pid}.tmp",
+            cbz_path.file_name().unwrap().to_string_lossy()
+        ));
 
         struct CleanupGuard<'a>(&'a Path);
         impl<'a> Drop for CleanupGuard<'a> {
@@ -428,7 +690,8 @@ impl MangaBakaClient {
 
         for i in 0..source.len() {
             let mut entry = source.by_index(i)?;
-            let options = zip::write::SimpleFileOptions::default().compression_method(entry.compression());
+            let options =
+                zip::write::SimpleFileOptions::default().compression_method(entry.compression());
             dest_zip.start_file(entry.name(), options)?;
             if i == comicinfo_idx {
                 dest_zip.write_all(updated_xml.as_bytes())?;
@@ -448,7 +711,11 @@ impl MangaBakaClient {
 }
 
 pub fn normalize_title(title: &str) -> String {
-    title.split_whitespace().map(|w| w.to_lowercase()).collect::<Vec<_>>().join(" ")
+    title
+        .split_whitespace()
+        .map(|w| w.to_lowercase())
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 pub fn enrich_comic_info_xml(xml: &str, enrichment: &MangaBakaEnrichment) -> Result<String> {
@@ -456,7 +723,18 @@ pub fn enrich_comic_info_xml(xml: &str, enrichment: &MangaBakaEnrichment) -> Res
     let mut inside_comicinfo = false;
 
     // Tags that MangaBaka can safely enrich
-    let managed_tags = ["Year", "Month", "Day", "Summary", "PageCount", "Writer", "Penciller", "Genre", "Publisher", "LanguageISO"];
+    let managed_tags = [
+        "Year",
+        "Month",
+        "Day",
+        "Summary",
+        "PageCount",
+        "Writer",
+        "Penciller",
+        "Genre",
+        "Publisher",
+        "LanguageISO",
+    ];
 
     for line in xml.lines() {
         let trimmed = line.trim();
@@ -482,19 +760,34 @@ pub fn enrich_comic_info_xml(xml: &str, enrichment: &MangaBakaEnrichment) -> Res
                 lines.push(format!("  <PageCount>{pages}</PageCount>"));
             }
             if let Some(summary) = &enrichment.summary {
-                lines.push(format!("  <Summary>{}</Summary>", crate::downloads::escape(summary)));
+                lines.push(format!(
+                    "  <Summary>{}</Summary>",
+                    crate::downloads::escape(summary)
+                ));
             }
             if !enrichment.writers.is_empty() {
-                lines.push(format!("  <Writer>{}</Writer>", crate::downloads::escape(&enrichment.writers.join(", "))));
+                lines.push(format!(
+                    "  <Writer>{}</Writer>",
+                    crate::downloads::escape(&enrichment.writers.join(", "))
+                ));
             }
             if !enrichment.pencillers.is_empty() {
-                lines.push(format!("  <Penciller>{}</Penciller>", crate::downloads::escape(&enrichment.pencillers.join(", "))));
+                lines.push(format!(
+                    "  <Penciller>{}</Penciller>",
+                    crate::downloads::escape(&enrichment.pencillers.join(", "))
+                ));
             }
             if !enrichment.genres.is_empty() {
-                lines.push(format!("  <Genre>{}</Genre>", crate::downloads::escape(&enrichment.genres.join(", "))));
+                lines.push(format!(
+                    "  <Genre>{}</Genre>",
+                    crate::downloads::escape(&enrichment.genres.join(", "))
+                ));
             }
             if let Some(publisher) = &enrichment.publisher {
-                lines.push(format!("  <Publisher>{}</Publisher>", crate::downloads::escape(publisher)));
+                lines.push(format!(
+                    "  <Publisher>{}</Publisher>",
+                    crate::downloads::escape(publisher)
+                ));
             }
             lines.push("  <LanguageISO>en</LanguageISO>".to_string());
 
@@ -503,7 +796,9 @@ pub fn enrich_comic_info_xml(xml: &str, enrichment: &MangaBakaEnrichment) -> Res
         }
 
         if inside_comicinfo {
-            let is_managed = managed_tags.iter().any(|tag| trimmed.starts_with(&format!("<{tag}>")));
+            let is_managed = managed_tags
+                .iter()
+                .any(|tag| trimmed.starts_with(&format!("<{tag}>")));
             if is_managed {
                 continue; // replaced by enriched version
             }
@@ -551,8 +846,14 @@ mod tests {
         let enriched = enrich_comic_info_xml(base_xml, &enrichment).unwrap();
         assert!(enriched.contains("<Series>Blue Lock</Series>"));
         assert!(enriched.contains("<Volume>1</Volume>"));
-        assert!(enriched.contains("<Translator>Stick</Translator>"), "Preserves existing Translator");
-        assert!(enriched.contains("<Notes>Saved by Mango</Notes>"), "Preserves existing Notes");
+        assert!(
+            enriched.contains("<Translator>Stick</Translator>"),
+            "Preserves existing Translator"
+        );
+        assert!(
+            enriched.contains("<Notes>Saved by Mango</Notes>"),
+            "Preserves existing Notes"
+        );
         assert!(enriched.contains("<Year>2021</Year>"));
         assert!(enriched.contains("<Month>03</Month>"));
         assert!(enriched.contains("<Day>16</Day>"));
@@ -581,7 +882,10 @@ mod tests {
 
         let not_found = MangaBakaOutcome::SeriesNotFound("Unknown Manga".into());
         assert!(!not_found.is_success());
-        assert_eq!(not_found.description(), "No exact title match for 'Unknown Manga'");
+        assert_eq!(
+            not_found.description(),
+            "No exact title match for 'Unknown Manga'"
+        );
 
         let ambiguous = MangaBakaOutcome::AmbiguousSeries(3);
         assert!(!ambiguous.is_success());
@@ -589,7 +893,10 @@ mod tests {
 
         let vol_not_found = MangaBakaOutcome::VolumeNotFound(99.0);
         assert!(!vol_not_found.is_success());
-        assert_eq!(vol_not_found.description(), "Volume 99 not found in collection");
+        assert_eq!(
+            vol_not_found.description(),
+            "Volume 99 not found in collection"
+        );
     }
 
     #[tokio::test]
@@ -600,35 +907,39 @@ mod tests {
         let app = Router::new()
             .route(
                 "/series/search",
-                get(|axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>| async move {
-                    let q = params.get("q").cloned().unwrap_or_default();
-                    if q == "Blue Lock" {
-                        Json(json!({
-                            "data": [
-                                {
-                                    "id": 101,
-                                    "title": "Blue Lock",
-                                    "title_english": "Blue Lock",
-                                    "title_romaji": "Blue Lock"
-                                },
-                                {
-                                    "id": 102,
-                                    "title": "Blue Lock: Episode Nagi",
-                                    "title_english": "Blue Lock: Episode Nagi"
-                                }
-                            ]
-                        }))
-                    } else if q == "Ambiguous Title" {
-                        Json(json!({
-                            "data": [
-                                { "id": 201, "title": "Ambiguous Title" },
-                                { "id": 202, "title": "Ambiguous Title" }
-                            ]
-                        }))
-                    } else {
-                        Json(json!({ "data": [] }))
-                    }
-                }),
+                get(
+                    |axum::extract::Query(params): axum::extract::Query<
+                        std::collections::HashMap<String, String>,
+                    >| async move {
+                        let q = params.get("q").cloned().unwrap_or_default();
+                        if q == "Blue Lock" {
+                            Json(json!({
+                                "data": [
+                                    {
+                                        "id": 101,
+                                        "title": "Blue Lock",
+                                        "title_english": "Blue Lock",
+                                        "title_romaji": "Blue Lock"
+                                    },
+                                    {
+                                        "id": 102,
+                                        "title": "Blue Lock: Episode Nagi",
+                                        "title_english": "Blue Lock: Episode Nagi"
+                                    }
+                                ]
+                            }))
+                        } else if q == "Ambiguous Title" {
+                            Json(json!({
+                                "data": [
+                                    { "id": 201, "title": "Ambiguous Title" },
+                                    { "id": 202, "title": "Ambiguous Title" }
+                                ]
+                            }))
+                        } else {
+                            Json(json!({ "data": [] }))
+                        }
+                    },
+                ),
             )
             .route(
                 "/series/101/collections",
@@ -703,7 +1014,10 @@ mod tests {
         assert!(client.test_connection().await.is_ok());
 
         // 2. Exact match success for Volume 1
-        let outcome1 = client.fetch_volume_enrichment("Blue Lock", 1.0).await.unwrap();
+        let outcome1 = client
+            .fetch_volume_enrichment("Blue Lock", 1.0)
+            .await
+            .unwrap();
         match outcome1 {
             MangaBakaOutcome::Success(e) => {
                 assert_eq!(e.series_id, 101);
@@ -717,15 +1031,27 @@ mod tests {
         }
 
         // 3. Exact match for non-existent volume (Volume 3) -> VolumeNotFound, no substitution!
-        let outcome3 = client.fetch_volume_enrichment("Blue Lock", 3.0).await.unwrap();
+        let outcome3 = client
+            .fetch_volume_enrichment("Blue Lock", 3.0)
+            .await
+            .unwrap();
         assert_eq!(outcome3, MangaBakaOutcome::VolumeNotFound(3.0));
 
         // 4. Ambiguous match rejection
-        let outcome_ambig = client.fetch_volume_enrichment("Ambiguous Title", 1.0).await.unwrap();
+        let outcome_ambig = client
+            .fetch_volume_enrichment("Ambiguous Title", 1.0)
+            .await
+            .unwrap();
         assert_eq!(outcome_ambig, MangaBakaOutcome::AmbiguousSeries(2));
 
         // 5. Unknown series rejection
-        let outcome_unknown = client.fetch_volume_enrichment("Nonexistent Title", 1.0).await.unwrap();
-        assert_eq!(outcome_unknown, MangaBakaOutcome::SeriesNotFound("Nonexistent Title".into()));
+        let outcome_unknown = client
+            .fetch_volume_enrichment("Nonexistent Title", 1.0)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome_unknown,
+            MangaBakaOutcome::SeriesNotFound("Nonexistent Title".into())
+        );
     }
 }
