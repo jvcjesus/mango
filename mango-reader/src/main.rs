@@ -21,6 +21,7 @@ mod net;
 mod opds;
 pub(crate) mod pipeline;
 pub(crate) mod release;
+pub(crate) mod sync;
 mod settings;
 mod spaces;
 mod store;

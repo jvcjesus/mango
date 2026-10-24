@@ -36,6 +36,15 @@ pub struct KomgaBookMetadata {
     pub number_sort: Option<f64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct KomgaReadProgress {
+    pub page: i64,
+    pub completed: bool,
+    #[serde(default)]
+    pub read_date: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KomgaBook {
@@ -44,6 +53,8 @@ pub struct KomgaBook {
     pub name: String,
     pub number: f64,
     pub metadata: Option<KomgaBookMetadata>,
+    #[serde(default)]
+    pub read_progress: Option<KomgaReadProgress>,
 }
 
 #[derive(Clone)]
@@ -205,6 +216,37 @@ impl KomgaClient {
 
         if !status.is_success() {
             return Err(AppError::new(status.as_u16(), "komga_error", format!("Komga series search returned HTTP {status}")));
+        }
+
+        #[derive(Deserialize)]
+        struct Page {
+            #[serde(default)]
+            content: Vec<KomgaSeries>,
+        }
+
+        let page: Page = resp.json().await.map_err(|e| AppError::internal(e.to_string()))?;
+        Ok(page.content)
+    }
+
+    /// Lists series in Komga, optionally filtered by library.
+    pub async fn list_series(&self, library_id: Option<&str>) -> Result<Vec<KomgaSeries>> {
+        let mut endpoint = "/api/v1/series?size=1000".to_string();
+        if let Some(lib_id) = library_id.filter(|s| !s.trim().is_empty()) {
+            endpoint.push_str(&format!("&library_id={lib_id}"));
+        }
+        let resp = self
+            .request_builder(reqwest::Method::GET, &endpoint)
+            .send()
+            .await
+            .map_err(|e| AppError::new(502, "komga_offline", format!("Cannot fetch Komga series: {e}")))?;
+
+        let status = resp.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            return Err(AppError::new(status.as_u16(), "komga_unauthorized", "Komga authentication failed"));
+        }
+
+        if !status.is_success() {
+            return Err(AppError::new(status.as_u16(), "komga_error", format!("Komga series fetch returned HTTP {status}")));
         }
 
         #[derive(Deserialize)]
