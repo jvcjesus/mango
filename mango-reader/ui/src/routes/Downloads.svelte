@@ -1,24 +1,30 @@
 <script lang="ts">
   import { get, message, send, type Queue, type Queued } from '../lib/api';
+  import { confirm } from '../lib/confirm.svelte';
   import Icon from '../lib/Icon.svelte';
   import Notice from '../lib/Notice.svelte';
+  import { toast } from '../lib/toast.svelte';
   import { ago } from '../lib/util';
 
   let data = $state<Queue | null>(null);
   let loading = $state(true);
   let error = $state<string | null>(null);
-  let sure = $state(false);
+  let togglingPause = $state(false);
+  let clearing = $state(false);
+  let reordering = $state(false);
+  let busyItems = $state<Record<number, boolean>>({});
 
   const queue = $derived(data?.queue ?? []);
   // Only chapters still waiting can be moved; the one being fetched stays where it is.
   const movable = $derived(queue.filter((q) => q.state !== 'downloading'));
 
-  async function load() {
+  async function load(isBackground = false) {
     try {
-      data = await get<Queue>('/downloads');
-      error = null;
+      const fresh = await get<Queue>('/downloads');
+      data = fresh;
+      if (!isBackground) error = null;
     } catch (e) {
-      error = message(e);
+      if (!isBackground || !data) error = message(e);
     }
     loading = false;
   }
@@ -27,34 +33,102 @@
   // The queue changes by itself: chapters finish, and updates add new ones. So the
   // screen looks again every two seconds for as long as it is open.
   $effect(() => {
-    const timer = setInterval(load, 2000);
+    const timer = setInterval(() => load(true), 2000);
     return () => clearInterval(timer);
   });
 
   async function act(method: string, path: string, body?: unknown) {
     try {
       await send(method, path, body);
+      error = null;
     } catch (e) {
-      error = message(e);
+      const msg = message(e);
+      error = msg;
+      toast.error(msg);
     }
     await load();
   }
 
-  function move(entry: Queued, by: number) {
+  async function togglePause() {
+    if (!data || togglingPause) return;
+    togglingPause = true;
+    const isPaused = data.paused;
+    try {
+      await send('POST', isPaused ? '/downloads/resume' : '/downloads/pause');
+      toast.info(isPaused ? 'Resumed downloads' : 'Paused downloads');
+      error = null;
+    } catch (e) {
+      const msg = message(e);
+      error = msg;
+      toast.error(msg);
+    } finally {
+      togglingPause = false;
+      await load();
+    }
+  }
+
+  async function move(entry: Queued, by: number) {
+    if (reordering) return;
+    reordering = true;
     const ids = movable.map((q) => q.chapterId);
     const at = ids.indexOf(entry.chapterId);
     ids.splice(at, 1);
     ids.splice(at + by, 0, entry.chapterId);
-    act('PUT', '/downloads/order', { ids });
+    try {
+      await send('PUT', '/downloads/order', { ids });
+    } catch (e) {
+      const msg = message(e);
+      error = msg;
+      toast.error(msg);
+    } finally {
+      reordering = false;
+      await load();
+    }
   }
 
-  function clear() {
-    if (!sure) {
-      sure = true;
-      return;
+  async function clear() {
+    const ok = await confirm({
+      title: 'Clear Download Queue?',
+      message: 'All chapters currently waiting or downloading will be canceled and removed.',
+      confirmText: 'Clear queue',
+      danger: true,
+    });
+    if (!ok) return;
+    clearing = true;
+    try {
+      await send('DELETE', '/downloads');
+      toast.info('Cleared download queue');
+      error = null;
+    } catch (e) {
+      const msg = message(e);
+      error = msg;
+      toast.error(msg);
+    } finally {
+      clearing = false;
+      await load();
     }
-    sure = false;
-    act('DELETE', '/downloads');
+  }
+
+  async function cancelDownload(entry: Queued) {
+    const ok = await confirm({
+      title: 'Cancel Download?',
+      message: `Cancel downloading "${entry.chapterName}" of ${entry.title}?`,
+      confirmText: 'Cancel download',
+      danger: true,
+    });
+    if (!ok) return;
+    busyItems[entry.chapterId] = true;
+    try {
+      await send('DELETE', `/downloads/${entry.chapterId}`);
+      toast.info(`Canceled ${entry.chapterName}`);
+    } catch (e) {
+      const msg = message(e);
+      error = msg;
+      toast.error(msg);
+    } finally {
+      busyItems[entry.chapterId] = false;
+      await load();
+    }
   }
 
   function describe(entry: Queued): string {
@@ -77,18 +151,39 @@
     {#if data}
       <div class="tools">
         {#if data.paused}
-          <button class="btn big spot" onclick={() => act('POST', '/downloads/resume')}><Icon name="play" size={18} fill />Resume</button>
+          <button class="btn big spot" disabled={togglingPause} onclick={togglePause}>
+            {#if togglingPause}
+              <span class="spin"><Icon name="spinner" size={18} stroke={3} /></span>
+            {:else}
+              <Icon name="play" size={18} fill />
+            {/if}
+            Resume
+          </button>
         {:else}
-          <button class="btn big" onclick={() => act('POST', '/downloads/pause')}><Icon name="pause" size={18} stroke={3} />Pause</button>
+          <button class="btn big" disabled={togglingPause} onclick={togglePause}>
+            {#if togglingPause}
+              <span class="spin"><Icon name="spinner" size={18} stroke={3} /></span>
+            {:else}
+              <Icon name="pause" size={18} stroke={3} />
+            {/if}
+            Pause
+          </button>
         {/if}
         {#if queue.length}
-          <button class="btn" onclick={clear}><Icon name="trash" size={18} />{sure ? 'Really clear the queue?' : 'Clear queue'}</button>
+          <button class="btn" disabled={clearing} onclick={clear}>
+            {#if clearing}
+              <span class="spin"><Icon name="spinner" size={18} stroke={3} /></span>
+            {:else}
+              <Icon name="trash" size={18} />
+            {/if}
+            Clear queue
+          </button>
         {/if}
       </div>
     {/if}
   </div>
 
-  <Notice {loading} {error} retry={load} />
+  <Notice {loading} {error} retry={() => load(false)} />
 
   {#if data}
     {#if queue.length === 0}
@@ -109,14 +204,29 @@
             </a>
             <span class="tools">
               {#if entry.state === 'failed'}
-                <button class="btn" onclick={() => act('POST', `/downloads/${entry.chapterId}/retry`)}><Icon name="refresh" size={18} />Try again</button>
+                <button class="btn" disabled={busyItems[entry.chapterId]} onclick={() => act('POST', `/downloads/${entry.chapterId}/retry`)}>
+                  <Icon name="refresh" size={18} />Try again
+                </button>
               {/if}
               {#if at >= 0}
-                <button class="btn icon" aria-label="Move {entry.chapterName} up" disabled={at === 0} onclick={() => move(entry, -1)}><Icon name="up" /></button>
-                <button class="btn icon" aria-label="Move {entry.chapterName} down" disabled={at === movable.length - 1} onclick={() => move(entry, 1)}><Icon name="down" /></button>
+                <button class="btn icon" aria-label="Move {entry.chapterName} up" disabled={at === 0 || reordering} onclick={() => move(entry, -1)}>
+                  <Icon name="up" />
+                </button>
+                <button class="btn icon" aria-label="Move {entry.chapterName} down" disabled={at === movable.length - 1 || reordering} onclick={() => move(entry, 1)}>
+                  <Icon name="down" />
+                </button>
               {/if}
-              <button class="btn icon" aria-label="Cancel {entry.chapterName} of {entry.title}" onclick={() => act('DELETE', `/downloads/${entry.chapterId}`)}>
-                <Icon name="close" />
+              <button
+                class="btn icon"
+                aria-label="Cancel {entry.chapterName} of {entry.title}"
+                disabled={busyItems[entry.chapterId]}
+                onclick={() => cancelDownload(entry)}
+              >
+                {#if busyItems[entry.chapterId]}
+                  <span class="spin"><Icon name="spinner" size={18} stroke={3} /></span>
+                {:else}
+                  <Icon name="close" />
+                {/if}
               </button>
             </span>
           </li>
