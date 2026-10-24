@@ -1272,5 +1272,95 @@ describe('first-class volume acquisition & release semantics', () => {
       const v3 = ownership.volumes.find((v) => v.volume === 3);
       expect(v3).toBeUndefined(); // Unowned/available
     });
+
+    it('formats acquisition queue lifecycle stages and detects komga retry availability', () => {
+      const normalQueued: import('./api').Queued = {
+        chapterId: 101,
+        chapterName: 'Chapter 1',
+        mangaId: 1,
+        title: 'Blue Lock',
+        state: 'queued',
+        stage: 'queued',
+        source: 'MangaDex',
+        releaseType: 'chapter',
+        done: 0,
+        total: 20,
+        attempts: 0,
+        canRetryKomga: false,
+      };
+
+      const optimizingQueued: import('./api').Queued = {
+        chapterId: 102,
+        chapterName: 'Chapter 2',
+        mangaId: 1,
+        title: 'Blue Lock',
+        state: 'downloading',
+        stage: 'optimizing',
+        statusMessage: 'Optimizing image compression (RustyLibraryShrinker)...',
+        source: 'MangaDex',
+        releaseType: 'chapter',
+        done: 20,
+        total: 20,
+        attempts: 0,
+        canRetryKomga: false,
+      };
+
+      const komgaFailedQueued: import('./api').Queued = {
+        chapterId: 103,
+        chapterName: 'Chapter 3',
+        mangaId: 1,
+        title: 'Blue Lock',
+        state: 'failed',
+        stage: 'komga',
+        error: 'Published to /srv/media/manga/Blue Lock, but Komga scan trigger failed: connection refused',
+        source: 'MangaDex',
+        releaseType: 'chapter',
+        done: 20,
+        total: 20,
+        attempts: 1,
+        canRetryKomga: true,
+        failureStage: 'komga',
+      };
+
+      expect(normalQueued.canRetryKomga).toBe(false);
+      expect(optimizingQueued.stage).toBe('optimizing');
+      expect(komgaFailedQueued.canRetryKomga).toBe(true);
+      expect(komgaFailedQueued.failureStage).toBe('komga');
+    });
+
+    it('validates Komga library discovery selection and dual library ID targeting', () => {
+      const discoveredLibraries: import('./api').KomgaLibrary[] = [
+        { id: 'lib-001', name: 'Manga', path: '/srv/media/manga' },
+        { id: 'lib-002', name: 'Manga (Chinese)', path: '/srv/media/manga-chinese' },
+      ];
+
+      expect(discoveredLibraries).toHaveLength(2);
+      expect(discoveredLibraries[0].id).toBe('lib-001');
+      expect(discoveredLibraries[1].id).toBe('lib-002');
+
+      const configWithDualLibs: import('./api').PipelineConfig = {
+        enabled: true,
+        library_dir: '/srv/media/manga',
+        chinese_library_dir: '/srv/media/manga-chinese',
+        mangabaka_enabled: true,
+        mangabaka_url: 'https://api.mangabaka.org/v1',
+        has_mangabaka_token: false,
+        komga_enabled: true,
+        komga_url: 'http://127.0.0.1:25600',
+        has_komga_api_key: true,
+        komga_library_id: 'lib-001',
+        komga_chinese_library_id: 'lib-002',
+        komga_scan_enabled: true,
+        optimize_enabled: true,
+        optimizer_bin: null,
+        target_height: 2400,
+        image_quality: 90,
+        min_savings_percent: 10,
+      };
+
+      expect(configWithDualLibs.komga_library_id).toBe('lib-001');
+      expect(configWithDualLibs.komga_chinese_library_id).toBe('lib-002');
+      expect(configWithDualLibs.komga_scan_enabled).toBe(true);
+    });
   });
 });

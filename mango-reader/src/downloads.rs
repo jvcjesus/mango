@@ -9,7 +9,7 @@ use crate::{
     settings,
 };
 use rusqlite::{params, Connection, OptionalExtension};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     fs,
     io::Write,
@@ -26,20 +26,38 @@ const TRIES: i64 = 5;
 /// Seconds to wait before the next try, by how many have failed so far.
 const WAITS: [i64; 4] = [30, 120, 600, 1800];
 
-#[derive(Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcquisitionLiveState {
+    pub chapter_id: i64,
+    pub stage: String,
+    pub status_message: String,
+    pub destination: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Queued {
     pub chapter_id: i64,
     pub chapter_name: String,
     pub manga_id: i64,
     pub title: String,
-    /// queued, downloading or failed.
+    /// queued, downloading, identifying, metadata, optimizing, validating, publishing, komga, or failed.
     pub state: String,
+    pub stage: String,
+    pub status_message: Option<String>,
+    pub destination: Option<String>,
+    pub source: Option<String>,
+    pub scanlator: Option<String>,
+    pub release_type: Option<String>,
+    pub volume: Option<f64>,
     pub done: i64,
     pub total: Option<i64>,
     pub attempts: i64,
     pub retry_at: Option<i64>,
     pub error: Option<String>,
+    pub can_retry_komga: bool,
+    pub failure_stage: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -51,6 +69,7 @@ pub struct QueueView {
 /// A chapter picked from the queue, with what its file name and ComicInfo need.
 pub(crate) struct Job {
     pub(crate) chapter: i64,
+    pub(crate) manga_id: i64,
     pub(crate) attempts: i64,
     pub(crate) source: String,
     pub(crate) title: String,
@@ -78,6 +97,7 @@ pub struct Downloads {
     wake: Arc<Notify>,
     /// The chapter being fetched: its id, pages done, pages in all.
     progress: Arc<StdMutex<Option<(i64, i64, i64)>>>,
+    live_stage: Arc<StdMutex<Option<AcquisitionLiveState>>>,
     pipeline: Option<Arc<crate::pipeline::Pipeline>>,
 }
 
@@ -91,6 +111,7 @@ impl Downloads {
             keep_free: keep_free_mb << 20,
             wake: Arc::default(),
             progress: Arc::default(),
+            live_stage: Arc::default(),
             pipeline: None,
         }
     }
@@ -133,7 +154,67 @@ impl Downloads {
                 entry.total = Some(total);
             }
         }
+        let active = self.live_stage.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        if let Some(st) = active {
+            if let Some(entry) = view.queue.iter_mut().find(|q| q.chapter_id == st.chapter_id) {
+                entry.stage = st.stage;
+                entry.status_message = Some(st.status_message);
+                if st.destination.is_some() {
+                    entry.destination = st.destination;
+                }
+            }
+        }
         Ok(view)
+    }
+
+    /// Retries the Komga library scan stage without re-downloading or re-optimizing.
+    pub async fn retry_komga(&self, chapter: i64) -> Result<String> {
+        let (manga_id, title, lang) = self
+            .db
+            .call(move |conn| {
+                let (manga_id, title, lang): (i64, String, Option<String>) = conn.query_row(
+                    "SELECT m.id, m.title, s.lang
+                     FROM chapters c
+                     JOIN manga m ON m.id = c.manga_id
+                     LEFT JOIN sources s ON s.id = m.source_id
+                     WHERE c.id = ?1",
+                    [chapter],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )?;
+                Ok((manga_id, title, lang))
+            })
+            .await?;
+
+        if let Some(pipeline) = &self.pipeline {
+            let (config, _, komga_key) = pipeline.load_internal_config().await?;
+            if !config.komga_enabled {
+                return Err(AppError::bad_request("Komga integration is disabled in Pipeline settings"));
+            }
+
+            let is_chinese = lang.as_deref().map(|l| l.to_lowercase()).map(|l| l == "zh" || l.contains("chinese") || l.contains("mandarin")).unwrap_or(false);
+            let target_library_id = if is_chinese {
+                config.komga_chinese_library_id.as_deref().or(config.komga_library_id.as_deref())
+            } else {
+                config.komga_library_id.as_deref()
+            };
+
+            let komga_client = crate::pipeline::komga::KomgaClient::new(pipeline.http.clone(), config.komga_url, komga_key);
+            komga_client.trigger_scan(target_library_id).await?;
+
+            pipeline.ownership.invalidate(manga_id);
+
+            // Remove from downloads queue as completed
+            self.db
+                .call(move |conn| {
+                    conn.execute("DELETE FROM downloads WHERE chapter_id = ?1", [chapter])?;
+                    Ok(())
+                })
+                .await?;
+
+            Ok(format!("Komga library scan triggered successfully for {title}"))
+        } else {
+            Err(AppError::bad_request("Pipeline not configured"))
+        }
     }
 
     /// Takes one chapter out of the queue, or with None all of them. A fetch in progress stops at its next page.
@@ -238,19 +319,41 @@ impl Downloads {
             };
             let outcome = self.save(&job).await;
             *self.progress.lock().unwrap_or_else(|e| e.into_inner()) = None;
+
+            let mut final_outcome = outcome.clone();
             if let Ok(Some((relative_path, _page_count))) = &outcome {
                 if let Some(pipeline) = &self.pipeline {
                     let cbz_file = self.dir.join(relative_path);
-                    if let Err(e) = pipeline.process_download(&cbz_file, &job).await {
+                    let live_stage = self.live_stage.clone();
+                    let chapter_id = job.chapter;
+
+                    let update_stage = move |stage: &str, msg: &str, dest: Option<String>| {
+                        if let Ok(mut lock) = live_stage.lock() {
+                            *lock = Some(AcquisitionLiveState {
+                                chapter_id,
+                                stage: stage.to_string(),
+                                status_message: msg.to_string(),
+                                destination: dest,
+                            });
+                        }
+                    };
+
+                    if let Err(e) = pipeline.process_download_with_progress(&cbz_file, &job, update_stage).await {
                         tracing::warn!("acquisition pipeline processing failed for {} / {}: {e}", job.title, job.name);
+                        final_outcome = Err(e);
+                    } else {
+                        pipeline.ownership.invalidate(job.manga_id);
                     }
                 }
             }
-            if let Err(e) = &outcome {
-                tracing::warn!("download of {} / {} failed: {e}", job.title, job.name);
+
+            *self.live_stage.lock().unwrap_or_else(|e| e.into_inner()) = None;
+
+            if let Err(e) = &final_outcome {
+                tracing::warn!("acquisition of {} / {} failed: {e}", job.title, job.name);
             }
             let (chapter, attempts) = (job.chapter, job.attempts);
-            if let Err(e) = self.db.call(move |conn| record(conn, chapter, attempts, outcome)).await {
+            if let Err(e) = self.db.call(move |conn| record(conn, chapter, attempts, final_outcome)).await {
                 tracing::warn!("could not record a download: {e}");
             }
         }
@@ -390,23 +493,53 @@ fn unread_of(conn: &Connection, titles: &[i64]) -> Result<Vec<i64>> {
 
 fn read_queue(conn: &Connection) -> Result<QueueView> {
     let mut stmt = conn.prepare(
-        "SELECT d.chapter_id, c.name, m.id, m.title, d.state, c.page_count, d.attempts, d.retry_at, d.error
-         FROM downloads d JOIN chapters c ON c.id = d.chapter_id JOIN manga m ON m.id = c.manga_id
+        "SELECT d.chapter_id, c.name, m.id, m.title, d.state, c.page_count, d.attempts, d.retry_at, d.error,
+                COALESCE(s.name, 'Unknown source'), c.scanlator, c.chapter_number
+         FROM downloads d
+         JOIN chapters c ON c.id = d.chapter_id
+         JOIN manga m ON m.id = c.manga_id
+         LEFT JOIN sources s ON s.id = m.source_id
          ORDER BY d.state != 'downloading', d.position, d.chapter_id",
     )?;
     let queue = stmt
         .query_map([], |r| {
+            let chapter_name: String = r.get(1)?;
+            let chapter_number: f64 = r.get(11)?;
+            let release_info = crate::release::parse_release(&chapter_name, chapter_number);
+            let state: String = r.get(4)?;
+            let error: Option<String> = r.get(8)?;
+            let can_retry_komga = state == "failed"
+                && error.as_deref().map(|e| e.to_lowercase().contains("komga")).unwrap_or(false);
+            let failure_stage = if can_retry_komga {
+                Some("komga".to_string())
+            } else if state == "failed" {
+                Some("download".to_string())
+            } else {
+                None
+            };
             Ok(Queued {
                 chapter_id: r.get(0)?,
-                chapter_name: r.get(1)?,
+                chapter_name,
                 manga_id: r.get(2)?,
                 title: r.get(3)?,
-                state: r.get(4)?,
+                state: state.clone(),
+                stage: state,
+                status_message: None,
+                destination: None,
+                source: r.get(9)?,
+                scanlator: r.get(10)?,
+                release_type: Some(match release_info.release_type {
+                    crate::release::ReleaseType::Volume => "volume".to_string(),
+                    crate::release::ReleaseType::Chapter => "chapter".to_string(),
+                }),
+                volume: release_info.volume,
                 done: 0,
                 total: r.get(5)?,
                 attempts: r.get(6)?,
                 retry_at: r.get(7)?,
-                error: r.get(8)?,
+                error,
+                can_retry_komga,
+                failure_stage,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -421,7 +554,7 @@ fn next_job(conn: &Connection) -> Result<Option<Job>> {
     let job = conn
         .query_row(
             "SELECT d.chapter_id, d.attempts, COALESCE(s.name, 'Unknown source'), m.title, c.name, c.chapter_number, c.scanlator,
-                    m.author, m.artist, m.genre, m.description, s.lang
+                    m.author, m.artist, m.genre, m.description, s.lang, m.id
              FROM downloads d JOIN chapters c ON c.id = d.chapter_id JOIN manga m ON m.id = c.manga_id
              LEFT JOIN sources s ON s.id = m.source_id
              WHERE d.state = 'queued' AND (d.retry_at IS NULL OR d.retry_at <= ?1)
@@ -433,6 +566,7 @@ fn next_job(conn: &Connection) -> Result<Option<Job>> {
                 let release_info = crate::release::parse_release(&name, number);
                 Ok(Job {
                     chapter: r.get(0)?,
+                    manga_id: r.get(12)?,
                     attempts: r.get(1)?,
                     source: r.get(2)?,
                     title: r.get(3)?,
@@ -675,6 +809,7 @@ mod tests {
 
         let job = Job {
             chapter: 1,
+            manga_id: 1,
             attempts: 0,
             source: "Src".into(),
             title: "Tom & Jerry <3".into(),
@@ -708,6 +843,7 @@ mod tests {
         // Case A: Pure Volume artifact
         let vol_job = Job {
             chapter: 10,
+            manga_id: 1,
             attempts: 0,
             source: "MangaDot".into(),
             title: "Blue Lock".into(),
@@ -733,6 +869,7 @@ mod tests {
         // Case B: Chapter belonging to a volume
         let ch_vol_job = Job {
             chapter: 11,
+            manga_id: 1,
             attempts: 0,
             source: "MangaDot".into(),
             title: "Blue Lock".into(),
@@ -756,6 +893,7 @@ mod tests {
         // Case C: Pure chapter (MangaDot style with colon)
         let ch_job = Job {
             chapter: 12,
+            manga_id: 1,
             attempts: 0,
             source: "MangaDot".into(),
             title: "Blue Lock".into(),
@@ -785,6 +923,7 @@ mod tests {
         // Case D: Fractional Volume artifact (e.g. v12.5)
         let frac_job = Job {
             chapter: 13,
+            manga_id: 1,
             attempts: 0,
             source: "MangaDot".into(),
             title: "Blue Lock".into(),
@@ -811,5 +950,46 @@ mod tests {
             crate::pipeline::publisher::canonical_release_name(&vol_job.title, true, 1.0),
             "Blue Lock v01"
         );
+    }
+
+    #[test]
+    fn queue_lifecycle_fields_and_komga_retry_detection() {
+        let mut conn = database();
+        add(&mut conn, &[10, 11, 12]).unwrap();
+
+        // 1. Mark chapter 10 as downloading
+        conn.execute("UPDATE downloads SET state = 'downloading' WHERE chapter_id = 10", []).unwrap();
+
+        // 2. Mark chapter 11 as failed with generic error
+        conn.execute(
+            "UPDATE downloads SET state = 'failed', attempts = 5, error = 'Network connection timed out' WHERE chapter_id = 11",
+            [],
+        )
+        .unwrap();
+
+        // 3. Mark chapter 12 as failed specifically with Komga scan error
+        conn.execute(
+            "UPDATE downloads SET state = 'failed', attempts = 1, error = 'Published to /srv/media/manga, but Komga scan trigger failed: connection refused' WHERE chapter_id = 12",
+            [],
+        )
+        .unwrap();
+
+        let queue_view = read_queue(&conn).unwrap();
+        assert_eq!(queue_view.queue.len(), 3);
+
+        let q10 = queue_view.queue.iter().find(|q| q.chapter_id == 10).unwrap();
+        assert_eq!(q10.state, "downloading");
+        assert_eq!(q10.can_retry_komga, false);
+        assert_eq!(q10.failure_stage, None);
+
+        let q11 = queue_view.queue.iter().find(|q| q.chapter_id == 11).unwrap();
+        assert_eq!(q11.state, "failed");
+        assert_eq!(q11.can_retry_komga, false);
+        assert_eq!(q11.failure_stage.as_deref(), Some("download"));
+
+        let q12 = queue_view.queue.iter().find(|q| q.chapter_id == 12).unwrap();
+        assert_eq!(q12.state, "failed");
+        assert_eq!(q12.can_retry_komga, true);
+        assert_eq!(q12.failure_stage.as_deref(), Some("komga"));
     }
 }

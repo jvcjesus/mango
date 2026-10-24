@@ -9,7 +9,7 @@ use std::fmt;
 pub type Result<T> = std::result::Result<T, AppError>;
 
 /// An error as the API reports it: `{"error": {"code", "message"}}`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AppError {
     pub status: StatusCode,
     pub code: String,

@@ -128,6 +128,7 @@ pub fn router(state: Spaces) -> Router {
         .route("/downloads/resume", post(resume_downloads))
         .route("/downloads/{chapter}", delete(cancel_download))
         .route("/downloads/{chapter}/retry", post(retry_download))
+        .route("/downloads/{chapter}/retry-komga", post(retry_komga_download))
         .route("/chapters/{id}/download", delete(delete_download))
         .route("/manga/{id}/auto-download", put(set_auto_download))
         .route("/manga/{id}/migrate/{to}", get(compare_titles).post(migrate_title))
@@ -148,6 +149,7 @@ pub fn router(state: Spaces) -> Router {
         .route("/pipeline/test-mangabaka", post(test_pipeline_mangabaka))
         .route("/pipeline/test-komga", post(test_pipeline_komga))
         .route("/pipeline/discover-komga-libraries", post(discover_pipeline_komga_libraries))
+        .route("/pipeline/retry-komga/{chapter}", post(retry_komga_download))
         .route("/pipeline/events", get(get_pipeline_events))
         .layer(middleware::from_fn_with_state(state.clone(), auth::require));
     let api = Router::new()
@@ -736,6 +738,11 @@ async fn cancel_download(Me(app): Me, Path(chapter): Path<i64>) -> Result<Json<V
 async fn retry_download(Me(app): Me, Path(chapter): Path<i64>) -> Result<Json<Value>> {
     app.downloads.retry(chapter).await?;
     Ok(done())
+}
+
+async fn retry_komga_download(Me(app): Me, Path(chapter): Path<i64>) -> Result<Json<Value>> {
+    let msg = app.downloads.retry_komga(chapter).await?;
+    Ok(Json(json!({ "message": msg })))
 }
 
 async fn order_downloads(Me(app): Me, Json(body): Json<Ids>) -> Result<Json<Value>> {

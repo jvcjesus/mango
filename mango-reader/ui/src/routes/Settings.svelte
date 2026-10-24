@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { get, message, send, type Category, type PipelineConfig, type PipelineEvent, type PathValidationResult, type OptimizerValidationResult, type ValidatePathsResponse, type Tracker } from '../lib/api';
+  import { get, message, send, type Category, type KomgaLibrary, type PipelineConfig, type PipelineEvent, type PathValidationResult, type OptimizerValidationResult, type ValidatePathsResponse, type Tracker } from '../lib/api';
   import { confirm } from '../lib/confirm.svelte';
   import { COVERS, display, MENUS, setDisplay, SIZES } from '../lib/display.svelte';
   import Icon, { type IconName } from '../lib/Icon.svelte';
@@ -529,6 +529,8 @@
   let mangabakaTestResult = $state<{ ok: boolean; message: string } | null>(null);
   let komgaTesting = $state(false);
   let komgaTestResult = $state<{ ok: boolean; message: string } | null>(null);
+  let komgaLibraries = $state<KomgaLibrary[]>([]);
+  let discoveringKomgaLibraries = $state(false);
 
   let libraryDirInput = $state('');
   let chineseLibraryDirInput = $state('');
@@ -537,6 +539,8 @@
   let komgaUrlInput = $state('');
   let komgaApiKeyInput = $state('');
   let komgaLibraryIdInput = $state('');
+  let komgaChineseLibraryIdInput = $state('');
+  let komgaScanEnabledInput = $state(true);
   let optimizerBinInput = $state('');
   let targetHeightInput = $state(2400);
   let imageQualityInput = $state(90);
@@ -572,6 +576,8 @@
       komgaUrlInput = cfg.komga_url ?? 'http://127.0.0.1:25600';
       komgaApiKeyInput = cfg.has_komga_api_key ? '********' : '';
       komgaLibraryIdInput = cfg.komga_library_id ?? '';
+      komgaChineseLibraryIdInput = cfg.komga_chinese_library_id ?? '';
+      komgaScanEnabledInput = cfg.komga_scan_enabled ?? true;
       optimizerBinInput = cfg.optimizer_bin ?? '';
       targetHeightInput = cfg.target_height ?? 2400;
       imageQualityInput = cfg.image_quality ?? 90;
@@ -627,6 +633,8 @@
         komga_url: komgaUrlInput.trim() || null,
         komga_api_key: komgaApiKeyInput.trim() || null,
         komga_library_id: komgaLibraryIdInput.trim() || null,
+        komga_chinese_library_id: komgaChineseLibraryIdInput.trim() || null,
+        komga_scan_enabled: komgaScanEnabledInput,
         optimizer_bin: optimizerBinInput.trim() || null,
         target_height: Number(targetHeightInput) || 2400,
         image_quality: Number(imageQualityInput) || 90,
@@ -665,13 +673,34 @@
     try {
       const res = await send<{ message: string }>('POST', '/pipeline/test-komga', {
         url: komgaUrlInput.trim() || null,
-        api_key: komgaApiKeyInput.trim() || null,
+        token: komgaApiKeyInput.trim() || null,
       });
       komgaTestResult = { ok: true, message: res.message };
+      discoverKomgaLibraries().catch(() => {});
     } catch (e) {
       komgaTestResult = { ok: false, message: message(e) };
     } finally {
       komgaTesting = false;
+    }
+  }
+
+  async function discoverKomgaLibraries() {
+    discoveringKomgaLibraries = true;
+    try {
+      const libs = await send<KomgaLibrary[]>('POST', '/pipeline/discover-komga-libraries', {
+        url: komgaUrlInput.trim() || null,
+        token: komgaApiKeyInput.trim() || null,
+      });
+      komgaLibraries = libs;
+      if (libs.length > 0) {
+        toast.success(`Discovered ${libs.length} Komga ${libs.length === 1 ? 'library' : 'libraries'}`);
+      } else {
+        toast.info('No libraries returned by Komga');
+      }
+    } catch (e) {
+      toast.error(`Library discovery failed: ${message(e)}`);
+    } finally {
+      discoveringKomgaLibraries = false;
     }
   }
 
@@ -1147,7 +1176,7 @@
                 </label>
                 <button class="btn" onclick={testMangaBaka} disabled={mangabakaTesting}>
                   <Icon name="refresh" size={16} />
-                  {mangabakaTesting ? 'Testing…' : 'Test MangaBaka'}
+                  {mangabakaTesting ? 'Validating…' : 'Validate Connection'}
                 </button>
               </div>
             </div>
@@ -1164,19 +1193,30 @@
             <h3>Komga Server Integration</h3>
             <div class="set">
               <div class="what">
-                <strong>Notify Komga on Acquisition</strong>
-                <span>Automatically trigger a library rescan when new volumes or chapters are published into the permanent library.</span>
+                <strong>Enable Komga Integration</strong>
+                <span>Connect to your Komga instance for ownership discovery and library synchronization.</span>
               </div>
               <div class="how">
-                {@render toggle(pipeline.komga_enabled, 'Komga scan triggers', () => {
+                {@render toggle(pipeline.komga_enabled, 'Komga integration', () => {
                   if (pipeline) pipeline.komga_enabled = !pipeline.komga_enabled;
+                })}
+              </div>
+            </div>
+            <div class="set">
+              <div class="what">
+                <strong>Post-Publication Library Scan</strong>
+                <span>Automatically trigger a library rescan in Komga when new volumes or chapters are published into the permanent library.</span>
+              </div>
+              <div class="how">
+                {@render toggle(komgaScanEnabledInput, 'Post-publication scan', () => {
+                  komgaScanEnabledInput = !komgaScanEnabledInput;
                 })}
               </div>
             </div>
             <div class="set stack">
               <div class="what">
                 <strong>Komga Server URL</strong>
-                <span>Address of your Komga server instance (e.g. http://10.0.0.140:25600 or http://127.0.0.1:25600).</span>
+                <span>Address of your Komga server. <em>Note for Docker:</em> <code>127.0.0.1</code> inside the container refers to the container itself. Use <code>http://host.docker.internal:25600</code> or your host LAN IP (e.g. <code>http://10.0.0.140:25600</code>) to reach host Komga.</span>
               </div>
               <div class="how wide">
                 <label class="field grow">
@@ -1187,7 +1227,7 @@
             <div class="set stack">
               <div class="what">
                 <strong>Komga API Key</strong>
-                <span>X-API-Key token configured in your Komga user profile. Leave as "********" to keep existing key.</span>
+                <span>API key generated in Komga under User Settings &gt; API Keys. Read-only validation never scans libraries.</span>
               </div>
               <div class="how wide">
                 <label class="field grow">
@@ -1195,18 +1235,55 @@
                 </label>
                 <button class="btn" onclick={testKomga} disabled={komgaTesting}>
                   <Icon name="refresh" size={16} />
-                  {komgaTesting ? 'Testing…' : 'Test Komga'}
+                  {komgaTesting ? 'Validating…' : 'Validate Connection'}
+                </button>
+                <button class="btn" onclick={discoverKomgaLibraries} disabled={discoveringKomgaLibraries}>
+                  <Icon name="search" size={16} />
+                  {discoveringKomgaLibraries ? 'Discovering…' : 'Discover Libraries'}
                 </button>
               </div>
             </div>
             <div class="set stack">
               <div class="what">
-                <strong>Specific Library ID (Optional)</strong>
-                <span>Leave blank to scan all libraries, or specify a specific Komga library ID to rescan.</span>
+                <strong>English / Default Library</strong>
+                <span>Target Komga library for canonical English manga acquisitions. Discovered from Komga or entered manually.</span>
               </div>
               <div class="how wide">
+                {#if komgaLibraries.length > 0}
+                  <select class="btn grow" bind:value={komgaLibraryIdInput}>
+                    <option value="">All libraries (or enter manual ID below)</option>
+                    {#if komgaLibraryIdInput && !komgaLibraries.some((l) => l.id === komgaLibraryIdInput)}
+                      <option value={komgaLibraryIdInput}>Current / Custom: {komgaLibraryIdInput}</option>
+                    {/if}
+                    {#each komgaLibraries as lib}
+                      <option value={lib.id}>{lib.name} ({lib.id})</option>
+                    {/each}
+                  </select>
+                {/if}
                 <label class="field grow">
-                  <input type="text" bind:value={komgaLibraryIdInput} placeholder="All libraries" autocomplete="off" />
+                  <input type="text" bind:value={komgaLibraryIdInput} placeholder="All libraries or specific Library ID" autocomplete="off" />
+                </label>
+              </div>
+            </div>
+            <div class="set stack">
+              <div class="what">
+                <strong>Chinese Library (Optional)</strong>
+                <span>Target Komga library for Chinese-translated manga (Bilibili, etc.).</span>
+              </div>
+              <div class="how wide">
+                {#if komgaLibraries.length > 0}
+                  <select class="btn grow" bind:value={komgaChineseLibraryIdInput}>
+                    <option value="">Same as default / unassigned</option>
+                    {#if komgaChineseLibraryIdInput && !komgaLibraries.some((l) => l.id === komgaChineseLibraryIdInput)}
+                      <option value={komgaChineseLibraryIdInput}>Current / Custom: {komgaChineseLibraryIdInput}</option>
+                    {/if}
+                    {#each komgaLibraries as lib}
+                      <option value={lib.id}>{lib.name} ({lib.id})</option>
+                    {/each}
+                  </select>
+                {/if}
+                <label class="field grow">
+                  <input type="text" bind:value={komgaChineseLibraryIdInput} placeholder="Leave blank to use default, or enter Library ID" autocomplete="off" />
                 </label>
               </div>
             </div>

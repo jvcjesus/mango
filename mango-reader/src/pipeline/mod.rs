@@ -161,7 +161,7 @@ pub struct PipelineEvent {
 #[derive(Clone)]
 pub struct Pipeline {
     db: Db,
-    http: Client,
+    pub(crate) http: Client,
     pub ownership: ownership::OwnershipService,
     events: Arc<RwLock<VecDeque<PipelineEvent>>>,
 }
@@ -244,7 +244,7 @@ impl Pipeline {
     }
 
     /// Internal helper to load configuration with secrets included for execution.
-    async fn load_internal_config(&self) -> Result<(PipelineConfig, Option<String>, Option<String>)> {
+    pub(crate) async fn load_internal_config(&self) -> Result<(PipelineConfig, Option<String>, Option<String>)> {
         self.db
             .call(|conn| {
                 let enabled = crate::settings::get::<bool>(conn, "pipeline.enabled").unwrap_or(false);
@@ -487,12 +487,28 @@ impl Pipeline {
     }
 
     /// Executes the full native acquisition post-processing pipeline for a downloaded chapter/volume.
+    #[allow(dead_code)]
     pub async fn process_download(&self, source_cbz: &Path, job: &crate::downloads::Job) -> Result<()> {
+        self.process_download_with_progress(source_cbz, job, |_, _, _| {}).await
+    }
+
+    /// Executes the pipeline reporting lifecycle stages to the provided callback.
+    pub async fn process_download_with_progress<F>(
+        &self,
+        source_cbz: &Path,
+        job: &crate::downloads::Job,
+        mut on_stage: F,
+    ) -> Result<()>
+    where
+        F: FnMut(&str, &str, Option<String>),
+    {
         let (config, mb_token, komga_key) = self.load_internal_config().await?;
 
         if !config.enabled {
             return Ok(());
         }
+
+        on_stage("identifying", "Classifying release format...", None);
 
         let is_volume = job.release_type == crate::release::ReleaseType::Volume;
         let release_num = if is_volume {
@@ -560,6 +576,7 @@ impl Pipeline {
         // 2. MangaBaka Enrichment (for volumes)
         let mut mangabaka_status = "skipped".to_string();
         if config.mangabaka_enabled && is_volume {
+            on_stage("metadata", "Querying MangaBaka catalog...", None);
             let mb_client = MangaBakaClient::new(self.http.clone(), config.mangabaka_url.clone(), mb_token);
             match mb_client.fetch_volume_enrichment(&job.title, release_num).await {
                 Ok(mangabaka::MangaBakaOutcome::Success(enrichment)) => {
@@ -582,6 +599,7 @@ impl Pipeline {
             optimizer_status = "skipped: Chinese edition (already optimized)".to_string();
             tracing::info!("OPTIMIZER: skipped: Chinese edition (already optimized)");
         } else {
+            on_stage("optimizing", "Optimizing image resolution and compression...", None);
             let (resolved_bin, bin_source) = optimizer::resolve_optimizer_binary(config.optimizer_bin.as_deref());
             match resolved_bin {
                 None => {
@@ -633,6 +651,7 @@ impl Pipeline {
         }
 
         // 4. Safe, Atomic Publication into Komga Library
+        on_stage("publishing", "Publishing to canonical Komga library...", None);
         let pub_res = publish_cbz(source_cbz, &dest_root, &job.title, is_volume, release_num);
         let (outcome_str, dest_path_str, publish_err) = match &pub_res {
             Ok(PublishOutcome::Published(p)) => ("published", Some(p.to_string_lossy().to_string()), None),
@@ -643,7 +662,9 @@ impl Pipeline {
 
         // 5. Automatic Komga Library Rescan Trigger
         let mut komga_status = "skipped".to_string();
+        let mut komga_scan_error: Option<String> = None;
         if config.komga_enabled && config.komga_scan_enabled && pub_res.is_ok() {
+            on_stage("komga", "Triggering targeted Komga library scan...", dest_path_str.clone());
             let target_library_id = if is_chinese {
                 config.komga_chinese_library_id.as_deref().or(config.komga_library_id.as_deref())
             } else {
@@ -657,7 +678,10 @@ impl Pipeline {
                         None => "scan triggered (all)".to_string(),
                     };
                 }
-                Err(e) => komga_status = format!("scan trigger failed: {e}"),
+                Err(e) => {
+                    komga_status = format!("scan trigger failed: {e}");
+                    komga_scan_error = Some(e.message);
+                }
             }
         }
 
@@ -671,16 +695,29 @@ impl Pipeline {
             is_volume,
             number: release_num,
             outcome: outcome_str.to_string(),
-            destination: dest_path_str,
+            destination: dest_path_str.clone(),
             mangabaka_status,
             optimizer_status,
             komga_status,
-            error: publish_err,
+            error: publish_err.clone().or(komga_scan_error.clone()),
         });
 
         // Fail-safe: if publication failed (e.g. conflict), return error so downloads worker knows,
         // but staging download remains preserved in Mango data directory.
-        pub_res.map(|_| ())
+        if let Err(e) = pub_res {
+            return Err(e);
+        }
+
+        if let Some(err_msg) = komga_scan_error {
+            return Err(AppError::new(
+                502,
+                "komga_scan_failed",
+                format!("Published to {}, but Komga scan trigger failed: {}", dest_path_str.as_deref().unwrap_or(""), err_msg),
+            ));
+        }
+
+        on_stage("complete", "Acquisition complete", dest_path_str);
+        Ok(())
     }
 }
 
@@ -907,6 +944,7 @@ mod tests {
         make_test_cbz(&eng_cbz, "English Series");
         let eng_job = crate::downloads::Job {
             chapter: 101,
+            manga_id: 1,
             attempts: 0,
             source: "MangaDot".into(),
             title: "English Series".into(),
@@ -932,6 +970,7 @@ mod tests {
         make_test_cbz(&zh_cbz, "Chinese Series");
         let zh_job = crate::downloads::Job {
             chapter: 102,
+            manga_id: 1,
             attempts: 0,
             source: "Bilibili".into(),
             title: "Chinese Series".into(),
@@ -1045,6 +1084,7 @@ exit 0
 
         let job = crate::downloads::Job {
             chapter: 201,
+            manga_id: 1,
             attempts: 0,
             source: "MangaDot".into(),
             title: "Series With Opt".into(),
@@ -1077,6 +1117,7 @@ exit 0
         make_test_cbz(&cbz2, "Series With Opt");
         let job2 = crate::downloads::Job {
             chapter: 202,
+            manga_id: 1,
             attempts: 0,
             source: "MangaDot".into(),
             title: "Series With Opt".into(),

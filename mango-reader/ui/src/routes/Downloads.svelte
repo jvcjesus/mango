@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { get, message, send, type Queue, type Queued } from '../lib/api';
+  import { get, message, send, type PipelineEvent, type Queue, type Queued } from '../lib/api';
   import { confirm } from '../lib/confirm.svelte';
   import Icon from '../lib/Icon.svelte';
   import Notice from '../lib/Notice.svelte';
@@ -7,6 +7,7 @@
   import { ago } from '../lib/util';
 
   let data = $state<Queue | null>(null);
+  let events = $state<PipelineEvent[]>([]);
   let loading = $state(true);
   let error = $state<string | null>(null);
   let togglingPause = $state(false);
@@ -16,12 +17,16 @@
 
   const queue = $derived(data?.queue ?? []);
   // Only chapters still waiting can be moved; the one being fetched stays where it is.
-  const movable = $derived(queue.filter((q) => q.state !== 'downloading'));
+  const movable = $derived(queue.filter((q) => q.state !== 'downloading' && q.stage !== 'downloading'));
 
   async function load(isBackground = false) {
     try {
-      const fresh = await get<Queue>('/downloads');
-      data = fresh;
+      const [freshQueue, freshEvents] = await Promise.all([
+        get<Queue>('/downloads'),
+        get<PipelineEvent[]>('/pipeline/events').catch(() => []),
+      ]);
+      data = freshQueue;
+      events = freshEvents;
       if (!isBackground) error = null;
     } catch (e) {
       if (!isBackground || !data) error = message(e);
@@ -132,13 +137,36 @@
   }
 
   function describe(entry: Queued): string {
+    if (entry.statusMessage) return entry.statusMessage;
     if (entry.state === 'downloading') return entry.total ? `Downloading, page ${entry.done} of ${entry.total}` : 'Downloading';
+    if (entry.state === 'identifying') return 'Identifying release semantics';
+    if (entry.state === 'metadata') return 'Querying MangaBaka metadata';
+    if (entry.state === 'optimizing') return 'Optimizing image compression';
+    if (entry.state === 'validating') return 'Validating archive integrity';
+    if (entry.state === 'publishing') return 'Publishing to library';
+    if (entry.state === 'komga') return 'Triggering Komga scan';
     if (entry.state === 'failed') return `Gave up after ${entry.attempts} tries: ${entry.error ?? 'unknown error'}`;
     if (entry.error) {
       const wait = entry.retryAt ? Math.max(0, Math.ceil((entry.retryAt - Date.now() / 1000) / 60)) : 0;
       return `Try ${entry.attempts} failed: ${entry.error}. Next try ${wait > 0 ? `in ${wait} min` : 'soon'}`;
     }
-    return data?.paused ? 'Waiting, queue paused' : 'Waiting';
+    return data?.paused ? 'Waiting, queue paused' : 'Waiting in queue';
+  }
+
+  function stageLabel(entry: Queued): string {
+    const s = entry.stage ?? entry.state;
+    switch (s) {
+      case 'downloading': return 'Downloading';
+      case 'identifying': return 'Identifying';
+      case 'metadata': return 'Metadata';
+      case 'optimizing': return 'Optimizing';
+      case 'validating': return 'Validating';
+      case 'publishing': return 'Publishing';
+      case 'komga': return 'Komga';
+      case 'complete': return 'Complete';
+      case 'failed': return 'Failed';
+      default: return 'Queued';
+    }
   }
 </script>
 
@@ -196,13 +224,26 @@
           {@const at = movable.indexOf(entry)}
           <li>
             <a class="main" href="#/title/{entry.mangaId}">
-              <strong>{entry.title}</strong>
+              <div class="row-header">
+                <strong>{entry.title}</strong>
+                <span class="tag" class:spot={entry.stage !== 'queued' && entry.stage !== 'failed'} class:error={entry.stage === 'failed'}>
+                  {stageLabel(entry)}
+                </span>
+                {#if entry.releaseType === 'volume' || (entry.volume !== undefined && entry.volume !== null)}
+                  <span class="tag">Vol. {entry.volume ?? 'Special'}</span>
+                {/if}
+              </div>
               <span>{entry.chapterName} · {describe(entry)}</span>
               {#if entry.state === 'downloading' && entry.total}
                 <span class="meter" aria-hidden="true"><span style:width="{Math.round((entry.done / entry.total) * 100)}%"></span></span>
               {/if}
             </a>
             <span class="tools">
+              {#if entry.canRetryKomga}
+                <button class="btn pill" disabled={busyItems[entry.chapterId]} onclick={() => act('POST', `/downloads/${entry.chapterId}/retry-komga`)}>
+                  <Icon name="refresh" size={16} />Retry Komga Scan
+                </button>
+              {/if}
               {#if entry.state === 'failed'}
                 <button class="btn" disabled={busyItems[entry.chapterId]} onclick={() => act('POST', `/downloads/${entry.chapterId}/retry`)}>
                   <Icon name="refresh" size={18} />Try again
@@ -233,6 +274,56 @@
         {/each}
       </ul>
     {/if}
+
+    {#if events.length > 0}
+      <div class="acquisitions-section">
+        <div class="heading">
+          <h2 class="display">RECENT ACQUISITIONS</h2>
+          <strong>{events.length} recorded</strong>
+        </div>
+        <ul class="rows">
+          {#each events as evt (evt.id)}
+            <li class="event-item">
+              <div class="main">
+                <div class="row-header">
+                  <strong>{evt.series}</strong>
+                  {#if evt.outcome === 'published'}
+                    <span class="tag spot">Published</span>
+                  {:else if evt.outcome === 'already_published'}
+                    <span class="tag">Already in Library</span>
+                  {:else if evt.outcome === 'conflict'}
+                    <span class="tag error">Conflict</span>
+                  {:else if evt.outcome === 'error'}
+                    <span class="tag error">Error</span>
+                  {/if}
+                </div>
+                <span>
+                  {evt.release_name}
+                  {#if evt.destination}
+                    · <span class="muted" title={evt.destination}>Canonical library</span>
+                  {/if}
+                  · {ago(evt.timestamp * 1000)}
+                </span>
+                <div class="event-details">
+                  {#if evt.optimizer_status && !evt.optimizer_status.startsWith('skipped')}
+                    <span class="tag">{evt.optimizer_status}</span>
+                  {/if}
+                  {#if evt.mangabaka_status && !evt.mangabaka_status.startsWith('skipped')}
+                    <span class="tag">{evt.mangabaka_status}</span>
+                  {/if}
+                  {#if evt.komga_status && !evt.komga_status.startsWith('skipped')}
+                    <span class="tag">{evt.komga_status}</span>
+                  {/if}
+                  {#if evt.error}
+                    <span class="muted error-text">{evt.error}</span>
+                  {/if}
+                </div>
+              </div>
+            </li>
+          {/each}
+        </ul>
+      </div>
+    {/if}
   {/if}
 </div>
 
@@ -242,6 +333,29 @@
     flex-wrap: wrap;
     align-items: baseline;
     gap: 6px 18px;
+  }
+
+  .row-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .acquisitions-section {
+    margin-top: 36px;
+  }
+
+  .event-details {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 4px;
+    font-size: 0.85rem;
+  }
+
+  .error-text {
+    color: var(--error, #e53935);
   }
 
   ul {

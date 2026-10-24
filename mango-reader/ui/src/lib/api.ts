@@ -206,12 +206,21 @@ export type Queued = {
   chapterName: string;
   mangaId: number;
   title: string;
-  state: 'queued' | 'downloading' | 'failed';
+  state: string;
+  stage: string;
+  statusMessage?: string | null;
+  destination?: string | null;
+  source?: string | null;
+  scanlator?: string | null;
+  releaseType?: 'volume' | 'chapter' | null;
+  volume?: number | null;
   done: number;
   total: number | null;
   attempts: number;
   retryAt: number | null;
   error: string | null;
+  canRetryKomga?: boolean;
+  failureStage?: string | null;
 };
 
 export type Queue = { paused: boolean; queue: Queued[] };
