@@ -537,3 +537,15 @@ export const saveSyncMapping = (mapping: TrackerMapping) =>
 
 export const deleteSyncMapping = (seriesId: string, tracker: string) =>
   send<boolean>('DELETE', `/sync/mappings/${encodeURIComponent(seriesId)}/${encodeURIComponent(tracker)}`);
+
+export interface SyncScheduleConfig {
+  enabled: boolean;
+  intervalHours: number;
+  lastRun?: number | null;
+}
+
+export const getSyncSchedule = () =>
+  get<SyncScheduleConfig>('/sync/schedule');
+
+export const saveSyncSchedule = (cfg: SyncScheduleConfig) =>
+  send<boolean>('PUT', '/sync/schedule', cfg);

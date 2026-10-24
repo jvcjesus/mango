@@ -282,3 +282,31 @@ async fn test_mangabaka_sync_dry_run_and_auth() {
     assert_eq!(dry_record.new_progress, Some(4.0));
     assert!(dry_record.message.contains("Vol 4"));
 }
+
+#[test]
+fn test_sync_scheduler_defaults_and_round_trip() {
+    let dir = std::env::temp_dir().join(format!("mango-sched-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = Db::open(&dir.join("test.db")).expect("test db");
+    let conn = db.second().expect("connection");
+
+    // Defaults MUST be disabled
+    let initial = super::scheduler::get_schedule_config(&conn);
+    assert!(!initial.enabled, "Scheduled sync must strictly default to OFF");
+    assert_eq!(initial.interval_hours, 24);
+
+    // Persist new config
+    let updated = super::scheduler::SyncScheduleConfig {
+        enabled: true,
+        interval_hours: 12,
+        last_run: None,
+    };
+    super::scheduler::set_schedule_config(&conn, &updated).unwrap();
+
+    let fetched = super::scheduler::get_schedule_config(&conn);
+    assert!(fetched.enabled);
+    assert_eq!(fetched.interval_hours, 12);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

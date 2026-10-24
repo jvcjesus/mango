@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { get, message, send, runSyncDryRun, runSync, getSyncStatus, getSyncHistory, type Category, type KomgaLibrary, type PipelineConfig, type PipelineEvent, type PathValidationResult, type OptimizerValidationResult, type ValidatePathsResponse, type Tracker, type SyncRecord, type SyncSummary } from '../lib/api';
+  import { get, message, send, runSyncDryRun, runSync, getSyncStatus, getSyncHistory, getSyncSchedule, saveSyncSchedule, type Category, type KomgaLibrary, type PipelineConfig, type PipelineEvent, type PathValidationResult, type OptimizerValidationResult, type ValidatePathsResponse, type Tracker, type SyncRecord, type SyncSummary, type SyncScheduleConfig } from '../lib/api';
   import { confirm } from '../lib/confirm.svelte';
   import { COVERS, display, MENUS, setDisplay, SIZES } from '../lib/display.svelte';
   import Icon, { type IconName } from '../lib/Icon.svelte';
@@ -710,13 +710,39 @@
   let syncSummary = $state<SyncSummary | null>(null);
   let syncHistory = $state<SyncRecord[]>([]);
   let syncError = $state<string | null>(null);
+  let syncSchedule = $state<SyncScheduleConfig>({
+    enabled: false,
+    intervalHours: 24,
+    lastRun: null,
+  });
   let askedSyncHistory = false;
+
+  async function loadSyncSchedule() {
+    try {
+      syncSchedule = await getSyncSchedule();
+    } catch {}
+  }
+
+  async function toggleSyncSchedule() {
+    syncSchedule.enabled = !syncSchedule.enabled;
+    await saveSchedule();
+  }
+
+  async function saveSchedule() {
+    try {
+      await saveSyncSchedule(syncSchedule);
+      toast.success('Sync schedule updated');
+    } catch (e) {
+      toast.error(`Failed to update schedule: ${message(e)}`);
+    }
+  }
 
   async function loadSyncHistory() {
     try {
       syncHistory = await getSyncHistory(50);
       const status = await getSyncStatus();
       syncRunning = status.running;
+      void loadSyncSchedule();
     } catch (e) {
       syncError = message(e);
     }
@@ -1687,6 +1713,32 @@
               <span class="status-badge status-valid">Sync in progress…</span>
             {/if}
           </div>
+
+          {#if session.admin}
+            <div class="set" style="border-top: 1px solid var(--ink); padding-top: 12px; margin-top: 12px;">
+              <div class="what">
+                <strong>Scheduled background synchronization</strong>
+                <span>Periodically synchronizes progress from Komga to trackers. Disabled by default.</span>
+              </div>
+              <div class="how">
+                {@render toggle(syncSchedule.enabled, 'Enable scheduled sync', toggleSyncSchedule)}
+              </div>
+            </div>
+            {#if syncSchedule.enabled}
+              <div class="set">
+                <div class="what">
+                  <strong>Sync interval</strong>
+                  <span>How often scheduled synchronization evaluates reading progress.</span>
+                </div>
+                <div class="how">
+                  <label class="field">
+                    <input type="number" min="1" max="168" bind:value={syncSchedule.intervalHours} onchange={saveSchedule} style="width: 80px;" />
+                    <span>hours</span>
+                  </label>
+                </div>
+              </div>
+            {/if}
+          {/if}
 
           {#if syncError}
             <Notice error={syncError} />

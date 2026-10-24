@@ -160,6 +160,7 @@ pub fn router(state: Spaces) -> Router {
         .route("/sync/history", get(sync_history))
         .route("/sync/mappings", get(get_sync_mappings).put(put_sync_mapping))
         .route("/sync/mappings/{series_id}/{tracker}", delete(delete_sync_mapping))
+        .route("/sync/schedule", get(get_sync_schedule).put(put_sync_schedule))
         .layer(middleware::from_fn_with_state(state.clone(), auth::require));
     let api = Router::new()
         .nest("/auth", auth::routes())
@@ -1182,6 +1183,20 @@ async fn delete_sync_mapping(
         .ok_or_else(|| AppError::bad_request(format!("Invalid tracker: {tracker_str}")))?;
     let deleted = app.db.call(move |conn| crate::sync::mapping::delete_mapping(conn, &series_id, trk)).await?;
     Ok(Json(deleted))
+}
+
+async fn get_sync_schedule(Me(app): Me) -> Result<Json<crate::sync::scheduler::SyncScheduleConfig>> {
+    let cfg = app.db.call(|conn| Ok(crate::sync::scheduler::get_schedule_config(conn))).await?;
+    Ok(Json(cfg))
+}
+
+async fn put_sync_schedule(
+    Me(app): Me,
+    Json(cfg): Json<crate::sync::scheduler::SyncScheduleConfig>,
+) -> Result<Json<bool>> {
+    app.me.admin()?;
+    app.db.call(move |conn| crate::sync::scheduler::set_schedule_config(conn, &cfg)).await?;
+    Ok(Json(true))
 }
 
 #[cfg(test)]
