@@ -387,15 +387,29 @@ Audit Log & Acquisition History
 #### 4. Komga-Backed Ownership Model
 - **Komga Source of Truth**: Komga remains the permanent authority on owned manga. Mango never creates a duplicate library database.
 - **Status Classification**: Every volume is classified as `Owned` (in Komga), `Acquiring` (active in queue), `Available` (unowned), or `Unknown`.
+- **Honest Denominators & Release Semantics**: Authoritative numerators are derived strictly from Komga. Denominators are calculated only from compatible releases. When release types diverge—such as a chapter source (e.g. MangaDot) and a volume library in Komga (*Blue Lock* regression)—Mango never fabricates misleading totals like 38/368; it reports `VOLUMES 38` with clear explanation: `Source provides chapters`. Mixed releases cleanly display both (`VOLUMES 12/14 · CHAPTERS 3/3`).
+- **Compact Details Drawer**: Reveals matched Komga series ID, library, owned volume list/ranges, missing volumes, and last refreshed timestamp.
+- **Read-Only Ownership Refresh**: Fast title-level ownership refresh without triggering Komga library scans.
 - **High-Performance Caching**: 60-second TTL in-memory cache per title, invalidated automatically upon publication or manual title refresh.
 - **Duplicate Protection**: Title pages display "Owned in Komga" badges and prompt for confirmation before re-acquiring already-owned volumes.
 
-#### 5. Downloads Queue & Lifecycle Visibility
+#### 5. Native Reading-Progress Synchronization (Komga &rarr; Mango &rarr; AniList / MangaBaka)
+- **Komga Authoritative Progress**: Komga is the single source of truth for reading progress (`completed`, `page`, `readDate`).
+- **Safe Tracker Derivation**:
+  - **AniList (Chapter-Based)**: Compares chapter progress safely. For volume-only Komga series without verified chapter mapping, synchronization fails closed (`SkippedUnsafeProgress`) to prevent dangerous volume-as-chapter corruption (e.g. never equates Vol 12 = Ch 12).
+  - **MangaBaka (Volume-Based)**: Synchronizes volume collection progress.
+- **Never-Decrease Safety**: Tracker progress strictly never moves backward: `tracker_progress = max(existing_tracker_progress, safely_derived_komga_progress)`.
+- **Dry-Run Evaluation**: Zero tracker writes and zero Komga mutations, producing detailed diagnostic audit records and update proposals.
+- **Manual Controls & Audit Trail**: Settings provides `[Run Dry Run]` and `[Sync Now]` with explicit confirmation, backed by a persistent SQLite audit log (`sync_records`).
+- **Disabled-By-Default Scheduler**: Background sync scheduler defaults strictly to OFF (`sync.enabled = false`), ensuring zero unattended external writes until manually enabled.
+- **Tracked Library Decoupling**: Explicitly separates `Tracked`, `Owned`, `Acquiring`, `Read progress`, and `Auto-acquire enabled`. Tracking a title never implies downloading or auto-acquiring it. Auto-acquire strictly defaults to false.
+
+#### 6. Downloads Queue & Lifecycle Visibility
 - **Live Pipeline Stages**: Real-time status indicators in the Downloads tab: `Queued`, `Downloading`, `Identifying`, `Metadata`, `Optimizing`, `Validating`, `Publishing`, `Komga`, `Complete`, and `Failed`.
 - **Targeted Komga Retry**: If library publication succeeds but Komga network notification fails, a **Retry Komga Scan** button allows re-triggering the scan without re-downloading or re-optimizing the archive.
 - **Recent Acquisitions**: Audit trail displaying published file locations, compression savings, and metadata status.
 
-#### 6. Image Optimization Quality Policy
+#### 7. Image Optimization Quality Policy
 - **Configurable Quality Controls**: Configurable via **Settings → Image Optimization**:
   - Target page height: `2400 px` (default)
   - WebP encoder quality: `90` (default)
