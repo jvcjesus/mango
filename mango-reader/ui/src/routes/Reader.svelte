@@ -13,8 +13,12 @@
   import { go, route, up } from '../lib/router.svelte';
   import { toast } from '../lib/toast.svelte';
   import Zones from '../lib/Zones.svelte';
+  import { PageLifecycleManager, MAX_AUTO_RETRIES } from '../lib/pageLifecycle.svelte';
 
   let { id }: { id: number } = $props();
+
+  const pageMgr = new PageLifecycleManager();
+  let showingDetails = $state<Record<number, boolean>>({});
 
   let info = $state<ReaderInfo | null>(null);
   let count = $state(0);
@@ -81,7 +85,7 @@
   /** The last page on screen: how far the reading got. */
   const reached = $derived(shown[shown.length - 1]);
 
-  const src = (i: number, chapter = id) => `api/chapters/${chapter}/pages/${i}${tries[i] ? `?try=${tries[i]}` : ''}`;
+  const src = (i: number, chapter = id) => `api/chapters/${chapter}/pages/${i}${pageMgr.get(i).attempt ? `?try=${pageMgr.get(i).attempt}` : ''}`;
   const clamp = (z: number) => Math.min(4, Math.max(0.5, z));
   const between = (value: number, low: number, high: number) => Math.min(high, Math.max(low, value));
 
@@ -145,18 +149,25 @@
     ready = true;
   }
 
+  const abortController = new AbortController();
+
   async function load() {
+    const targetChapterId = id;
     // Both at once. A chapter opened before already knows its page count, and then
     // the first page shows without waiting for the source.
-    const counting = get<{ count: number }>(`/chapters/${id}/pages`);
+    const counting = get<{ count: number }>(`/chapters/${targetChapterId}/pages`, abortController.signal);
     counting.catch(() => {});
     try {
-      info = await get<ReaderInfo>(`/chapters/${id}`);
+      const freshInfo = await get<ReaderInfo>(`/chapters/${targetChapterId}`, abortController.signal);
+      if (abortController.signal.aborted || id !== targetChapterId) return;
+      info = freshInfo;
       own = owned(info);
       if (info.chapter.pageCount) open(info.chapter.pageCount);
       const got = await counting;
+      if (abortController.signal.aborted || id !== targetChapterId) return;
       open(got.count);
     } catch (e) {
+      if (abortController.signal.aborted || id !== targetChapterId) return;
       if (!ready) {
         error = message(e);
       } else {
@@ -215,10 +226,13 @@
   function save(now: boolean) {
     clearTimeout(saving);
     const page = reached;
-    if (!ready || page === saved) return;
+    // Guard against saving if unready, unchanged, or if current page has failed or is retrying
+    if (!ready || page === saved || pageMgr.isErrorOrRetrying(page)) return;
     const write = () => {
       saved = page;
-      const body = page >= count - 1 ? { page, read: true } : { page };
+      // ONLY mark chapter read if count > 0 and final page has loaded successfully
+      const isFinished = count > 0 && page >= count - 1 && pageMgr.canMarkRead(count);
+      const body = isFinished ? { page, read: true } : { page };
       // keepalive lets the request finish while the page is closing.
       fetch(`api/chapters/${id}/progress`, { method: 'PUT', keepalive: true, headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }).catch(() => {});
     };
@@ -233,7 +247,28 @@
   $effect(() => () => {
     save(true);
     if (unkept) remember(true);
+    abortController.abort();
+    pageMgr.destroy();
   });
+
+  // ---------- image lifecycle events ----------
+
+  function handleImageLoad(i: number, img: HTMLImageElement) {
+    pageMgr.get(i).handleLoad(img).then((ok) => {
+      if (ok) {
+        seen(i, img);
+        measured(i, img);
+      }
+    });
+  }
+
+  function handleImageError(i: number) {
+    pageMgr.get(i).handleFailure('The image failed to load from the server.', 'network');
+  }
+
+  function retryPage(i: number) {
+    pageMgr.get(i).manualRetry();
+  }
 
   // ---------- fetching ahead ----------
 
@@ -249,15 +284,20 @@
       const ahead = Array.from({ length: p.ahead }, (_, k) => reached + 1 + k);
       for (const i of [...ahead, shown[0] - 1]) {
         if (i < 0 || i >= count) continue;
-        const image = new Image();
-        image.onload = () => seen(i, image);
-        image.src = src(i);
+        const pState = pageMgr.get(i);
+        if (pState.status === 'idle') {
+          pState.startLoad();
+          const image = new Image();
+          image.onload = () => handleImageLoad(i, image);
+          image.onerror = () => handleImageError(i);
+          image.src = src(i);
+        }
       }
     }
     const after = info?.next;
     if (after && !warmed && reached >= count - 3) {
       warmed = true;
-      get(`/chapters/${after}/pages`)
+      get(`/chapters/${after}/pages`, abortController.signal)
         .then(() => [0, 1].forEach((i) => (new Image().src = `api/chapters/${after}/pages/${i}`)))
         .catch(() => {});
     }
@@ -609,18 +649,57 @@
       ontouchcancel={() => ((held = false), (touch = null))}
       onwheel={wheel}
     >
-      {#key shown.join()}
+      {#key `${shown.join('-')}:${shown.map((i) => pageMgr.get(i).attempt).join('-')}`}
         <span class="number display" aria-hidden="true">{shown[0] + 1}</span>
         <div class="leaf" class:two={shown.length > 1} class:rtl={mode === 'rtl'}>
-          {#each shown as i (`${i}:${tries[i] ?? 0}`)}
-            {#if broken[i]}
-              <div class="panel message">
-                <strong>Page {i + 1} did not load.</strong>
-                <button class="btn" onclick={() => retry(i)}>Try again</button>
-              </div>
-            {:else}
-              <img src={src(i)} alt="Page {i + 1} of {count}" draggable="false" onload={(e) => seen(i, e.currentTarget as HTMLImageElement)} onerror={() => (broken[i] = true)} />
-            {/if}
+          {#each shown as i (i)}
+            {@const pState = pageMgr.get(i)}
+            <div class="page-container" class:spread-page={shown.length > 1}>
+              {#if pState.status === 'retrying'}
+                <div class="panel page-card retrying" role="status">
+                  <span class="spin"><Icon name="spinner" size={28} stroke={3} /></span>
+                  <strong class="display">PAGE {i + 1} COULDN'T LOAD</strong>
+                  <span class="muted">Retrying… (attempt {pState.retryCount} of {MAX_AUTO_RETRIES})</span>
+                </div>
+              {:else if pState.status === 'failed'}
+                <div class="panel page-card failed" role="alert">
+                  <strong class="display">PAGE {i + 1} COULDN'T LOAD</strong>
+                  <p class="muted">{pState.error ?? 'The image failed to load or decode.'}</p>
+                  <div class="tools">
+                    <button class="btn spot" onclick={() => retryPage(i)}>
+                      <Icon name="refresh" size={16} />Retry
+                    </button>
+                    <button class="btn" aria-expanded={showingDetails[i]} onclick={() => (showingDetails[i] = !showingDetails[i])}>
+                      Details
+                    </button>
+                  </div>
+                  {#if showingDetails[i]}
+                    <div class="diag">
+                      <div><span>Status:</span> <code>{pState.status}</code></div>
+                      <div><span>Attempt:</span> <code>{pState.attempt + 1}</code></div>
+                      <div><span>Error:</span> <code>{pState.errorType ?? 'network'}</code></div>
+                      <div><span>Duration:</span> <code>{pState.durationMs ? `${pState.durationMs}ms` : '—'}</code></div>
+                      <div><span>URL:</span> <code class="url">{src(i)}</code></div>
+                    </div>
+                  {/if}
+                </div>
+              {:else}
+                {#if pState.status === 'loading'}
+                  <div class="page-loading-overlay" aria-label="Loading page {i + 1}">
+                    <span class="spin"><Icon name="spinner" size={24} stroke={3} /></span>
+                    <span class="page-badge">Page {i + 1}</span>
+                  </div>
+                {/if}
+                <img
+                  src={src(i)}
+                  alt="Page {i + 1} of {count}"
+                  draggable="false"
+                  class:loading-img={pState.status !== 'loaded'}
+                  onload={(e) => handleImageLoad(i, e.currentTarget as HTMLImageElement)}
+                  onerror={() => handleImageError(i)}
+                />
+              {/if}
+            </div>
           {/each}
         </div>
       {/key}
@@ -637,14 +716,55 @@
       ontouchcancel={() => (held = false)}
     >
       {#each pages as i (i)}
+        {@const pState = pageMgr.get(i)}
         <div class="frame" data-page={i} style:aspect-ratio={shapes[i] ?? '2 / 3'} style:max-width="{p.width * zoom}px" style:margin-bottom="{p.gap}px">
-          {#if broken[i]}
-            <div class="panel message">
-              <strong>Page {i + 1} did not load.</strong>
-              <button class="btn" onclick={() => retry(i)}>Try again</button>
+          {#if pState.status === 'retrying'}
+            <div class="panel page-card retrying" role="status">
+              <span class="spin"><Icon name="spinner" size={28} stroke={3} /></span>
+              <strong class="display">PAGE {i + 1} COULDN'T LOAD</strong>
+              <span class="muted">Retrying… (attempt {pState.retryCount} of {MAX_AUTO_RETRIES})</span>
+            </div>
+          {:else if pState.status === 'failed'}
+            <div class="panel page-card failed" role="alert">
+              <strong class="display">PAGE {i + 1} COULDN'T LOAD</strong>
+              <p class="muted">{pState.error ?? 'The image failed to load or decode.'}</p>
+              <div class="tools">
+                <button class="btn spot" onclick={() => retryPage(i)}>
+                  <Icon name="refresh" size={16} />Retry
+                </button>
+                <button class="btn" aria-expanded={showingDetails[i]} onclick={() => (showingDetails[i] = !showingDetails[i])}>
+                  Details
+                </button>
+              </div>
+              {#if showingDetails[i]}
+                <div class="diag">
+                  <div><span>Status:</span> <code>{pState.status}</code></div>
+                  <div><span>Attempt:</span> <code>{pState.attempt + 1}</code></div>
+                  <div><span>Error:</span> <code>{pState.errorType ?? 'network'}</code></div>
+                  <div><span>Duration:</span> <code>{pState.durationMs ? `${pState.durationMs}ms` : '—'}</code></div>
+                  <div><span>URL:</span> <code class="url">{src(i)}</code></div>
+                </div>
+              {/if}
             </div>
           {:else if near[i]}
-            <img src={src(i)} alt="Page {i + 1} of {count}" draggable="false" onload={(e) => measured(i, e.currentTarget as HTMLImageElement)} onerror={() => (broken[i] = true)} />
+            {#if pState.status === 'loading'}
+              <div class="page-loading-overlay" aria-label="Loading page {i + 1}">
+                <span class="spin"><Icon name="spinner" size={24} stroke={3} /></span>
+                <span class="page-badge">Page {i + 1}</span>
+              </div>
+            {/if}
+            <img
+              src={src(i)}
+              alt="Page {i + 1} of {count}"
+              draggable="false"
+              class:loading-img={pState.status !== 'loaded'}
+              onload={(e) => handleImageLoad(i, e.currentTarget as HTMLImageElement)}
+              onerror={() => handleImageError(i)}
+            />
+          {:else}
+            <div class="page-standby">
+              <span class="muted">Page {i + 1}</span>
+            </div>
           {/if}
         </div>
       {/each}
@@ -862,7 +982,129 @@
 
   .stage[data-fit='width'] .two img,
   .stage[data-fit='screen'] .two img {
+    width: 100%;
+  }
+
+  .page-container {
+    position: relative;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 0;
+  }
+
+  .stage[data-fit='height'] .page-container {
+    height: calc((100dvh - env(safe-area-inset-top, 0px)) * var(--z));
+  }
+
+  .stage[data-fit='width'] .page-container {
+    width: 100%;
+  }
+
+  .stage[data-fit='screen'] .page-container {
+    width: 100%;
+    height: 100%;
+  }
+
+  .stage[data-fit='width'] .two .page-container,
+  .stage[data-fit='screen'] .two .page-container {
     width: 50%;
+  }
+
+  .stage[data-fit='screen'] .two .page-container:first-child img {
+    object-position: right center;
+  }
+
+  .stage[data-fit='screen'] .two .page-container:last-child img {
+    object-position: left center;
+  }
+
+  .stage[data-fit='screen'] .two.rtl .page-container:first-child img {
+    object-position: left center;
+  }
+
+  .stage[data-fit='screen'] .two.rtl .page-container:last-child img {
+    object-position: right center;
+  }
+
+  .page-loading-overlay {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    background: var(--surface);
+    color: var(--ink);
+    opacity: 0.88;
+    z-index: 1;
+    pointer-events: none;
+  }
+
+  .page-badge {
+    font-size: 13px;
+    font-weight: 900;
+    letter-spacing: 0.05em;
+  }
+
+  .loading-img {
+    opacity: 0;
+  }
+
+  .page-card {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+    padding: 24px;
+    margin: auto;
+    width: min(340px, 90%);
+    background: var(--surface);
+    color: var(--ink);
+    border: 3px solid var(--ink);
+    box-shadow: 4px 4px 0 var(--ink);
+    text-align: center;
+    z-index: 2;
+  }
+
+  .page-card.retrying {
+    border-style: dashed;
+  }
+
+  .page-card .diag {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    width: 100%;
+    margin-top: 10px;
+    padding: 8px 12px;
+    background: var(--paper);
+    color: var(--ink);
+    border: 2px solid var(--ink);
+    font-size: 11px;
+    text-align: left;
+  }
+
+  .page-card .diag div {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+  }
+
+  .page-card .diag .url {
+    word-break: break-all;
+    max-width: 180px;
+  }
+
+  .page-standby {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    height: 100%;
+    background: var(--surface);
+    opacity: 0.25;
   }
 
   /* Two pages meet at the spine, whichever side each is on. */
