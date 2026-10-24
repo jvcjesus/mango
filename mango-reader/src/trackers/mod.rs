@@ -35,7 +35,12 @@ pub enum Kind {
 }
 
 impl Kind {
-    const ALL: [Kind; 4] = [Kind::AniList, Kind::MyAnimeList, Kind::Kitsu, Kind::MangaUpdates];
+    const ALL: [Kind; 4] = [
+        Kind::AniList,
+        Kind::MyAnimeList,
+        Kind::Kitsu,
+        Kind::MangaUpdates,
+    ];
 
     /// The tracker's id in Mihon, which backups carry.
     pub fn id(self) -> i64 {
@@ -72,15 +77,45 @@ impl Kind {
     /// The statuses in the order shown, by Mihon's numbers. On MangaUpdates they are its lists.
     fn statuses(self) -> &'static [(i32, &'static str)] {
         match self {
-            Kind::AniList => &[(1, "Reading"), (2, "Completed"), (3, "Paused"), (4, "Dropped"), (5, "Planning"), (6, "Rereading")],
-            Kind::MyAnimeList => &[(1, "Reading"), (2, "Completed"), (3, "On hold"), (4, "Dropped"), (6, "Plan to read"), (7, "Rereading")],
-            Kind::Kitsu => &[(1, "Reading"), (2, "Completed"), (3, "On hold"), (4, "Dropped"), (5, "Want to read")],
-            Kind::MangaUpdates => &[(0, "Reading"), (1, "Wish list"), (2, "Complete"), (3, "Unfinished"), (4, "On hold")],
+            Kind::AniList => &[
+                (1, "Reading"),
+                (2, "Completed"),
+                (3, "Paused"),
+                (4, "Dropped"),
+                (5, "Planning"),
+                (6, "Rereading"),
+            ],
+            Kind::MyAnimeList => &[
+                (1, "Reading"),
+                (2, "Completed"),
+                (3, "On hold"),
+                (4, "Dropped"),
+                (6, "Plan to read"),
+                (7, "Rereading"),
+            ],
+            Kind::Kitsu => &[
+                (1, "Reading"),
+                (2, "Completed"),
+                (3, "On hold"),
+                (4, "Dropped"),
+                (5, "Want to read"),
+            ],
+            Kind::MangaUpdates => &[
+                (0, "Reading"),
+                (1, "Wish list"),
+                (2, "Complete"),
+                (3, "Unfinished"),
+                (4, "On hold"),
+            ],
         }
     }
 
     fn reading(self) -> i32 {
-        if self == Kind::MangaUpdates { 0 } else { 1 }
+        if self == Kind::MangaUpdates {
+            0
+        } else {
+            1
+        }
     }
 
     fn completed(self) -> i32 {
@@ -163,16 +198,16 @@ pub struct Info {
 }
 
 /// A title as a tracker's search lists it.
-#[derive(Serialize, Debug)]
+#[derive(Serialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Found {
-    media_id: i64,
-    title: String,
-    summary: String,
-    kind: String,
-    year: Option<i64>,
-    total_chapters: i64,
-    url: String,
+    pub media_id: i64,
+    pub title: String,
+    pub summary: String,
+    pub kind: String,
+    pub year: Option<i64>,
+    pub total_chapters: i64,
+    pub url: String,
 }
 
 /// The search result the owner picked for a title.
@@ -197,13 +232,15 @@ pub struct Change {
 }
 
 /// The owner's entry for a title on a tracker, in the units a link is stored in.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Entry {
     pub(crate) library_id: i64,
     pub(crate) status: i32,
     pub(crate) last_chapter_read: f64,
+    pub(crate) last_volume_read: f64,
     pub(crate) score: f64,
     pub(crate) total_chapters: i64,
+    pub(crate) total_volumes: i64,
 }
 
 /// A title's link to a tracker.
@@ -238,12 +275,22 @@ fn tracker_error(message: String) -> AppError {
 }
 
 fn signed_out(kind: Kind) -> AppError {
-    AppError::new(409, "tracker_signed_out", format!("Sign in to {} again, in Settings", kind.name()))
+    AppError::new(
+        409,
+        "tracker_signed_out",
+        format!("Sign in to {} again, in Settings", kind.name()),
+    )
 }
 
 /// Sends a request and reads the answer as JSON, whatever its status.
 async fn ask(kind: Kind, request: RequestBuilder) -> Result<(StatusCode, Value)> {
-    let response = request.send().await.map_err(|e| tracker_error(format!("{} did not answer: {}", kind.name(), e.without_url())))?;
+    let response = request.send().await.map_err(|e| {
+        tracker_error(format!(
+            "{} did not answer: {}",
+            kind.name(),
+            e.without_url()
+        ))
+    })?;
     let status = response.status();
     let text = response.text().await.unwrap_or_default();
     Ok((status, serde_json::from_str(&text).unwrap_or(Value::Null)))
@@ -251,8 +298,21 @@ async fn ask(kind: Kind, request: RequestBuilder) -> Result<(StatusCode, Value)>
 
 /// What a tracker said went wrong, from the places they put it.
 fn said(body: &Value) -> String {
-    let places = [&body["errors"][0]["message"], &body["errors"][0]["detail"], &body["error_description"], &body["reason"], &body["message"], &body["error"]];
-    places.into_iter().find_map(Value::as_str).unwrap_or("no reason given").chars().take(200).collect()
+    let places = [
+        &body["errors"][0]["message"],
+        &body["errors"][0]["detail"],
+        &body["error_description"],
+        &body["reason"],
+        &body["message"],
+        &body["error"],
+    ];
+    places
+        .into_iter()
+        .find_map(Value::as_str)
+        .unwrap_or("no reason given")
+        .chars()
+        .take(200)
+        .collect()
 }
 
 /// Turns a refusal into an error that names the tracker. A 401 means the token is no good any more.
@@ -262,7 +322,12 @@ fn judge(kind: Kind, status: StatusCode, body: Value) -> Result<Value> {
     } else if status == StatusCode::UNAUTHORIZED {
         Err(signed_out(kind))
     } else {
-        Err(tracker_error(format!("{} answered {}: {}", kind.name(), status.as_u16(), said(&body))))
+        Err(tracker_error(format!(
+            "{} answered {}: {}",
+            kind.name(),
+            status.as_u16(),
+            said(&body)
+        )))
     }
 }
 
@@ -276,7 +341,11 @@ async fn call(kind: Kind, request: RequestBuilder) -> Result<Value> {
 async fn sign_in(kind: Kind, request: RequestBuilder) -> Result<Value> {
     let (status, body) = ask(kind, request).await?;
     if status.is_client_error() {
-        return Err(AppError::new(422, "tracker_login", format!("{} did not accept that: {}", kind.name(), said(&body))));
+        return Err(AppError::new(
+            422,
+            "tracker_login",
+            format!("{} did not accept that: {}", kind.name(), said(&body)),
+        ));
     }
     judge(kind, status, body)
 }
@@ -296,7 +365,10 @@ fn text(value: &Value) -> String {
 
 /// A number that some trackers send as text.
 fn whole(value: &Value) -> i64 {
-    value.as_i64().or_else(|| value.as_str()?.parse().ok()).unwrap_or(0)
+    value
+        .as_i64()
+        .or_else(|| value.as_str()?.parse().ok())
+        .unwrap_or(0)
 }
 
 /// "ONE_SHOT" as "one shot".
@@ -306,7 +378,10 @@ fn label(value: &Value) -> String {
 
 /// The year of a date like "2019-03-01", or of a bare number.
 fn year(value: &Value) -> Option<i64> {
-    value.as_i64().or_else(|| value.as_str()?.get(..4)?.parse().ok()).filter(|year| *year > 0)
+    value
+        .as_i64()
+        .or_else(|| value.as_str()?.get(..4)?.parse().ok())
+        .filter(|year| *year > 0)
 }
 
 /// A summary for a search result: tags out, a few lines at most.
@@ -330,7 +405,8 @@ fn plain(value: &Value) -> String {
 /// Random letters for a sign-in's secrets.
 fn secret(bytes: usize) -> Result<String> {
     let mut raw = vec![0u8; bytes];
-    getrandom::getrandom(&mut raw).map_err(|e| AppError::internal(format!("no random bytes: {e}")))?;
+    getrandom::getrandom(&mut raw)
+        .map_err(|e| AppError::internal(format!("no random bytes: {e}")))?;
     Ok(URL_SAFE_NO_PAD.encode(raw))
 }
 
@@ -358,15 +434,23 @@ fn track_row(r: &Row) -> rusqlite::Result<Track> {
 }
 
 fn tracks(conn: &Connection, manga: i64) -> Result<Vec<Track>> {
-    let mut stmt = conn.prepare_cached(&format!("SELECT {COLUMNS} FROM tracks WHERE manga_id = ?1 ORDER BY tracker"))?;
-    let rows = stmt.query_map([manga], track_row)?.collect::<rusqlite::Result<_>>()?;
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {COLUMNS} FROM tracks WHERE manga_id = ?1 ORDER BY tracker"
+    ))?;
+    let rows = stmt
+        .query_map([manga], track_row)?
+        .collect::<rusqlite::Result<_>>()?;
     Ok(rows)
 }
 
 fn track(conn: &Connection, manga: i64, kind: Kind) -> Result<Track> {
-    conn.query_row(&format!("SELECT {COLUMNS} FROM tracks WHERE manga_id = ?1 AND tracker = ?2"), [manga, kind.id()], track_row)
-        .optional()?
-        .ok_or_else(|| AppError::not_found(format!("This title is not linked to {}", kind.name())))
+    conn.query_row(
+        &format!("SELECT {COLUMNS} FROM tracks WHERE manga_id = ?1 AND tracker = ?2"),
+        [manga, kind.id()],
+        track_row,
+    )
+    .optional()?
+    .ok_or_else(|| AppError::not_found(format!("This title is not linked to {}", kind.name())))
 }
 
 /// Writes a link. What a backup brought along and Mango does not change, the dates, stays.
@@ -396,7 +480,11 @@ fn store(conn: &Connection, manga: i64, track: &Track) -> Result<()> {
 
 /// The highest number among a title's read chapters, in whole chapters; 0 when none is read or numbered.
 fn reached(conn: &Connection, manga: i64) -> Result<f64> {
-    let highest: f64 = conn.query_row("SELECT COALESCE(MAX(chapter_number), 0) FROM chapters WHERE manga_id = ?1 AND read", [manga], |r| r.get(0))?;
+    let highest: f64 = conn.query_row(
+        "SELECT COALESCE(MAX(chapter_number), 0) FROM chapters WHERE manga_id = ?1 AND read",
+        [manga],
+        |r| r.get(0),
+    )?;
     Ok(highest.clamp(0.0, MAX_CHAPTER).floor())
 }
 
@@ -404,7 +492,8 @@ fn infos(conn: &Connection) -> Result<Vec<Info>> {
     Kind::ALL
         .into_iter()
         .map(|kind| {
-            let account: Option<Account> = db::state(conn, &key(kind))?.and_then(|text| serde_json::from_str(&text).ok());
+            let account: Option<Account> =
+                db::state(conn, &key(kind))?.and_then(|text| serde_json::from_str(&text).ok());
             let (score_scale, score_step) = kind.score();
             Ok(Info {
                 id: kind.id(),
@@ -412,7 +501,11 @@ fn infos(conn: &Connection) -> Result<Vec<Info>> {
                 login: kind.login(),
                 signed_in: account.is_some(),
                 user_name: account.map(|account| account.user_name),
-                statuses: kind.statuses().iter().map(|&(value, label)| Choice { value, label }).collect(),
+                statuses: kind
+                    .statuses()
+                    .iter()
+                    .map(|&(value, label)| Choice { value, label })
+                    .collect(),
                 score_scale,
                 score_step,
             })
@@ -466,7 +559,12 @@ impl Trackers {
             .timeout(Duration::from_secs(30))
             .build()
             .map_err(|e| AppError::internal(e.to_string()))?;
-        Ok(Self { db, http, sending: Arc::default(), renewing: Arc::default() })
+        Ok(Self {
+            db,
+            http,
+            sending: Arc::default(),
+            renewing: Arc::default(),
+        })
     }
 
     /// Every tracker, and who is signed in to it.
@@ -476,17 +574,29 @@ impl Trackers {
 
     /// The trackers and a title's links to them. From the database alone.
     pub async fn view(&self, manga: i64) -> Result<View> {
-        self.db.call(move |conn| Ok(View { trackers: infos(conn)?, tracks: tracks(conn, manga)? })).await
+        self.db
+            .call(move |conn| {
+                Ok(View {
+                    trackers: infos(conn)?,
+                    tracks: tracks(conn, manga)?,
+                })
+            })
+            .await
     }
 
     async fn stored(&self, kind: Kind) -> Result<Option<Account>> {
-        let text = self.db.call(move |conn| db::state(conn, &key(kind))).await?;
+        let text = self
+            .db
+            .call(move |conn| db::state(conn, &key(kind)))
+            .await?;
         Ok(text.and_then(|text| serde_json::from_str(&text).ok()))
     }
 
     async fn keep(&self, kind: Kind, account: &Account) -> Result<()> {
         let text = serde_json::to_string(account).map_err(|e| AppError::internal(e.to_string()))?;
-        self.db.call(move |conn| db::set_state(conn, &key(kind), &text)).await
+        self.db
+            .call(move |conn| db::set_state(conn, &key(kind), &text))
+            .await
     }
 
     pub fn http(&self) -> &Client {
@@ -516,18 +626,43 @@ impl Trackers {
     }
 
     /// Starts a sign-in that goes through the tracker's own page. Answers with that page's address.
-    pub async fn authorize(&self, kind: Kind, client_id: String, redirect: String) -> Result<String> {
+    pub async fn authorize(
+        &self,
+        kind: Kind,
+        client_id: String,
+        redirect: String,
+    ) -> Result<String> {
         if kind != Kind::MyAnimeList {
-            return Err(AppError::bad_request(format!("{} has no page to sign in through", kind.name())));
+            return Err(AppError::bad_request(format!(
+                "{} has no page to sign in through",
+                kind.name()
+            )));
         }
         let client_id = client_id.trim().to_owned();
-        if client_id.is_empty() || !(redirect.starts_with("http://") || redirect.starts_with("https://")) {
-            return Err(AppError::bad_request("A client id and the address to come back to are needed"));
+        if client_id.is_empty()
+            || !(redirect.starts_with("http://") || redirect.starts_with("https://"))
+        {
+            return Err(AppError::bad_request(
+                "A client id and the address to come back to are needed",
+            ));
         }
-        let pending = Pending { client_id, verifier: secret(48)?, state: secret(16)?, redirect };
-        let url = mal::authorize_url(&pending.client_id, &pending.verifier, &pending.state, &pending.redirect)?;
-        let text = serde_json::to_string(&pending).map_err(|e| AppError::internal(e.to_string()))?;
-        self.db.call(move |conn| db::set_state(conn, PENDING, &text)).await?;
+        let pending = Pending {
+            client_id,
+            verifier: secret(48)?,
+            state: secret(16)?,
+            redirect,
+        };
+        let url = mal::authorize_url(
+            &pending.client_id,
+            &pending.verifier,
+            &pending.state,
+            &pending.redirect,
+        )?;
+        let text =
+            serde_json::to_string(&pending).map_err(|e| AppError::internal(e.to_string()))?;
+        self.db
+            .call(move |conn| db::set_state(conn, PENDING, &text))
+            .await?;
         Ok(url)
     }
 
@@ -535,16 +670,35 @@ impl Trackers {
         let account = match kind {
             Kind::AniList => anilist::login(&self.http, &given.token).await?,
             Kind::Kitsu => kitsu::login(&self.http, given.username.trim(), &given.password).await?,
-            Kind::MangaUpdates => mangaupdates::login(&self.http, given.username.trim(), &given.password).await?,
+            Kind::MangaUpdates => {
+                mangaupdates::login(&self.http, given.username.trim(), &given.password).await?
+            }
             Kind::MyAnimeList => {
                 let started = self.db.call(|conn| db::state(conn, PENDING)).await?;
                 let pending: Pending = started
                     .and_then(|text| serde_json::from_str(&text).ok())
-                    .ok_or_else(|| AppError::new(409, "tracker_login", "Start the sign-in to MyAnimeList again"))?;
+                    .ok_or_else(|| {
+                        AppError::new(
+                            409,
+                            "tracker_login",
+                            "Start the sign-in to MyAnimeList again",
+                        )
+                    })?;
                 if given.code.is_empty() || given.state != pending.state {
-                    return Err(AppError::new(422, "tracker_login", "This is not the answer to the sign-in Mango started. Start it again."));
+                    return Err(AppError::new(
+                        422,
+                        "tracker_login",
+                        "This is not the answer to the sign-in Mango started. Start it again.",
+                    ));
                 }
-                let account = mal::login(&self.http, &pending.client_id, &given.code, &pending.verifier, &pending.redirect).await?;
+                let account = mal::login(
+                    &self.http,
+                    &pending.client_id,
+                    &given.code,
+                    &pending.verifier,
+                    &pending.redirect,
+                )
+                .await?;
                 self.db.call(|conn| db::forget_state(conn, PENDING)).await?;
                 account
             }
@@ -554,7 +708,9 @@ impl Trackers {
 
     /// Forgets the account. The links stay, and go on when someone signs in again.
     pub async fn logout(&self, kind: Kind) -> Result<()> {
-        self.db.call(move |conn| db::forget_state(conn, &key(kind))).await
+        self.db
+            .call(move |conn| db::forget_state(conn, &key(kind)))
+            .await
     }
 
     pub async fn search(&self, kind: Kind, query: &str) -> Result<Vec<Found>> {
@@ -591,7 +747,13 @@ impl Trackers {
 
     /// Brings a link and the tracker's entry together: the tracker's status and score, the
     /// further chapter of the two. Sends Mango's side when it is ahead or the entry is new.
-    async fn settle(&self, kind: Kind, account: &Account, track: &mut Track, reached: f64) -> Result<()> {
+    async fn settle(
+        &self,
+        kind: Kind,
+        account: &Account,
+        track: &mut Track,
+        reached: f64,
+    ) -> Result<()> {
         let theirs = self.find(kind, account, track.media_id).await?;
         let target = track.last_chapter_read.max(reached);
         let known = theirs.is_some();
@@ -614,7 +776,9 @@ impl Trackers {
         let reached = self
             .db
             .call(move |conn| {
-                let known: Option<i64> = conn.query_row("SELECT id FROM manga WHERE id = ?1", [manga], |r| r.get(0)).optional()?;
+                let known: Option<i64> = conn
+                    .query_row("SELECT id FROM manga WHERE id = ?1", [manga], |r| r.get(0))
+                    .optional()?;
                 known.ok_or_else(|| AppError::not_found("No such title"))?;
                 reached(conn, manga)
             })
@@ -624,7 +788,9 @@ impl Trackers {
             library_id: 0,
             media_id: pick.media_id,
             // It is shown as a link, so it has to be one.
-            url: Some(pick.url).filter(|url| url.starts_with("https://")).unwrap_or_default(),
+            url: Some(pick.url)
+                .filter(|url| url.starts_with("https://"))
+                .unwrap_or_default(),
             title: pick.title.chars().take(300).collect(),
             last_chapter_read: 0.0,
             total_chapters: pick.total_chapters.max(0),
@@ -647,7 +813,10 @@ impl Trackers {
         let mut track = self.db.call(move |conn| track(conn, manga, kind)).await?;
         if let Some(status) = change.status {
             if !kind.statuses().iter().any(|(value, _)| *value == status) {
-                return Err(AppError::bad_request(format!("{} has no such status", kind.name())));
+                return Err(AppError::bad_request(format!(
+                    "{} has no such status",
+                    kind.name()
+                )));
             }
             track.status = status;
         }
@@ -676,7 +845,10 @@ impl Trackers {
     /// Looks at the tracker's entry again and settles the two sides.
     pub async fn refresh(&self, manga: i64, kind: Kind) -> Result<Track> {
         let account = self.account(kind).await?;
-        let (mut track, reached) = self.db.call(move |conn| Ok((track(conn, manga, kind)?, reached(conn, manga)?))).await?;
+        let (mut track, reached) = self
+            .db
+            .call(move |conn| Ok((track(conn, manga, kind)?, reached(conn, manga)?)))
+            .await?;
         self.settle(kind, &account, &mut track, reached).await?;
         self.db
             .call(move |conn| {
@@ -688,9 +860,20 @@ impl Trackers {
 
     /// Takes the link away. The entry on the tracker stays as it is.
     pub async fn unbind(&self, manga: i64, kind: Kind) -> Result<()> {
-        let gone = self.db.call(move |conn| Ok(conn.execute("DELETE FROM tracks WHERE manga_id = ?1 AND tracker = ?2", [manga, kind.id()])?)).await?;
+        let gone = self
+            .db
+            .call(move |conn| {
+                Ok(conn.execute(
+                    "DELETE FROM tracks WHERE manga_id = ?1 AND tracker = ?2",
+                    [manga, kind.id()],
+                )?)
+            })
+            .await?;
         match gone {
-            0 => Err(AppError::not_found(format!("This title is not linked to {}", kind.name()))),
+            0 => Err(AppError::not_found(format!(
+                "This title is not linked to {}",
+                kind.name()
+            ))),
             _ => Ok(()),
         }
     }
@@ -710,7 +893,18 @@ impl Trackers {
     pub fn read_chapter(&self, chapter: i64) {
         let this = self.clone();
         tokio::spawn(async move {
-            let manga = this.db.call(move |conn| Ok(conn.query_row("SELECT manga_id FROM chapters WHERE id = ?1", [chapter], |r| r.get(0)).optional()?)).await;
+            let manga = this
+                .db
+                .call(move |conn| {
+                    Ok(conn
+                        .query_row(
+                            "SELECT manga_id FROM chapters WHERE id = ?1",
+                            [chapter],
+                            |r| r.get(0),
+                        )
+                        .optional()?)
+                })
+                .await;
             match manga {
                 Ok(Some(manga)) => {
                     if let Err(e) = this.follow(manga).await {
@@ -730,7 +924,11 @@ impl Trackers {
             .db
             .call(move |conn| {
                 let links = tracks(conn, manga)?;
-                let reached = if links.is_empty() { 0.0 } else { reached(conn, manga)? };
+                let reached = if links.is_empty() {
+                    0.0
+                } else {
+                    reached(conn, manga)?
+                };
                 Ok((links, reached))
             })
             .await?;
@@ -739,7 +937,9 @@ impl Trackers {
         }
         let _one = self.sending.lock().await;
         for mut track in links {
-            let Some(kind) = Kind::from_id(track.tracker) else { continue };
+            let Some(kind) = Kind::from_id(track.tracker) else {
+                continue;
+            };
             if !advance(kind, &mut track, reached) && track.error.is_none() {
                 continue;
             }
@@ -799,7 +999,11 @@ mod tests {
         for kind in Kind::ALL {
             assert_eq!(Kind::from_id(kind.id()), Some(kind));
             for status in [kind.reading(), kind.completed(), kind.planned()] {
-                assert!(kind.statuses().iter().any(|(value, _)| *value == status), "{} has status {status}", kind.name());
+                assert!(
+                    kind.statuses().iter().any(|(value, _)| *value == status),
+                    "{} has status {status}",
+                    kind.name()
+                );
             }
         }
         assert_eq!(Kind::ALL.map(Kind::id), [2, 1, 3, 7]);
@@ -810,7 +1014,11 @@ mod tests {
     fn progress_only_moves_forward() {
         let mut track = link(Kind::AniList, 5, 0.0, 12);
         assert!(advance(Kind::AniList, &mut track, 3.0));
-        assert_eq!((track.last_chapter_read, track.status), (3.0, 1), "a planned title that is read is being read");
+        assert_eq!(
+            (track.last_chapter_read, track.status),
+            (3.0, 1),
+            "a planned title that is read is being read"
+        );
         assert!(!advance(Kind::AniList, &mut track, 2.0));
         assert!(!advance(Kind::AniList, &mut track, 3.0));
         assert_eq!(track.last_chapter_read, 3.0, "never back");
@@ -823,7 +1031,10 @@ mod tests {
 
         let mut list = link(Kind::MangaUpdates, 1, 0.0, 0);
         assert!(advance(Kind::MangaUpdates, &mut list, 40.0));
-        assert_eq!(list.status, 0, "from the wish list to the reading list; no total, so never complete");
+        assert_eq!(
+            list.status, 0,
+            "from the wish list to the reading list; no total, so never complete"
+        );
     }
 
     #[test]
@@ -836,16 +1047,37 @@ mod tests {
         store(&conn, 1, &track).unwrap();
         store(&conn, 1, &link(Kind::Kitsu, 5, 0.0, 0)).unwrap();
         assert_eq!(super::track(&conn, 1, Kind::AniList).unwrap(), track);
-        assert_eq!(tracks(&conn, 1).unwrap().iter().map(|t| t.tracker).collect::<Vec<_>>(), [2, 3]);
-        assert_eq!(super::track(&conn, 1, Kind::MyAnimeList).unwrap_err().code, "not_found");
-        let started: i64 = conn.query_row("SELECT started_at FROM tracks WHERE tracker = 2", [], |r| r.get(0)).unwrap();
-        assert_eq!(started, 1_700_000_000_000, "what Mango does not change is kept");
+        assert_eq!(
+            tracks(&conn, 1)
+                .unwrap()
+                .iter()
+                .map(|t| t.tracker)
+                .collect::<Vec<_>>(),
+            [2, 3]
+        );
+        assert_eq!(
+            super::track(&conn, 1, Kind::MyAnimeList).unwrap_err().code,
+            "not_found"
+        );
+        let started: i64 = conn
+            .query_row("SELECT started_at FROM tracks WHERE tracker = 2", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(
+            started, 1_700_000_000_000,
+            "what Mango does not change is kept"
+        );
     }
 
     #[test]
     fn reached_is_the_highest_read_chapter() {
         let conn = database();
-        assert_eq!(reached(&conn, 1).unwrap(), 2.0, "whole chapters; the unread third does not count");
+        assert_eq!(
+            reached(&conn, 1).unwrap(),
+            2.0,
+            "whole chapters; the unread third does not count"
+        );
         conn.execute("UPDATE chapters SET read = 0", []).unwrap();
         assert_eq!(reached(&conn, 1).unwrap(), 0.0);
         assert_eq!(reached(&conn, 99).unwrap(), 0.0);
@@ -855,24 +1087,56 @@ mod tests {
     fn accounts_show_without_their_tokens() {
         let conn = database();
         assert!(infos(&conn).unwrap().iter().all(|info| !info.signed_in));
-        let account = Account { token: "secret-token".into(), user_name: "reader".into(), ..Account::default() };
-        db::set_state(&conn, &key(Kind::Kitsu), &serde_json::to_string(&account).unwrap()).unwrap();
+        let account = Account {
+            token: "secret-token".into(),
+            user_name: "reader".into(),
+            ..Account::default()
+        };
+        db::set_state(
+            &conn,
+            &key(Kind::Kitsu),
+            &serde_json::to_string(&account).unwrap(),
+        )
+        .unwrap();
         let shown = serde_json::to_string(&infos(&conn).unwrap()).unwrap();
         assert!(shown.contains(r#""signedIn":true,"userName":"reader""#));
         assert!(!shown.contains("secret-token"));
-        assert!(crate::settings::all(&conn).unwrap().is_empty(), "and the settings API has no way to them");
+        assert!(
+            crate::settings::all(&conn).unwrap().is_empty(),
+            "and the settings API has no way to them"
+        );
     }
 
     #[test]
     fn answers_are_read_loosely() {
-        assert_eq!(plain(&json!("A <i>quiet</i> town.<br><br>\nThen it rains.")), "A quiet town. Then it rains.");
+        assert_eq!(
+            plain(&json!("A <i>quiet</i> town.<br><br>\nThen it rains.")),
+            "A quiet town. Then it rains."
+        );
         assert_eq!(plain(&json!("ab".repeat(200))).chars().count(), 281);
         assert_eq!(plain(&Value::Null), "");
-        assert_eq!((whole(&json!("42")), whole(&json!(42)), whole(&json!(null))), (42, 42, 0));
-        assert_eq!((year(&json!("2019-03-01")), year(&json!(2019)), year(&json!("")), year(&json!(0))), (Some(2019), Some(2019), None, None));
+        assert_eq!(
+            (whole(&json!("42")), whole(&json!(42)), whole(&json!(null))),
+            (42, 42, 0)
+        );
+        assert_eq!(
+            (
+                year(&json!("2019-03-01")),
+                year(&json!(2019)),
+                year(&json!("")),
+                year(&json!(0))
+            ),
+            (Some(2019), Some(2019), None, None)
+        );
         assert_eq!(label(&json!("ONE_SHOT")), "one shot");
-        assert_eq!(said(&json!({ "errors": [{ "message": "Invalid token" }] })), "Invalid token");
-        assert_eq!(said(&json!({ "status": "exception", "reason": "No such user" })), "No such user");
+        assert_eq!(
+            said(&json!({ "errors": [{ "message": "Invalid token" }] })),
+            "Invalid token"
+        );
+        assert_eq!(
+            said(&json!({ "status": "exception", "reason": "No such user" })),
+            "No such user"
+        );
         assert_eq!(said(&Value::Null), "no reason given");
         assert_eq!(secret(48).unwrap().len(), 64);
     }
