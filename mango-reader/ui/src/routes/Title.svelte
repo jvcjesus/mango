@@ -73,8 +73,18 @@
   const chapters = $derived(title?.chapters ?? []);
   const unread = $derived(chapters.filter((c) => !c.read).length);
   const saved = $derived(chapters.filter((c) => c.downloaded).length);
+  const hasVolumes = $derived(
+    chapters.some((c) => (c.volume !== undefined && c.volume !== null) || parseVolume(c.name) !== null)
+  );
   // The order is kept for every title, on the server like the library's.
-  const view = $derived<View>({ ...DEFAULT, ...pref<Partial<View>>('title.view', {}) });
+  // When trustworthy volumes exist, default to volume view unless user explicitly chose otherwise.
+  // For chapter-only/manhwa titles without volume metadata, never force volume grouping.
+  const savedView = $derived(pref<Partial<View>>('title.view', {}));
+  const view = $derived<View>({
+    sort: savedView.sort ?? 'source',
+    down: savedView.down ?? true,
+    volumes: hasVolumes && (savedView.volumes !== undefined ? savedView.volumes : true),
+  });
 
   const hasUnknown = $derived(chapters.some((c) => !c.scanlator?.trim()));
   const namedGroups = $derived(
@@ -117,15 +127,34 @@
     return view.down ? list : list.reverse();
   });
   const filteredUnread = $derived(listed.filter((c) => !c.read && !c.downloaded));
-  const hasVolumes = $derived(chapters.some((c) => parseVolume(c.name) !== null));
-  type VolumeGroup = { volume: number | null; label: string; chapters: Chapter[] };
+  type VolumeGroup = {
+    volume: number | null;
+    label: string;
+    chapters: Chapter[];
+    downloadedCount: number;
+    missingCount: number;
+    isFullyDownloaded: boolean;
+    isPartiallyDownloaded: boolean;
+    isBusy: boolean;
+  };
   const volumeGroups = $derived.by<VolumeGroup[]>(() => {
     if (!view.volumes) {
-      return [{ volume: null, label: '', chapters: listed }];
+      const downloadedCount = listed.filter((c) => c.downloaded).length;
+      const missingCount = listed.filter((c) => !c.downloaded).length;
+      return [{
+        volume: null,
+        label: '',
+        chapters: listed,
+        downloadedCount,
+        missingCount,
+        isFullyDownloaded: listed.length > 0 && missingCount === 0,
+        isPartiallyDownloaded: downloadedCount > 0 && missingCount > 0,
+        isBusy: listed.some((c) => busyChapter[c.id]),
+      }];
     }
     const map = new Map<number | null, Chapter[]>();
     for (const c of listed) {
-      const vol = parseVolume(c.name);
+      const vol = c.volume !== undefined && c.volume !== null ? c.volume : parseVolume(c.name);
       const list = map.get(vol) ?? [];
       list.push(c);
       map.set(vol, list);
@@ -136,11 +165,20 @@
       if (b === null) return -1;
       return view.down ? b - a : a - b;
     });
-    return entries.map(([vol, chs]) => ({
-      volume: vol,
-      label: volumeHeading(vol),
-      chapters: chs,
-    }));
+    return entries.map(([vol, chs]) => {
+      const downloadedCount = chs.filter((c) => c.downloaded).length;
+      const missingCount = chs.filter((c) => !c.downloaded).length;
+      return {
+        volume: vol,
+        label: volumeHeading(vol),
+        chapters: chs,
+        downloadedCount,
+        missingCount,
+        isFullyDownloaded: chs.length > 0 && missingCount === 0,
+        isPartiallyDownloaded: downloadedCount > 0 && missingCount > 0,
+        isBusy: chs.some((c) => busyChapter[c.id]),
+      };
+    });
   });
   const nothing = $derived(
     !chapters.length
@@ -217,6 +255,36 @@
     } finally {
       downloading = false;
       for (const c of list) busyChapter[c.id] = false;
+    }
+  }
+
+  async function downloadVolume(grp: VolumeGroup) {
+    if (downloading) return;
+    const missing = grp.chapters.filter((c) => !c.downloaded && !busyChapter[c.id]);
+    if (!missing.length) return;
+    for (const c of missing) busyChapter[c.id] = true;
+    try {
+      const answer = await send<{ queued: number }>('POST', '/downloads', { chapters: missing.map((c) => c.id) });
+      const queuedCount = answer.queued;
+      const volName = grp.volume !== null ? `Volume ${grp.volume}` : 'Chapters';
+      if (queuedCount === missing.length) {
+        const text = `Queued ${volName} (${queuedCount} ${queuedCount === 1 ? 'chapter' : 'chapters'}) for download.`;
+        note = text;
+        toast.info(text, { action: { label: 'See downloads', run: () => (location.hash = '#/downloads') } });
+      } else if (queuedCount > 0) {
+        const text = `Queued ${queuedCount} of ${missing.length} chapters for ${volName}.`;
+        note = text;
+        toast.info(text, { action: { label: 'See downloads', run: () => (location.hash = '#/downloads') } });
+      } else {
+        const text = `All chapters for ${volName} already saved or queued.`;
+        note = text;
+        toast.info(text);
+      }
+    } catch (e) {
+      refreshError = message(e);
+      toast.error(`Failed to queue ${grp.label}: ${refreshError}`);
+    } finally {
+      for (const c of missing) busyChapter[c.id] = false;
     }
   }
 
@@ -538,8 +606,50 @@
         {#each volumeGroups as grp (grp.volume ?? 'unassigned')}
           {#if grp.label}
             <div class="volume-header">
-              <h3 class="display">{grp.label}</h3>
-              <span class="tag">{grp.chapters.length} {grp.chapters.length === 1 ? 'chapter' : 'chapters'}</span>
+              <div class="volume-info">
+                <h3 class="display">{grp.label}</h3>
+                <span class="tag">{grp.chapters.length} {grp.chapters.length === 1 ? 'chapter' : 'chapters'}</span>
+                {#if grp.isFullyDownloaded}
+                  <span class="tag spot">Downloaded</span>
+                {:else if grp.isPartiallyDownloaded}
+                  <span class="tag">{grp.downloadedCount}/{grp.chapters.length} saved</span>
+                {/if}
+              </div>
+              {#if grp.volume !== null}
+                <div class="volume-actions">
+                  {#if grp.isFullyDownloaded}
+                    <span class="tag spot"><Icon name="check" size={14} /> Complete</span>
+                  {:else if grp.isPartiallyDownloaded}
+                    <button
+                      class="btn pill"
+                      aria-label="Download missing chapters for {grp.label}"
+                      disabled={downloading || grp.isBusy || grp.missingCount === 0}
+                      onclick={() => downloadVolume(grp)}
+                    >
+                      {#if grp.isBusy}
+                        <span class="spin"><Icon name="spinner" size={14} stroke={3} /></span>
+                      {:else}
+                        <Icon name="download" size={14} />
+                      {/if}
+                      Missing ({grp.missingCount})
+                    </button>
+                  {:else}
+                    <button
+                      class="btn pill spot"
+                      aria-label="Download {grp.label}"
+                      disabled={downloading || grp.isBusy || !grp.chapters.length}
+                      onclick={() => downloadVolume(grp)}
+                    >
+                      {#if grp.isBusy}
+                        <span class="spin"><Icon name="spinner" size={14} stroke={3} /></span>
+                      {:else}
+                        <Icon name="download" size={14} />
+                      {/if}
+                      Download Volume
+                    </button>
+                  {/if}
+                </div>
+              {/if}
             </div>
           {/if}
           <ul class="rows">
@@ -548,8 +658,8 @@
                 <a class="main" href="#/read/{chapter.id}">
                   <strong>
                     {#if chapter.bookmark}<span class="kept"><Icon name="bookmark" size={14} fill /><span class="sr">Bookmarked.</span></span>{/if}
-                    {#if parseVolume(chapter.name) !== null && !view.volumes}
-                      <span class="tag vol">Vol. {parseVolume(chapter.name)}</span>
+                    {#if (chapter.volume !== undefined && chapter.volume !== null ? chapter.volume : parseVolume(chapter.name)) !== null && !view.volumes}
+                      <span class="tag vol">Vol. {chapter.volume ?? parseVolume(chapter.name)}</span>
                     {/if}
                     {chapter.name}
                   </strong>
@@ -903,11 +1013,25 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
+    gap: 8px;
     padding: 8px 12px;
     margin-top: 16px;
     background: var(--surface);
     border: 3px solid var(--ink);
     box-shadow: 2px 2px 0 var(--ink);
+  }
+
+  .volume-info {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .volume-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
   }
 
   .volume-header h3 {

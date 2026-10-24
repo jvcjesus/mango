@@ -806,3 +806,273 @@ describe('uploader/source filtering on Title page', () => {
     expect(res2.html).not.toContain('Vol. 1 Ch. 1 - Group A Edition');
   });
 });
+
+describe('first-class volume acquisition & release semantics', () => {
+  it('conservatively detects volume numbers and rejects chapter revisions', async () => {
+    const { parseVolume, parseRelease } = await import('./util');
+
+    // Fixture A: MangaDot-style chapter
+    expect(parseVolume('Chapter 1')).toBeNull();
+    const relA = parseRelease('Chapter 1', 1);
+    expect(relA.releaseType).toBe('chapter');
+    expect(relA.volume).toBeNull();
+    expect(relA.chapterNumber).toBe(1);
+
+    // Fixture B: Explicit volume-name data
+    expect(parseVolume('Vol. 1 Ch. 5')).toBe(1);
+    const relB = parseRelease('Vol. 1 Ch. 5', 5);
+    expect(relB.releaseType).toBe('chapter');
+    expect(relB.volume).toBe(1);
+    expect(relB.chapterNumber).toBe(5);
+
+    // Source-provided true volume artifact
+    expect(parseVolume('Volume 12')).toBe(12);
+    expect(parseVolume('Vol 12')).toBe(12);
+    const relVol = parseRelease('Volume 12', 12);
+    expect(relVol.releaseType).toBe('volume');
+    expect(relVol.volume).toBe(12);
+    expect(relVol.chapterNumber).toBeNull(); // No fake chapter number
+
+    // Volume 0
+    expect(parseVolume('Volume 0')).toBe(0);
+    expect(parseVolume('Vol. 0 Ch. 0.5')).toBe(0);
+
+    // Short notation
+    expect(parseVolume('v3 c20')).toBe(3);
+    const relShort = parseRelease('v3 c20', 20);
+    expect(relShort.releaseType).toBe('chapter');
+    expect(relShort.volume).toBe(3);
+    expect(relShort.chapterNumber).toBe(20);
+
+    // Chapter revisions (MUST NOT be treated as volumes)
+    expect(parseVolume('Chapter 5 v2')).toBeNull();
+    expect(parseVolume('Ch. 12 (v2)')).toBeNull();
+    const relRev = parseRelease('Chapter 5 v2', 5);
+    expect(relRev.releaseType).toBe('chapter');
+    expect(relRev.volume).toBeNull();
+    expect(relRev.chapterNumber).toBe(5);
+
+    // Unrelated numbers
+    expect(parseVolume('Season 2 14')).toBeNull();
+    expect(parseVolume('104.')).toBeNull();
+  });
+
+  it('renders chapter-only/manhwa titles without fake volume headers or volume toggle', async () => {
+    const { keep } = await import('./keep');
+    const { render } = await import('svelte/server');
+    const Title = (await import('../routes/Title.svelte')).default;
+
+    // Fixture C: Chapter-only manhwa
+    const manhwaTitle = {
+      id: 5001,
+      sourceId: '1',
+      sourceName: 'WebtoonSource',
+      sourceLang: 'en',
+      webUrl: 'https://example.com/manhwa/solo',
+      title: 'Level Up Solo',
+      artist: 'Artist',
+      author: 'Author',
+      description: 'Manhwa with no volumes',
+      genres: ['Action'],
+      status: 1,
+      cover: null,
+      inLibrary: false,
+      addedAt: null,
+      initialized: true,
+      readerMode: null,
+      readerFit: null,
+      autoDownload: false,
+      chaptersAt: 1000,
+      releaseDays: null,
+      categories: [],
+      chapters: [
+        { id: 1, name: 'Chapter 1', number: 1, scanlator: null, dateUpload: 1000, fetchedAt: 1000, read: false, lastPageRead: 0, pageCount: 30, downloaded: false, bookmark: false },
+        { id: 2, name: 'Chapter 2', number: 2, scanlator: null, dateUpload: 2000, fetchedAt: 2000, read: false, lastPageRead: 0, pageCount: 30, downloaded: false, bookmark: false },
+        { id: 3, name: 'Chapter 3', number: 3, scanlator: null, dateUpload: 3000, fetchedAt: 3000, read: false, lastPageRead: 0, pageCount: 30, downloaded: false, bookmark: false },
+      ],
+    };
+
+    keep('title', manhwaTitle);
+
+    const result = render(Title, { props: { id: 5001 } });
+    // Must NOT contain VOLUME 1
+    expect(result.html).not.toContain('VOLUME 1');
+    expect(result.html).not.toContain('OTHER CHAPTERS');
+    // All chapters are visible as flat list
+    expect(result.html).toContain('Chapter 1');
+    expect(result.html).toContain('Chapter 2');
+    expect(result.html).toContain('Chapter 3');
+  });
+
+  it('renders volume acquisition actions and download states (all, partial, missing)', async () => {
+    const { keep } = await import('./keep');
+    const { prefs } = await import('./prefs.svelte');
+    const { render } = await import('svelte/server');
+    const Title = (await import('../routes/Title.svelte')).default;
+
+    prefs.values['title.view'] = { volumes: true, sort: 'source', down: false };
+
+    const multiVolumeTitle = {
+      id: 5002,
+      sourceId: '1',
+      sourceName: 'MangaSource',
+      sourceLang: 'en',
+      webUrl: 'https://example.com/manga/multi-vol',
+      title: 'Multi Volume Manga',
+      artist: 'Artist',
+      author: 'Author',
+      description: 'Manga with multiple volumes',
+      genres: ['Adventure'],
+      status: 1,
+      cover: null,
+      inLibrary: false,
+      addedAt: null,
+      initialized: true,
+      readerMode: null,
+      readerFit: null,
+      autoDownload: false,
+      chaptersAt: 1000,
+      releaseDays: null,
+      categories: [],
+      chapters: [
+        // Volume 1: Both downloaded
+        { id: 11, name: 'Vol. 1 Ch. 1', number: 1, scanlator: 'ScanGroup', dateUpload: 1000, fetchedAt: 1000, read: false, lastPageRead: 0, pageCount: 20, downloaded: true, bookmark: false },
+        { id: 12, name: 'Vol. 1 Ch. 2', number: 2, scanlator: 'ScanGroup', dateUpload: 2000, fetchedAt: 2000, read: false, lastPageRead: 0, pageCount: 20, downloaded: true, bookmark: false },
+        // Volume 2: 1 of 2 downloaded (partial state)
+        { id: 21, name: 'Vol. 2 Ch. 3', number: 3, scanlator: 'ScanGroup', dateUpload: 3000, fetchedAt: 3000, read: false, lastPageRead: 0, pageCount: 20, downloaded: true, bookmark: false },
+        { id: 22, name: 'Vol. 2 Ch. 4', number: 4, scanlator: 'ScanGroup', dateUpload: 4000, fetchedAt: 4000, read: false, lastPageRead: 0, pageCount: 20, downloaded: false, bookmark: false },
+        // Volume 3: None downloaded
+        { id: 31, name: 'Vol. 3 Ch. 5', number: 5, scanlator: 'ScanGroup', dateUpload: 5000, fetchedAt: 5000, read: false, lastPageRead: 0, pageCount: 20, downloaded: false, bookmark: false },
+      ],
+    };
+
+    keep('title', multiVolumeTitle);
+
+    const result = render(Title, { props: { id: 5002 } });
+    expect(result.html).toContain('VOLUME 1');
+    expect(result.html).toContain('VOLUME 2');
+    expect(result.html).toContain('VOLUME 3');
+
+    // Volume 1 (complete)
+    expect(result.html).toContain('Downloaded');
+    expect(result.html).toContain('Complete');
+
+    // Volume 2 (partially downloaded)
+    expect(result.html).toContain('1/2 saved');
+    expect(result.html).toContain('Missing (1)');
+
+    // Volume 3 (not downloaded)
+    expect(result.html).toContain('Download Volume');
+  });
+
+  it('respects uploader filter in volume groups and keeps duplicate chapters distinct (Fixture D)', async () => {
+    const { keep } = await import('./keep');
+    const { prefs } = await import('./prefs.svelte');
+    const { render } = await import('svelte/server');
+    const Title = (await import('../routes/Title.svelte')).default;
+
+    prefs.values['title.view'] = { volumes: true, sort: 'source', down: false };
+
+    // Fixture D: Multiple uploaders with same chapter numbers
+    const duplicateChapterTitle = {
+      id: 5003,
+      sourceId: '1',
+      sourceName: 'MangaSource',
+      sourceLang: 'en',
+      webUrl: 'https://example.com/manga/dup',
+      title: 'Duplicate Chapter Manga',
+      artist: 'Artist',
+      author: 'Author',
+      description: 'Multiple uploaders release same chapter',
+      genres: ['Action'],
+      status: 1,
+      cover: null,
+      inLibrary: false,
+      addedAt: null,
+      initialized: true,
+      readerMode: null,
+      readerFit: null,
+      autoDownload: false,
+      chaptersAt: 1000,
+      releaseDays: null,
+      categories: [],
+      chapters: [
+        { id: 101, name: 'Volume 2 Chapter 10', number: 10, scanlator: 'Group A', dateUpload: 1000, fetchedAt: 1000, read: false, lastPageRead: 0, pageCount: 20, downloaded: false, bookmark: false },
+        { id: 102, name: 'Volume 2 Chapter 10', number: 10, scanlator: 'Group B', dateUpload: 2000, fetchedAt: 2000, read: false, lastPageRead: 0, pageCount: 20, downloaded: true, bookmark: false },
+      ],
+    };
+
+    // When unfiltered (All): both distinct releases exist in Volume 2
+    keep('title', duplicateChapterTitle);
+    keep('title.5003.uploader', '');
+
+    const resAll = render(Title, { props: { id: 5003 } });
+    expect(resAll.html).toContain('VOLUME 2');
+    expect(resAll.html).toContain('2 chapters');
+
+    // When filtered to Group A: only Group A's un-downloaded chapter is in Volume 2
+    keep('title.5003.uploader', 'Group A');
+    const resA = render(Title, { props: { id: 5003 } });
+    expect(resA.html).toContain('VOLUME 2');
+    expect(resA.html).toContain('1 chapter');
+    expect(resA.html).toContain('Download Volume');
+    expect(resA.html).not.toContain('Complete');
+
+    // When filtered to Group B: only Group B's downloaded chapter is in Volume 2
+    keep('title.5003.uploader', 'Group B');
+    const resB = render(Title, { props: { id: 5003 } });
+    expect(resB.html).toContain('VOLUME 2');
+    expect(resB.html).toContain('1 chapter');
+    expect(resB.html).toContain('Complete');
+    expect(resB.html).not.toContain('Download Volume');
+  });
+
+  it('handles mixed volume metadata by grouping known volumes and leaving unknown in OTHER CHAPTERS', async () => {
+    const { keep } = await import('./keep');
+    const { prefs } = await import('./prefs.svelte');
+    const { render } = await import('svelte/server');
+    const Title = (await import('../routes/Title.svelte')).default;
+
+    prefs.values['title.view'] = { volumes: true, sort: 'source', down: false };
+
+    const mixedTitle = {
+      id: 5004,
+      sourceId: '1',
+      sourceName: 'MangaSource',
+      sourceLang: 'en',
+      webUrl: 'https://example.com/manga/mixed',
+      title: 'Mixed Metadata Manga',
+      artist: 'Artist',
+      author: 'Author',
+      description: 'Some chapters have volumes, some do not',
+      genres: ['Fantasy'],
+      status: 1,
+      cover: null,
+      inLibrary: false,
+      addedAt: null,
+      initialized: true,
+      readerMode: null,
+      readerFit: null,
+      autoDownload: false,
+      chaptersAt: 1000,
+      releaseDays: null,
+      categories: [],
+      chapters: [
+        { id: 1, name: 'Vol. 1 Ch. 1', number: 1, scanlator: 'Group A', dateUpload: 1000, fetchedAt: 1000, read: false, lastPageRead: 0, pageCount: 20, downloaded: false, bookmark: false },
+        { id: 2, name: 'Vol. 1 Ch. 2', number: 2, scanlator: 'Group A', dateUpload: 2000, fetchedAt: 2000, read: false, lastPageRead: 0, pageCount: 20, downloaded: false, bookmark: false },
+        { id: 3, name: 'Chapter 3', number: 3, scanlator: 'Group B', dateUpload: 3000, fetchedAt: 3000, read: false, lastPageRead: 0, pageCount: 20, downloaded: false, bookmark: false },
+        { id: 4, name: 'Vol. 2 Ch. 4', number: 4, scanlator: 'Group A', dateUpload: 4000, fetchedAt: 4000, read: false, lastPageRead: 0, pageCount: 20, downloaded: false, bookmark: false },
+      ],
+    };
+
+    keep('title', mixedTitle);
+    keep('title.5004.uploader', '');
+
+    const res = render(Title, { props: { id: 5004 } });
+    expect(res.html).toContain('VOLUME 1');
+    expect(res.html).toContain('VOLUME 2');
+    expect(res.html).toContain('OTHER CHAPTERS');
+    // Volume headers have Download Volume, but OTHER CHAPTERS does not have "Download Volume"
+    expect(res.html).toContain('Download Volume');
+  });
+});

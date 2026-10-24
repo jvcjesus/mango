@@ -128,6 +128,9 @@ pub struct ChapterView {
     pub page_count: Option<i64>,
     pub downloaded: bool,
     pub bookmark: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub volume: Option<f64>,
+    pub release_type: crate::release::ReleaseType,
 }
 
 #[derive(Serialize)]
@@ -414,7 +417,7 @@ fn web_url(base: Option<String>, url: &str) -> Option<String> {
 }
 
 /// A chapter number read from its name, for sources that give none: "Vol.2 Ch. 10.5 - Rain" is 10.5.
-fn number_from_name(name: &str) -> f64 {
+pub(crate) fn number_from_name(name: &str) -> f64 {
     fn leading(text: &str) -> Option<f64> {
         let end = text.find(|c: char| !(c.is_ascii_digit() || c == '.')).unwrap_or(text.len());
         text[..end].trim_end_matches('.').parse().ok()
@@ -429,7 +432,7 @@ fn number_from_name(name: &str) -> f64 {
     let mut rest = lower.as_str();
     while let Some(at) = rest.find(|c: char| c.is_ascii_digit()) {
         let before = rest[..at].trim_end();
-        let volume = ["vol.", "vol", "volume", "season"].iter().any(|word| before.ends_with(word));
+        let volume = ["vol.", "vol", "volume", "season", "v", "v."].iter().any(|word| before.ends_with(word));
         let end = rest[at..].find(|c: char| !(c.is_ascii_digit() || c == '.')).map_or(rest.len(), |len| at + len);
         match leading(&rest[at..]) {
             Some(number) if !volume => return number,
@@ -465,10 +468,13 @@ pub(crate) fn rhythm(mut days: Vec<i64>) -> Option<(i64, i64)> {
 }
 
 fn chapter_row(r: &Row) -> rusqlite::Result<ChapterView> {
+    let name: String = r.get(1)?;
+    let number: f64 = r.get(2)?;
+    let release_info = crate::release::parse_release(&name, number);
     Ok(ChapterView {
         id: r.get(0)?,
-        name: r.get(1)?,
-        number: r.get(2)?,
+        name,
+        number,
         scanlator: r.get(3)?,
         date_upload: r.get(4)?,
         fetched_at: r.get(5)?,
@@ -477,6 +483,8 @@ fn chapter_row(r: &Row) -> rusqlite::Result<ChapterView> {
         page_count: r.get(8)?,
         downloaded: r.get(9)?,
         bookmark: r.get(10)?,
+        volume: release_info.volume,
+        release_type: release_info.release_type,
     })
 }
 

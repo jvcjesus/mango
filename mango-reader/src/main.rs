@@ -19,6 +19,7 @@ mod local;
 mod migrate;
 mod net;
 mod opds;
+pub(crate) mod release;
 mod settings;
 mod spaces;
 mod store;

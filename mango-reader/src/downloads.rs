@@ -49,7 +49,7 @@ pub struct QueueView {
 }
 
 /// A chapter picked from the queue, with what its file name and ComicInfo need.
-struct Job {
+pub(crate) struct Job {
     chapter: i64,
     attempts: i64,
     source: String,
@@ -62,6 +62,9 @@ struct Job {
     genre: Option<String>,
     summary: Option<String>,
     lang: Option<String>,
+    volume: Option<f64>,
+    release_type: crate::release::ReleaseType,
+    chapter_number: Option<f64>,
 }
 
 #[derive(Clone)]
@@ -329,18 +332,23 @@ impl Downloads {
 
     /// Where a chapter's file goes, relative to the downloads folder.
     fn place(&self, job: &Job) -> PathBuf {
-        let folder = Path::new(&clean(&job.source)).join(clean(&job.title));
-        let name = match job.scanlator.as_deref().filter(|s| !s.is_empty()) {
-            Some(scanlator) => clean(&format!("{} [{scanlator}]", job.name)),
-            None => clean(&job.name),
-        };
-        let path = folder.join(format!("{name}.cbz"));
-        // Two chapters of one title can share a name; the second gets its id added.
-        if self.dir.join(&path).exists() {
-            return folder.join(format!("{name} ({}).cbz", job.chapter));
-        }
-        path
+        place_in(&self.dir, job)
     }
+}
+
+pub(crate) fn place_in(dir: &Path, job: &Job) -> PathBuf {
+    let folder = Path::new(&clean(&job.source)).join(clean(&job.title));
+    let base_name = sanitize_release_name(&job.name);
+    let name = match job.scanlator.as_deref().filter(|s| !s.is_empty()) {
+        Some(scanlator) => clean(&format!("{base_name} [{scanlator}]")),
+        None => clean(&base_name),
+    };
+    let path = folder.join(format!("{name}.cbz"));
+    // Two chapters of one title can share a name; the second gets its id added.
+    if dir.join(&path).exists() {
+        return folder.join(format!("{name} ({}).cbz", job.chapter));
+    }
+    path
 }
 
 fn add(conn: &mut Connection, chapters: &[i64]) -> Result<usize> {
@@ -406,19 +414,25 @@ fn next_job(conn: &Connection) -> Result<Option<Job>> {
              ORDER BY d.position, d.chapter_id LIMIT 1",
             [now()],
             |r| {
+                let name: String = r.get(4)?;
+                let number: f64 = r.get(5)?;
+                let release_info = crate::release::parse_release(&name, number);
                 Ok(Job {
                     chapter: r.get(0)?,
                     attempts: r.get(1)?,
                     source: r.get(2)?,
                     title: r.get(3)?,
-                    name: r.get(4)?,
-                    number: r.get(5)?,
+                    name,
+                    number,
                     scanlator: r.get(6)?,
                     author: r.get(7)?,
                     artist: r.get(8)?,
                     genre: r.get(9)?,
                     summary: r.get(10)?,
                     lang: r.get(11)?,
+                    volume: release_info.volume,
+                    release_type: release_info.release_type,
+                    chapter_number: release_info.chapter_number,
                 })
             },
         )
@@ -472,6 +486,17 @@ fn free_space(_: &Path) -> Option<u64> {
     None
 }
 
+/// Trims trailing colons, hyphens, underscores and extra whitespace from release names before
+/// appending uploader brackets to avoid artifacts like "Chapter 1_  [Stick].cbz".
+pub(crate) fn sanitize_release_name(name: &str) -> String {
+    let trimmed = name.trim().trim_end_matches([':', '-', '_']).trim();
+    if trimmed.is_empty() {
+        name.trim().to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// A name that is safe as a file or folder on Linux, macOS and Windows.
 pub(crate) fn clean(name: &str) -> String {
     let safe: String = name.chars().map(|c| if c.is_control() || "<>:\"/\\|?*".contains(c) { '_' } else { c }).collect();
@@ -508,10 +533,36 @@ fn comic_info(job: &Job, pages: i64) -> String {
             xml.push_str(&format!("  <{tag}>{}</{tag}>\n", escape(value)));
         }
     };
-    let number = (job.number >= 0.0).then(|| job.number.to_string());
     field("Title", Some(&job.name));
     field("Series", Some(&job.title));
-    field("Number", number.as_deref());
+
+    if let Some(vol) = job.volume {
+        let vol_str = if vol.fract() == 0.0 {
+            (vol as i64).to_string()
+        } else {
+            vol.to_string()
+        };
+        field("Volume", Some(&vol_str));
+    }
+
+    if job.release_type == crate::release::ReleaseType::Chapter {
+        if let Some(num) = job.chapter_number {
+            let num_str = if num.fract() == 0.0 {
+                (num as i64).to_string()
+            } else {
+                num.to_string()
+            };
+            field("Number", Some(&num_str));
+        } else if job.number >= 0.0 {
+            let num_str = if job.number.fract() == 0.0 {
+                (job.number as i64).to_string()
+            } else {
+                job.number.to_string()
+            };
+            field("Number", Some(&num_str));
+        }
+    }
+
     field("Summary", job.summary.as_deref());
     field("Writer", job.author.as_deref());
     field("Penciller", job.artist.as_deref());
@@ -519,7 +570,17 @@ fn comic_info(job: &Job, pages: i64) -> String {
     field("Translator", job.scanlator.as_deref());
     field("LanguageISO", job.lang.as_deref().filter(|lang| !matches!(*lang, "all" | "other")));
     field("PageCount", Some(&pages.to_string()));
-    field("Notes", Some("Saved by Mango"));
+
+    if !job.source.is_empty() && job.source != "Unknown source" {
+        field("ScanInformation", Some(&job.source));
+    }
+
+    let notes = match &job.source {
+        s if !s.is_empty() && s != "Unknown source" => format!("Saved by Mango · Source: {s}"),
+        _ => "Saved by Mango".to_string(),
+    };
+    field("Notes", Some(&notes));
+
     xml.push_str("</ComicInfo>\n");
     xml
 }
@@ -611,11 +672,100 @@ mod tests {
             genre: None,
             summary: None,
             lang: Some("all".into()),
+            volume: None,
+            release_type: crate::release::ReleaseType::Chapter,
+            chapter_number: Some(1.5),
         };
         let xml = comic_info(&job, 12);
         assert!(xml.contains("<Series>Tom &amp; Jerry &lt;3</Series>"));
         assert!(xml.contains("<Title>Ch &quot;1&quot;</Title>"));
         assert!(xml.contains("<Number>1.5</Number>") && xml.contains("<PageCount>12</PageCount>"));
         assert!(!xml.contains("Translator") && !xml.contains("LanguageISO"), "empty fields are left out");
+        assert!(xml.contains("<ScanInformation>Src</ScanInformation>"));
+        assert!(xml.contains("<Notes>Saved by Mango · Source: Src</Notes>"));
+    }
+
+    #[test]
+    fn volume_and_chapter_comic_info_and_clean_naming() {
+        assert_eq!(sanitize_release_name("Chapter 1: "), "Chapter 1");
+        assert_eq!(sanitize_release_name("Chapter 1 - "), "Chapter 1");
+        assert_eq!(sanitize_release_name("Chapter 1: The Beginning"), "Chapter 1: The Beginning");
+
+        // Case A: Pure Volume artifact
+        let vol_job = Job {
+            chapter: 10,
+            attempts: 0,
+            source: "MangaDot".into(),
+            title: "Blue Lock".into(),
+            name: "Volume 1".into(),
+            number: 1.0,
+            scanlator: Some("Stick".into()),
+            author: Some("Muneyuki Kaneshiro".into()),
+            artist: Some("Yusuke Nomura".into()),
+            genre: Some("Sports, Shounen".into()),
+            summary: Some("High school soccer".into()),
+            lang: Some("en".into()),
+            volume: Some(1.0),
+            release_type: crate::release::ReleaseType::Volume,
+            chapter_number: None,
+        };
+        let vol_xml = comic_info(&vol_job, 192);
+        assert!(vol_xml.contains("<Volume>1</Volume>"));
+        assert!(!vol_xml.contains("<Number>"), "Volume artifact must not emit fake chapter Number");
+        assert!(vol_xml.contains("<Translator>Stick</Translator>"));
+        assert!(vol_xml.contains("<ScanInformation>MangaDot</ScanInformation>"));
+        assert!(vol_xml.contains("<Notes>Saved by Mango · Source: MangaDot</Notes>"));
+
+        // Case B: Chapter belonging to a volume
+        let ch_vol_job = Job {
+            chapter: 11,
+            attempts: 0,
+            source: "MangaDot".into(),
+            title: "Blue Lock".into(),
+            name: "Vol. 1 Ch. 5".into(),
+            number: 5.0,
+            scanlator: Some("Stick".into()),
+            author: None,
+            artist: None,
+            genre: None,
+            summary: None,
+            lang: Some("en".into()),
+            volume: Some(1.0),
+            release_type: crate::release::ReleaseType::Chapter,
+            chapter_number: Some(5.0),
+        };
+        let ch_vol_xml = comic_info(&ch_vol_job, 24);
+        assert!(ch_vol_xml.contains("<Volume>1</Volume>"));
+        assert!(ch_vol_xml.contains("<Number>5</Number>"));
+        assert!(ch_vol_xml.contains("<Title>Vol. 1 Ch. 5</Title>"));
+
+        // Case C: Pure chapter (MangaDot style with colon)
+        let ch_job = Job {
+            chapter: 12,
+            attempts: 0,
+            source: "MangaDot".into(),
+            title: "Blue Lock".into(),
+            name: "Chapter 1: ".into(),
+            number: 1.0,
+            scanlator: Some("Stick".into()),
+            author: None,
+            artist: None,
+            genre: None,
+            summary: None,
+            lang: Some("en".into()),
+            volume: None,
+            release_type: crate::release::ReleaseType::Chapter,
+            chapter_number: Some(1.0),
+        };
+        let ch_xml = comic_info(&ch_job, 75);
+        assert!(ch_xml.contains("<Number>1</Number>"));
+        assert!(!ch_xml.contains("<Volume>"), "Pure chapter must not emit Volume");
+
+        // Filename verification for clean naming
+        let place = place_in(Path::new("/tmp"), &ch_job);
+        assert_eq!(place.file_name().unwrap().to_str().unwrap(), "Chapter 1 [Stick].cbz");
+
+        let vol_place = place_in(Path::new("/tmp"), &vol_job);
+        assert_eq!(vol_place.file_name().unwrap().to_str().unwrap(), "Volume 1 [Stick].cbz");
     }
 }

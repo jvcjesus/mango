@@ -90,6 +90,8 @@ export type Chapter = {
   pageCount: number | null;
   downloaded: boolean;
   bookmark: boolean;
+  volume?: number | null;
+  releaseType?: 'chapter' | 'volume';
 };
 
 export type Title = {
