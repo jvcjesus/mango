@@ -161,6 +161,9 @@ pub fn router(state: Spaces) -> Router {
         .route("/sync/mappings", get(get_sync_mappings).put(put_sync_mapping))
         .route("/sync/mappings/{series_id}/{tracker}", delete(delete_sync_mapping))
         .route("/sync/schedule", get(get_sync_schedule).put(put_sync_schedule))
+        .route("/catalog/tracked", get(get_tracked_catalog).post(post_tracked_catalog))
+        .route("/catalog/tracked/{id}/auto-acquire", put(put_tracked_auto_acquire))
+        .route("/catalog/tracked/{id}/tracked", put(put_tracked_status))
         .layer(middleware::from_fn_with_state(state.clone(), auth::require));
     let api = Router::new()
         .nest("/auth", auth::routes())
@@ -1196,6 +1199,68 @@ async fn put_sync_schedule(
 ) -> Result<Json<bool>> {
     app.me.admin()?;
     app.db.call(move |conn| crate::sync::scheduler::set_schedule_config(conn, &cfg)).await?;
+    Ok(Json(true))
+}
+
+async fn get_tracked_catalog(Me(app): Me) -> Result<Json<Vec<crate::sync::catalog::TrackedCatalogEntry>>> {
+    let entries = app.db.call(|conn| crate::sync::catalog::list_tracked(conn)).await?;
+    Ok(Json(entries))
+}
+
+#[derive(Deserialize)]
+struct AddTrackedPayload {
+    title: String,
+    #[serde(default = "default_origin")]
+    origin: String,
+    komga_series_id: Option<String>,
+    manga_id: Option<i64>,
+}
+
+fn default_origin() -> String {
+    "mango".to_string()
+}
+
+async fn post_tracked_catalog(
+    Me(app): Me,
+    Json(payload): Json<AddTrackedPayload>,
+) -> Result<Json<crate::sync::catalog::TrackedCatalogEntry>> {
+    let entry = app
+        .db
+        .call(move |conn| {
+            crate::sync::catalog::add_or_update_tracked(
+                conn,
+                &payload.title,
+                &payload.origin,
+                payload.komga_series_id.as_deref(),
+                payload.manga_id,
+            )
+        })
+        .await?;
+    Ok(Json(entry))
+}
+
+#[derive(Deserialize)]
+struct ToggleFlagPayload {
+    enabled: bool,
+}
+
+async fn put_tracked_auto_acquire(
+    Me(app): Me,
+    Path(id): Path<i64>,
+    Json(payload): Json<ToggleFlagPayload>,
+) -> Result<Json<bool>> {
+    app.me.admin()?;
+    app.db.call(move |conn| crate::sync::catalog::set_auto_acquire(conn, id, payload.enabled)).await?;
+    Ok(Json(true))
+}
+
+async fn put_tracked_status(
+    Me(app): Me,
+    Path(id): Path<i64>,
+    Json(payload): Json<ToggleFlagPayload>,
+) -> Result<Json<bool>> {
+    app.me.admin()?;
+    app.db.call(move |conn| crate::sync::catalog::set_tracked(conn, id, payload.enabled)).await?;
     Ok(Json(true))
 }
 

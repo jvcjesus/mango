@@ -549,3 +549,24 @@ export const getSyncSchedule = () =>
 
 export const saveSyncSchedule = (cfg: SyncScheduleConfig) =>
   send<boolean>('PUT', '/sync/schedule', cfg);
+
+export interface TrackedCatalogEntry {
+  id: number;
+  mangaId?: number | null;
+  komgaSeriesId?: string | null;
+  title: string;
+  origins: string[];
+  autoAcquire: boolean;
+  tracked: boolean;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export const getTrackedCatalog = () =>
+  get<TrackedCatalogEntry[]>('/catalog/tracked');
+
+export const setTrackedAutoAcquire = (id: number, enabled: boolean) =>
+  send<boolean>('PUT', `/catalog/tracked/${id}/auto-acquire`, { enabled });
+
+export const setTrackedStatus = (id: number, enabled: boolean) =>
+  send<boolean>('PUT', `/catalog/tracked/${id}/tracked`, { enabled });

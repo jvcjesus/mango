@@ -6,6 +6,7 @@
 
 pub mod anilist;
 pub mod audit;
+pub mod catalog;
 pub mod komga_reader;
 pub mod mangabaka;
 pub mod mapping;

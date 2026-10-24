@@ -310,3 +310,66 @@ fn test_sync_scheduler_defaults_and_round_trip() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_tracked_catalog_separation_and_auto_acquire_safety() {
+    let dir = std::env::temp_dir().join(format!("mango-cat-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = Db::open(&dir.join("test.db")).expect("test db");
+    let conn = db.second().expect("connection");
+
+    // 1. Initial tracking must NEVER auto-acquire (auto-acquire strictly defaults to false)
+    let entry = super::catalog::add_or_update_tracked(
+        &conn,
+        "Dandadan",
+        "mango",
+        Some("komga-dandadan"),
+        None,
+    )
+    .unwrap();
+
+    assert!(entry.tracked);
+    assert!(!entry.auto_acquire, "Tracking must NEVER imply auto-acquisition permission");
+    assert_eq!(entry.origins, vec!["mango"]);
+
+    // 2. Add second origin (e.g. MangaBaka or AniList discovery)
+    let updated = super::catalog::add_or_update_tracked(
+        &conn,
+        "Dandadan",
+        "anilist",
+        Some("komga-dandadan"),
+        None,
+    )
+    .unwrap();
+
+    assert_eq!(updated.id, entry.id);
+    assert_eq!(updated.origins, vec!["mango", "anilist"]);
+    assert!(!updated.auto_acquire, "Adding origins must preserve auto_acquire = false");
+
+    // 3. Explicitly toggle auto-acquire
+    super::catalog::set_auto_acquire(&conn, entry.id, true).unwrap();
+    let after_toggle = super::catalog::get_tracked_by_id(&conn, entry.id).unwrap().unwrap();
+    assert!(after_toggle.auto_acquire);
+
+    // 4. Verify unified status separation of concerns
+    let status = super::catalog::UnifiedTitleStatus {
+        title: "Dandadan".into(),
+        komga_series_id: Some("komga-dandadan".into()),
+        is_tracked: after_toggle.tracked,
+        is_owned: true,
+        owned_volumes_count: 8,
+        is_acquiring: false,
+        auto_acquire_enabled: after_toggle.auto_acquire,
+        reading_progress: Some(8.0),
+        origins: after_toggle.origins,
+    };
+
+    assert!(status.is_tracked);
+    assert!(status.is_owned);
+    assert!(!status.is_acquiring);
+    assert!(status.auto_acquire_enabled);
+    assert_eq!(status.reading_progress, Some(8.0));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

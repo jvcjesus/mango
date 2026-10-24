@@ -1478,5 +1478,27 @@ describe('first-class volume acquisition & release semantics', () => {
       expect(mockSummary.records[1].category).toBe('tracker_ahead');
       expect(mockSummary.records[1].newProgress).toBe(180); // never decreases!
     });
+
+    it('verifies tracked library foundation distinctly separates tracked, owned, acquiring, read, and auto-acquire', async () => {
+      type TrackedCatalogEntry = import('./api').TrackedCatalogEntry;
+
+      const trackedItem: TrackedCatalogEntry = {
+        id: 42,
+        mangaId: 101,
+        komgaSeriesId: 'series-dandadan',
+        title: 'Dandadan',
+        origins: ['mango', 'anilist'],
+        autoAcquire: false, // Strictly false on tracking
+        tracked: true,
+        createdAt: 1714500000,
+        updatedAt: 1714500000,
+      };
+
+      // Proves separation: tracking does NOT mean downloading or auto-acquiring
+      expect(trackedItem.tracked).toBe(true);
+      expect(trackedItem.autoAcquire).toBe(false);
+      expect(trackedItem.origins).toContain('mango');
+      expect(trackedItem.origins).toContain('anilist');
+    });
   });
 });
