@@ -172,3 +172,113 @@ fn test_tracker_mappings_persistence_and_resolution() {
     assert!(after_delete.is_none());
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn test_anilist_sync_skips_volume_only_series_safely() {
+    let dir = std::env::temp_dir().join(format!("mango-anilist-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = Db::open(&dir.join("test.db")).expect("test db");
+    let trackers = crate::trackers::Trackers::new(db).unwrap();
+
+    let volume_progress = super::model::KomgaSeriesProgress {
+        series_id: "series-bluelock-vol".into(),
+        series_title: "Blue Lock".into(),
+        library_id: "lib-en".into(),
+        total_books: 38,
+        completed_books: 12,
+        highest_completed_book: Some(12.0),
+        highest_completed_volume: Some(12.0),
+        highest_completed_chapter: None, // strictly volume based
+        is_series_completed: false,
+        last_read_date: None,
+        books: vec![],
+    };
+
+    let mapping = TrackerMapping {
+        komga_series_id: "series-bluelock-vol".into(),
+        tracker: SyncTarget::AniList,
+        tracker_id: "106130".into(), // Blue Lock AniList ID
+        tracker_title: Some("Blue Lock".into()),
+        manual_override: false,
+        updated_at: 1700000000,
+    };
+
+    // Even in dry-run or live, volume-only series MUST fail closed for chapter-based AniList!
+    let record = super::anilist::sync_series_to_anilist(&trackers, &volume_progress, Some(&mapping), true).await;
+    assert_eq!(record.category, super::model::SyncResultCategory::SkippedUnsafeProgress);
+    assert!(record.message.contains("volume-based (Vol 12)"));
+    assert!(record.message.contains("cannot safely derive chapter progress"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn test_anilist_sync_skips_when_no_mapping() {
+    let dir = std::env::temp_dir().join(format!("mango-nomap-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = Db::open(&dir.join("test.db")).expect("test db");
+    let trackers = crate::trackers::Trackers::new(db).unwrap();
+
+    let progress = super::model::KomgaSeriesProgress {
+        series_id: "series-unknown".into(),
+        series_title: "Unknown Series".into(),
+        library_id: "lib-en".into(),
+        total_books: 10,
+        completed_books: 5,
+        highest_completed_book: Some(5.0),
+        highest_completed_volume: None,
+        highest_completed_chapter: Some(5.0),
+        is_series_completed: false,
+        last_read_date: None,
+        books: vec![],
+    };
+
+    let record = super::anilist::sync_series_to_anilist(&trackers, &progress, None, true).await;
+    assert_eq!(record.category, super::model::SyncResultCategory::SkippedNoMapping);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn test_mangabaka_sync_dry_run_and_auth() {
+    let mb_client = crate::pipeline::mangabaka::MangaBakaClient::new(
+        reqwest::Client::new(),
+        None,
+        Some("dummy-token".into()),
+    );
+
+    let progress = super::model::KomgaSeriesProgress {
+        series_id: "series-vol".into(),
+        series_title: "Sample Manga".into(),
+        library_id: "lib-en".into(),
+        total_books: 10,
+        completed_books: 4,
+        highest_completed_book: Some(4.0),
+        highest_completed_volume: Some(4.0),
+        highest_completed_chapter: None,
+        is_series_completed: false,
+        last_read_date: None,
+        books: vec![],
+    };
+
+    let mapping = TrackerMapping {
+        komga_series_id: "series-vol".into(),
+        tracker: SyncTarget::MangaBaka,
+        tracker_id: "mb-123".into(),
+        tracker_title: Some("Sample Manga".into()),
+        manual_override: false,
+        updated_at: 1700000000,
+    };
+
+    // 1. Without token: AuthError
+    let unauth_record = super::mangabaka::sync_series_to_mangabaka(&mb_client, false, &progress, Some(&mapping), true).await;
+    assert_eq!(unauth_record.category, super::model::SyncResultCategory::AuthError);
+
+    // 2. With token: DryRunWouldUpdate
+    let dry_record = super::mangabaka::sync_series_to_mangabaka(&mb_client, true, &progress, Some(&mapping), true).await;
+    assert_eq!(dry_record.category, super::model::SyncResultCategory::DryRunWouldUpdate);
+    assert_eq!(dry_record.new_progress, Some(4.0));
+    assert!(dry_record.message.contains("Vol 4"));
+}

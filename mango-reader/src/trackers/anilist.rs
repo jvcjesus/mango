@@ -66,7 +66,7 @@ pub(super) async fn search(http: &Client, query: &str) -> Result<Vec<Found>> {
     Ok(found.collect())
 }
 
-pub(super) async fn find(http: &Client, account: &Account, media: i64) -> Result<Option<Entry>> {
+pub(crate) async fn find(http: &Client, account: &Account, media: i64) -> Result<Option<Entry>> {
     let user: i64 = account.user_id.parse().map_err(|_| signed_out(Kind::AniList))?;
     let data = graphql(http, Some(&account.token), FIND, json!({ "user": user, "media": media })).await?;
     let Some(entry) = data["Page"]["mediaList"].get(0) else { return Ok(None) };
@@ -79,7 +79,7 @@ pub(super) async fn find(http: &Client, account: &Account, media: i64) -> Result
     }))
 }
 
-pub(super) async fn save(http: &Client, account: &Account, track: &Track) -> Result<i64> {
+pub(crate) async fn save(http: &Client, account: &Account, track: &Track) -> Result<i64> {
     let status = STATUSES.iter().find(|(number, _)| *number == track.status).map_or("CURRENT", |(_, name)| *name);
     let variables = json!({ "media": track.media_id, "status": status, "progress": track.last_chapter_read as i64, "score": track.score as i64 });
     let data = graphql(http, Some(&account.token), SAVE, variables).await?;

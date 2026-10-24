@@ -4,7 +4,9 @@
 //! (AniList, MangaBaka) safely with dry-run support, never-decrease progress semantics,
 //! and complete audit logging.
 
+pub mod anilist;
 pub mod komga_reader;
+pub mod mangabaka;
 pub mod mapping;
 pub mod model;
 

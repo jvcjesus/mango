@@ -5,7 +5,7 @@
 //! with a backup and go out with one unchanged. Tokens live in the `state` table, which
 //! the settings API never shows. A password is used once to sign in and is not kept.
 
-mod anilist;
+pub(crate) mod anilist;
 mod kitsu;
 mod mal;
 mod mangaupdates;
@@ -198,12 +198,12 @@ pub struct Change {
 
 /// The owner's entry for a title on a tracker, in the units a link is stored in.
 #[derive(Debug)]
-struct Entry {
-    library_id: i64,
-    status: i32,
-    last_chapter_read: f64,
-    score: f64,
-    total_chapters: i64,
+pub(crate) struct Entry {
+    pub(crate) library_id: i64,
+    pub(crate) status: i32,
+    pub(crate) last_chapter_read: f64,
+    pub(crate) score: f64,
+    pub(crate) total_chapters: i64,
 }
 
 /// A title's link to a tracker.
@@ -489,8 +489,12 @@ impl Trackers {
         self.db.call(move |conn| db::set_state(conn, &key(kind), &text)).await
     }
 
+    pub fn http(&self) -> &Client {
+        &self.http
+    }
+
     /// The signed-in account, with a token that is good for a while yet.
-    async fn account(&self, kind: Kind) -> Result<Account> {
+    pub async fn account(&self, kind: Kind) -> Result<Account> {
         let fresh = |account: &Account| account.expires_at == 0 || account.expires_at > now() + 300;
         let account = self.stored(kind).await?.ok_or_else(|| signed_out(kind))?;
         if fresh(&account) {
