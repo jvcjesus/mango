@@ -53,20 +53,62 @@
   let opened = $state<number | null>(null);
   // What the list is narrowed to lasts as long as the page: the next title opened shows whole.
   let show = $state<Show>('all');
-  let group = $state('');
+  // Selected uploader filter: '' means All, '__unknown__' means chapters with no uploader/scanlator,
+  // or a specific scanlator/uploader string.
+  function initialUploader(): string {
+    return recall<string>(`title.${id}.uploader`) ?? '';
+  }
+  let uploader = $state(initialUploader());
+
+  $effect(() => {
+    // Whenever the title id changes, recall that title's uploader preference
+    uploader = recall<string>(`title.${id}.uploader`) ?? '';
+  });
+
+  function setUploader(val: string) {
+    uploader = val;
+    keep(`title.${id}.uploader`, val);
+  }
 
   const chapters = $derived(title?.chapters ?? []);
   const unread = $derived(chapters.filter((c) => !c.read).length);
   const saved = $derived(chapters.filter((c) => c.downloaded).length);
   // The order is kept for every title, on the server like the library's.
   const view = $derived<View>({ ...DEFAULT, ...pref<Partial<View>>('title.view', {}) });
-  const groups = $derived([...new Set(chapters.map((c) => c.scanlator ?? '').filter(Boolean))].sort((a, b) => a.localeCompare(b)));
-  // A group a refresh took away narrows nothing.
-  const from = $derived(groups.includes(group) ? group : '');
-  const filtering = $derived(show !== 'all' || from !== '');
+
+  const hasUnknown = $derived(chapters.some((c) => !c.scanlator?.trim()));
+  const namedGroups = $derived(
+    [...new Set(chapters.map((c) => c.scanlator?.trim() ?? '').filter(Boolean))].sort((a, b) => a.localeCompare(b))
+  );
+  // Show uploader filter when there are multiple uploaders or a named uploader mixed with unknown releases
+  const hasMultipleUploaders = $derived(namedGroups.length > 1 || (namedGroups.length >= 1 && hasUnknown));
+
+  // If a refresh took away the selected uploader, safely fall back to ''
+  const currentUploader = $derived(
+    uploader && (uploader === '__unknown__' ? hasUnknown : namedGroups.includes(uploader)) ? uploader : ''
+  );
+
+  type UploaderChoice = { value: string; label: string };
+  const uploaderChoices = $derived.by<UploaderChoice[]>(() => {
+    const list: UploaderChoice[] = [{ value: '', label: 'All' }];
+    for (const g of namedGroups) {
+      list.push({ value: g, label: g });
+    }
+    if (hasUnknown && namedGroups.length > 0) {
+      list.push({ value: '__unknown__', label: 'Unknown' });
+    }
+    return list;
+  });
+
+  const filtering = $derived(show !== 'all' || currentUploader !== '');
   const listed = $derived.by(() => {
     const shown: Record<Show, (c: Chapter) => boolean> = { all: () => true, unread: (c) => !c.read, downloaded: (c) => c.downloaded, bookmarked: (c) => c.bookmark };
-    const list = chapters.filter((c) => shown[show](c) && (!from || c.scanlator === from));
+    const list = chapters.filter((c) => {
+      if (!shown[show](c)) return false;
+      if (!currentUploader) return true;
+      if (currentUploader === '__unknown__') return !c.scanlator?.trim();
+      return c.scanlator?.trim() === currentUploader;
+    });
     // Sources list the newest first, and so does every order here until it is turned round.
     if (view.sort !== 'source') {
       const key = view.sort === 'number' ? (c: Chapter) => c.number : (c: Chapter) => c.dateUpload || c.fetchedAt * 1000;
@@ -74,6 +116,7 @@
     }
     return view.down ? list : list.reverse();
   });
+  const filteredUnread = $derived(listed.filter((c) => !c.read && !c.downloaded));
   const hasVolumes = $derived(chapters.some((c) => parseVolume(c.name) !== null));
   type VolumeGroup = { volume: number | null; label: string; chapters: Chapter[] };
   const volumeGroups = $derived.by<VolumeGroup[]>(() => {
@@ -100,7 +143,11 @@
     }));
   });
   const nothing = $derived(
-    !chapters.length ? 'No chapters yet.' : show === 'unread' && !from ? 'Every chapter is read.' : 'No chapter fits the filter.',
+    !chapters.length
+      ? 'No chapters yet.'
+      : show === 'unread' && !currentUploader
+        ? 'Every chapter is read.'
+        : 'No chapter fits the filter.',
   );
   // Reading goes from the bottom of the list up: the next one to read is the last unread.
   const resume = $derived(chapters.findLast((c) => !c.read) ?? null);
@@ -402,8 +449,8 @@
             <button
               class="btn icon"
               aria-label="Download the unread chapters"
-              disabled={downloading || !chapters.some((c) => !c.read && !c.downloaded)}
-              onclick={() => download(chapters.filter((c) => !c.read && !c.downloaded))}
+              disabled={downloading || !filteredUnread.length}
+              onclick={() => download(filteredUnread)}
             >
               {#if downloading}
                 <span class="spin"><Icon name="spinner" size={18} stroke={3} /></span>
@@ -426,6 +473,35 @@
           </div>
         </div>
 
+        {#if hasMultipleUploaders}
+          <div class="uploader-filter" role="group" aria-label="Filter by uploader">
+            <span class="uploader-label">Uploader</span>
+            {#if uploaderChoices.length <= 4}
+              <div class="pills">
+                {#each uploaderChoices as choice (choice.value)}
+                  <button
+                    class="btn pill"
+                    class:spot={currentUploader === choice.value}
+                    aria-pressed={currentUploader === choice.value}
+                    onclick={() => setUploader(choice.value)}
+                  >
+                    {choice.label}
+                  </button>
+                {/each}
+              </div>
+            {:else}
+              <label class="sorter">
+                <span class="sr">Filter by uploader</span>
+                <select class="btn" value={currentUploader} onchange={(e) => setUploader(e.currentTarget.value)}>
+                  {#each uploaderChoices as choice (choice.value)}
+                    <option value={choice.value}>{choice.label}</option>
+                  {/each}
+                </select>
+              </label>
+            {/if}
+          </div>
+        {/if}
+
         {#if filters}
           <div class="tools" role="group" aria-label="Sort and filter">
             <label class="sorter">
@@ -443,15 +519,6 @@
                 {#each SHOWS as [value, label] (value)}<option {value}>{label}</option>{/each}
               </select>
             </label>
-            {#if groups.length > 1}
-              <label class="sorter">
-                <span class="sr">Translated by</span>
-                <select class="btn" value={from} onchange={(e) => (group = e.currentTarget.value)}>
-                  <option value="">Every group</option>
-                  {#each groups as name (name)}<option value={name}>{name}</option>{/each}
-                </select>
-              </label>
-            {/if}
             {#if hasVolumes}
               <button
                 class="btn pill"
@@ -775,6 +842,30 @@
 
   .sorter select {
     max-width: 220px;
+  }
+
+  .uploader-filter {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+    margin-top: 14px;
+    padding-bottom: 2px;
+  }
+
+  .uploader-label {
+    font-size: 13px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--muted);
+  }
+
+  .uploader-filter .pills {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
   }
 
   .own .sheet {

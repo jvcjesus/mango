@@ -594,3 +594,215 @@ describe('duplicate chapter ID tolerance', () => {
     });
   });
 });
+
+describe('uploader/source filtering on Title page', () => {
+  const multiUploaderTitle = {
+    id: 8888,
+    sourceId: '1',
+    sourceName: 'MangaDot',
+    sourceLang: 'en',
+    webUrl: 'https://mangadot.net/manga/multi',
+    title: 'Multi-Uploader Test Manga',
+    artist: 'Artist',
+    author: 'Author',
+    description: 'Testing multi-uploader filtering',
+    genres: ['Action', 'Fantasy'],
+    status: 1,
+    cover: null,
+    inLibrary: false,
+    addedAt: null,
+    initialized: true,
+    readerMode: null,
+    readerFit: null,
+    autoDownload: false,
+    chaptersAt: 1000,
+    releaseDays: null,
+    categories: [],
+    chapters: [
+      {
+        id: 101,
+        name: 'Vol. 1 Ch. 1 - Group A Edition',
+        number: 1,
+        scanlator: 'Group A',
+        dateUpload: 1000,
+        fetchedAt: 1000,
+        read: false,
+        lastPageRead: 0,
+        pageCount: 20,
+        downloaded: false,
+        bookmark: false,
+      },
+      {
+        id: 102,
+        name: 'Vol. 1 Ch. 1 - Group B Edition',
+        number: 1,
+        scanlator: 'Group B',
+        dateUpload: 2000,
+        fetchedAt: 2000,
+        read: false,
+        lastPageRead: 0,
+        pageCount: 20,
+        downloaded: false,
+        bookmark: false,
+      },
+      {
+        id: 103,
+        name: 'Vol. 1 Ch. 2 - Group A Edition',
+        number: 2,
+        scanlator: 'Group A',
+        dateUpload: 3000,
+        fetchedAt: 3000,
+        read: false,
+        lastPageRead: 0,
+        pageCount: 22,
+        downloaded: false,
+        bookmark: false,
+      },
+      {
+        id: 104,
+        name: 'Vol. 2 Ch. 3 - Anonymous Release',
+        number: 3,
+        scanlator: null, // Unknown uploader
+        dateUpload: 4000,
+        fetchedAt: 4000,
+        read: false,
+        lastPageRead: 0,
+        pageCount: 25,
+        downloaded: false,
+        bookmark: false,
+      },
+    ],
+  };
+
+  it('renders uploader filter with All, named groups, and Unknown', async () => {
+    const { keep } = await import('./keep');
+    const { render } = await import('svelte/server');
+    const Title = (await import('../routes/Title.svelte')).default;
+
+    keep('title', multiUploaderTitle);
+    keep('title.8888.uploader', '');
+
+    const result = render(Title, { props: { id: 8888 } });
+    expect(result.html).toContain('Uploader');
+    expect(result.html).toContain('All');
+    expect(result.html).toContain('Group A');
+    expect(result.html).toContain('Group B');
+    expect(result.html).toContain('Unknown');
+
+    // Default All shows all legitimate chapters across uploaders
+    expect(result.html).toContain('Vol. 1 Ch. 1 - Group A Edition');
+    expect(result.html).toContain('Vol. 1 Ch. 1 - Group B Edition');
+    expect(result.html).toContain('Vol. 1 Ch. 2 - Group A Edition');
+    expect(result.html).toContain('Vol. 2 Ch. 3 - Anonymous Release');
+  });
+
+  it('filters chapters when a specific uploader is selected', async () => {
+    const { keep } = await import('./keep');
+    const { render } = await import('svelte/server');
+    const Title = (await import('../routes/Title.svelte')).default;
+
+    // Filter to Group A only
+    keep('title', multiUploaderTitle);
+    keep('title.8888.uploader', 'Group A');
+
+    const resultA = render(Title, { props: { id: 8888 } });
+    expect(resultA.html).toContain('Vol. 1 Ch. 1 - Group A Edition');
+    expect(resultA.html).toContain('Vol. 1 Ch. 2 - Group A Edition');
+    expect(resultA.html).not.toContain('Vol. 1 Ch. 1 - Group B Edition');
+    expect(resultA.html).not.toContain('Vol. 2 Ch. 3 - Anonymous Release');
+
+    // Filter to Group B only
+    keep('title.8888.uploader', 'Group B');
+    const resultB = render(Title, { props: { id: 8888 } });
+    expect(resultB.html).toContain('Vol. 1 Ch. 1 - Group B Edition');
+    expect(resultB.html).not.toContain('Vol. 1 Ch. 1 - Group A Edition');
+    expect(resultB.html).not.toContain('Vol. 1 Ch. 2 - Group A Edition');
+    expect(resultB.html).not.toContain('Vol. 2 Ch. 3 - Anonymous Release');
+  });
+
+  it('filters to unknown/empty uploaders when Unknown is selected', async () => {
+    const { keep } = await import('./keep');
+    const { render } = await import('svelte/server');
+    const Title = (await import('../routes/Title.svelte')).default;
+
+    keep('title', multiUploaderTitle);
+    keep('title.8888.uploader', '__unknown__');
+
+    const result = render(Title, { props: { id: 8888 } });
+    expect(result.html).toContain('Vol. 2 Ch. 3 - Anonymous Release');
+    expect(result.html).not.toContain('Vol. 1 Ch. 1 - Group A Edition');
+    expect(result.html).not.toContain('Vol. 1 Ch. 1 - Group B Edition');
+  });
+
+  it('filters before volume grouping so only the selected uploader volumes appear', async () => {
+    const { keep } = await import('./keep');
+    const { prefs } = await import('./prefs.svelte');
+    const { render } = await import('svelte/server');
+    const Title = (await import('../routes/Title.svelte')).default;
+
+    // Enable volumes view
+    prefs.values['title.view'] = { volumes: true, sort: 'source', down: true };
+
+    // Select Group A: should show Volume 1 (2 chapters) and NOT Volume 2
+    keep('title', multiUploaderTitle);
+    keep('title.8888.uploader', 'Group A');
+
+    const result = render(Title, { props: { id: 8888 } });
+    expect(result.html).toContain('VOLUME 1');
+    expect(result.html).not.toContain('VOLUME 2');
+    expect(result.html).toContain('2 chapters');
+
+    // Select Unknown: should show Volume 2 (1 chapter) and NOT Volume 1
+    keep('title.8888.uploader', '__unknown__');
+    const resultUnknown = render(Title, { props: { id: 8888 } });
+    expect(resultUnknown.html).toContain('VOLUME 2');
+    expect(resultUnknown.html).not.toContain('VOLUME 1');
+    expect(resultUnknown.html).toContain('1 chapter');
+  });
+
+  it('renders a compact dropdown when there are more than 4 uploader choices', async () => {
+    const { keep } = await import('./keep');
+    const { render } = await import('svelte/server');
+    const Title = (await import('../routes/Title.svelte')).default;
+
+    const manyUploadersTitle = {
+      ...multiUploaderTitle,
+      id: 7777,
+      chapters: [
+        { ...multiUploaderTitle.chapters[0], id: 201, scanlator: 'Group 1' },
+        { ...multiUploaderTitle.chapters[1], id: 202, scanlator: 'Group 2' },
+        { ...multiUploaderTitle.chapters[2], id: 203, scanlator: 'Group 3' },
+        { ...multiUploaderTitle.chapters[3], id: 204, scanlator: 'Group 4' },
+        { ...multiUploaderTitle.chapters[0], id: 205, scanlator: 'Group 5' },
+      ],
+    };
+
+    keep('title', manyUploadersTitle);
+    keep('title.7777.uploader', '');
+
+    const result = render(Title, { props: { id: 7777 } });
+    // Should render a <select> dropdown for uploader choices rather than overflowing pill row
+    expect(result.html).toContain('<select class="btn');
+    expect(result.html).toContain('<option value="Group 1">Group 1</option>');
+    expect(result.html).toContain('<option value="Group 5">Group 5</option>');
+  });
+
+  it('persists uploader selection when reopening title from cache', async () => {
+    const { keep } = await import('./keep');
+    const { render } = await import('svelte/server');
+    const Title = (await import('../routes/Title.svelte')).default;
+
+    keep('title', multiUploaderTitle);
+    keep('title.8888.uploader', 'Group B');
+
+    // First render
+    const res1 = render(Title, { props: { id: 8888 } });
+    expect(res1.html).toContain('Vol. 1 Ch. 1 - Group B Edition');
+    expect(res1.html).not.toContain('Vol. 1 Ch. 1 - Group A Edition');
+
+    // Simulate reopening title (retained in keep cache)
+    const res2 = render(Title, { props: { id: 8888 } });
+    expect(res2.html).toContain('Vol. 1 Ch. 1 - Group B Edition');
+    expect(res2.html).not.toContain('Vol. 1 Ch. 1 - Group A Edition');
+  });
+});
