@@ -3,6 +3,8 @@
   import { display } from './lib/display.svelte';
   import Icon, { type IconName } from './lib/Icon.svelte';
   import Notice from './lib/Notice.svelte';
+  import ConfirmDialog from './lib/ConfirmDialog.svelte';
+  import ToastContainer from './lib/ToastContainer.svelte';
   import Tour from './lib/Tour.svelte';
   import { tour } from './lib/guide.svelte';
   import { back, go, route } from './lib/router.svelte';
@@ -185,6 +187,9 @@
 {#if tour.open && session.signedIn && area !== 'read'}
   <Tour />
 {/if}
+
+<ToastContainer />
+<ConfirmDialog />
 
 <style>
   /* Everything but the reader. The size picked for this device scales it whole. */

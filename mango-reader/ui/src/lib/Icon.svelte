@@ -36,6 +36,7 @@
     info: '<circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7v.5"/>',
     upload: '<path d="M12 15V4M7 9l5-5 5 5M5 20h14"/>',
     link: '<path d="M10 14a4 4 0 0 0 5.7 0l3-3a4 4 0 0 0-5.7-5.7l-1 1M14 10a4 4 0 0 0-5.7 0l-3 3a4 4 0 0 0 5.7 5.7l1-1"/>',
+    spinner: '<path d="M12 3a9 9 0 0 1 9 9"/>',
   };
   export type IconName = keyof typeof SHAPES;
 </script>
