@@ -346,16 +346,65 @@ Mango knows how many pages it has.
 
 ### Native Acquisition Pipeline
 
-Mango includes a native acquisition and publishing pipeline to automatically process completed downloads into your permanent manga library (such as Komga):
+Mango includes a native acquisition and publishing pipeline to automatically process completed downloads into your permanent manga library (with Komga as the canonical library and reader backend):
 
-1. **Volume Metadata Enrichment**: Automatically fetches official publication dates, volume summaries, writers, artists, and publishers from MangaBaka and embeds them into `ComicInfo.xml`.
-2. **Non-destructive Image Optimization**: The `mango:full` image bundles `RustyLibraryShrinker` (`/opt/mango/bin/RustyLibraryShrinker`) to shrink CBZ archives down to efficient WebP formats while strictly verifying page count parity, ComicInfo.xml metadata retention, ZIP integrity, and minimum size savings. Configurable controls in Settings allow fine-tuning target page height (default 2400 px), WebP encoder quality (default 90), and minimum savings threshold (default 10%).
-3. **Canonical Atomic Publication**: Moves files safely into canonical series folder hierarchies with byte-for-byte duplicate deduplication and refusal of conflicting overwrites.
-4. **Komga Scan Triggers**: Automatically triggers library rescans via Komga REST API.
+```
+Downloads Queue
+      ↓
+Release Identification (Chapter vs True Volume semantics)
+      ↓
+Metadata Enrichment (MangaBaka API with fail-closed precision)
+      ↓
+Image Optimization (RustyLibraryShrinker with quality & savings validation)
+      ↓
+Archive Integrity Validation (ZIP integrity, page count parity, ComicInfo retention)
+      ↓
+Canonical Publishing (Deterministic naming, deduplication, Chinese routing)
+      ↓
+Komga Synchronization (Targeted library rescan, ownership cache invalidation)
+      ↓
+Audit Log & Acquisition History
+```
 
-#### Container-Aware Paths & Docker Volume Mounting
+#### 1. First-Class Volume Acquisition & Release Semantics
+- **Conservative Volume Detection**: Intelligently classifies releases into true volumes (`Series v01`, `[Group] Series v02`, `Series v12.5`) versus chapters (`Chapter 10`, `Vol. 1 Ch. 5`). Chapter revisions (such as `Chapter 5 v2`) are strictly recognized as chapters rather than volume 2.
+- **Robust ComicInfo.xml Generation**: Volume archives emit clean `<Volume>` elements and strictly omit fake `<Number>` elements to avoid polluting reader chapter indices. Chapter releases retain `<Number>` tags.
+- **Canonical Release Naming**: Standardized naming such as `Series v01.cbz`, `Series v12.5.cbz`, and `Series - c001 (v01) [Group].cbz`.
+- **Title UI Integration**: Title pages group chapters into volume cards, allowing one-click batch volume acquisition with partial/full status tracking and uploader filtering.
 
-Configured pipeline paths in **Settings → Pipeline** refer to paths visible **inside the Mango container runtime**. When running Mango in Docker, mount your permanent library storage into the container:
+#### 2. MangaBaka Metadata Enrichment & Precision Matching
+- **Fail-Closed Matching**: Normalizes and matches titles across English, romanized, and alternate/native titles. Ambiguous series or conflicting titles fail closed rather than applying inaccurate metadata.
+- **Edition Selection**: Selects English digital Standard Editions and matches exact volume numbers (including fractional volumes).
+- **Outcome Classification**: Rich audit states (`Success`, `NotConfigured`, `AuthError`, `NetworkError`, `SeriesNotFound`, `AmbiguousSeries`, `CollectionNotFound`, `VolumeNotFound`).
+- **Secret Protection**: API tokens are never exposed in GET responses, audit logs, or frontend payloads.
+
+#### 3. Komga Server Integration & Discovery
+- **Safe Read-Only Validation**: Connection validation queries `/api/v1/users/me` and strictly never triggers unauthorized library scans during testing.
+- **Dynamic Library Discovery**: Discovers libraries directly from Komga via REST API and populates library selection dropdowns with fallback to manual ID entry.
+- **Dual Library Routing**: Separate target libraries for canonical English manga and Chinese-translated manga (e.g. Bilibili).
+- **Targeted Library Rescans**: Triggers rescans only for the specific library receiving the published release. Can be toggled on/off independently in Settings.
+
+#### 4. Komga-Backed Ownership Model
+- **Komga Source of Truth**: Komga remains the permanent authority on owned manga. Mango never creates a duplicate library database.
+- **Status Classification**: Every volume is classified as `Owned` (in Komga), `Acquiring` (active in queue), `Available` (unowned), or `Unknown`.
+- **High-Performance Caching**: 60-second TTL in-memory cache per title, invalidated automatically upon publication or manual title refresh.
+- **Duplicate Protection**: Title pages display "Owned in Komga" badges and prompt for confirmation before re-acquiring already-owned volumes.
+
+#### 5. Downloads Queue & Lifecycle Visibility
+- **Live Pipeline Stages**: Real-time status indicators in the Downloads tab: `Queued`, `Downloading`, `Identifying`, `Metadata`, `Optimizing`, `Validating`, `Publishing`, `Komga`, `Complete`, and `Failed`.
+- **Targeted Komga Retry**: If library publication succeeds but Komga network notification fails, a **Retry Komga Scan** button allows re-triggering the scan without re-downloading or re-optimizing the archive.
+- **Recent Acquisitions**: Audit trail displaying published file locations, compression savings, and metadata status.
+
+#### 6. Image Optimization Quality Policy
+- **Configurable Quality Controls**: Configurable via **Settings → Image Optimization**:
+  - Target page height: `2400 px` (default)
+  - WebP encoder quality: `90` (default)
+  - Minimum savings threshold: `10%` (default)
+- **Non-Destructive Validation**: Verifies ZIP integrity, exact page count parity, ComicInfo.xml retention, and minimum savings threshold before atomic replacement. If optimization yields insufficient savings or fails validation, the original CBZ is preserved unaltered.
+
+#### Container-Aware Paths & Docker Networking
+
+Configured pipeline paths in **Settings → Pipeline** refer to paths visible **inside the Mango container runtime**. Mount your permanent storage volumes into the container:
 
 ```sh
 docker run -d --name mango -p 8787:8787 \
@@ -365,7 +414,8 @@ docker run -d --name mango -p 8787:8787 \
   ghcr.io/apixelsnet/mango:full
 ```
 
-Then configure `/library/manga` as your **Permanent Manga Library** in Settings.
+> [!NOTE]
+> Inside Docker containers, `127.0.0.1` refers to the container itself, not the host machine. If Komga is running on the host, configure Mango's Komga Server URL as `http://host.docker.internal:25600` or use your host's LAN IP (e.g. `http://10.0.0.140:25600`).
 
 > [!IMPORTANT]
 > Mango validates that library destinations exist, are directories, and are writable by the container process before allowing the pipeline to be enabled. Nonexistent or read-only destinations will clearly fail validation with actionable errors.
