@@ -5,6 +5,7 @@
   import Notice from '../lib/Notice.svelte';
   import { browseLangs, setPref } from '../lib/prefs.svelte';
   import { go } from '../lib/router.svelte';
+  import { toast } from '../lib/toast.svelte';
   import { langName } from '../lib/util';
 
   // What was here last time shows at once; the sources are then asked for again.
@@ -14,6 +15,7 @@
   let showHidden = $state(false);
   let picking = $state(false);
   let words = $state('');
+  let busySource = $state<Record<string, boolean>>({});
 
   const langs = $derived([...new Set(sources.filter((s) => s.id !== '0').map((s) => s.lang))].sort());
   const chosen = $derived(browseLangs(sources));
@@ -40,11 +42,24 @@
   load();
 
   async function change(source: Source, patch: { pinned?: boolean; hidden?: boolean }) {
+    if (busySource[source.id]) return;
+    busySource[source.id] = true;
+    const previous = { pinned: source.pinned, hidden: source.hidden };
     Object.assign(source, patch);
     try {
       await send('PUT', `/sources/${source.id}`, patch);
+      if (patch.pinned !== undefined) {
+        toast.success(patch.pinned ? `Pinned ${source.name}` : `Unpinned ${source.name}`);
+      } else if (patch.hidden !== undefined) {
+        toast.info(patch.hidden ? `Hidden ${source.name}` : `Showing ${source.name}`);
+      }
     } catch (e) {
-      error = message(e);
+      Object.assign(source, previous);
+      const msg = message(e);
+      error = msg;
+      toast.error(msg);
+    } finally {
+      busySource[source.id] = false;
     }
   }
 
@@ -71,14 +86,20 @@
         class="btn icon spot-on"
         aria-pressed={source.pinned}
         aria-label={source.pinned ? `Unpin ${source.name}` : `Pin ${source.name}`}
+        disabled={busySource[source.id]}
         onclick={() => change(source, { pinned: !source.pinned })}
       >
-        <Icon name="pin" fill={source.pinned} />
+        {#if busySource[source.id]}
+          <span class="spin"><Icon name="spinner" size={16} stroke={3} /></span>
+        {:else}
+          <Icon name="pin" fill={source.pinned} />
+        {/if}
       </button>
       <button
         class="btn icon"
         aria-pressed={source.hidden}
         aria-label={source.hidden ? `Show ${source.name}` : `Hide ${source.name}`}
+        disabled={busySource[source.id]}
         onclick={() => change(source, { hidden: !source.hidden })}
       >
         <Icon name={source.hidden ? 'eyeoff' : 'eye'} />
