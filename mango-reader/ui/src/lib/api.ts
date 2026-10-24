@@ -345,3 +345,37 @@ export type Installed = {
   availableVersion: string | null;
   sources: Source[];
 };
+
+export interface PipelineConfig {
+  enabled: boolean;
+  library_dir: string | null;
+  chinese_library_dir: string | null;
+  mangabaka_enabled: boolean;
+  mangabaka_url: string | null;
+  mangabaka_token?: string | null;
+  has_mangabaka_token: boolean;
+  komga_enabled: boolean;
+  komga_url: string | null;
+  komga_api_key?: string | null;
+  has_komga_api_key: boolean;
+  komga_library_id: string | null;
+  optimize_enabled: boolean;
+  optimizer_bin: string | null;
+  min_savings_percent: number;
+}
+
+export interface PipelineEvent {
+  id: string;
+  timestamp: number;
+  chapter_id: number;
+  series: string;
+  release_name: string;
+  is_volume: boolean;
+  number: number;
+  outcome: 'published' | 'already_published' | 'conflict' | 'skipped' | 'error';
+  destination: string | null;
+  mangabaka_status: string;
+  optimizer_status: string;
+  komga_status: string;
+  error: string | null;
+}

@@ -112,7 +112,9 @@ impl Spaces {
         let stores = Stores::new(db.clone(), shared.host.clone(), self.fleet.clone(), id, shared.store_rules, shared.blocklist.clone())?;
         let titles = Titles::new(db.clone(), shared.host.clone(), shared.local.clone());
         let images = Images::new(db.clone(), shared.host.clone(), shared.local.clone(), &dir, shared.cache_mb);
-        let downloads = Downloads::new(db.clone(), images.clone(), &dir, shared.keep_free_mb);
+        let pipeline = Arc::new(crate::pipeline::Pipeline::new(db.clone()));
+        let mut downloads = Downloads::new(db.clone(), images.clone(), &dir, shared.keep_free_mb);
+        downloads.set_pipeline(pipeline.clone());
         let updates = Updates::new(db.clone(), titles.clone(), downloads.clone());
         let tasks = vec![
             tokio::spawn(images.clone().sweep_forever()),
@@ -134,6 +136,7 @@ impl Spaces {
             images,
             downloads,
             updates,
+            pipeline,
             local_dir: shared.local.root().display().to_string(),
             db: db.clone(),
         };

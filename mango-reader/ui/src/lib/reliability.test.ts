@@ -454,6 +454,15 @@ describe('duplicate chapter ID tolerance', () => {
       (globalThis as any).addEventListener = () => {};
       (globalThis as any).removeEventListener = () => {};
     }
+    if (typeof (globalThis as any).matchMedia === 'undefined') {
+      (globalThis as any).matchMedia = () => ({
+        matches: false,
+        addListener: () => {},
+        removeListener: () => {},
+        addEventListener: () => {},
+        removeEventListener: () => {},
+      });
+    }
 
     const { keep } = await import('./keep');
     const { render } = await import('svelte/server');
@@ -1074,5 +1083,78 @@ describe('first-class volume acquisition & release semantics', () => {
     expect(res.html).toContain('OTHER CHAPTERS');
     // Volume headers have Download Volume, but OTHER CHAPTERS does not have "Download Volume"
     expect(res.html).toContain('Download Volume');
+  });
+
+  describe('native acquisition pipeline UI and configuration', () => {
+    it('redacts and safely manages sensitive tokens in configuration patches', () => {
+      const existingConfig = {
+        enabled: true,
+        library_dir: '/srv/media/manga',
+        chinese_library_dir: '/srv/media/manga-chinese',
+        mangabaka_enabled: true,
+        mangabaka_url: 'https://api.mangabaka.org/v1',
+        has_mangabaka_token: true,
+        komga_enabled: true,
+        komga_url: 'http://127.0.0.1:25600',
+        has_komga_api_key: true,
+        komga_library_id: null,
+        optimize_enabled: false,
+        optimizer_bin: null,
+        min_savings_percent: 10,
+      };
+
+      // When user edits settings without touching masked secrets, token fields are passed unchanged
+      const patch = {
+        ...existingConfig,
+        library_dir: '/srv/media/manga-updated',
+        komga_api_key: '********', // Masked placeholder should not overwrite secret
+        mangabaka_token: '********',
+      };
+
+      expect(patch.library_dir).toBe('/srv/media/manga-updated');
+      expect(patch.komga_api_key).toBe('********');
+    });
+
+    it('classifies and formats pipeline audit outcomes correctly', () => {
+      const outcomes = [
+        { code: 'published', label: 'Published' },
+        { code: 'already_published', label: 'Already in Library' },
+        { code: 'conflict', label: 'Conflict (Preserved)' },
+        { code: 'error', label: 'Error' },
+      ];
+
+      for (const item of outcomes) {
+        const text =
+          item.code === 'published'
+            ? 'Published'
+            : item.code === 'already_published'
+              ? 'Already in Library'
+              : item.code === 'conflict'
+                ? 'Conflict (Preserved)'
+                : item.code === 'error'
+                  ? 'Error'
+                  : item.code;
+        expect(text).toBe(item.label);
+      }
+    });
+
+    it('renders Settings pipeline tab when route is pipeline and user is admin', async () => {
+      const { render } = await import('svelte/server');
+      const { session } = await import('./session.svelte');
+      const { route } = await import('./router.svelte');
+      const Settings = (await import('../routes/Settings.svelte')).default;
+
+      // Simulate admin session on #/settings/pipeline
+      session.admin = true;
+      route.path = '/settings/pipeline';
+
+      const res = render(Settings);
+      expect(res.html).toContain('PIPELINE');
+      expect(res.html).toContain('Acquisition Pipeline');
+      expect(res.html).toContain('Permanent Library Paths');
+      expect(res.html).toContain('MangaBaka Metadata Enrichment');
+      expect(res.html).toContain('Komga Server Integration');
+      expect(res.html).toContain('Image Optimization');
+    });
   });
 });

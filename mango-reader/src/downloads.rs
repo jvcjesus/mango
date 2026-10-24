@@ -50,21 +50,21 @@ pub struct QueueView {
 
 /// A chapter picked from the queue, with what its file name and ComicInfo need.
 pub(crate) struct Job {
-    chapter: i64,
-    attempts: i64,
-    source: String,
-    title: String,
-    name: String,
-    number: f64,
-    scanlator: Option<String>,
-    author: Option<String>,
-    artist: Option<String>,
-    genre: Option<String>,
-    summary: Option<String>,
-    lang: Option<String>,
-    volume: Option<f64>,
-    release_type: crate::release::ReleaseType,
-    chapter_number: Option<f64>,
+    pub(crate) chapter: i64,
+    pub(crate) attempts: i64,
+    pub(crate) source: String,
+    pub(crate) title: String,
+    pub(crate) name: String,
+    pub(crate) number: f64,
+    pub(crate) scanlator: Option<String>,
+    pub(crate) author: Option<String>,
+    pub(crate) artist: Option<String>,
+    pub(crate) genre: Option<String>,
+    pub(crate) summary: Option<String>,
+    pub(crate) lang: Option<String>,
+    pub(crate) volume: Option<f64>,
+    pub(crate) release_type: crate::release::ReleaseType,
+    pub(crate) chapter_number: Option<f64>,
 }
 
 #[derive(Clone)]
@@ -78,6 +78,7 @@ pub struct Downloads {
     wake: Arc<Notify>,
     /// The chapter being fetched: its id, pages done, pages in all.
     progress: Arc<StdMutex<Option<(i64, i64, i64)>>>,
+    pipeline: Option<Arc<crate::pipeline::Pipeline>>,
 }
 
 impl Downloads {
@@ -90,7 +91,12 @@ impl Downloads {
             keep_free: keep_free_mb << 20,
             wake: Arc::default(),
             progress: Arc::default(),
+            pipeline: None,
         }
+    }
+
+    pub fn set_pipeline(&mut self, pipeline: Arc<crate::pipeline::Pipeline>) {
+        self.pipeline = Some(pipeline);
     }
 
     /// The folder chapters are saved in.
@@ -232,6 +238,14 @@ impl Downloads {
             };
             let outcome = self.save(&job).await;
             *self.progress.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            if let Ok(Some((relative_path, _page_count))) = &outcome {
+                if let Some(pipeline) = &self.pipeline {
+                    let cbz_file = self.dir.join(relative_path);
+                    if let Err(e) = pipeline.process_download(&cbz_file, &job).await {
+                        tracing::warn!("acquisition pipeline processing failed for {} / {}: {e}", job.title, job.name);
+                    }
+                }
+            }
             if let Err(e) = &outcome {
                 tracing::warn!("download of {} / {} failed: {e}", job.title, job.name);
             }

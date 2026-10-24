@@ -58,6 +58,7 @@ pub struct AppState {
     pub updates: Updates,
     pub importer: Importer,
     pub trackers: Trackers,
+    pub pipeline: Arc<crate::pipeline::Pipeline>,
     /// The local source's folder, shown in Settings so the owner knows where to put files.
     pub local_dir: String,
 }
@@ -141,6 +142,10 @@ pub fn router(state: Spaces) -> Router {
         .route("/manga/{id}/tracks", get(tracks))
         .route("/manga/{id}/tracks/{tracker}", post(bind_track).put(edit_track).delete(unbind_track))
         .route("/manga/{id}/tracks/{tracker}/refresh", post(refresh_track))
+        .route("/pipeline/config", get(get_pipeline_config).put(put_pipeline_config))
+        .route("/pipeline/test-mangabaka", post(test_pipeline_mangabaka))
+        .route("/pipeline/test-komga", post(test_pipeline_komga))
+        .route("/pipeline/events", get(get_pipeline_events))
         .layer(middleware::from_fn_with_state(state.clone(), auth::require));
     let api = Router::new()
         .nest("/auth", auth::routes())
@@ -987,6 +992,52 @@ async fn forget(Me(app): Me, Path(chapter): Path<i64>) -> Result<Json<Value>> {
 async fn clear_history(Me(app): Me) -> Result<Json<Value>> {
     app.db.call(|conn| library::forget(conn, None)).await?;
     Ok(done())
+}
+
+// ---------- pipeline ----------
+
+async fn get_pipeline_config(Me(app): Me) -> Result<Json<crate::pipeline::PipelineConfig>> {
+    app.me.admin()?;
+    let config = app.pipeline.load_config().await?;
+    Ok(Json(config))
+}
+
+async fn put_pipeline_config(
+    Me(app): Me,
+    Json(config): Json<crate::pipeline::PipelineConfig>,
+) -> Result<Json<Value>> {
+    app.me.admin()?;
+    app.pipeline.save_config(config).await?;
+    Ok(done())
+}
+
+#[derive(Deserialize)]
+struct TestPipelinePayload {
+    url: Option<String>,
+    token: Option<String>,
+}
+
+async fn test_pipeline_mangabaka(
+    Me(app): Me,
+    Json(payload): Json<TestPipelinePayload>,
+) -> Result<Json<Value>> {
+    app.me.admin()?;
+    let msg = app.pipeline.test_mangabaka(payload.url, payload.token).await?;
+    Ok(Json(json!({ "message": msg })))
+}
+
+async fn test_pipeline_komga(
+    Me(app): Me,
+    Json(payload): Json<TestPipelinePayload>,
+) -> Result<Json<Value>> {
+    app.me.admin()?;
+    let msg = app.pipeline.test_komga(payload.url, payload.token).await?;
+    Ok(Json(json!({ "message": msg })))
+}
+
+async fn get_pipeline_events(Me(app): Me) -> Result<Json<Vec<crate::pipeline::PipelineEvent>>> {
+    app.me.admin()?;
+    Ok(Json(app.pipeline.recent_events()))
 }
 
 #[cfg(test)]

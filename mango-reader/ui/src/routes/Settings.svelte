@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { get, message, send, type Category, type Tracker } from '../lib/api';
+  import { get, message, send, type Category, type PipelineConfig, type PipelineEvent, type Tracker } from '../lib/api';
   import { confirm } from '../lib/confirm.svelte';
   import { COVERS, display, MENUS, setDisplay, SIZES } from '../lib/display.svelte';
   import Icon, { type IconName } from '../lib/Icon.svelte';
@@ -16,16 +16,17 @@
   import { activeName, contrast, isHex, palette, PRESETS, saveTheme, sound, SPOTS, theme, type Theme } from '../lib/theme.svelte';
 
   // One group is on screen at a time. Which one is in the address: #/settings/<id>.
-  const TABS: { id: string; label: string; icon: IconName; about: string }[] = [
+  const TABS: { id: string; label: string; icon: IconName; about: string }[] = $derived([
     { id: 'appearance', label: 'Appearance', icon: 'eye', about: 'Themes, colours and print effects.' },
     { id: 'reader', label: 'Reader', icon: 'book', about: 'How each kind of series is read.' },
     { id: 'library', label: 'Library', icon: 'bookmark', about: 'Categories, and the check for new chapters.' },
     { id: 'downloads', label: 'Downloads', icon: 'download', about: 'Chapters kept on this server.' },
+    ...(session.admin ? [{ id: 'pipeline', label: 'Pipeline', icon: 'upload' as IconName, about: 'Komga publication, MangaBaka, and image optimization.' }] : []),
     { id: 'sources', label: 'Sources', icon: 'puzzle', about: 'Where titles come from, and backups in and out.' },
     { id: 'trackers', label: 'Trackers', icon: 'link', about: 'Keep reading progress in step with a tracking site.' },
     { id: 'account', label: 'Account', icon: 'user', about: 'The password, signing out, and who else may use this Mango.' },
     { id: 'about', label: 'About', icon: 'info', about: 'The tour, this version, and newer ones.' },
-  ];
+  ]);
   const tab = $derived(TABS.find((entry) => entry.id === route.path.split('/')[2]) ?? TABS[0]);
 
   // On a narrow screen the groups are a strip that scrolls sideways; keep the open one in view.
@@ -498,6 +499,135 @@
       .catch((e) => (solverError = message(e)));
   });
 
+  // ---------- acquisition pipeline ----------
+
+  let pipeline = $state<PipelineConfig>({
+    enabled: false,
+    library_dir: null,
+    chinese_library_dir: null,
+    mangabaka_enabled: true,
+    mangabaka_url: 'https://api.mangabaka.org/v1',
+    has_mangabaka_token: false,
+    komga_enabled: false,
+    komga_url: 'http://127.0.0.1:25600',
+    has_komga_api_key: false,
+    komga_library_id: null,
+    optimize_enabled: false,
+    optimizer_bin: null,
+    min_savings_percent: 10,
+  });
+  let pipelineEvents = $state<PipelineEvent[]>([]);
+  let pipelineLoading = $state(false);
+  let pipelineSaving = $state(false);
+  let pipelineError = $state<string | null>(null);
+  let mangabakaTesting = $state(false);
+  let mangabakaTestResult = $state<{ ok: boolean; message: string } | null>(null);
+  let komgaTesting = $state(false);
+  let komgaTestResult = $state<{ ok: boolean; message: string } | null>(null);
+
+  let libraryDirInput = $state('');
+  let chineseLibraryDirInput = $state('');
+  let mangabakaUrlInput = $state('');
+  let mangabakaTokenInput = $state('');
+  let komgaUrlInput = $state('');
+  let komgaApiKeyInput = $state('');
+  let komgaLibraryIdInput = $state('');
+  let optimizerBinInput = $state('');
+  let minSavingsPercentInput = $state(10);
+
+  let askedPipeline = false;
+  $effect(() => {
+    if (tab.id !== 'pipeline' || askedPipeline || !session.admin) return;
+    askedPipeline = true;
+    loadPipeline();
+  });
+
+  async function loadPipeline() {
+    pipelineLoading = true;
+    pipelineError = null;
+    try {
+      const [cfg, evts] = await Promise.all([
+        get<PipelineConfig>('/pipeline/config'),
+        get<PipelineEvent[]>('/pipeline/events'),
+      ]);
+      pipeline = cfg;
+      pipelineEvents = evts;
+      libraryDirInput = cfg.library_dir ?? '';
+      chineseLibraryDirInput = cfg.chinese_library_dir ?? '';
+      mangabakaUrlInput = cfg.mangabaka_url ?? 'https://api.mangabaka.org/v1';
+      mangabakaTokenInput = cfg.has_mangabaka_token ? '********' : '';
+      komgaUrlInput = cfg.komga_url ?? 'http://127.0.0.1:25600';
+      komgaApiKeyInput = cfg.has_komga_api_key ? '********' : '';
+      komgaLibraryIdInput = cfg.komga_library_id ?? '';
+      optimizerBinInput = cfg.optimizer_bin ?? '';
+      minSavingsPercentInput = cfg.min_savings_percent ?? 10;
+    } catch (e) {
+      pipelineError = message(e);
+    } finally {
+      pipelineLoading = false;
+    }
+  }
+
+  async function savePipeline() {
+    if (!pipeline) return;
+    pipelineSaving = true;
+    pipelineError = null;
+    try {
+      const patch: PipelineConfig = {
+        ...pipeline,
+        library_dir: libraryDirInput.trim() || null,
+        chinese_library_dir: chineseLibraryDirInput.trim() || null,
+        mangabaka_url: mangabakaUrlInput.trim() || null,
+        mangabaka_token: mangabakaTokenInput.trim() || null,
+        komga_url: komgaUrlInput.trim() || null,
+        komga_api_key: komgaApiKeyInput.trim() || null,
+        komga_library_id: komgaLibraryIdInput.trim() || null,
+        optimizer_bin: optimizerBinInput.trim() || null,
+        min_savings_percent: Number(minSavingsPercentInput) || 10,
+      };
+      await send('PUT', '/pipeline/config', patch);
+      toast.success('Acquisition pipeline settings saved');
+      await loadPipeline();
+    } catch (e) {
+      pipelineError = message(e);
+      toast.error(message(e));
+    } finally {
+      pipelineSaving = false;
+    }
+  }
+
+  async function testMangaBaka() {
+    mangabakaTesting = true;
+    mangabakaTestResult = null;
+    try {
+      const res = await send<{ message: string }>('POST', '/pipeline/test-mangabaka', {
+        url: mangabakaUrlInput.trim() || null,
+        token: mangabakaTokenInput.trim() || null,
+      });
+      mangabakaTestResult = { ok: true, message: res.message };
+    } catch (e) {
+      mangabakaTestResult = { ok: false, message: message(e) };
+    } finally {
+      mangabakaTesting = false;
+    }
+  }
+
+  async function testKomga() {
+    komgaTesting = true;
+    komgaTestResult = null;
+    try {
+      const res = await send<{ message: string }>('POST', '/pipeline/test-komga', {
+        url: komgaUrlInput.trim() || null,
+        api_key: komgaApiKeyInput.trim() || null,
+      });
+      komgaTestResult = { ok: true, message: res.message };
+    } catch (e) {
+      komgaTestResult = { ok: false, message: message(e) };
+    } finally {
+      komgaTesting = false;
+    }
+  }
+
   // ---------- version ----------
 
   const v = $derived(about.info);
@@ -843,6 +973,239 @@
             </div>
           </div>
         </section>
+      {:else if tab.id === 'pipeline'}
+        {#if pipelineError}
+          <div class="set stack"><Notice error={pipelineError} /></div>
+        {/if}
+
+        <section class="card">
+          <h3>Acquisition Pipeline</h3>
+            <div class="set">
+              <div class="what">
+                <strong>Enable Acquisition Pipeline</strong>
+                <span>Post-process new volume and chapter acquisitions: enrich metadata, optimize images, publish to Komga library folders, and trigger library scans.</span>
+              </div>
+              <div class="how">
+                {@render toggle(pipeline.enabled, 'Enable pipeline', () => {
+                  if (pipeline) pipeline.enabled = !pipeline.enabled;
+                })}
+              </div>
+            </div>
+          </section>
+
+          <section class="card">
+            <h3>Permanent Library Paths</h3>
+            <div class="set stack">
+              <div class="what">
+                <strong>Permanent Manga Library</strong>
+                <span>Canonical destination folder where standard/English series are published (e.g. Komga library root).</span>
+              </div>
+              <div class="how wide">
+                <label class="field grow">
+                  <input type="text" bind:value={libraryDirInput} placeholder="/srv/media/manga" autocomplete="off" />
+                </label>
+              </div>
+            </div>
+            <div class="set stack">
+              <div class="what">
+                <strong>Chinese Manga Library</strong>
+                <span>Optional separate destination for Chinese/Mandarin series acquisitions.</span>
+              </div>
+              <div class="how wide">
+                <label class="field grow">
+                  <input type="text" bind:value={chineseLibraryDirInput} placeholder="/srv/media/manga-chinese" autocomplete="off" />
+                </label>
+              </div>
+            </div>
+          </section>
+
+          <section class="card">
+            <h3>MangaBaka Metadata Enrichment</h3>
+            <div class="set">
+              <div class="what">
+                <strong>Enrich Volume Metadata</strong>
+                <span>Fetch official release dates, volume summaries, writers, artists, and publishers from MangaBaka.</span>
+              </div>
+              <div class="how">
+                {@render toggle(pipeline.mangabaka_enabled, 'MangaBaka enrichment', () => {
+                  if (pipeline) pipeline.mangabaka_enabled = !pipeline.mangabaka_enabled;
+                })}
+              </div>
+            </div>
+            <div class="set stack">
+              <div class="what">
+                <strong>MangaBaka API Endpoint</strong>
+                <span>Default: https://api.mangabaka.org/v1</span>
+              </div>
+              <div class="how wide">
+                <label class="field grow">
+                  <input type="url" bind:value={mangabakaUrlInput} placeholder="https://api.mangabaka.org/v1" autocomplete="off" />
+                </label>
+              </div>
+            </div>
+            <div class="set stack">
+              <div class="what">
+                <strong>MangaBaka API Token</strong>
+                <span>Optional Bearer token for higher rate limits. Leave as "********" to keep existing token.</span>
+              </div>
+              <div class="how wide">
+                <label class="field grow">
+                  <input type="password" bind:value={mangabakaTokenInput} placeholder={pipeline.has_mangabaka_token ? 'Configured (type CLEAR to remove)' : 'Optional API token'} autocomplete="off" />
+                </label>
+                <button class="btn" onclick={testMangaBaka} disabled={mangabakaTesting}>
+                  <Icon name="refresh" size={16} />
+                  {mangabakaTesting ? 'Testing…' : 'Test MangaBaka'}
+                </button>
+              </div>
+            </div>
+            {#if mangabakaTestResult}
+              <div class="set stack">
+                <Notice error={mangabakaTestResult.ok ? null : mangabakaTestResult.message}>
+                  {#if mangabakaTestResult.ok}<span>{mangabakaTestResult.message}</span>{/if}
+                </Notice>
+              </div>
+            {/if}
+          </section>
+
+          <section class="card">
+            <h3>Komga Server Integration</h3>
+            <div class="set">
+              <div class="what">
+                <strong>Notify Komga on Acquisition</strong>
+                <span>Automatically trigger a library rescan when new volumes or chapters are published into the permanent library.</span>
+              </div>
+              <div class="how">
+                {@render toggle(pipeline.komga_enabled, 'Komga scan triggers', () => {
+                  if (pipeline) pipeline.komga_enabled = !pipeline.komga_enabled;
+                })}
+              </div>
+            </div>
+            <div class="set stack">
+              <div class="what">
+                <strong>Komga Server URL</strong>
+                <span>Address of your Komga server instance (e.g. http://10.0.0.140:25600 or http://127.0.0.1:25600).</span>
+              </div>
+              <div class="how wide">
+                <label class="field grow">
+                  <input type="url" bind:value={komgaUrlInput} placeholder="http://127.0.0.1:25600" autocomplete="off" />
+                </label>
+              </div>
+            </div>
+            <div class="set stack">
+              <div class="what">
+                <strong>Komga API Key</strong>
+                <span>X-API-Key token configured in your Komga user profile. Leave as "********" to keep existing key.</span>
+              </div>
+              <div class="how wide">
+                <label class="field grow">
+                  <input type="password" bind:value={komgaApiKeyInput} placeholder={pipeline.has_komga_api_key ? 'Configured (type CLEAR to remove)' : 'Komga API Key'} autocomplete="off" />
+                </label>
+                <button class="btn" onclick={testKomga} disabled={komgaTesting}>
+                  <Icon name="refresh" size={16} />
+                  {komgaTesting ? 'Testing…' : 'Test Komga'}
+                </button>
+              </div>
+            </div>
+            <div class="set stack">
+              <div class="what">
+                <strong>Specific Library ID (Optional)</strong>
+                <span>Leave blank to scan all libraries, or specify a specific Komga library ID to rescan.</span>
+              </div>
+              <div class="how wide">
+                <label class="field grow">
+                  <input type="text" bind:value={komgaLibraryIdInput} placeholder="All libraries" autocomplete="off" />
+                </label>
+              </div>
+            </div>
+            {#if komgaTestResult}
+              <div class="set stack">
+                <Notice error={komgaTestResult.ok ? null : komgaTestResult.message}>
+                  {#if komgaTestResult.ok}<span>{komgaTestResult.message}</span>{/if}
+                </Notice>
+              </div>
+            {/if}
+          </section>
+
+          <section class="card">
+            <h3>Image Optimization</h3>
+            <div class="set">
+              <div class="what">
+                <strong>Enable Image Optimization</strong>
+                <span>Non-destructively shrink CBZ archives before permanent library publication using RustyLibraryShrinker.</span>
+              </div>
+              <div class="how">
+                {@render toggle(pipeline.optimize_enabled, 'Image optimization', () => {
+                  if (pipeline) pipeline.optimize_enabled = !pipeline.optimize_enabled;
+                })}
+              </div>
+            </div>
+            <div class="set stack">
+              <div class="what">
+                <strong>Optimizer Executable Path</strong>
+                <span>Absolute path to RustyLibraryShrinker binary on the host (e.g. /srv/apps/manga/manga-itagger/RustyLibraryShrinker).</span>
+              </div>
+              <div class="how wide">
+                <label class="field grow">
+                  <input type="text" bind:value={optimizerBinInput} placeholder="/srv/apps/manga/manga-itagger/RustyLibraryShrinker" autocomplete="off" />
+                </label>
+              </div>
+            </div>
+            <div class="set">
+              <div class="what">
+                <strong>Minimum Size Savings Required (%)</strong>
+                <span>Optimized CBZs that achieve less savings than this threshold or change page count are rejected; original archive is kept untouched.</span>
+              </div>
+              <div class="how">
+                <label class="field seconds">
+                  <input type="number" bind:value={minSavingsPercentInput} min="1" max="90" />
+                </label>
+              </div>
+            </div>
+          </section>
+
+          <div class="action-bar">
+            <button class="btn spot" onclick={savePipeline} disabled={pipelineSaving}>
+              <Icon name="check" size={18} />
+              {pipelineSaving ? 'Saving…' : 'Save Pipeline Settings'}
+            </button>
+            <button class="btn" onclick={loadPipeline} disabled={pipelineLoading}>
+              <Icon name="refresh" size={18} />
+              Refresh
+            </button>
+          </div>
+
+          <section class="card">
+            <h3>Recent Pipeline Activity</h3>
+            {#if pipelineEvents.length === 0}
+              <p class="muted">No recent pipeline executions recorded. When downloads complete, their processing and publication will appear here.</p>
+            {:else}
+              <div class="events-list">
+                {#each pipelineEvents as evt (evt.id)}
+                  <div class="event-item">
+                    <div class="event-header">
+                      <span class="event-series">{evt.series}</span>
+                      <span class="event-release">{evt.release_name}</span>
+                      <span class="event-badge badge-{evt.outcome}">
+                        {evt.outcome === 'published' ? 'Published' : evt.outcome === 'already_published' ? 'Already in Library' : evt.outcome === 'conflict' ? 'Conflict (Preserved)' : evt.outcome === 'error' ? 'Error' : evt.outcome}
+                      </span>
+                      <span class="event-time">{ago(evt.timestamp * 1000)}</span>
+                    </div>
+                    <div class="event-details">
+                      <span class="detail">MangaBaka: <em>{evt.mangabaka_status}</em></span>
+                      <span class="detail">Optimizer: <em>{evt.optimizer_status}</em></span>
+                      <span class="detail">Komga: <em>{evt.komga_status}</em></span>
+                    </div>
+                    {#if evt.destination}
+                      <div class="event-dest">Canonical: <code>{evt.destination}</code></div>
+                    {/if}
+                    {#if evt.error}
+                      <div class="event-error">{evt.error}</div>
+                    {/if}
+                  </div>
+                {/each}
+              </div>
+            {/if}
+          </section>
       {:else if tab.id === 'sources'}
         <section class="card">
           <h3>Sources</h3>
@@ -1621,5 +1984,118 @@
     .rail a:last-child {
       border-right: 0;
     }
+  }
+
+  .action-bar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin: 16px 0;
+  }
+
+  .events-list {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    margin-top: 12px;
+  }
+
+  .event-item {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 12px 14px;
+    border: 2px solid var(--ink);
+    background: var(--surface);
+    box-shadow: var(--sh-2);
+  }
+
+  .event-header {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 12px;
+  }
+
+  .event-series {
+    font-weight: 900;
+    font-size: 14px;
+  }
+
+  .event-release {
+    font-size: 13px;
+    color: var(--muted);
+  }
+
+  .event-time {
+    margin-left: auto;
+    font-size: 12px;
+    color: var(--muted);
+  }
+
+  .event-badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 8px;
+    border: 2px solid var(--ink);
+    font-size: 11px;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+
+  .badge-published {
+    background: var(--spot);
+    color: var(--on-spot);
+  }
+
+  .badge-already_published {
+    background: var(--paper);
+    color: var(--ink);
+  }
+
+  .badge-conflict {
+    background: #ffb703;
+    color: #000;
+  }
+
+  .badge-error {
+    background: #e63946;
+    color: #fff;
+  }
+
+  .badge-skipped {
+    background: var(--surface);
+    color: var(--muted);
+  }
+
+  .event-details {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    font-size: 12px;
+  }
+
+  .event-details .detail em {
+    font-style: normal;
+    font-weight: 700;
+  }
+
+  .event-dest {
+    font-size: 12px;
+    word-break: break-all;
+  }
+
+  .event-dest code {
+    font-size: 11px;
+    background: var(--paper);
+    padding: 2px 4px;
+    border: 1px solid var(--ink);
+  }
+
+  .event-error {
+    color: #e63946;
+    font-size: 12px;
+    font-weight: 700;
   }
 </style>
