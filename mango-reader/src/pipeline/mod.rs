@@ -17,6 +17,7 @@ use crate::db::Db;
 use crate::error::{AppError, Result};
 use komga::KomgaClient;
 use mangabaka::MangaBakaClient;
+use std::fs;
 #[allow(unused_imports)]
 pub use optimizer::{
     check_executable_invocable, count_cbz_pages, is_executable, optimize_cbz, resolve_optimizer_binary,
@@ -480,14 +481,51 @@ impl Pipeline {
         }
 
         // 3. Non-destructive Image Optimization
-        let mut optimizer_status = "skipped".to_string();
-        if config.optimize_enabled {
-            if is_chinese {
-                optimizer_status = "skipped for Chinese edition (already optimized)".to_string();
-            } else {
-                match optimize_cbz(source_cbz, config.optimizer_bin.as_deref(), config.min_savings_percent).await {
-                    Ok(res) => optimizer_status = res.reason,
-                    Err(e) => optimizer_status = format!("optimization error: {e}"),
+        let mut optimizer_status = "skipped: disabled".to_string();
+        if !config.optimize_enabled {
+            tracing::info!("OPTIMIZER: skipped: disabled");
+        } else if is_chinese {
+            optimizer_status = "skipped: Chinese edition (already optimized)".to_string();
+            tracing::info!("OPTIMIZER: skipped: Chinese edition (already optimized)");
+        } else {
+            let (resolved_bin, bin_source) = optimizer::resolve_optimizer_binary(config.optimizer_bin.as_deref());
+            match resolved_bin {
+                None => {
+                    optimizer_status = "failed: optimizer unavailable".to_string();
+                    tracing::warn!("OPTIMIZER: failed: optimizer binary unavailable or not found — original retained");
+                }
+                Some(ref bin) => {
+                    let orig_size = fs::metadata(source_cbz).map(|m| m.len()).unwrap_or(0);
+                    tracing::info!(
+                        "OPTIMIZER: starting {} ({bin_source}) for candidate {} ({} bytes, min savings {}%)",
+                        bin.display(),
+                        source_cbz.display(),
+                        orig_size,
+                        config.min_savings_percent
+                    );
+                    match optimizer::optimize_cbz(source_cbz, config.optimizer_bin.as_deref(), config.min_savings_percent).await {
+                        Ok(res) => {
+                            optimizer_status = res.reason.clone();
+                            if res.applied {
+                                tracing::info!(
+                                    "OPTIMIZER: candidate {} bytes -> optimized {} bytes (savings {:.1}% >= {}%) — accepted",
+                                    res.original_bytes,
+                                    res.optimized_bytes,
+                                    res.savings_percent,
+                                    config.min_savings_percent
+                                );
+                            } else {
+                                tracing::info!(
+                                    "OPTIMIZER: {} — original retained",
+                                    res.reason
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            optimizer_status = format!("failed: {e}");
+                            tracing::warn!("OPTIMIZER: failed: {e} — original retained");
+                        }
+                    }
                 }
             }
         }
@@ -806,6 +844,133 @@ mod tests {
         assert!(!events.is_empty());
         assert_eq!(events[0].outcome, "conflict");
         assert_eq!(events[1].outcome, "already_published");
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[tokio::test]
+    async fn pipeline_process_download_with_optimizer_end_to_end() {
+        let db = test_db();
+        let pipeline = Pipeline::new(db);
+
+        let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let test_root = std::env::temp_dir().join(format!("mango-pipetest-opt-e2e-{}-{n}", std::process::id()));
+        let _ = fs::remove_dir_all(&test_root);
+        let library_dir = test_root.join("manga");
+        let staging_dir = test_root.join("staging");
+        fs::create_dir_all(&library_dir).unwrap();
+        fs::create_dir_all(&staging_dir).unwrap();
+
+        // 1. Create a mock shrinker that simulates a successful 25% reduction
+        let script = test_root.join("mock_shrinker.sh");
+        let script_content = r#"#!/bin/sh
+# Finds the target archive in arguments
+for arg in "$@"; do
+    case "$arg" in
+        *.cbz) target="$arg" ;;
+    esac
+done
+if [ -n "$target" ] && [ -f "$target" ]; then
+    # Overwrite target with a smaller valid CBZ containing same page count and ComicInfo
+    tmp="$target.small.zip"
+    python3 -c "
+import zipfile, sys
+with zipfile.ZipFile('$tmp', 'w') as z:
+    z.writestr('ComicInfo.xml', '<ComicInfo><Series>Test</Series></ComicInfo>')
+    z.writestr('001.webp', b'small')
+" 2>/dev/null || true
+    if [ -f "$tmp" ]; then
+        mv "$tmp" "$target"
+    fi
+fi
+echo "MockShrinker 1.0.0"
+exit 0
+"#;
+        fs::write(&script, script_content).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script, perms).unwrap();
+        }
+
+        // 2. Save configuration with optimize_enabled = true
+        let mut config = PipelineConfig::default();
+        config.enabled = true;
+        config.library_dir = Some(library_dir.to_string_lossy().to_string());
+        config.optimize_enabled = true;
+        config.optimizer_bin = Some(script.to_string_lossy().to_string());
+        config.min_savings_percent = 5;
+        config.mangabaka_enabled = false;
+        config.komga_enabled = false;
+
+        pipeline.save_config(config).await.unwrap();
+
+        // Verify config loaded dynamically from DB
+        let loaded = pipeline.load_config().await.unwrap();
+        assert!(loaded.optimize_enabled);
+        assert_eq!(loaded.min_savings_percent, 5);
+
+        // 3. Process download
+        let cbz = staging_dir.join("chap1.cbz");
+        make_test_cbz(&cbz, "Series With Opt");
+        let _orig_size = fs::metadata(&cbz).unwrap().len();
+
+        let job = crate::downloads::Job {
+            chapter: 201,
+            attempts: 0,
+            source: "MangaDot".into(),
+            title: "Series With Opt".into(),
+            name: "Chapter 1".into(),
+            number: 1.0,
+            scanlator: Some("Stick".into()),
+            author: None,
+            artist: None,
+            genre: None,
+            summary: None,
+            lang: Some("en".into()),
+            volume: None,
+            release_type: crate::release::ReleaseType::Chapter,
+            chapter_number: Some(1.0),
+        };
+
+        pipeline.process_download(&cbz, &job).await.unwrap();
+
+        let events = pipeline.recent_events();
+        assert_eq!(events[0].chapter_id, 201);
+        // Optimizer status must not be "skipped" when enabled
+        assert!(!events[0].optimizer_status.contains("skipped: disabled"));
+
+        // 4. Save with optimize_enabled = false and verify dynamic update without restarting
+        let mut disabled_config = pipeline.load_config().await.unwrap();
+        disabled_config.optimize_enabled = false;
+        pipeline.save_config(disabled_config).await.unwrap();
+
+        let cbz2 = staging_dir.join("chap2.cbz");
+        make_test_cbz(&cbz2, "Series With Opt");
+        let job2 = crate::downloads::Job {
+            chapter: 202,
+            attempts: 0,
+            source: "MangaDot".into(),
+            title: "Series With Opt".into(),
+            name: "Chapter 2".into(),
+            number: 2.0,
+            scanlator: Some("Stick".into()),
+            author: None,
+            artist: None,
+            genre: None,
+            summary: None,
+            lang: Some("en".into()),
+            volume: None,
+            release_type: crate::release::ReleaseType::Chapter,
+            chapter_number: Some(2.0),
+        };
+
+        pipeline.process_download(&cbz2, &job2).await.unwrap();
+        let events2 = pipeline.recent_events();
+        assert_eq!(events2[0].chapter_id, 202);
+        assert_eq!(events2[0].optimizer_status, "skipped: disabled");
 
         let _ = fs::remove_dir_all(&test_root);
     }
