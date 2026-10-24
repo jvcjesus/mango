@@ -383,6 +383,8 @@ export interface PipelineConfig {
   komga_api_key?: string | null;
   has_komga_api_key: boolean;
   komga_library_id: string | null;
+  komga_chinese_library_id: string | null;
+  komga_scan_enabled: boolean;
   optimize_enabled: boolean;
   optimizer_bin: string | null;
   target_height: number;
@@ -409,4 +411,28 @@ export interface PipelineEvent {
   optimizer_status: string;
   komga_status: string;
   error: string | null;
+}
+
+export type OwnershipStatus = 'owned' | 'available' | 'acquiring' | 'unknown';
+
+export interface VolumeOwnership {
+  volume: number;
+  status: OwnershipStatus;
+  bookId?: string | null;
+  bookName?: string | null;
+}
+
+export interface TitleOwnership {
+  komgaConnected: boolean;
+  seriesId?: string | null;
+  seriesName?: string | null;
+  libraryId?: string | null;
+  volumes: VolumeOwnership[];
+}
+
+export interface KomgaLibrary {
+  id: string;
+  name: string;
+  root: string;
+  unavailable: boolean;
 }

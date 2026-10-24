@@ -10,6 +10,7 @@
 pub mod komga;
 pub mod mangabaka;
 pub mod optimizer;
+pub mod ownership;
 pub mod publisher;
 pub mod validation;
 
@@ -161,17 +162,21 @@ pub struct PipelineEvent {
 pub struct Pipeline {
     db: Db,
     http: Client,
+    pub ownership: ownership::OwnershipService,
     events: Arc<RwLock<VecDeque<PipelineEvent>>>,
 }
 
 impl Pipeline {
     pub fn new(db: Db) -> Self {
+        let http = Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_default();
+        let ownership = ownership::OwnershipService::new(http.clone(), db.clone());
         Self {
             db,
-            http: Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .unwrap_or_default(),
+            http,
+            ownership,
             events: Arc::new(RwLock::new(VecDeque::with_capacity(MAX_RECENT_EVENTS))),
         }
     }
@@ -705,6 +710,10 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         Db::open(&dir.join("test.db")).unwrap()
+    }
+
+    pub(crate) fn test_db_instance() -> Db {
+        test_db()
     }
 
     #[test]

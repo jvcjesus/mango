@@ -104,6 +104,7 @@ pub fn router(state: Spaces) -> Router {
         .route("/sources/{id}/{kind}", get(browse))
         .route("/manga/{id}", get(title))
         .route("/manga/{id}/refresh", post(refresh_title))
+        .route("/manga/{id}/ownership", get(manga_ownership))
         .route("/manga/{id}/cover", get(cover))
         .route("/manga/{id}/library", put(set_library))
         .route("/manga/{id}/reader", put(set_reader))
@@ -593,7 +594,14 @@ async fn title(Me(app): Me, Path(id): Path<i64>) -> Result<Json<TitleView>> {
 }
 
 async fn refresh_title(Me(app): Me, Path(id): Path<i64>) -> Result<Json<TitleView>> {
+    app.pipeline.ownership.invalidate(id);
     Ok(Json(app.titles.refresh(id).await?))
+}
+
+async fn manga_ownership(Me(app): Me, Path(id): Path<i64>) -> Result<Json<crate::pipeline::ownership::TitleOwnership>> {
+    let title_view = app.titles.get(id).await?;
+    let ownership = app.pipeline.ownership.get_title_ownership(id, &title_view.title).await;
+    Ok(Json(ownership))
 }
 
 /// The address carries a version, so with one the answer never changes.

@@ -1098,6 +1098,8 @@ describe('first-class volume acquisition & release semantics', () => {
         komga_url: 'http://127.0.0.1:25600',
         has_komga_api_key: true,
         komga_library_id: null,
+        komga_chinese_library_id: null,
+        komga_scan_enabled: true,
         optimize_enabled: false,
         optimizer_bin: null,
         min_savings_percent: 10,
@@ -1222,6 +1224,8 @@ describe('first-class volume acquisition & release semantics', () => {
         komga_url: 'http://127.0.0.1:25600',
         has_komga_api_key: false,
         komga_library_id: null,
+        komga_chinese_library_id: null,
+        komga_scan_enabled: true,
         optimize_enabled: false,
         optimizer_bin: null,
         target_height: 2400,
@@ -1244,6 +1248,29 @@ describe('first-class volume acquisition & release semantics', () => {
       expect(customPatch.target_height).toBe(3000);
       expect(customPatch.image_quality).toBe(85);
       expect(customPatch.min_savings_percent).toBe(15);
+    });
+
+    it('models Komga volume ownership states and detects owned and acquiring volumes', () => {
+      const ownership: import('./api').TitleOwnership = {
+        komgaConnected: true,
+        seriesId: 'series-123',
+        seriesName: 'Blue Lock',
+        libraryId: 'lib-en',
+        volumes: [
+          { volume: 1, status: 'owned', bookId: 'b-1', bookName: 'Blue Lock v01' },
+          { volume: 2, status: 'acquiring', bookId: null, bookName: null },
+        ],
+      };
+
+      const v1 = ownership.volumes.find((v) => v.volume === 1);
+      expect(v1?.status).toBe('owned');
+      expect(v1?.bookName).toBe('Blue Lock v01');
+
+      const v2 = ownership.volumes.find((v) => v.volume === 2);
+      expect(v2?.status).toBe('acquiring');
+
+      const v3 = ownership.volumes.find((v) => v.volume === 3);
+      expect(v3).toBeUndefined(); // Unowned/available
     });
   });
 });

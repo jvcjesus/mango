@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { get, message, send, type Category, type Chapter, type Title } from '../lib/api';
+  import { get, message, send, type Category, type Chapter, type OwnershipStatus, type Title, type TitleOwnership } from '../lib/api';
   import { confirm } from '../lib/confirm.svelte';
   import Cover from '../lib/Cover.svelte';
   import Icon from '../lib/Icon.svelte';
@@ -127,6 +127,16 @@
     return view.down ? list : list.reverse();
   });
   const filteredUnread = $derived(listed.filter((c) => !c.read && !c.downloaded));
+  let ownership = $state<TitleOwnership | null>(null);
+
+  async function loadOwnership() {
+    try {
+      ownership = await get<TitleOwnership>(`/manga/${id}/ownership`);
+    } catch {
+      ownership = null;
+    }
+  }
+
   type VolumeGroup = {
     volume: number | null;
     label: string;
@@ -136,6 +146,8 @@
     isFullyDownloaded: boolean;
     isPartiallyDownloaded: boolean;
     isBusy: boolean;
+    ownershipStatus: OwnershipStatus | null;
+    ownedBookName: string | null;
   };
   const volumeGroups = $derived.by<VolumeGroup[]>(() => {
     if (!view.volumes) {
@@ -150,6 +162,8 @@
         isFullyDownloaded: listed.length > 0 && missingCount === 0,
         isPartiallyDownloaded: downloadedCount > 0 && missingCount > 0,
         isBusy: listed.some((c) => busyChapter[c.id]),
+        ownershipStatus: null,
+        ownedBookName: null,
       }];
     }
     const map = new Map<number | null, Chapter[]>();
@@ -168,6 +182,7 @@
     return entries.map(([vol, chs]) => {
       const downloadedCount = chs.filter((c) => c.downloaded).length;
       const missingCount = chs.filter((c) => !c.downloaded).length;
+      const volOwnership = vol !== null ? ownership?.volumes.find((v) => Math.abs(v.volume - vol) < 0.001) : null;
       return {
         volume: vol,
         label: volumeHeading(vol),
@@ -177,6 +192,8 @@
         isFullyDownloaded: chs.length > 0 && missingCount === 0,
         isPartiallyDownloaded: downloadedCount > 0 && missingCount > 0,
         isBusy: chs.some((c) => busyChapter[c.id]),
+        ownershipStatus: volOwnership?.status ?? null,
+        ownedBookName: volOwnership?.bookName ?? null,
       };
     });
   });
@@ -198,6 +215,7 @@
       const fresh = await get<Title>(`/manga/${id}`);
       keep('title', fresh);
       title = fresh;
+      loadOwnership();
       // A title only seen in a list has no details or chapters yet.
       if (!title.initialized || title.chapters.length === 0) refresh();
     } catch (e) {
@@ -217,6 +235,7 @@
     refreshError = null;
     try {
       title = await send<Title>('POST', `/manga/${id}/refresh`);
+      await loadOwnership();
       toast.success('Updated title from source');
     } catch (e) {
       refreshError = message(e);
@@ -241,6 +260,20 @@
 
   async function download(list: Chapter[]) {
     if (!list.length || downloading) return;
+    const ownedVols = new Set(ownership?.volumes.filter((v) => v.status === 'owned').map((v) => v.volume) ?? []);
+    const downloadingOwned = list.some((c) => {
+      const vol = c.volume !== undefined && c.volume !== null ? c.volume : parseVolume(c.name);
+      return vol !== null && ownedVols.has(vol);
+    });
+    if (downloadingOwned && list.length === 1) {
+      const ok = await confirm({
+        title: 'Already Owned in Komga',
+        message: `This release belongs to a volume already present in your canonical Komga library. Acquire anyway?`,
+        confirmText: 'Acquire anyway',
+        danger: false,
+      });
+      if (!ok) return;
+    }
     downloading = true;
     for (const c of list) busyChapter[c.id] = true;
     try {
@@ -260,6 +293,15 @@
 
   async function downloadVolume(grp: VolumeGroup) {
     if (downloading) return;
+    if (grp.ownershipStatus === 'owned') {
+      const ok = await confirm({
+        title: 'Already Owned in Komga',
+        message: `${grp.label} is already present in your canonical Komga library${grp.ownedBookName ? ` ("${grp.ownedBookName}")` : ''}. Are you sure you want to acquire it again?`,
+        confirmText: 'Acquire anyway',
+        danger: false,
+      });
+      if (!ok) return;
+    }
     const missing = grp.chapters.filter((c) => !c.downloaded && !busyChapter[c.id]);
     if (!missing.length) return;
     for (const c of missing) busyChapter[c.id] = true;
@@ -609,6 +651,11 @@
               <div class="volume-info">
                 <h3 class="display">{grp.label}</h3>
                 <span class="tag">{grp.chapters.length} {grp.chapters.length === 1 ? 'chapter' : 'chapters'}</span>
+                {#if grp.ownershipStatus === 'owned'}
+                  <span class="tag spot" title="Present in canonical Komga library"><Icon name="check" size={14} /> Owned in Komga</span>
+                {:else if grp.ownershipStatus === 'acquiring'}
+                  <span class="tag" title="In acquisition pipeline"><span class="spin"><Icon name="spinner" size={14} stroke={3} /></span> Acquiring</span>
+                {/if}
                 {#if grp.isFullyDownloaded}
                   <span class="tag spot">Downloaded</span>
                 {:else if grp.isPartiallyDownloaded}
@@ -617,7 +664,22 @@
               </div>
               {#if grp.volume !== null}
                 <div class="volume-actions">
-                  {#if grp.isFullyDownloaded}
+                  {#if grp.ownershipStatus === 'owned'}
+                    <button
+                      class="btn pill"
+                      aria-label="Re-acquire {grp.label}"
+                      disabled={downloading || grp.isBusy || !grp.chapters.length}
+                      onclick={() => downloadVolume(grp)}
+                      title="Already in Komga library. Click to re-acquire"
+                    >
+                      {#if grp.isBusy}
+                        <span class="spin"><Icon name="spinner" size={14} stroke={3} /></span>
+                      {:else}
+                        <Icon name="refresh" size={14} />
+                      {/if}
+                      Re-acquire
+                    </button>
+                  {:else if grp.isFullyDownloaded}
                     <span class="tag spot"><Icon name="check" size={14} /> Complete</span>
                   {:else if grp.isPartiallyDownloaded}
                     <button

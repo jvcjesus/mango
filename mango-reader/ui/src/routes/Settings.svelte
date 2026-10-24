@@ -512,6 +512,8 @@
     komga_url: 'http://127.0.0.1:25600',
     has_komga_api_key: false,
     komga_library_id: null,
+    komga_chinese_library_id: null,
+    komga_scan_enabled: true,
     optimize_enabled: false,
     optimizer_bin: null,
     target_height: 2400,
