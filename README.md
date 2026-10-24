@@ -344,6 +344,37 @@ password and sees that account's library: its categories, its titles, their
 chapters. A chapter comes as a CBZ, downloaded or not, and page by page once
 Mango knows how many pages it has.
 
+### Native Acquisition Pipeline
+
+Mango includes a native acquisition and publishing pipeline to automatically process completed downloads into your permanent manga library (such as Komga):
+
+1. **Volume Metadata Enrichment**: Automatically fetches official publication dates, volume summaries, writers, artists, and publishers from MangaBaka and embeds them into `ComicInfo.xml`.
+2. **Non-destructive Image Optimization**: The `mango:full` image bundles `RustyLibraryShrinker` (`/opt/mango/bin/RustyLibraryShrinker`) to shrink CBZ archives down to efficient WebP formats while strictly verifying page count parity, ZIP integrity, and minimum size savings.
+3. **Canonical Atomic Publication**: Moves files safely into canonical series folder hierarchies with byte-for-byte duplicate deduplication and refusal of conflicting overwrites.
+4. **Komga Scan Triggers**: Automatically triggers library rescans via Komga REST API.
+
+#### Container-Aware Paths & Docker Volume Mounting
+
+Configured pipeline paths in **Settings → Pipeline** refer to paths visible **inside the Mango container runtime**. When running Mango in Docker, mount your permanent library storage into the container:
+
+```sh
+docker run -d --name mango -p 8787:8787 \
+  -v mango-data:/data \
+  -v /path/to/host/manga:/library/manga \
+  -v /path/to/host/manga-chinese:/library/manga-chinese \
+  ghcr.io/apixelsnet/mango:full
+```
+
+Then configure `/library/manga` as your **Permanent Manga Library** in Settings.
+
+> [!IMPORTANT]
+> Mango validates that library destinations exist, are directories, and are writable by the container process before allowing the pipeline to be enabled. Nonexistent or read-only destinations will clearly fail validation with actionable errors.
+
+#### Bundled Optimizer & Overrides
+
+* **Docker (Full Image)**: `mango:full` contains the bundled optimizer at `/opt/mango/bin/RustyLibraryShrinker`. No host path or external installation is required.
+* **Custom Executables**: In custom or non-containerized environments, you can specify an absolute path to a custom optimizer binary, or let Mango discover `RustyLibraryShrinker` in your system `PATH`.
+
 ### Settings
 
 A `mango.toml` in the working directory, or `MANGO_*` variables; the variables

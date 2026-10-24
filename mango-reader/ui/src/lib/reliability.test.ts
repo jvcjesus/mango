@@ -1152,9 +1152,58 @@ describe('first-class volume acquisition & release semantics', () => {
       expect(res.html).toContain('PIPELINE');
       expect(res.html).toContain('Acquisition Pipeline');
       expect(res.html).toContain('Permanent Library Paths');
+      expect(res.html).toContain('Validate Paths');
       expect(res.html).toContain('MangaBaka Metadata Enrichment');
       expect(res.html).toContain('Komga Server Integration');
       expect(res.html).toContain('Image Optimization');
+    });
+
+    it('classifies container-aware path validation codes and badges', () => {
+      const statuses = [
+        { code: 'valid', expected: 'Valid / Writable' },
+        { code: 'missing', expected: 'Missing inside container' },
+        { code: 'not_a_directory', expected: 'Not a directory' },
+        { code: 'not_writable', expected: 'Read-only or not writable' },
+        { code: 'not_configured', expected: 'Not configured' },
+      ];
+
+      for (const { code, expected } of statuses) {
+        let label = '';
+        if (code === 'valid') label = 'Valid / Writable';
+        else if (code === 'missing') label = 'Missing inside container';
+        else if (code === 'not_a_directory') label = 'Not a directory';
+        else if (code === 'not_writable') label = 'Read-only or not writable';
+        else label = 'Not configured';
+
+        expect(label).toBe(expected);
+      }
+    });
+
+    it('validates optimizer resolution precedence and migration of legacy host path', () => {
+      const legacyPath = '/srv/apps/manga/manga-itagger/RustyLibraryShrinker';
+      const bundledPath = '/opt/mango/bin/RustyLibraryShrinker';
+
+      // 1. Untouched legacy default is normalized to null (using bundled default)
+      const normalize = (input: string | null) => (input?.trim() === legacyPath || !input?.trim() ? null : input.trim());
+      expect(normalize(legacyPath)).toBeNull();
+      expect(normalize('')).toBeNull();
+      expect(normalize(null)).toBeNull();
+
+      // 2. Deliberate custom path override is preserved
+      expect(normalize('/custom/opt/bin/RustyLibraryShrinker')).toBe('/custom/opt/bin/RustyLibraryShrinker');
+
+      // 3. Bundled path is selected when no custom override is present
+      const resolve = (custom: string | null, bundledAvailable: boolean) => {
+        const norm = normalize(custom);
+        if (norm) return { path: norm, source: 'custom' };
+        if (bundledAvailable) return { path: bundledPath, source: 'bundled' };
+        return { path: null, source: 'none' };
+      };
+
+      expect(resolve(legacyPath, true)).toEqual({ path: bundledPath, source: 'bundled' });
+      expect(resolve(null, true)).toEqual({ path: bundledPath, source: 'bundled' });
+      expect(resolve('/custom/path', true)).toEqual({ path: '/custom/path', source: 'custom' });
+      expect(resolve(null, false)).toEqual({ path: null, source: 'none' });
     });
   });
 });

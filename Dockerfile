@@ -20,6 +20,8 @@ ARG SUWAYOMI_SHA256=af9feb20af9d7ebe9e30769e6c6ebc7fc7ab1c447388d42e0280b1da5fe0
 ARG KOTLIN_VERSION=2.4.21
 ARG KOTLIN_SHA256=7cc140e76daf416a0424a5557f99afd7ca89ebd463ea1101261e3e01c33e75cd
 ARG CARGO_ABOUT_VERSION=0.9.2
+ARG RUSTY_VERSION=v1.0.3
+ARG RUSTY_AMD64_SHA256=5add146cebb3aa77a0080d5bf4f932e4315c38a92c7682aa7f6e9ac97a751a3f
 
 # ---------- the extension host's jars ----------
 # Java bytecode: built on the machine doing the build, whatever the image is for.
@@ -190,6 +192,47 @@ RUN jlink --module-path /jmods --output /java \
       $([ "$BUILDARCH" = "$TARGETARCH" ] && echo --generate-cds-archive) \
       --add-modules java.base,java.compiler,java.desktop,java.instrument,java.logging,java.management,java.naming,java.net.http,java.prefs,java.rmi,java.scripting,java.security.jgss,java.security.sasl,java.sql,java.xml,jdk.charsets,jdk.crypto.cryptoki,jdk.crypto.ec,jdk.httpserver,jdk.localedata,jdk.management,jdk.naming.dns,jdk.net,jdk.unsupported,jdk.xml.dom,jdk.zipfs
 
+# ---------- the bundled image optimizer (RustyLibraryShrinker) ----------
+# Upstream: https://github.com/StuffGest/RustyLibraryShrinker (v1.0.3, MIT License)
+
+FROM --platform=$BUILDPLATFORM debian:bookworm-slim AS optimizer-fetch
+ARG TARGETARCH
+ARG RUSTY_VERSION
+ARG RUSTY_AMD64_SHA256
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
+      curl -fsSL -o /tmp/rusty.tar.gz "https://github.com/StuffGest/RustyLibraryShrinker/releases/download/${RUSTY_VERSION}/RustyLibraryShrinker-x86_64-unknown-linux-gnu.tar.gz" \
+      && echo "${RUSTY_AMD64_SHA256}  /tmp/rusty.tar.gz" | sha256sum -c - \
+      && tar -xzf /tmp/rusty.tar.gz -C / \
+      && chmod 755 /RustyLibraryShrinker; \
+    else \
+      touch /RustyLibraryShrinker; \
+    fi
+
+FROM rust:1-bookworm AS optimizer-compile
+ARG TARGETARCH
+ARG RUSTY_VERSION
+RUN if [ "$TARGETARCH" != "amd64" ]; then \
+      apt-get update && apt-get install -y --no-install-recommends git cmake g++ && rm -rf /var/lib/apt/lists/* \
+      && git clone --depth 1 --branch "$RUSTY_VERSION" https://github.com/StuffGest/RustyLibraryShrinker.git /tmp/src \
+      && cd /tmp/src && cargo build --release \
+      && cp target/release/RustyLibraryShrinker /RustyLibraryShrinker \
+      && chmod 755 /RustyLibraryShrinker; \
+    else \
+      touch /RustyLibraryShrinker; \
+    fi
+
+FROM debian:bookworm-slim AS optimizer
+ARG TARGETARCH
+COPY --from=optimizer-fetch /RustyLibraryShrinker /opt-fetch
+COPY --from=optimizer-compile /RustyLibraryShrinker /opt-compile
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
+      mv /opt-fetch /RustyLibraryShrinker; \
+    else \
+      mv /opt-compile /RustyLibraryShrinker; \
+    fi \
+ && chmod 755 /RustyLibraryShrinker
+
 # ---------- the images ----------
 # `mango`, the last stage, is what a plain build gives. `full` is the same with what
 # a web view needs.
@@ -231,7 +274,13 @@ RUN apt-get update \
       libxss1 libxext6 libxrender1 libxcomposite1 libxdamage1 libxkbcommon0 libxtst6 libxcursor1 libxi6 \
       libglib2.0-0 libnss3 libdbus-1-3 libpango-1.0-0 libcairo2 libasound2 libatk-bridge2.0-0 libcups2 \
       libdrm2 libgbm1 libegl1 xvfb xauth \
+      libstdc++6 \
  && rm -rf /var/lib/apt/lists/*
+RUN mkdir -p /opt/mango/bin
+COPY --from=optimizer /RustyLibraryShrinker /opt/mango/bin/RustyLibraryShrinker
+RUN chmod 755 /opt/mango/bin/RustyLibraryShrinker \
+ && ln -sf /opt/mango/bin/RustyLibraryShrinker /usr/local/bin/RustyLibraryShrinker
+ENV PATH="/opt/mango/bin:${PATH}"
 USER mango
 
 FROM base AS mango

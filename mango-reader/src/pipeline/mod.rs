@@ -11,13 +11,24 @@ pub mod komga;
 pub mod mangabaka;
 pub mod optimizer;
 pub mod publisher;
+pub mod validation;
 
 use crate::db::Db;
 use crate::error::{AppError, Result};
 use komga::KomgaClient;
 use mangabaka::MangaBakaClient;
-use optimizer::optimize_cbz;
-use publisher::{publish_cbz, PublishOutcome};
+#[allow(unused_imports)]
+pub use optimizer::{
+    check_executable_invocable, count_cbz_pages, is_executable, optimize_cbz, resolve_optimizer_binary,
+    validate_optimizer, BUNDLED_OPTIMIZER_PATH, DEFAULT_MIN_SAVINGS_PERCENT, LEGACY_DEFAULT_OPTIMIZER_BIN,
+    OptimizationResult, OptimizerValidationCode, OptimizerValidationResult,
+};
+#[allow(unused_imports)]
+pub use publisher::{canonical_release_name, publish_cbz, PublishOutcome};
+#[allow(unused_imports)]
+pub use validation::{
+    probe_writable_directory, validate_destination_dir, PathValidationCode, PathValidationResult,
+};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -27,7 +38,6 @@ use std::{
     time::SystemTime,
 };
 
-pub const DEFAULT_MIN_SAVINGS_PERCENT: u32 = 10;
 const MAX_RECENT_EVENTS: usize = 50;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -49,6 +59,18 @@ pub struct PipelineConfig {
     pub optimize_enabled: bool,
     pub optimizer_bin: Option<String>,
     pub min_savings_percent: u32,
+
+    // Container-aware validation status fields (populated on load/validate)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub library_status: Option<PathValidationResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chinese_library_status: Option<PathValidationResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub optimizer_status: Option<OptimizerValidationResult>,
+    #[serde(default)]
+    pub bundled_optimizer_present: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_optimizer_bin: Option<String>,
 }
 
 impl Default for PipelineConfig {
@@ -69,8 +91,22 @@ impl Default for PipelineConfig {
             optimize_enabled: false,
             optimizer_bin: None,
             min_savings_percent: DEFAULT_MIN_SAVINGS_PERCENT,
+            library_status: None,
+            chinese_library_status: None,
+            optimizer_status: None,
+            bundled_optimizer_present: false,
+            resolved_optimizer_bin: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ValidatePathsResponse {
+    pub library: PathValidationResult,
+    pub chinese_library: PathValidationResult,
+    pub optimizer: OptimizerValidationResult,
+    pub bundled_optimizer_present: bool,
+    pub resolved_optimizer_bin: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -109,47 +145,62 @@ impl Pipeline {
         }
     }
 
-    /// Loads the active pipeline configuration from settings and state.
+    /// Loads the active pipeline configuration from settings and state, enriched with live validation statuses.
     pub async fn load_config(&self) -> Result<PipelineConfig> {
-        self.db
-            .call(|conn| {
-                let enabled = crate::settings::get::<bool>(conn, "pipeline.enabled").unwrap_or(false);
-                let library_dir = crate::settings::get::<String>(conn, "pipeline.library_dir");
-                let chinese_library_dir = crate::settings::get::<String>(conn, "pipeline.chinese_library_dir");
-                let mangabaka_enabled = crate::settings::get::<bool>(conn, "pipeline.mangabaka_enabled").unwrap_or(true);
-                let mangabaka_url = crate::settings::get::<String>(conn, "pipeline.mangabaka_url")
-                    .or_else(|| Some(mangabaka::DEFAULT_MANGABAKA_API.to_string()));
-                let komga_enabled = crate::settings::get::<bool>(conn, "pipeline.komga_enabled").unwrap_or(false);
-                let komga_url = crate::settings::get::<String>(conn, "pipeline.komga_url")
-                    .or_else(|| Some(komga::DEFAULT_KOMGA_URL.to_string()));
-                let komga_library_id = crate::settings::get::<String>(conn, "pipeline.komga_library_id");
-                let optimize_enabled = crate::settings::get::<bool>(conn, "pipeline.optimize_enabled").unwrap_or(false);
-                let optimizer_bin = crate::settings::get::<String>(conn, "pipeline.optimizer_bin");
-                let min_savings_percent = crate::settings::get::<u32>(conn, "pipeline.min_savings_percent")
-                    .unwrap_or(DEFAULT_MIN_SAVINGS_PERCENT);
+        let (raw_cfg, mangabaka_token, komga_api_key) = self.load_internal_config().await?;
 
-                let mangabaka_token = crate::db::state(conn, "pipeline.mangabaka_token")?;
-                let komga_api_key = crate::db::state(conn, "pipeline.komga_api_key")?;
+        // Authoritative server-side runtime validation of library destinations and optimizer
+        let library_status = validate_destination_dir(raw_cfg.library_dir.as_deref(), raw_cfg.enabled);
+        let chinese_library_status =
+            validate_destination_dir(raw_cfg.chinese_library_dir.as_deref(), false);
+        let optimizer_status = validate_optimizer(raw_cfg.optimizer_bin.as_deref()).await;
+        let (resolved_bin, _src) = resolve_optimizer_binary(raw_cfg.optimizer_bin.as_deref());
+        let bundled_present = Path::new(BUNDLED_OPTIMIZER_PATH).is_file();
 
-                Ok(PipelineConfig {
-                    enabled,
-                    library_dir,
-                    chinese_library_dir,
-                    mangabaka_enabled,
-                    mangabaka_url,
-                    mangabaka_token: None, // Secret redacted in config view
-                    has_mangabaka_token: mangabaka_token.is_some_and(|t| !t.trim().is_empty()),
-                    komga_enabled,
-                    komga_url,
-                    komga_api_key: None, // Secret redacted in config view
-                    has_komga_api_key: komga_api_key.is_some_and(|k| !k.trim().is_empty()),
-                    komga_library_id,
-                    optimize_enabled,
-                    optimizer_bin,
-                    min_savings_percent,
-                })
-            })
-            .await
+        Ok(PipelineConfig {
+            enabled: raw_cfg.enabled,
+            library_dir: raw_cfg.library_dir,
+            chinese_library_dir: raw_cfg.chinese_library_dir,
+            mangabaka_enabled: raw_cfg.mangabaka_enabled,
+            mangabaka_url: raw_cfg.mangabaka_url,
+            mangabaka_token: None, // Secret redacted in config view
+            has_mangabaka_token: mangabaka_token.is_some_and(|t| !t.trim().is_empty()),
+            komga_enabled: raw_cfg.komga_enabled,
+            komga_url: raw_cfg.komga_url,
+            komga_api_key: None, // Secret redacted in config view
+            has_komga_api_key: komga_api_key.is_some_and(|k| !k.trim().is_empty()),
+            komga_library_id: raw_cfg.komga_library_id,
+            optimize_enabled: raw_cfg.optimize_enabled,
+            optimizer_bin: raw_cfg.optimizer_bin,
+            min_savings_percent: raw_cfg.min_savings_percent,
+            library_status: Some(library_status),
+            chinese_library_status: Some(chinese_library_status),
+            optimizer_status: Some(optimizer_status),
+            bundled_optimizer_present: bundled_present,
+            resolved_optimizer_bin: resolved_bin.map(|p| p.to_string_lossy().to_string()),
+        })
+    }
+
+    /// Evaluates candidate paths on-demand without modifying saved configuration.
+    pub async fn validate_paths(
+        &self,
+        library_dir: Option<&str>,
+        chinese_library_dir: Option<&str>,
+        optimizer_bin: Option<&str>,
+    ) -> ValidatePathsResponse {
+        let library = validate_destination_dir(library_dir, true);
+        let chinese_library = validate_destination_dir(chinese_library_dir, false);
+        let optimizer = validate_optimizer(optimizer_bin).await;
+        let (resolved_bin, _src) = resolve_optimizer_binary(optimizer_bin);
+        let bundled_present = Path::new(BUNDLED_OPTIMIZER_PATH).is_file();
+
+        ValidatePathsResponse {
+            library,
+            chinese_library,
+            optimizer,
+            bundled_optimizer_present: bundled_present,
+            resolved_optimizer_bin: resolved_bin.map(|p| p.to_string_lossy().to_string()),
+        }
     }
 
     /// Internal helper to load configuration with secrets included for execution.
@@ -167,7 +218,15 @@ impl Pipeline {
                     .or_else(|| Some(komga::DEFAULT_KOMGA_URL.to_string()));
                 let komga_library_id = crate::settings::get::<String>(conn, "pipeline.komga_library_id");
                 let optimize_enabled = crate::settings::get::<bool>(conn, "pipeline.optimize_enabled").unwrap_or(false);
-                let optimizer_bin = crate::settings::get::<String>(conn, "pipeline.optimizer_bin");
+
+                // Migration semantics: untouched legacy default path is migrated to None (using bundled path)
+                let raw_bin = crate::settings::get::<String>(conn, "pipeline.optimizer_bin");
+                let optimizer_bin = match raw_bin.as_deref().map(str::trim) {
+                    Some(s) if s == LEGACY_DEFAULT_OPTIMIZER_BIN || s.is_empty() => None,
+                    Some(s) => Some(s.to_string()),
+                    None => None,
+                };
+
                 let min_savings_percent = crate::settings::get::<u32>(conn, "pipeline.min_savings_percent")
                     .unwrap_or(DEFAULT_MIN_SAVINGS_PERCENT);
 
@@ -190,6 +249,11 @@ impl Pipeline {
                     optimize_enabled,
                     optimizer_bin,
                     min_savings_percent,
+                    library_status: None,
+                    chinese_library_status: None,
+                    optimizer_status: None,
+                    bundled_optimizer_present: false,
+                    resolved_optimizer_bin: None,
                 };
 
                 Ok((cfg, mangabaka_token, komga_api_key))
@@ -198,7 +262,48 @@ impl Pipeline {
     }
 
     /// Saves updated pipeline configuration and tokens.
-    pub async fn save_config(&self, patch: PipelineConfig) -> Result<()> {
+    ///
+    /// Authoritative server-side safety checks ensure the pipeline cannot be enabled
+    /// with invalid, missing, or non-writable destination directories.
+    pub async fn save_config(&self, mut patch: PipelineConfig) -> Result<()> {
+        // Normalize legacy optimizer path: replace untouched legacy default with None (bundled default)
+        patch.optimizer_bin = match patch.optimizer_bin.as_deref().map(str::trim) {
+            Some(s) if s == LEGACY_DEFAULT_OPTIMIZER_BIN || s.is_empty() => None,
+            Some(s) => Some(s.to_string()),
+            None => None,
+        };
+
+        // Strict authoritative server-side validation when enabling the pipeline
+        if patch.enabled {
+            let lib_status = validate_destination_dir(patch.library_dir.as_deref(), true);
+            if !lib_status.is_valid() {
+                return Err(AppError::bad_request(format!(
+                    "Cannot enable acquisition pipeline: Permanent manga library error: {}",
+                    lib_status.message
+                )));
+            }
+
+            if patch.chinese_library_dir.as_deref().is_some_and(|s| !s.trim().is_empty()) {
+                let zh_status = validate_destination_dir(patch.chinese_library_dir.as_deref(), false);
+                if !zh_status.is_valid() {
+                    return Err(AppError::bad_request(format!(
+                        "Cannot enable acquisition pipeline: Chinese manga library error: {}",
+                        zh_status.message
+                    )));
+                }
+            }
+
+            if patch.optimize_enabled {
+                let opt_status = validate_optimizer(patch.optimizer_bin.as_deref()).await;
+                if !opt_status.is_valid() {
+                    return Err(AppError::bad_request(format!(
+                        "Cannot enable image optimization: {}",
+                        opt_status.message
+                    )));
+                }
+            }
+        }
+
         self.db
             .call(move |conn| {
                 let mut map = serde_json::Map::new();
@@ -334,8 +439,10 @@ impl Pipeline {
             return Err(AppError::bad_request(err));
         };
 
-        if !dest_root.exists() {
-            let err = format!("Configured library path does not exist: {}", dest_root.display());
+        // Safety verification: Authoritatively verify destination is valid and writable before proceeding
+        let dest_val = validate_destination_dir(Some(&dest_root.to_string_lossy()), true);
+        if !dest_val.is_valid() {
+            let err = format!("Configured library path cannot safely be used: {}", dest_val.message);
             tracing::warn!("PIPELINE: {err}");
             self.record_event(PipelineEvent {
                 id: format!("{}-{}", job.chapter, now),
@@ -375,9 +482,13 @@ impl Pipeline {
         // 3. Non-destructive Image Optimization
         let mut optimizer_status = "skipped".to_string();
         if config.optimize_enabled {
-            match optimize_cbz(source_cbz, config.optimizer_bin.as_deref(), config.min_savings_percent).await {
-                Ok(res) => optimizer_status = res.reason,
-                Err(e) => optimizer_status = format!("optimization error: {e}"),
+            if is_chinese {
+                optimizer_status = "skipped for Chinese edition (already optimized)".to_string();
+            } else {
+                match optimize_cbz(source_cbz, config.optimizer_bin.as_deref(), config.min_savings_percent).await {
+                    Ok(res) => optimizer_status = res.reason,
+                    Err(e) => optimizer_status = format!("optimization error: {e}"),
+                }
             }
         }
 
@@ -457,16 +568,136 @@ mod tests {
         assert!(!cfg.enabled);
         assert!(cfg.mangabaka_enabled);
         assert_eq!(cfg.min_savings_percent, 10);
+        assert_eq!(cfg.optimizer_bin, None);
+    }
+
+    #[tokio::test]
+    async fn pipeline_cannot_enable_optimizer_with_invalid_binary() {
+        let db = test_db();
+        let pipeline = Pipeline::new(db);
+        let temp_lib = TempDir::new("pipetest-opt-err");
+
+        let mut config = PipelineConfig::default();
+        config.enabled = true;
+        config.library_dir = Some(temp_lib.path().to_string_lossy().to_string());
+        config.optimize_enabled = true;
+        config.optimizer_bin = Some("/nonexistent/custom_shrinker".into());
+
+        let err = pipeline.save_config(config).await.unwrap_err();
+        assert_eq!(err.code, "bad_request");
+        assert!(err.message.contains("Cannot enable image optimization"));
+        assert!(err.message.contains("Binary not found"));
+    }
+
+    #[tokio::test]
+    async fn pipeline_validate_paths_method() {
+        let db = test_db();
+        let pipeline = Pipeline::new(db);
+        let temp_lib = TempDir::new("pipetest-val-resp");
+
+        let resp = pipeline
+            .validate_paths(
+                Some(temp_lib.path().to_str().unwrap()),
+                Some("/nonexistent/zh"),
+                Some(LEGACY_DEFAULT_OPTIMIZER_BIN),
+            )
+            .await;
+
+        assert_eq!(resp.library.code, PathValidationCode::Valid);
+        assert!(resp.library.writable);
+        assert_eq!(resp.chinese_library.code, PathValidationCode::Missing);
+        // Legacy default should not be reported as a custom missing path
+        assert_ne!(resp.optimizer.source, "custom");
+    }
+
+    #[tokio::test]
+    async fn pipeline_disabled_saves_paths_without_enabling_validation() {
+        let db = test_db();
+        let pipeline = Pipeline::new(db);
+
+        let mut config = PipelineConfig::default();
+        config.enabled = false;
+        config.library_dir = Some("/unmounted/future/library".into());
+
+        // Saving while disabled should succeed so users can prepare settings
+        pipeline.save_config(config).await.unwrap();
+
+        let loaded = pipeline.load_config().await.unwrap();
+        assert!(!loaded.enabled);
+        assert_eq!(loaded.library_dir.as_deref(), Some("/unmounted/future/library"));
+        assert_eq!(loaded.library_status.unwrap().code, PathValidationCode::Missing);
+    }
+
+    struct TempDir(std::path::PathBuf);
+    impl TempDir {
+        fn new(prefix: &str) -> Self {
+            let pid = std::process::id();
+            let nanos = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let path = std::env::temp_dir().join(format!("{prefix}-{pid}-{nanos}"));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn pipeline_migrates_legacy_untouched_optimizer_path() {
+        let db = test_db();
+        let pipeline = Pipeline::new(db);
+
+        let temp_dir = TempDir::new("opt-mig");
+
+        let mut config = PipelineConfig::default();
+        config.enabled = false;
+        config.library_dir = Some(temp_dir.path().to_string_lossy().to_string());
+        // Simulating the legacy default untouched path
+        config.optimizer_bin = Some(LEGACY_DEFAULT_OPTIMIZER_BIN.into());
+
+        pipeline.save_config(config).await.unwrap();
+
+        let loaded = pipeline.load_config().await.unwrap();
+        // Untouched legacy path must be normalized to None
+        assert_eq!(loaded.optimizer_bin, None);
+    }
+
+    #[tokio::test]
+    async fn pipeline_preserves_custom_optimizer_path() {
+        let db = test_db();
+        let pipeline = Pipeline::new(db);
+
+        let temp_dir = TempDir::new("opt-cust");
+
+        let mut config = PipelineConfig::default();
+        config.enabled = false;
+        config.library_dir = Some(temp_dir.path().to_string_lossy().to_string());
+        config.optimizer_bin = Some("/custom/tools/my_shrinker".into());
+
+        pipeline.save_config(config).await.unwrap();
+
+        let loaded = pipeline.load_config().await.unwrap();
+        assert_eq!(loaded.optimizer_bin.as_deref(), Some("/custom/tools/my_shrinker"));
     }
 
     #[tokio::test]
     async fn pipeline_config_round_trip_and_secret_masking() {
         let db = test_db();
         let pipeline = Pipeline::new(db);
+        let temp_lib = TempDir::new("pipetest-lib");
 
         let mut config = PipelineConfig::default();
         config.enabled = true;
-        config.library_dir = Some("/srv/media/manga".into());
+        config.library_dir = Some(temp_lib.path().to_string_lossy().to_string());
         config.komga_enabled = true;
         config.komga_api_key = Some("super_secret_komga_key".into());
 
@@ -474,11 +705,13 @@ mod tests {
 
         let loaded = pipeline.load_config().await.unwrap();
         assert!(loaded.enabled);
-        assert_eq!(loaded.library_dir.as_deref(), Some("/srv/media/manga"));
+        assert_eq!(loaded.library_dir.as_deref(), Some(temp_lib.path().to_str().unwrap()));
         assert!(loaded.komga_enabled);
         assert!(loaded.has_komga_api_key);
         // Secret must not be exposed in user-facing config
         assert_eq!(loaded.komga_api_key, None);
+        // Live validation status is populated
+        assert!(loaded.library_status.unwrap().is_valid());
 
         // Internal loader has access to actual secret
         let (_, _, secret_key) = pipeline.load_internal_config().await.unwrap();

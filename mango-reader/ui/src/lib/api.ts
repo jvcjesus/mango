@@ -346,6 +346,30 @@ export type Installed = {
   sources: Source[];
 };
 
+export interface PathValidationResult {
+  path: string | null;
+  code: 'valid' | 'not_configured' | 'missing' | 'not_a_directory' | 'not_writable';
+  message: string;
+  writable: boolean;
+}
+
+export interface OptimizerValidationResult {
+  configured_path: string | null;
+  resolved_path: string | null;
+  source: 'custom' | 'bundled' | 'path' | 'none';
+  code: 'valid' | 'not_configured' | 'missing' | 'not_a_file' | 'not_executable' | 'failed';
+  message: string;
+  version: string | null;
+}
+
+export interface ValidatePathsResponse {
+  library: PathValidationResult;
+  chinese_library: PathValidationResult;
+  optimizer: OptimizerValidationResult;
+  bundled_optimizer_present: boolean;
+  resolved_optimizer_bin: string | null;
+}
+
 export interface PipelineConfig {
   enabled: boolean;
   library_dir: string | null;
@@ -362,6 +386,11 @@ export interface PipelineConfig {
   optimize_enabled: boolean;
   optimizer_bin: string | null;
   min_savings_percent: number;
+  library_status?: PathValidationResult | null;
+  chinese_library_status?: PathValidationResult | null;
+  optimizer_status?: OptimizerValidationResult | null;
+  bundled_optimizer_present?: boolean;
+  resolved_optimizer_bin?: string | null;
 }
 
 export interface PipelineEvent {

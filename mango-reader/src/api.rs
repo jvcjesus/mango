@@ -143,6 +143,7 @@ pub fn router(state: Spaces) -> Router {
         .route("/manga/{id}/tracks/{tracker}", post(bind_track).put(edit_track).delete(unbind_track))
         .route("/manga/{id}/tracks/{tracker}/refresh", post(refresh_track))
         .route("/pipeline/config", get(get_pipeline_config).put(put_pipeline_config))
+        .route("/pipeline/validate-paths", post(validate_pipeline_paths))
         .route("/pipeline/test-mangabaka", post(test_pipeline_mangabaka))
         .route("/pipeline/test-komga", post(test_pipeline_komga))
         .route("/pipeline/events", get(get_pipeline_events))
@@ -1009,6 +1010,26 @@ async fn put_pipeline_config(
     app.me.admin()?;
     app.pipeline.save_config(config).await?;
     Ok(done())
+}
+
+#[derive(Deserialize)]
+struct ValidatePipelinePathsPayload {
+    library_dir: Option<String>,
+    chinese_library_dir: Option<String>,
+    optimizer_bin: Option<String>,
+}
+
+async fn validate_pipeline_paths(
+    Me(app): Me,
+    Json(payload): Json<ValidatePipelinePathsPayload>,
+) -> Result<Json<crate::pipeline::ValidatePathsResponse>> {
+    app.me.admin()?;
+    let res = app.pipeline.validate_paths(
+        payload.library_dir.as_deref(),
+        payload.chinese_library_dir.as_deref(),
+        payload.optimizer_bin.as_deref(),
+    ).await;
+    Ok(Json(res))
 }
 
 #[derive(Deserialize)]

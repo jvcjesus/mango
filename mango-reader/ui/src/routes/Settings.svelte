@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { get, message, send, type Category, type PipelineConfig, type PipelineEvent, type Tracker } from '../lib/api';
+  import { get, message, send, type Category, type PipelineConfig, type PipelineEvent, type PathValidationResult, type OptimizerValidationResult, type ValidatePathsResponse, type Tracker } from '../lib/api';
   import { confirm } from '../lib/confirm.svelte';
   import { COVERS, display, MENUS, setDisplay, SIZES } from '../lib/display.svelte';
   import Icon, { type IconName } from '../lib/Icon.svelte';
@@ -519,6 +519,7 @@
   let pipelineEvents = $state<PipelineEvent[]>([]);
   let pipelineLoading = $state(false);
   let pipelineSaving = $state(false);
+  let validatingPaths = $state(false);
   let pipelineError = $state<string | null>(null);
   let mangabakaTesting = $state(false);
   let mangabakaTestResult = $state<{ ok: boolean; message: string } | null>(null);
@@ -534,6 +535,12 @@
   let komgaLibraryIdInput = $state('');
   let optimizerBinInput = $state('');
   let minSavingsPercentInput = $state(10);
+
+  let libraryStatus = $state<PathValidationResult | null>(null);
+  let chineseLibraryStatus = $state<PathValidationResult | null>(null);
+  let optimizerStatus = $state<OptimizerValidationResult | null>(null);
+  let bundledOptimizerPresent = $state(false);
+  let resolvedOptimizerBin = $state<string | null>(null);
 
   let askedPipeline = false;
   $effect(() => {
@@ -561,10 +568,40 @@
       komgaLibraryIdInput = cfg.komga_library_id ?? '';
       optimizerBinInput = cfg.optimizer_bin ?? '';
       minSavingsPercentInput = cfg.min_savings_percent ?? 10;
+      libraryStatus = cfg.library_status ?? null;
+      chineseLibraryStatus = cfg.chinese_library_status ?? null;
+      optimizerStatus = cfg.optimizer_status ?? null;
+      bundledOptimizerPresent = cfg.bundled_optimizer_present ?? false;
+      resolvedOptimizerBin = cfg.resolved_optimizer_bin ?? null;
     } catch (e) {
       pipelineError = message(e);
     } finally {
       pipelineLoading = false;
+    }
+  }
+
+  async function validatePaths() {
+    validatingPaths = true;
+    try {
+      const res = await send<ValidatePathsResponse>('POST', '/pipeline/validate-paths', {
+        library_dir: libraryDirInput.trim() || null,
+        chinese_library_dir: chineseLibraryDirInput.trim() || null,
+        optimizer_bin: optimizerBinInput.trim() || null,
+      });
+      libraryStatus = res.library;
+      chineseLibraryStatus = res.chinese_library;
+      optimizerStatus = res.optimizer;
+      bundledOptimizerPresent = res.bundled_optimizer_present;
+      resolvedOptimizerBin = res.resolved_optimizer_bin;
+      if (res.library.writable) {
+        toast.success('Library destination is valid and writable inside container');
+      } else {
+        toast.error(`Library path issue: ${res.library.message}`);
+      }
+    } catch (e) {
+      toast.error(message(e));
+    } finally {
+      validatingPaths = false;
     }
   }
 
@@ -994,28 +1031,74 @@
           </section>
 
           <section class="card">
-            <h3>Permanent Library Paths</h3>
+            <div class="card-header-row">
+              <h3>Permanent Library Paths</h3>
+              <button class="btn small" onclick={validatePaths} disabled={validatingPaths}>
+                <Icon name="check" size={16} />
+                {validatingPaths ? 'Validating…' : 'Validate Paths'}
+              </button>
+            </div>
             <div class="set stack">
               <div class="what">
                 <strong>Permanent Manga Library</strong>
-                <span>Canonical destination folder where standard/English series are published (e.g. Komga library root).</span>
+                <span>Canonical destination folder visible to Mango where standard/English series are published (e.g. <code>/library/manga</code> mounted via Docker).</span>
               </div>
               <div class="how wide">
                 <label class="field grow">
-                  <input type="text" bind:value={libraryDirInput} placeholder="/srv/media/manga" autocomplete="off" />
+                  <input type="text" bind:value={libraryDirInput} placeholder="/library/manga (container path)" autocomplete="off" />
                 </label>
               </div>
+              {#if libraryStatus}
+                <div class="path-status-row">
+                  <span class="status-badge status-{libraryStatus.code}">
+                    {#if libraryStatus.code === 'valid'}
+                      ✓ Valid / Writable
+                    {:else if libraryStatus.code === 'missing'}
+                      ✗ Missing inside container
+                    {:else if libraryStatus.code === 'not_a_directory'}
+                      ✗ Not a directory
+                    {:else if libraryStatus.code === 'not_writable'}
+                      ✗ Read-only or not writable
+                    {:else}
+                      Not configured
+                    {/if}
+                  </span>
+                  {#if libraryStatus.code !== 'valid' && libraryStatus.code !== 'not_configured'}
+                    <span class="status-msg">{libraryStatus.message}</span>
+                  {/if}
+                </div>
+              {/if}
             </div>
             <div class="set stack">
               <div class="what">
                 <strong>Chinese Manga Library</strong>
-                <span>Optional separate destination for Chinese/Mandarin series acquisitions.</span>
+                <span>Optional separate destination folder visible to Mango for Chinese/Mandarin acquisitions (e.g. <code>/library/manga-chinese</code>).</span>
               </div>
               <div class="how wide">
                 <label class="field grow">
-                  <input type="text" bind:value={chineseLibraryDirInput} placeholder="/srv/media/manga-chinese" autocomplete="off" />
+                  <input type="text" bind:value={chineseLibraryDirInput} placeholder="/library/manga-chinese (optional container path)" autocomplete="off" />
                 </label>
               </div>
+              {#if chineseLibraryStatus}
+                <div class="path-status-row">
+                  <span class="status-badge status-{chineseLibraryStatus.code}">
+                    {#if chineseLibraryStatus.code === 'valid'}
+                      ✓ Valid / Writable
+                    {:else if chineseLibraryStatus.code === 'missing'}
+                      ✗ Missing inside container
+                    {:else if chineseLibraryStatus.code === 'not_a_directory'}
+                      ✗ Not a directory
+                    {:else if chineseLibraryStatus.code === 'not_writable'}
+                      ✗ Read-only or not writable
+                    {:else}
+                      Not configured (optional)
+                    {/if}
+                  </span>
+                  {#if chineseLibraryStatus.code !== 'valid' && chineseLibraryStatus.code !== 'not_configured'}
+                    <span class="status-msg">{chineseLibraryStatus.message}</span>
+                  {/if}
+                </div>
+              {/if}
             </div>
           </section>
 
@@ -1141,14 +1224,46 @@
             </div>
             <div class="set stack">
               <div class="what">
-                <strong>Optimizer Executable Path</strong>
-                <span>Absolute path to RustyLibraryShrinker binary on the host (e.g. /srv/apps/manga/manga-itagger/RustyLibraryShrinker).</span>
+                <strong>Optimizer Executable Path (Optional Override)</strong>
+                <span>
+                  Defaults to the bundled optimizer inside the Mango container (<code>/opt/mango/bin/RustyLibraryShrinker</code>).
+                  {#if bundledOptimizerPresent}
+                    <strong class="text-spot">Bundled optimizer available.</strong>
+                  {/if}
+                </span>
               </div>
               <div class="how wide">
                 <label class="field grow">
-                  <input type="text" bind:value={optimizerBinInput} placeholder="/srv/apps/manga/manga-itagger/RustyLibraryShrinker" autocomplete="off" />
+                  <input
+                    type="text"
+                    bind:value={optimizerBinInput}
+                    placeholder={resolvedOptimizerBin ? `${resolvedOptimizerBin} (detected)` : '/opt/mango/bin/RustyLibraryShrinker (bundled default)'}
+                    autocomplete="off"
+                  />
                 </label>
               </div>
+              {#if optimizerStatus}
+                <div class="path-status-row">
+                  <span class="status-badge status-{optimizerStatus.code}">
+                    {#if optimizerStatus.code === 'valid'}
+                      ✓ Ready ({optimizerStatus.version ?? 'Executable'} — {optimizerStatus.source === 'bundled' ? 'bundled' : optimizerStatus.source === 'path' ? 'system PATH' : 'custom override'})
+                    {:else if optimizerStatus.code === 'missing'}
+                      ✗ Not found ({optimizerStatus.source === 'custom' ? 'custom path' : 'bundled optimizer'})
+                    {:else if optimizerStatus.code === 'not_a_file'}
+                      ✗ Not a file
+                    {:else if optimizerStatus.code === 'not_executable'}
+                      ✗ Not executable by Mango runtime
+                    {:else if optimizerStatus.code === 'failed'}
+                      ✗ Invocation test failed
+                    {:else}
+                      Not configured
+                    {/if}
+                  </span>
+                  {#if optimizerStatus.code !== 'valid' && optimizerStatus.message}
+                    <span class="status-msg">{optimizerStatus.message}</span>
+                  {/if}
+                </div>
+              {/if}
             </div>
             <div class="set">
               <div class="what">
@@ -2096,6 +2211,69 @@
   .event-error {
     color: #e63946;
     font-size: 12px;
+    font-weight: 700;
+  }
+
+  .card-header-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 8px;
+  }
+
+  .card-header-row h3 {
+    margin: 0;
+  }
+
+  .path-status-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 12px;
+    margin-top: 4px;
+    font-size: 12px;
+  }
+
+  .status-badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 8px;
+    border: 1px solid var(--ink);
+    font-size: 11px;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+
+  .status-valid {
+    background: var(--spot);
+    color: var(--on-spot);
+  }
+
+  .status-missing,
+  .status-not_a_directory,
+  .status-not_writable,
+  .status-not_a_file,
+  .status-not_executable,
+  .status-failed {
+    background: #e63946;
+    color: #fff;
+  }
+
+  .status-not_configured {
+    background: var(--surface);
+    color: var(--muted);
+  }
+
+  .status-msg {
+    color: var(--muted);
+    font-size: 12px;
+  }
+
+  .text-spot {
+    color: var(--spot);
     font-weight: 700;
   }
 </style>
