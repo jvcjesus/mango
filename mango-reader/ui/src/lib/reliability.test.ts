@@ -238,3 +238,147 @@ describe('volume parsing and grouping', () => {
     expect(map.get(null)?.length).toBe(1);
   });
 });
+
+describe('reader page lifecycle and decode verification', () => {
+  it('manages normal load lifecycle from idle to loaded', async () => {
+    const { PageState } = await import('./pageLifecycle.svelte');
+    const page = new PageState(0);
+
+    expect(page.status).toBe('idle');
+
+    page.startLoad();
+    expect(page.status).toBe('loading');
+
+    const fakeImg = {
+      naturalWidth: 800,
+      naturalHeight: 1200,
+      decode: vi.fn().mockResolvedValue(undefined),
+    } as unknown as HTMLImageElement;
+
+    const ok = await page.handleLoad(fakeImg);
+    expect(ok).toBe(true);
+    expect(page.status).toBe('loaded');
+    expect(page.naturalWidth).toBe(800);
+    expect(page.naturalHeight).toBe(1200);
+    expect(page.error).toBeNull();
+    expect(page.diagnostics.durationMs).toBeTypeOf('number');
+
+    page.destroy();
+  });
+
+  it('detects decode failures and triggers automatic retry', async () => {
+    vi.useFakeTimers();
+    const { PageState } = await import('./pageLifecycle.svelte');
+    const page = new PageState(1);
+
+    page.startLoad();
+
+    const corruptImg = {
+      naturalWidth: 100,
+      naturalHeight: 100,
+      decode: vi.fn().mockRejectedValue(new Error('Corrupt JPEG stream')),
+    } as unknown as HTMLImageElement;
+
+    const ok = await page.handleLoad(corruptImg);
+    expect(ok).toBe(false);
+    expect(page.status).toBe('retrying');
+    expect(page.retryCount).toBe(1);
+    expect(page.errorType).toBe('decode');
+
+    page.destroy();
+    vi.useRealTimers();
+  });
+
+  it('rejects zero-dimension images as failure', async () => {
+    const { PageState } = await import('./pageLifecycle.svelte');
+    const page = new PageState(2);
+
+    page.startLoad();
+
+    const zeroImg = {
+      naturalWidth: 0,
+      naturalHeight: 0,
+      decode: vi.fn().mockResolvedValue(undefined),
+    } as unknown as HTMLImageElement;
+
+    const ok = await page.handleLoad(zeroImg);
+    expect(ok).toBe(false);
+    expect(page.status).toBe('retrying');
+    expect(page.errorType).toBe('decode');
+
+    page.destroy();
+  });
+
+  it('stops auto-retrying after max retries and allows manual retry', async () => {
+    vi.useFakeTimers();
+    const { PageState, MAX_AUTO_RETRIES } = await import('./pageLifecycle.svelte');
+    const page = new PageState(3);
+
+    page.startLoad();
+    expect(page.status).toBe('loading');
+
+    // Failure 1 -> retrying (1/2)
+    page.handleFailure('Network failure 1', 'network');
+    expect(page.status).toBe('retrying');
+    expect(page.retryCount).toBe(1);
+
+    // Failure 2 -> retrying (2/2)
+    page.handleFailure('Network failure 2', 'network');
+    expect(page.status).toBe('retrying');
+    expect(page.retryCount).toBe(MAX_AUTO_RETRIES);
+
+    // Failure 3 -> failed (max reached)
+    page.handleFailure('Network failure 3', 'network');
+    expect(page.status).toBe('failed');
+    expect(page.retryCount).toBe(MAX_AUTO_RETRIES);
+
+    // Manual retry resets count and starts loading again
+    let triggered = false;
+    page.manualRetry(() => {
+      triggered = true;
+    });
+    expect(triggered).toBe(true);
+    expect(page.status).toBe('loading');
+    expect(page.retryCount).toBe(0);
+    expect(page.attempt).toBe(3);
+
+    page.destroy();
+    vi.useRealTimers();
+  });
+
+  it('guards progress marking so unread/broken chapters never mark finished', async () => {
+    const { PageLifecycleManager } = await import('./pageLifecycle.svelte');
+    const mgr = new PageLifecycleManager();
+
+    // Invalid total counts
+    expect(mgr.canMarkRead(0)).toBe(false);
+    expect(mgr.canMarkRead(-1)).toBe(false);
+
+    // Chapter with 5 pages, page 4 (last page) is not loaded
+    expect(mgr.canMarkRead(5)).toBe(false);
+
+    // Page 4 fails initially (enters retrying)
+    const lastPage = mgr.get(4);
+    lastPage.handleFailure('Server 500', 'network');
+    expect(mgr.canMarkRead(5)).toBe(false);
+    expect(mgr.isErrorOrRetrying(4)).toBe(true);
+
+    // Page 4 exhausts retries (enters failed)
+    lastPage.handleFailure('Server 500', 'network');
+    lastPage.handleFailure('Server 500', 'network');
+    expect(mgr.isFailed(4)).toBe(true);
+
+    // Page 4 loads successfully
+    const successImg = {
+      naturalWidth: 800,
+      naturalHeight: 1200,
+      decode: vi.fn().mockResolvedValue(undefined),
+    } as unknown as HTMLImageElement;
+    await lastPage.handleLoad(successImg);
+
+    expect(mgr.isLoaded(4)).toBe(true);
+    expect(mgr.canMarkRead(5)).toBe(true);
+
+    mgr.destroy();
+  });
+});
