@@ -386,7 +386,7 @@
         {/if}
         {#if title.genres.length}
           <div class="tools genres">
-            {#each title.genres as genre (genre)}<span class="tag">{genre}</span>{/each}
+            {#each title.genres as genre}<span class="tag">{genre}</span>{/each}
           </div>
         {/if}
         <Tracking {id} title={title.title} />

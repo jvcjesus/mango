@@ -468,8 +468,8 @@ describe('duplicate chapter ID tolerance', () => {
       title: 'Duplicate ID Test Manga',
       artist: 'Artist',
       author: 'Author',
-      description: 'Testing duplicate chapter IDs',
-      genres: ['Action'],
+      description: 'Testing duplicate chapter IDs and genres',
+      genres: ['Action', 'Action', 'Drama'], // Upstream source with duplicate genre tags
       status: 1,
       cover: null,
       inLibrary: false,
@@ -514,9 +514,83 @@ describe('duplicate chapter ID tolerance', () => {
     // Synchronously preload title into recall cache
     keep('title', mockTitle);
 
-    // Rendering Title with duplicate chapter IDs should NOT throw each_key_duplicate
+    // Rendering Title with duplicate chapter IDs and duplicate genres should NOT throw each_key_duplicate
     const result = render(Title, { props: { id: 9999 } });
     expect(result.html).toContain('Vol. 1 Ch. 1 - Release A');
     expect(result.html).toContain('Vol. 1 Ch. 1 - Release B');
+    // Both duplicate 'Action' tags and 'Drama' tag should be rendered
+    const actionTagMatches = result.html.match(/<span class="tag[^>]*>Action<\/span>/g);
+    expect(actionTagMatches?.length).toBe(2);
+    expect(result.html).toContain('Drama');
+
+    // Simulate navigating away and reopening the title with cache
+    keep('title', mockTitle);
+    const reopenResult = render(Title, { props: { id: 9999 } });
+    expect(reopenResult.html).toContain('Vol. 1 Ch. 1 - Release A');
+    const reopenMatches = reopenResult.html.match(/<span class="tag[^>]*>Action<\/span>/g);
+    expect(reopenMatches?.length).toBe(2);
+  });
+
+  it('proves client-side genre each block is unkeyed to prevent each_key_duplicate', async () => {
+    const titleSource = (await import('../routes/Title.svelte?raw')).default;
+    const { compile } = await import('svelte/compiler');
+    // @ts-expect-error internal client module
+    const $ = (await import('svelte/internal/client')) as any;
+
+    // Compile Title.svelte in client mode as Vite does for browser builds
+    const compiled = compile(titleSource, { generate: 'client', filename: 'Title.svelte' });
+
+    // Verify that genres loop in client code uses $.index rather than (genre) => genre
+    expect(compiled.js.code).not.toContain('(genre) => genre');
+    expect(compiled.js.code).toMatch(/\$\.each\(div_\d+,\s*\d+,\s*\(\)\s*=>\s*.*\.genres,\s*\$\.index/);
+
+    // Demonstrate the exact runtime behavior:
+    // A keyed loop with (genre) => genre throws each_key_duplicate on duplicate genres
+    const createElem = (tag: string) => ({
+      nodeType: 1,
+      tagName: tag.toUpperCase(),
+      childNodes: [] as any[],
+      parentNode: null as any,
+      appendChild(c: any) { c.parentNode = this; this.childNodes.push(c); return c; },
+      insertBefore(c: any, _ref: any) { c.parentNode = this; this.childNodes.push(c); return c; },
+      removeChild(c: any) { return c; },
+      append(c: any) { c.parentNode = this; this.childNodes.push(c); return c; },
+      setAttribute: () => {},
+      removeAttribute: () => {},
+      style: {},
+    });
+
+    (globalThis as any).document = {
+      createComment: () => ({ nodeType: 8, parentNode: null }),
+      createTextNode: (t: string) => ({ nodeType: 3, nodeValue: t, parentNode: null }),
+      createElement: createElem,
+      createDocumentFragment: () => createElem('fragment'),
+    };
+
+    const duplicateGenres = ['Action', 'Action', 'Drama'];
+
+    // 1. Keyed block throws each_key_duplicate when duplicates are present
+    $.effect_root(() => {
+      let threwDuplicateKeyError = false;
+      try {
+        const keyedContainer = createElem('div');
+        $.each(keyedContainer, 20, () => duplicateGenres, (g: string) => g, () => {});
+      } catch (err: any) {
+        if (err.message.includes('each_key_duplicate')) {
+          threwDuplicateKeyError = true;
+        }
+      }
+      expect(threwDuplicateKeyError).toBe(true);
+
+      // 2. Unkeyed block (using $.index) safely tolerates duplicate values
+      let unkeyedThrew = false;
+      try {
+        const unkeyedContainer = createElem('div');
+        $.each(unkeyedContainer, 21, () => duplicateGenres, $.index, () => {});
+      } catch {
+        unkeyedThrew = true;
+      }
+      expect(unkeyedThrew).toBe(false);
+    });
   });
 });
