@@ -1,11 +1,13 @@
 <script lang="ts">
   import { get, message, send, type Library, type LibraryItem } from '../lib/api';
+  import { confirm } from '../lib/confirm.svelte';
   import Cover from '../lib/Cover.svelte';
   import Icon from '../lib/Icon.svelte';
   import { keep, recall } from '../lib/keep';
   import Notice from '../lib/Notice.svelte';
   import { pref, prefs, setPref } from '../lib/prefs.svelte';
   import TitleCard from '../lib/TitleCard.svelte';
+  import { toast } from '../lib/toast.svelte';
   import { startTour, tour } from '../lib/guide.svelte';
 
   type Sort = 'lastRead' | 'latest' | 'unread' | 'title' | 'added';
@@ -38,7 +40,7 @@
   let picking = $state(false);
   let picked = $state<Record<number, boolean>>({});
   let filters = $state(false);
-  let sure = $state(false);
+  let acting = $state(false);
 
   // A new account lands here with an empty library: the tour starts by itself, once.
   // An account that has titles already found its way, and is not shown it unasked.
@@ -94,23 +96,36 @@
   function stopPicking() {
     picking = false;
     picked = {};
-    sure = false;
   }
 
-  async function act(body: Record<string, unknown>) {
+  async function act(body: Record<string, unknown>, successMessage?: string) {
+    if (acting) return;
+    acting = true;
     error = null;
     try {
       await send('POST', '/library/bulk', { ids: chosen, ...body });
+      if (successMessage) toast.success(successMessage);
       stopPicking();
       await load();
     } catch (e) {
-      error = message(e);
+      const msg = message(e);
+      error = msg;
+      toast.error(msg);
+    } finally {
+      acting = false;
     }
   }
 
-  function remove() {
-    if (sure) act({ action: 'remove' });
-    else sure = true;
+  async function remove() {
+    const count = chosen.length;
+    const ok = await confirm({
+      title: 'Remove from Library?',
+      message: `Remove ${count} selected ${count === 1 ? 'title' : 'titles'} from your library?`,
+      confirmText: 'Remove',
+      danger: true,
+    });
+    if (!ok) return;
+    act({ action: 'remove' }, `Removed ${count} ${count === 1 ? 'title' : 'titles'} from library`);
   }
 
   /** While picking, a click on a title selects it instead of opening it. */
@@ -119,7 +134,6 @@
     event.preventDefault();
     event.stopPropagation();
     picked[id] = !picked[id];
-    sure = false;
   }
 </script>
 
@@ -214,21 +228,45 @@
         {#if picking}
           <div class="panel bulk" role="group" aria-label="Selected titles">
             <strong>{chosen.length} selected</strong>
-            <button class="btn" onclick={() => (picked = Object.fromEntries(shown.map((item) => [item.id, true])))}>All shown</button>
-            <button class="btn" disabled={!chosen.length} onclick={() => act({ action: 'read' })}>Mark read</button>
-            <button class="btn" disabled={!chosen.length} onclick={() => act({ action: 'unread' })}>Mark unread</button>
-            <button class="btn" disabled={!chosen.length} onclick={() => act({ action: 'download' })}><Icon name="download" size={18} />Download unread</button>
+            <button class="btn" disabled={acting} onclick={() => (picked = Object.fromEntries(shown.map((item) => [item.id, true])))}>All shown</button>
+            <button class="btn" disabled={!chosen.length || acting} onclick={() => act({ action: 'read' }, `Marked ${chosen.length} as read`)}>Mark read</button>
+            <button class="btn" disabled={!chosen.length || acting} onclick={() => act({ action: 'unread' }, `Marked ${chosen.length} as unread`)}>Mark unread</button>
+            <button class="btn" disabled={!chosen.length || acting} onclick={() => act({ action: 'download' }, `Queued downloads for ${chosen.length} titles`)}>
+              {#if acting}
+                <span class="spin"><Icon name="spinner" size={18} stroke={3} /></span>
+              {:else}
+                <Icon name="download" size={18} />
+              {/if}
+              Download unread
+            </button>
             {#if data.categories.length}
               <label>
                 <span class="sr">Add to a category</span>
-                <select class="btn" disabled={!chosen.length} onchange={(e) => e.currentTarget.value && act({ action: 'categories', categories: [Number(e.currentTarget.value)] })}>
+                <select
+                  class="btn"
+                  disabled={!chosen.length || acting}
+                  onchange={(e) => {
+                    const catId = Number(e.currentTarget.value);
+                    if (catId) {
+                      const catName = data?.categories.find((c) => c.id === catId)?.name ?? 'category';
+                      act({ action: 'categories', categories: [catId] }, `Added ${chosen.length} titles to ${catName}`);
+                    }
+                  }}
+                >
                   <option value="">Add to category…</option>
                   {#each data.categories as c (c.id)}<option value={c.id}>{c.name}</option>{/each}
                 </select>
               </label>
             {/if}
-            <button class="btn" disabled={!chosen.length} onclick={remove}><Icon name="trash" size={18} />{sure ? 'Really remove?' : 'Remove'}</button>
-            <button class="btn icon" aria-label="Stop selecting" onclick={stopPicking}><Icon name="close" /></button>
+            <button class="btn" disabled={!chosen.length || acting} onclick={remove}>
+              {#if acting}
+                <span class="spin"><Icon name="spinner" size={18} stroke={3} /></span>
+              {:else}
+                <Icon name="trash" size={18} />
+              {/if}
+              Remove
+            </button>
+            <button class="btn icon" aria-label="Stop selecting" disabled={acting} onclick={stopPicking}><Icon name="close" /></button>
           </div>
         {/if}
 
