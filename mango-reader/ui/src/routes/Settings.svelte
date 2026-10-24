@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { get, message, send, runSyncDryRun, runSync, getSyncStatus, getSyncHistory, getSyncSchedule, saveSyncSchedule, type Category, type KomgaLibrary, type PipelineConfig, type PipelineEvent, type PathValidationResult, type OptimizerValidationResult, type ValidatePathsResponse, type Tracker, type SyncRecord, type SyncSummary, type SyncScheduleConfig } from '../lib/api';
+  import { get, message, send, runSyncDryRun, runSync, getSyncStatus, getSyncHistory, getSyncSchedule, saveSyncSchedule, getUnresolvedDiagnostics, setManualSyncMapping, resetSyncMapping, type Category, type KomgaLibrary, type PipelineConfig, type PipelineEvent, type PathValidationResult, type OptimizerValidationResult, type ValidatePathsResponse, type Tracker, type SyncRecord, type SyncSummary, type SyncScheduleConfig, type UnresolvedTitleDiagnostic } from '../lib/api';
   import { confirm } from '../lib/confirm.svelte';
   import { COVERS, display, MENUS, setDisplay, SIZES } from '../lib/display.svelte';
   import Icon, { type IconName } from '../lib/Icon.svelte';
@@ -737,12 +737,66 @@
     }
   }
 
+  let syncDiagnostics = $state<UnresolvedTitleDiagnostic[]>([]);
+  let manualMappingModal = $state<{
+    open: boolean;
+    komgaSeriesId: string;
+    komgaTitle: string;
+    tracker: string;
+    trackerId: string;
+    editionId: string;
+  }>({
+    open: false,
+    komgaSeriesId: '',
+    komgaTitle: '',
+    tracker: 'anilist',
+    trackerId: '',
+    editionId: '',
+  });
+
+  async function loadSyncDiagnostics() {
+    try {
+      syncDiagnostics = await getUnresolvedDiagnostics();
+    } catch {}
+  }
+
+  async function handleSetManualMapping() {
+    if (!manualMappingModal.trackerId.trim()) return;
+    try {
+      await setManualSyncMapping({
+        komgaSeriesId: manualMappingModal.komgaSeriesId,
+        tracker: manualMappingModal.tracker,
+        trackerId: manualMappingModal.trackerId.trim(),
+        editionId: manualMappingModal.editionId.trim() || null,
+        trackerTitle: manualMappingModal.komgaTitle,
+      });
+      toast.success('Manual mapping saved');
+      manualMappingModal.open = false;
+      await loadSyncDiagnostics();
+      await loadSyncHistory();
+    } catch (e) {
+      toast.error(`Failed to save manual mapping: ${message(e)}`);
+    }
+  }
+
+  async function handleResetMapping(komgaSeriesId: string, tracker: string) {
+    try {
+      await resetSyncMapping(komgaSeriesId, tracker);
+      toast.success('Mapping reset to automatic resolution');
+      await loadSyncDiagnostics();
+      await loadSyncHistory();
+    } catch (e) {
+      toast.error(`Failed to reset mapping: ${message(e)}`);
+    }
+  }
+
   async function loadSyncHistory() {
     try {
       syncHistory = await getSyncHistory(50);
       const status = await getSyncStatus();
       syncRunning = status.running;
       void loadSyncSchedule();
+      void loadSyncDiagnostics();
     } catch (e) {
       syncError = message(e);
     }
@@ -1755,8 +1809,60 @@
               <div class="sync-summary-counts">
                 <span><strong>{syncSummary.isDryRun ? syncSummary.dryRunUpdates : syncSummary.updated}</strong> {syncSummary.isDryRun ? 'would update' : 'updated'}</span>
                 <span><strong>{syncSummary.noChange}</strong> unchanged</span>
+                {#if syncSummary.trackerAhead}
+                  <span><strong>{syncSummary.trackerAhead}</strong> tracker ahead</span>
+                {/if}
                 <span><strong>{syncSummary.skipped}</strong> skipped</span>
+                {#if syncSummary.untouchedSeries}
+                  <span class="muted">({syncSummary.untouchedSeries} untouched)</span>
+                {/if}
                 <span><strong>{syncSummary.errors}</strong> errors</span>
+              </div>
+            </div>
+          {/if}
+
+          {#if syncDiagnostics.length > 0}
+            <div class="sync-history-container" style="margin-bottom: 16px;">
+              <div class="sync-history-header">
+                <h4>Unresolved &amp; Ambiguous Titles ({syncDiagnostics.length})</h4>
+                <button class="btn" onclick={loadSyncDiagnostics} style="font-size: 11px; padding: 2px 8px;">Refresh</button>
+              </div>
+              <div class="sync-records-list">
+                {#each syncDiagnostics as diag (diag.komgaSeriesId + diag.tracker)}
+                  <div class="sync-record-item">
+                    <div class="rec-top">
+                      <span class="rec-title">{diag.komgaTitle}</span>
+                      <span class="rec-tracker badge">{diag.tracker.toUpperCase()}</span>
+                      <span class="status-badge status-failed">{diag.confidence}</span>
+                      <button
+                        class="btn"
+                        style="font-size: 11px; padding: 2px 8px; margin-left: auto;"
+                        onclick={() => {
+                          manualMappingModal = {
+                            open: true,
+                            komgaSeriesId: diag.komgaSeriesId,
+                            komgaTitle: diag.komgaTitle,
+                            tracker: diag.tracker,
+                            trackerId: '',
+                            editionId: '',
+                          };
+                        }}
+                      >
+                        Set Manual ID
+                      </button>
+                      <button
+                        class="btn"
+                        style="font-size: 11px; padding: 2px 8px;"
+                        onclick={() => handleResetMapping(diag.komgaSeriesId, diag.tracker)}
+                      >
+                        Reset to Auto
+                      </button>
+                    </div>
+                    <div class="rec-body">
+                      <span class="rec-msg">{diag.reason}</span>
+                    </div>
+                  </div>
+                {/each}
               </div>
             </div>
           {/if}
@@ -1773,7 +1879,10 @@
                     <div class="rec-top">
                       <span class="rec-title">{rec.komgaSeriesTitle}</span>
                       <span class="rec-tracker badge">{rec.tracker.toUpperCase()}</span>
-                      <span class="status-badge {rec.category === 'updated' || rec.category === 'dry_run_would_update' ? 'status-valid' : rec.category.startsWith('skipped') ? 'status-not_configured' : rec.category.includes('error') ? 'status-failed' : 'status-not_configured'}">
+                      {#if rec.dimension}
+                        <span class="badge" style="font-size: 10px; opacity: 0.8;">{rec.dimension.toUpperCase()}</span>
+                      {/if}
+                      <span class="status-badge {rec.category === 'updated' || rec.category === 'would_update' || rec.category === 'dry_run_would_update' ? 'status-valid' : rec.category.startsWith('skipped') ? 'status-not_configured' : rec.category.includes('error') ? 'status-failed' : 'status-not_configured'}">
                         {rec.category.replace(/_/g, ' ')}
                       </span>
                       <span class="rec-time">{ago(rec.timestamp)}</span>
@@ -1791,6 +1900,36 @@
                     </div>
                   </div>
                 {/each}
+              </div>
+            </div>
+          {/if}
+
+          {#if manualMappingModal.open}
+            <div class="modal-backdrop" style="position: fixed; top: 0; left: 0; right: 0; bottom: 0; background: rgba(0,0,0,0.6); z-index: 1000; display: flex; align-items: center; justify-content: center;">
+              <div class="card" style="max-width: 480px; width: 90%; padding: 24px; box-shadow: 0 4px 20px rgba(0,0,0,0.3);">
+                <h3>Manual Tracker Mapping Override</h3>
+                <p class="muted" style="margin-bottom: 16px; font-size: 13px;">Explicit manual overrides take permanent precedence over automated title matching.</p>
+                <div style="margin-bottom: 12px; font-size: 14px;">
+                  <strong>Title:</strong> {manualMappingModal.komgaTitle} ({manualMappingModal.tracker.toUpperCase()})
+                </div>
+                <div style="margin-bottom: 12px;">
+                  <label class="field grow" style="display: block; margin-bottom: 4px; font-size: 13px;">
+                    <span>Tracker ID (AniList media ID or MangaBaka ID):</span>
+                    <input type="text" class="input" style="width: 100%; padding: 8px; margin-top: 4px;" bind:value={manualMappingModal.trackerId} placeholder="e.g. 106130" required />
+                  </label>
+                </div>
+                {#if manualMappingModal.tracker === 'mangabaka'}
+                  <div style="margin-bottom: 16px;">
+                    <label class="field grow" style="display: block; margin-bottom: 4px; font-size: 13px;">
+                      <span>Edition Collection ID (Optional):</span>
+                      <input type="text" class="input" style="width: 100%; padding: 8px; margin-top: 4px;" bind:value={manualMappingModal.editionId} placeholder="e.g. digital-standard" />
+                    </label>
+                  </div>
+                {/if}
+                <div style="display: flex; gap: 8px; justify-content: flex-end; margin-top: 20px;">
+                  <button class="btn" onclick={() => (manualMappingModal.open = false)}>Cancel</button>
+                  <button class="btn ink" onclick={handleSetManualMapping}>Save Manual Override</button>
+                </div>
               </div>
             </div>
           {/if}

@@ -634,7 +634,7 @@
                   {#if ownership.summary.ownedVolumesCount > 0}
                     <div class="ownership-metric-col">
                       <span class="ownership-metric">
-                        VOLUMES <strong>{ownership.summary.ownedVolumesCount}{#if ownership.summary.totalSourceVolumes} / {ownership.summary.totalSourceVolumes}{/if}</strong>
+                        VOLUMES <strong>{ownership.summary.ownedVolumesCount}{#if ownership.summary.totalSourceVolumes} / {ownership.summary.totalSourceVolumes}{:else if ownership.summary.authoritativeTotalVolumes} / {ownership.summary.authoritativeTotalVolumes}{/if}</strong>
                       </span>
                       {#if ownership.summary.explanation}
                         <span class="ownership-expl">{ownership.summary.explanation}</span>
@@ -644,7 +644,7 @@
                   {#if ownership.summary.ownedChaptersCount > 0}
                     <div class="ownership-metric-col">
                       <span class="ownership-metric">
-                        CHAPTERS <strong>{ownership.summary.ownedChaptersCount}{#if ownership.summary.totalSourceChapters} / {ownership.summary.totalSourceChapters}{/if}</strong>
+                        CHAPTERS <strong>{ownership.summary.ownedChaptersCount}{#if ownership.summary.totalSourceChapters} / {ownership.summary.totalSourceChapters}{:else if ownership.summary.authoritativeTotalChapters} / {ownership.summary.authoritativeTotalChapters}{/if}</strong>
                       </span>
                     </div>
                   {/if}

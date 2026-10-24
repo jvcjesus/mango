@@ -5,8 +5,6 @@ use crate::{
     auth::{self, Account, AccountChange, Auth, Invite, Who},
     db::Db,
     downloads::{Downloads, QueueView},
-    updates::{Status, Updates, UpdatesView},
-    version::{self, Releases},
     error::{AppError, Result},
     export, files,
     host::{Host, Solver},
@@ -20,6 +18,8 @@ use crate::{
     titles::{Browse, Listing, ReaderView, TitleView, Titles},
     trackers::{self, Change, Credentials, Kind, Pick, Track, Trackers},
     ui,
+    updates::{Status, Updates, UpdatesView},
+    version::{self, Releases},
 };
 use axum::{
     body::{to_bytes, Body, Bytes},
@@ -71,7 +71,11 @@ impl<S: Send + Sync> FromRequestParts<S> for Me {
     type Rejection = AppError;
 
     async fn from_request_parts(parts: &mut Parts, _: &S) -> Result<Self> {
-        parts.extensions.remove::<AppState>().map(Me).ok_or_else(auth::signed_out)
+        parts
+            .extensions
+            .remove::<AppState>()
+            .map(Me)
+            .ok_or_else(auth::signed_out)
     }
 }
 
@@ -100,14 +104,23 @@ pub fn router(state: Spaces) -> Router {
         .route("/extensions/{pkg}/install", post(install))
         .route("/sources", get(sources))
         .route("/sources/{id}", put(change_source))
-        .route("/sources/{id}/preferences", get(source_preferences).put(set_source_preference))
+        .route(
+            "/sources/{id}/preferences",
+            get(source_preferences).put(set_source_preference),
+        )
         .route("/sources/{id}/filters", get(source_filters))
         .route("/sources/{id}/{kind}", get(browse))
         .route("/manga/{id}", get(title))
         .route("/manga/{id}/refresh", post(refresh_title))
         .route("/manga/{id}/ownership", get(manga_ownership))
-        .route("/manga/{id}/ownership/refresh", post(refresh_manga_ownership))
-        .route("/manga/{id}/refresh-ownership", post(refresh_manga_ownership))
+        .route(
+            "/manga/{id}/ownership/refresh",
+            post(refresh_manga_ownership),
+        )
+        .route(
+            "/manga/{id}/refresh-ownership",
+            post(refresh_manga_ownership),
+        )
         .route("/manga/{id}/cover", get(cover))
         .route("/manga/{id}/library", put(set_library))
         .route("/manga/{id}/reader", put(set_reader))
@@ -118,51 +131,112 @@ pub fn router(state: Spaces) -> Router {
         .route("/chapters/{id}/progress", put(progress))
         .route("/library", get(library))
         .route("/library/bulk", post(bulk))
-        .route("/categories", get(list_categories).post(add_category).put(order_categories))
-        .route("/categories/{id}", put(rename_category).delete(remove_category))
+        .route(
+            "/categories",
+            get(list_categories)
+                .post(add_category)
+                .put(order_categories),
+        )
+        .route(
+            "/categories/{id}",
+            put(rename_category).delete(remove_category),
+        )
         .route("/manga/{id}/categories", put(set_categories))
         .route("/history", get(history).delete(clear_history))
         .route("/history/{chapter}", delete(forget))
         .route("/updates", get(updates))
         .route("/updates/run", post(run_updates))
-        .route("/downloads", get(downloads).post(queue_downloads).delete(clear_downloads))
+        .route(
+            "/downloads",
+            get(downloads).post(queue_downloads).delete(clear_downloads),
+        )
         .route("/downloads/order", put(order_downloads))
         .route("/downloads/pause", post(pause_downloads))
         .route("/downloads/resume", post(resume_downloads))
         .route("/downloads/{chapter}", delete(cancel_download))
         .route("/downloads/{chapter}/retry", post(retry_download))
-        .route("/downloads/{chapter}/retry-komga", post(retry_komga_download))
+        .route(
+            "/downloads/{chapter}/retry-komga",
+            post(retry_komga_download),
+        )
         .route("/chapters/{id}/download", delete(delete_download))
         .route("/manga/{id}/auto-download", put(set_auto_download))
-        .route("/manga/{id}/migrate/{to}", get(compare_titles).post(migrate_title))
-        .route("/import",get(import_status).post(start_import).layer(DefaultBodyLimit::max(import::MAX_UPLOAD)))
-        .route("/import/preview", post(preview_import).layer(DefaultBodyLimit::max(import::MAX_UPLOAD)))
+        .route(
+            "/manga/{id}/migrate/{to}",
+            get(compare_titles).post(migrate_title),
+        )
+        .route(
+            "/import",
+            get(import_status)
+                .post(start_import)
+                .layer(DefaultBodyLimit::max(import::MAX_UPLOAD)),
+        )
+        .route(
+            "/import/preview",
+            post(preview_import).layer(DefaultBodyLimit::max(import::MAX_UPLOAD)),
+        )
         .route("/export", get(export_library))
         .route("/export/files", get(export_files))
         .route("/export/files/size", get(files_size))
         .route("/trackers", get(list_trackers))
         .route("/trackers/{id}/authorize", post(authorize_tracker))
-        .route("/trackers/{id}/login", post(login_tracker).delete(logout_tracker))
+        .route(
+            "/trackers/{id}/login",
+            post(login_tracker).delete(logout_tracker),
+        )
         .route("/trackers/{id}/search", get(search_tracker))
         .route("/manga/{id}/tracks", get(tracks))
-        .route("/manga/{id}/tracks/{tracker}", post(bind_track).put(edit_track).delete(unbind_track))
+        .route(
+            "/manga/{id}/tracks/{tracker}",
+            post(bind_track).put(edit_track).delete(unbind_track),
+        )
         .route("/manga/{id}/tracks/{tracker}/refresh", post(refresh_track))
-        .route("/pipeline/config", get(get_pipeline_config).put(put_pipeline_config))
+        .route(
+            "/pipeline/config",
+            get(get_pipeline_config).put(put_pipeline_config),
+        )
         .route("/pipeline/validate-paths", post(validate_pipeline_paths))
         .route("/pipeline/test-mangabaka", post(test_pipeline_mangabaka))
         .route("/pipeline/test-komga", post(test_pipeline_komga))
-        .route("/pipeline/discover-komga-libraries", post(discover_pipeline_komga_libraries))
-        .route("/pipeline/retry-komga/{chapter}", post(retry_komga_download))
+        .route(
+            "/pipeline/discover-komga-libraries",
+            post(discover_pipeline_komga_libraries),
+        )
+        .route(
+            "/pipeline/retry-komga/{chapter}",
+            post(retry_komga_download),
+        )
         .route("/pipeline/events", get(get_pipeline_events))
         .route("/sync/dry-run", post(sync_dry_run))
         .route("/sync/run", post(sync_run))
         .route("/sync/status", get(sync_status))
         .route("/sync/history", get(sync_history))
-        .route("/sync/mappings", get(get_sync_mappings).put(put_sync_mapping))
-        .route("/sync/mappings/{series_id}/{tracker}", delete(delete_sync_mapping))
-        .route("/sync/schedule", get(get_sync_schedule).put(put_sync_schedule))
-        .route("/catalog/tracked", get(get_tracked_catalog).post(post_tracked_catalog))
-        .route("/catalog/tracked/{id}/auto-acquire", put(put_tracked_auto_acquire))
+        .route(
+            "/sync/mappings",
+            get(get_sync_mappings).put(put_sync_mapping),
+        )
+        .route(
+            "/sync/mappings/{series_id}/{tracker}",
+            delete(delete_sync_mapping),
+        )
+        .route("/sync/mappings/manual", post(post_sync_manual_mapping))
+        .route("/sync/mappings/reset", post(post_sync_reset_mapping))
+        .route(
+            "/sync/diagnostics/unresolved",
+            get(get_sync_unresolved_diagnostics),
+        )
+        .route(
+            "/sync/schedule",
+            get(get_sync_schedule).put(put_sync_schedule),
+        )
+        .route(
+            "/catalog/tracked",
+            get(get_tracked_catalog).post(post_tracked_catalog),
+        )
+        .route(
+            "/catalog/tracked/{id}/auto-acquire",
+            put(put_tracked_auto_acquire),
+        )
         .route("/catalog/tracked/{id}/tracked", put(put_tracked_status))
         .layer(middleware::from_fn_with_state(state.clone(), auth::require));
     let api = Router::new()
@@ -190,7 +264,10 @@ async fn sent_once(request: Request, next: Next) -> Response {
     let got = request.method() == Method::GET;
     let held = request.headers().get(header::IF_NONE_MATCH).cloned();
     let response = next.run(request).await;
-    let asked_again = response.headers().get(header::CACHE_CONTROL).is_some_and(|kept| kept == "no-cache");
+    let asked_again = response
+        .headers()
+        .get(header::CACHE_CONTROL)
+        .is_some_and(|kept| kept == "no-cache");
     if !got || !asked_again || response.status() != StatusCode::OK {
         return response;
     }
@@ -203,7 +280,11 @@ async fn sent_once(request: Request, next: Next) -> Response {
     if let Ok(value) = HeaderValue::from_str(&mark) {
         head.headers.insert(header::ETAG, value);
     }
-    if held.as_ref().and_then(|held| held.to_str().ok()).is_some_and(|held| names(held, &mark)) {
+    if held
+        .as_ref()
+        .and_then(|held| held.to_str().ok())
+        .is_some_and(|held| names(held, &mark))
+    {
         head.status = StatusCode::NOT_MODIFIED;
         head.headers.remove(header::CONTENT_LENGTH);
         return Response::from_parts(head, Body::empty());
@@ -216,7 +297,8 @@ fn names(held: &str, mark: &str) -> bool {
     fn bare(mark: &str) -> &str {
         mark.trim().trim_start_matches("W/")
     }
-    held.split(',').any(|one| one.trim() == "*" || bare(one) == bare(mark))
+    held.split(',')
+        .any(|one| one.trim() == "*" || bare(one) == bare(mark))
 }
 
 /// Text of some size goes out gzipped to a caller that reads gzip: the page's script and
@@ -224,13 +306,19 @@ fn names(held: &str, mark: &str) -> bool {
 async fn gzipped(request: Request, next: Next) -> Response {
     let reads = reads_gzip(request.headers());
     let mut response = next.run(request).await;
-    let kind = response.headers().get(header::CONTENT_TYPE).and_then(|kind| kind.to_str().ok()).unwrap_or("");
+    let kind = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|kind| kind.to_str().ok())
+        .unwrap_or("");
     let text = kind.starts_with("text/") || kind.contains("json") || kind.contains("xml");
     if !text || response.headers().contains_key(header::CONTENT_ENCODING) {
         return response;
     }
     // A cache between Mango and its callers has to keep the two forms apart.
-    response.headers_mut().append(header::VARY, HeaderValue::from_static("Accept-Encoding"));
+    response
+        .headers_mut()
+        .append(header::VARY, HeaderValue::from_static("Accept-Encoding"));
     if !reads {
         return response;
     }
@@ -250,7 +338,8 @@ async fn gzipped(request: Request, next: Next) -> Response {
     .await;
     match packed {
         Ok(Ok(packed)) => {
-            head.headers.insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
+            head.headers
+                .insert(header::CONTENT_ENCODING, HeaderValue::from_static("gzip"));
             head.headers.remove(header::CONTENT_LENGTH);
             Response::from_parts(head, Body::from(packed))
         }
@@ -260,11 +349,21 @@ async fn gzipped(request: Request, next: Next) -> Response {
 
 /// Whether a caller says it reads gzip, and does not take it back with `q=0`.
 fn reads_gzip(headers: &HeaderMap) -> bool {
-    headers.get_all(header::ACCEPT_ENCODING).iter().filter_map(|value| value.to_str().ok()).flat_map(|value| value.split(',')).any(|coding| {
-        let mut parts = coding.split(';').map(str::trim);
-        let named = parts.next().is_some_and(|name| name.eq_ignore_ascii_case("gzip"));
-        named && !parts.any(|part| part.strip_prefix("q=").and_then(|q| q.parse::<f32>().ok()) == Some(0.0))
-    })
+    headers
+        .get_all(header::ACCEPT_ENCODING)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|coding| {
+            let mut parts = coding.split(';').map(str::trim);
+            let named = parts
+                .next()
+                .is_some_and(|name| name.eq_ignore_ascii_case("gzip"));
+            named
+                && !parts.any(|part| {
+                    part.strip_prefix("q=").and_then(|q| q.parse::<f32>().ok()) == Some(0.0)
+                })
+        })
 }
 
 /// Refuses a call that names Mango by a host it does not go by; see `Auth::answers`.
@@ -280,16 +379,27 @@ async fn known_host_only(State(server): State<Spaces>, request: Request, next: N
 /// or proxy keeps a copy, unless the answer itself says how long it holds, as pictures do.
 async fn kept_nowhere(request: Request, next: Next) -> Response {
     let mut response = next.run(request).await;
-    response.headers_mut().entry(header::CACHE_CONTROL).or_insert(HeaderValue::from_static("no-store"));
+    response
+        .headers_mut()
+        .entry(header::CACHE_CONTROL)
+        .or_insert(HeaderValue::from_static("no-store"));
     response
 }
 
 /// Refuses changes that a page on another site sends through the owner's browser.
 /// The session cookie is not sent along with them from another site either.
 async fn same_site_only(request: Request, next: Next) -> Response {
-    let changes_something = !matches!(*request.method(), Method::GET | Method::HEAD | Method::OPTIONS);
+    let changes_something = !matches!(
+        *request.method(),
+        Method::GET | Method::HEAD | Method::OPTIONS
+    );
     if changes_something && from_elsewhere(request.headers()) {
-        return AppError::new(403, "cross_site", "Requests from other sites are not accepted").into_response();
+        return AppError::new(
+            403,
+            "cross_site",
+            "Requests from other sites are not accepted",
+        )
+        .into_response();
     }
     next.run(request).await
 }
@@ -304,7 +414,10 @@ fn from_elsewhere(headers: &HeaderMap) -> bool {
         None => header("origin").is_some_and(|origin| {
             let from = origin.split_once("://").map_or(origin, |(_, host)| host);
             // A proxy may put its own name for Mango in `Host`, and the one the browser used beside it.
-            !["host", "x-forwarded-host"].into_iter().filter_map(header).any(|host| host.eq_ignore_ascii_case(from))
+            !["host", "x-forwarded-host"]
+                .into_iter()
+                .filter_map(header)
+                .any(|host| host.eq_ignore_ascii_case(from))
         }),
     }
 }
@@ -318,14 +431,19 @@ fn done() -> Json<Value> {
 }
 
 fn picture(image: Image, cache: &'static str) -> Response {
-    let headers =
-        [(header::CONTENT_TYPE, image.content_type), (header::CACHE_CONTROL, cache), (header::X_CONTENT_TYPE_OPTIONS, "nosniff")];
+    let headers = [
+        (header::CONTENT_TYPE, image.content_type),
+        (header::CACHE_CONTROL, cache),
+        (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+    ];
     (headers, image.bytes).into_response()
 }
 
 async fn health(Me(app): Me) -> Json<Value> {
     let anyone_installs = app.stores.anyone_installs();
-    Json(json!({ "version": version::VERSION, "host": app.host.status(), "localDir": app.local_dir, "anyoneInstalls": anyone_installs }))
+    Json(
+        json!({ "version": version::VERSION, "host": app.host.status(), "localDir": app.local_dir, "anyoneInstalls": anyone_installs }),
+    )
 }
 
 /// This Mango's version and what the release list said when it was last asked.
@@ -339,12 +457,16 @@ async fn check_version(Me(app): Me) -> Result<Json<version::View>> {
 }
 
 async fn get_settings(Me(app): Me) -> Result<Json<Value>> {
-    Ok(Json(Value::Object(app.db.call(|conn| settings::all(conn)).await?)))
+    Ok(Json(Value::Object(
+        app.db.call(|conn| settings::all(conn)).await?,
+    )))
 }
 
 /// Stores the keys given; a null removes one. Keys not named are left alone.
 async fn put_settings(Me(app): Me, Json(values): Json<Map<String, Value>>) -> Result<Json<Value>> {
-    app.db.call(move |conn| settings::put(conn, &values)).await?;
+    app.db
+        .call(move |conn| settings::put(conn, &values))
+        .await?;
     Ok(done())
 }
 
@@ -364,7 +486,11 @@ struct NewUser {
 }
 
 /// A new account starts with an empty library and no stores.
-async fn add_user(State(server): State<Spaces>, Me(app): Me, Json(body): Json<NewUser>) -> Result<Json<Account>> {
+async fn add_user(
+    State(server): State<Spaces>,
+    Me(app): Me,
+    Json(body): Json<NewUser>,
+) -> Result<Json<Account>> {
     app.me.admin()?;
     let account = app.auth.add(&body.name, body.password, body.admin).await?;
     if let Err(why) = server.create(account.id) {
@@ -374,16 +500,26 @@ async fn add_user(State(server): State<Spaces>, Me(app): Me, Json(body): Json<Ne
     Ok(Json(account))
 }
 
-async fn edit_user(Me(app): Me, Path(id): Path<i64>, Json(change): Json<AccountChange>) -> Result<Json<Account>> {
+async fn edit_user(
+    Me(app): Me,
+    Path(id): Path<i64>,
+    Json(change): Json<AccountChange>,
+) -> Result<Json<Account>> {
     app.me.admin()?;
     Ok(Json(app.auth.edit(id, change).await?))
 }
 
 /// Removes an account with its library, its stores, its downloads and its tracker sign-ins.
-async fn remove_user(State(server): State<Spaces>, Me(app): Me, Path(id): Path<i64>) -> Result<Json<Value>> {
+async fn remove_user(
+    State(server): State<Spaces>,
+    Me(app): Me,
+    Path(id): Path<i64>,
+) -> Result<Json<Value>> {
     app.me.admin()?;
     if id == app.me.id {
-        return Err(AppError::bad_request("That is the account you are signed in with"));
+        return Err(AppError::bad_request(
+            "That is the account you are signed in with",
+        ));
     }
     app.auth.remove(id).await?;
     server.close(id).await;
@@ -427,11 +563,18 @@ async fn get_solver(Me(app): Me) -> Result<Json<Solver>> {
 
 /// Where the sources send a Cloudflare check to be passed. The extension host is
 /// restarted to learn of it, at its next call.
-async fn put_solver(State(server): State<Spaces>, Me(app): Me, Json(solver): Json<Solver>) -> Result<Json<Solver>> {
+async fn put_solver(
+    State(server): State<Spaces>,
+    Me(app): Me,
+    Json(solver): Json<Solver>,
+) -> Result<Json<Solver>> {
     app.me.admin()?;
     let solver = solver.checked()?;
     let kept = serde_json::to_value(&solver).map_err(|e| AppError::internal(e.to_string()))?;
-    server.shared().call(move |conn| settings::set(conn, Solver::KEY, &kept)).await?;
+    server
+        .shared()
+        .call(move |conn| settings::set(conn, Solver::KEY, &kept))
+        .await?;
     app.host.set_solver(solver.clone()).await;
     Ok(Json(solver))
 }
@@ -487,7 +630,13 @@ struct CatalogParams {
 }
 
 async fn catalog(Me(app): Me, Query(params): Query<CatalogParams>) -> Result<Json<Value>> {
-    let words = |list: &str| list.split(',').map(str::trim).filter(|word| !word.is_empty()).map(str::to_owned).collect::<Vec<_>>();
+    let words = |list: &str| {
+        list.split(',')
+            .map(str::trim)
+            .filter(|word| !word.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
     let mut levels = Vec::new();
     for word in words(&params.content) {
         match word.as_str() {
@@ -497,8 +646,14 @@ async fn catalog(Me(app): Me, Query(params): Query<CatalogParams>) -> Result<Jso
             _ => return Err(AppError::bad_request("content takes safe, mixed and nsfw")),
         }
     }
-    if params.state.as_deref().is_some_and(|state| !matches!(state, "installed" | "available" | "updates")) {
-        return Err(AppError::bad_request("state takes installed, available or updates"));
+    if params
+        .state
+        .as_deref()
+        .is_some_and(|state| !matches!(state, "installed" | "available" | "updates"))
+    {
+        return Err(AppError::bad_request(
+            "state takes installed, available or updates",
+        ));
     }
     let query = CatalogQuery {
         text: params.q,
@@ -513,7 +668,10 @@ async fn catalog(Me(app): Me, Query(params): Query<CatalogParams>) -> Result<Jso
     Ok(Json(json!({ "items": items, "total": total })))
 }
 
-async fn catalog_item(Me(app): Me, Path((store, pkg)): Path<(i64, String)>) -> Result<Json<CatalogItem>> {
+async fn catalog_item(
+    Me(app): Me,
+    Path((store, pkg)): Path<(i64, String)>,
+) -> Result<Json<CatalogItem>> {
     Ok(Json(app.stores.catalog_item(store, pkg).await?))
 }
 
@@ -530,12 +688,22 @@ struct InstallParams {
 }
 
 /// Installs, or updates to the store's version.
-async fn install(Me(app): Me, Path(pkg): Path<String>, Query(params): Query<InstallParams>) -> Result<Json<Installed>> {
-    Ok(Json(app.stores.install(&pkg, params.store, app.stores.open_to(&app.me)).await?))
+async fn install(
+    Me(app): Me,
+    Path(pkg): Path<String>,
+    Query(params): Query<InstallParams>,
+) -> Result<Json<Installed>> {
+    Ok(Json(
+        app.stores
+            .install(&pkg, params.store, app.stores.open_to(&app.me))
+            .await?,
+    ))
 }
 
 async fn update_all(Me(app): Me) -> Result<Json<Value>> {
-    Ok(Json(json!({ "results": app.stores.update_all(app.stores.open_to(&app.me)).await? })))
+    Ok(Json(
+        json!({ "results": app.stores.update_all(app.stores.open_to(&app.me)).await? }),
+    ))
 }
 
 async fn remove_extension(Me(app): Me, Path(pkg): Path<String>) -> Result<Json<Value>> {
@@ -553,7 +721,11 @@ struct SourceChange {
     hidden: Option<bool>,
 }
 
-async fn change_source(Me(app): Me, Path(id): Path<i64>, Json(body): Json<SourceChange>) -> Result<Json<Value>> {
+async fn change_source(
+    Me(app): Me,
+    Path(id): Path<i64>,
+    Json(body): Json<SourceChange>,
+) -> Result<Json<Value>> {
     app.stores.set_source(id, body.pinned, body.hidden).await?;
     Ok(done())
 }
@@ -569,7 +741,11 @@ async fn source_preferences(Me(app): Me, Path(id): Path<i64>) -> Result<Json<Val
 }
 
 /// Changes one of them: `{position, key, value}`. Answers with the list as it is afterwards.
-async fn set_source_preference(Me(app): Me, Path(id): Path<i64>, Json(change): Json<Value>) -> Result<Json<Value>> {
+async fn set_source_preference(
+    Me(app): Me,
+    Path(id): Path<i64>,
+    Json(change): Json<Value>,
+) -> Result<Json<Value>> {
     if !app.stores.open_to(&app.me) {
         app.me.admin()?;
     }
@@ -590,13 +766,22 @@ struct BrowseParams {
 }
 
 /// `kind` is popular, latest or search.
-async fn browse(Me(app): Me, Path((id, kind)): Path<(i64, String)>, Query(params): Query<BrowseParams>) -> Result<Json<Listing>> {
+async fn browse(
+    Me(app): Me,
+    Path((id, kind)): Path<(i64, String)>,
+    Query(params): Query<BrowseParams>,
+) -> Result<Json<Listing>> {
     let kind = Browse::parse(&kind).ok_or_else(|| AppError::not_found("No such endpoint"))?;
     let filters: Vec<Value> = match params.filters.as_deref() {
-        Some(text) if !text.is_empty() => serde_json::from_str(text).map_err(|_| AppError::bad_request("filters is not a JSON list"))?,
+        Some(text) if !text.is_empty() => serde_json::from_str(text)
+            .map_err(|_| AppError::bad_request("filters is not a JSON list"))?,
         _ => Vec::new(),
     };
-    Ok(Json(app.titles.browse(id, kind, params.page.unwrap_or(1), &params.q, &filters).await?))
+    Ok(Json(
+        app.titles
+            .browse(id, kind, params.page.unwrap_or(1), &params.q, &filters)
+            .await?,
+    ))
 }
 
 /// What a source's search can be narrowed by: `{filters}`, each named by its place in the list.
@@ -613,22 +798,43 @@ async fn refresh_title(Me(app): Me, Path(id): Path<i64>) -> Result<Json<TitleVie
     Ok(Json(app.titles.refresh(id).await?))
 }
 
-async fn manga_ownership(Me(app): Me, Path(id): Path<i64>) -> Result<Json<crate::pipeline::ownership::TitleOwnership>> {
+async fn manga_ownership(
+    Me(app): Me,
+    Path(id): Path<i64>,
+) -> Result<Json<crate::pipeline::ownership::TitleOwnership>> {
     let title_view = app.titles.get(id).await?;
-    let ownership = app.pipeline.ownership.get_title_ownership(id, &title_view.title).await;
+    let ownership = app
+        .pipeline
+        .ownership
+        .get_title_ownership(id, &title_view.title)
+        .await;
     Ok(Json(ownership))
 }
 
-async fn refresh_manga_ownership(Me(app): Me, Path(id): Path<i64>) -> Result<Json<crate::pipeline::ownership::TitleOwnership>> {
+async fn refresh_manga_ownership(
+    Me(app): Me,
+    Path(id): Path<i64>,
+) -> Result<Json<crate::pipeline::ownership::TitleOwnership>> {
     let title_view = app.titles.get(id).await?;
-    let ownership = app.pipeline.ownership.refresh_title(id, &title_view.title).await;
+    let ownership = app
+        .pipeline
+        .ownership
+        .refresh_title(id, &title_view.title)
+        .await;
     Ok(Json(ownership))
 }
 
 /// The address carries a version, so with one the answer never changes.
 async fn cover(Me(app): Me, Path(id): Path<i64>, RawQuery(version): RawQuery) -> Result<Response> {
     let image = app.images.cover(id).await?;
-    Ok(picture(image, if version.is_some() { FOREVER } else { "no-cache" }))
+    Ok(picture(
+        image,
+        if version.is_some() {
+            FOREVER
+        } else {
+            "no-cache"
+        },
+    ))
 }
 
 #[derive(Deserialize)]
@@ -637,7 +843,11 @@ struct LibraryChange {
     in_library: bool,
 }
 
-async fn set_library(Me(app): Me, Path(id): Path<i64>, Json(body): Json<LibraryChange>) -> Result<Json<Value>> {
+async fn set_library(
+    Me(app): Me,
+    Path(id): Path<i64>,
+    Json(body): Json<LibraryChange>,
+) -> Result<Json<Value>> {
     app.titles.set_library(id, body.in_library).await?;
     Ok(done())
 }
@@ -650,8 +860,14 @@ struct ReaderChange {
     prefs: Option<Value>,
 }
 
-async fn set_reader(Me(app): Me, Path(id): Path<i64>, Json(body): Json<ReaderChange>) -> Result<Json<Value>> {
-    app.titles.set_reader(id, body.mode, body.fit, body.prefs).await?;
+async fn set_reader(
+    Me(app): Me,
+    Path(id): Path<i64>,
+    Json(body): Json<ReaderChange>,
+) -> Result<Json<Value>> {
+    app.titles
+        .set_reader(id, body.mode, body.fit, body.prefs)
+        .await?;
     Ok(done())
 }
 
@@ -664,9 +880,15 @@ struct MarkChange {
     bookmark: Option<bool>,
 }
 
-async fn mark_chapters(Me(app): Me, Path(id): Path<i64>, Json(body): Json<MarkChange>) -> Result<Json<Value>> {
+async fn mark_chapters(
+    Me(app): Me,
+    Path(id): Path<i64>,
+    Json(body): Json<MarkChange>,
+) -> Result<Json<Value>> {
     if body.read.is_none() && body.bookmark.is_none() {
-        return Err(AppError::bad_request("Say what to change: read or bookmark"));
+        return Err(AppError::bad_request(
+            "Say what to change: read or bookmark",
+        ));
     }
     if let Some(on) = body.bookmark {
         app.titles.bookmark(id, body.ids.clone(), on).await?;
@@ -701,7 +923,11 @@ struct Progress {
     read: Option<bool>,
 }
 
-async fn progress(Me(app): Me, Path(id): Path<i64>, Json(body): Json<Progress>) -> Result<Json<Value>> {
+async fn progress(
+    Me(app): Me,
+    Path(id): Path<i64>,
+    Json(body): Json<Progress>,
+) -> Result<Json<Value>> {
     app.titles.progress(id, body.page, body.read).await?;
     if body.read == Some(true) {
         app.downloads.finished_reading(id).await;
@@ -790,7 +1016,11 @@ struct Switch {
     on: bool,
 }
 
-async fn set_auto_download(Me(app): Me, Path(id): Path<i64>, Json(body): Json<Switch>) -> Result<Json<Value>> {
+async fn set_auto_download(
+    Me(app): Me,
+    Path(id): Path<i64>,
+    Json(body): Json<Switch>,
+) -> Result<Json<Value>> {
     app.titles.set_auto_download(id, body.on).await?;
     Ok(done())
 }
@@ -804,7 +1034,11 @@ async fn compare_titles(Me(app): Me, Path((id, to)): Path<(i64, i64)>) -> Result
     if id != to {
         app.titles.fetch(to, !target.initialized, true).await?;
     }
-    Ok(Json(app.db.call(move |conn| migrate::compare(conn, id, to)).await?))
+    Ok(Json(
+        app.db
+            .call(move |conn| migrate::compare(conn, id, to))
+            .await?,
+    ))
 }
 
 /// Moves a title's place in the library, its progress, categories and tracker links to
@@ -818,7 +1052,11 @@ async fn migrate_title(
     if id != to && target.chapters_at.is_none() {
         app.titles.fetch(to, !target.initialized, true).await?;
     }
-    Ok(Json(app.db.call(move |conn| migrate::apply(conn, id, to, &options)).await?))
+    Ok(Json(
+        app.db
+            .call(move |conn| migrate::apply(conn, id, to, &options))
+            .await?,
+    ))
 }
 
 // ---------- import ----------
@@ -842,7 +1080,10 @@ async fn export_library(Me(app): Me) -> Result<Response> {
     let file = app.db.call(|conn| export::write(conn)).await?;
     let headers = [
         (header::CONTENT_TYPE, "application/octet-stream".to_owned()),
-        (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{}\"", export::file_name())),
+        (
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{}\"", export::file_name()),
+        ),
         (header::CACHE_CONTROL, "no-store".to_owned()),
     ];
     Ok((headers, file).into_response())
@@ -852,18 +1093,27 @@ async fn export_library(Me(app): Me) -> Result<Response> {
 async fn export_files(Me(app): Me) -> Result<Response> {
     let titles = files::plan(&app.db, &app.images, app.downloads.dir()).await?;
     if titles.is_empty() {
-        return Err(AppError::new(404, "nothing_downloaded", "No chapter is downloaded, so there are no files to export."));
+        return Err(AppError::new(
+            404,
+            "nothing_downloaded",
+            "No chapter is downloaded, so there are no files to export.",
+        ));
     }
     let headers = [
         (header::CONTENT_TYPE, "application/zip".to_owned()),
-        (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{}\"", files::file_name())),
+        (
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{}\"", files::file_name()),
+        ),
         (header::CACHE_CONTROL, "no-store".to_owned()),
     ];
     Ok((headers, files::send(titles)).into_response())
 }
 
 async fn files_size(Me(app): Me) -> Result<Json<files::Size>> {
-    Ok(Json(files::size(&files::plan(&app.db, &app.images, app.downloads.dir()).await?)))
+    Ok(Json(files::size(
+        &files::plan(&app.db, &app.images, app.downloads.dir()).await?,
+    )))
 }
 
 // ---------- trackers ----------
@@ -885,11 +1135,21 @@ struct Authorize {
 }
 
 /// Starts a sign-in that goes through the tracker's own page.
-async fn authorize_tracker(Me(app): Me, Path(id): Path<i64>, Json(body): Json<Authorize>) -> Result<Json<Value>> {
-    Ok(Json(json!({ "url": app.trackers.authorize(tracker(id)?, body.client_id, body.redirect).await? })))
+async fn authorize_tracker(
+    Me(app): Me,
+    Path(id): Path<i64>,
+    Json(body): Json<Authorize>,
+) -> Result<Json<Value>> {
+    Ok(Json(
+        json!({ "url": app.trackers.authorize(tracker(id)?, body.client_id, body.redirect).await? }),
+    ))
 }
 
-async fn login_tracker(Me(app): Me, Path(id): Path<i64>, Json(body): Json<Credentials>) -> Result<Json<Value>> {
+async fn login_tracker(
+    Me(app): Me,
+    Path(id): Path<i64>,
+    Json(body): Json<Credentials>,
+) -> Result<Json<Value>> {
     app.trackers.login(tracker(id)?, body).await?;
     Ok(done())
 }
@@ -905,8 +1165,14 @@ struct Wanted {
     q: String,
 }
 
-async fn search_tracker(Me(app): Me, Path(id): Path<i64>, Query(wanted): Query<Wanted>) -> Result<Json<Value>> {
-    Ok(Json(json!({ "results": app.trackers.search(tracker(id)?, &wanted.q).await? })))
+async fn search_tracker(
+    Me(app): Me,
+    Path(id): Path<i64>,
+    Query(wanted): Query<Wanted>,
+) -> Result<Json<Value>> {
+    Ok(Json(
+        json!({ "results": app.trackers.search(tracker(id)?, &wanted.q).await? }),
+    ))
 }
 
 /// The trackers and this title's links to them. Asks no tracker.
@@ -914,11 +1180,19 @@ async fn tracks(Me(app): Me, Path(id): Path<i64>) -> Result<Json<trackers::View>
     Ok(Json(app.trackers.view(id).await?))
 }
 
-async fn bind_track(Me(app): Me, Path((id, kind)): Path<(i64, i64)>, Json(pick): Json<Pick>) -> Result<Json<Track>> {
+async fn bind_track(
+    Me(app): Me,
+    Path((id, kind)): Path<(i64, i64)>,
+    Json(pick): Json<Pick>,
+) -> Result<Json<Track>> {
     Ok(Json(app.trackers.bind(id, tracker(kind)?, pick).await?))
 }
 
-async fn edit_track(Me(app): Me, Path((id, kind)): Path<(i64, i64)>, Json(change): Json<Change>) -> Result<Json<Track>> {
+async fn edit_track(
+    Me(app): Me,
+    Path((id, kind)): Path<(i64, i64)>,
+    Json(change): Json<Change>,
+) -> Result<Json<Track>> {
     Ok(Json(app.trackers.edit(id, tracker(kind)?, change).await?))
 }
 
@@ -960,11 +1234,20 @@ async fn bulk(Me(app): Me, Json(body): Json<BulkChange>) -> Result<Json<Value>> 
         "read" => Bulk::Read,
         "unread" => Bulk::Unread,
         "remove" => Bulk::Remove,
-        "categories" => Bulk::Categories { ids: body.categories, replace: body.replace },
-        _ => return Err(AppError::bad_request("action takes read, unread, remove or categories")),
+        "categories" => Bulk::Categories {
+            ids: body.categories,
+            replace: body.replace,
+        },
+        _ => {
+            return Err(AppError::bad_request(
+                "action takes read, unread, remove or categories",
+            ))
+        }
     };
     let (ids, read) = (body.ids.clone(), matches!(action, Bulk::Read));
-    app.db.call(move |conn| library::bulk(conn, &body.ids, &action)).await?;
+    app.db
+        .call(move |conn| library::bulk(conn, &body.ids, &action))
+        .await?;
     if read {
         ids.into_iter().for_each(|id| app.trackers.read_title(id));
     }
@@ -977,20 +1260,34 @@ struct Named {
 }
 
 async fn list_categories(Me(app): Me) -> Result<Json<Value>> {
-    Ok(Json(json!({ "categories": app.db.call(|conn| library::categories(conn)).await? })))
+    Ok(Json(
+        json!({ "categories": app.db.call(|conn| library::categories(conn)).await? }),
+    ))
 }
 
 async fn add_category(Me(app): Me, Json(body): Json<Named>) -> Result<Json<Category>> {
-    Ok(Json(app.db.call(move |conn| library::add_category(conn, &body.name)).await?))
+    Ok(Json(
+        app.db
+            .call(move |conn| library::add_category(conn, &body.name))
+            .await?,
+    ))
 }
 
-async fn rename_category(Me(app): Me, Path(id): Path<i64>, Json(body): Json<Named>) -> Result<Json<Value>> {
-    app.db.call(move |conn| library::rename_category(conn, id, &body.name)).await?;
+async fn rename_category(
+    Me(app): Me,
+    Path(id): Path<i64>,
+    Json(body): Json<Named>,
+) -> Result<Json<Value>> {
+    app.db
+        .call(move |conn| library::rename_category(conn, id, &body.name))
+        .await?;
     Ok(done())
 }
 
 async fn remove_category(Me(app): Me, Path(id): Path<i64>) -> Result<Json<Value>> {
-    app.db.call(move |conn| library::remove_category(conn, id)).await?;
+    app.db
+        .call(move |conn| library::remove_category(conn, id))
+        .await?;
     Ok(done())
 }
 
@@ -1000,12 +1297,20 @@ struct Ids {
 }
 
 async fn order_categories(Me(app): Me, Json(body): Json<Ids>) -> Result<Json<Value>> {
-    app.db.call(move |conn| library::order_categories(conn, &body.ids)).await?;
+    app.db
+        .call(move |conn| library::order_categories(conn, &body.ids))
+        .await?;
     Ok(done())
 }
 
-async fn set_categories(Me(app): Me, Path(id): Path<i64>, Json(body): Json<Ids>) -> Result<Json<Value>> {
-    app.db.call(move |conn| library::set_categories(conn, id, &body.ids)).await?;
+async fn set_categories(
+    Me(app): Me,
+    Path(id): Path<i64>,
+    Json(body): Json<Ids>,
+) -> Result<Json<Value>> {
+    app.db
+        .call(move |conn| library::set_categories(conn, id, &body.ids))
+        .await?;
     Ok(done())
 }
 
@@ -1016,12 +1321,19 @@ struct Slice {
 }
 
 async fn history(Me(app): Me, Query(slice): Query<Slice>) -> Result<Json<Value>> {
-    let entries = app.db.call(move |conn| library::history(conn, slice.limit.unwrap_or(100), slice.offset.unwrap_or(0))).await?;
+    let entries = app
+        .db
+        .call(move |conn| {
+            library::history(conn, slice.limit.unwrap_or(100), slice.offset.unwrap_or(0))
+        })
+        .await?;
     Ok(Json(json!({ "entries": entries })))
 }
 
 async fn forget(Me(app): Me, Path(chapter): Path<i64>) -> Result<Json<Value>> {
-    app.db.call(move |conn| library::forget(conn, Some(chapter))).await?;
+    app.db
+        .call(move |conn| library::forget(conn, Some(chapter)))
+        .await?;
     Ok(done())
 }
 
@@ -1059,11 +1371,14 @@ async fn validate_pipeline_paths(
     Json(payload): Json<ValidatePipelinePathsPayload>,
 ) -> Result<Json<crate::pipeline::ValidatePathsResponse>> {
     app.me.admin()?;
-    let res = app.pipeline.validate_paths(
-        payload.library_dir.as_deref(),
-        payload.chinese_library_dir.as_deref(),
-        payload.optimizer_bin.as_deref(),
-    ).await;
+    let res = app
+        .pipeline
+        .validate_paths(
+            payload.library_dir.as_deref(),
+            payload.chinese_library_dir.as_deref(),
+            payload.optimizer_bin.as_deref(),
+        )
+        .await;
     Ok(Json(res))
 }
 
@@ -1078,7 +1393,10 @@ async fn test_pipeline_mangabaka(
     Json(payload): Json<TestPipelinePayload>,
 ) -> Result<Json<Value>> {
     app.me.admin()?;
-    let msg = app.pipeline.test_mangabaka(payload.url, payload.token).await?;
+    let msg = app
+        .pipeline
+        .test_mangabaka(payload.url, payload.token)
+        .await?;
     Ok(Json(json!({ "message": msg })))
 }
 
@@ -1096,7 +1414,10 @@ async fn discover_pipeline_komga_libraries(
     Json(payload): Json<TestPipelinePayload>,
 ) -> Result<Json<Vec<crate::pipeline::komga::KomgaLibrary>>> {
     app.me.admin()?;
-    let libs = app.pipeline.discover_komga_libraries(payload.url, payload.token).await?;
+    let libs = app
+        .pipeline
+        .discover_komga_libraries(payload.url, payload.token)
+        .await?;
     Ok(Json(libs))
 }
 
@@ -1118,7 +1439,10 @@ async fn sync_dry_run(
     Json(payload): Json<Option<SyncRunPayload>>,
 ) -> Result<Json<crate::sync::model::SyncSummary>> {
     let payload = payload.unwrap_or_default();
-    let target = payload.target.as_deref().and_then(crate::sync::model::SyncTarget::parse);
+    let target = payload
+        .target
+        .as_deref()
+        .and_then(crate::sync::model::SyncTarget::parse);
     let summary = app.sync.run_sync(true, target, payload.library_id).await?;
     Ok(Json(summary))
 }
@@ -1129,7 +1453,10 @@ async fn sync_run(
 ) -> Result<Json<crate::sync::model::SyncSummary>> {
     app.me.admin()?;
     let payload = payload.unwrap_or_default();
-    let target = payload.target.as_deref().and_then(crate::sync::model::SyncTarget::parse);
+    let target = payload
+        .target
+        .as_deref()
+        .and_then(crate::sync::model::SyncTarget::parse);
     let summary = app.sync.run_sync(false, target, payload.library_id).await?;
     Ok(Json(summary))
 }
@@ -1163,8 +1490,14 @@ async fn get_sync_mappings(
     Me(app): Me,
     Query(query): Query<MappingsQuery>,
 ) -> Result<Json<Vec<crate::sync::model::TrackerMapping>>> {
-    let trk = query.tracker.as_deref().and_then(crate::sync::model::SyncTarget::parse);
-    let mappings = app.db.call(move |conn| crate::sync::mapping::list_mappings(conn, trk)).await?;
+    let trk = query
+        .tracker
+        .as_deref()
+        .and_then(crate::sync::model::SyncTarget::parse);
+    let mappings = app
+        .db
+        .call(move |conn| crate::sync::mapping::list_mappings(conn, trk))
+        .await?;
     Ok(Json(mappings))
 }
 
@@ -1173,7 +1506,9 @@ async fn put_sync_mapping(
     Json(mapping): Json<crate::sync::model::TrackerMapping>,
 ) -> Result<Json<bool>> {
     app.me.admin()?;
-    app.db.call(move |conn| crate::sync::mapping::save_mapping(conn, &mapping)).await?;
+    app.db
+        .call(move |conn| crate::sync::mapping::save_mapping(conn, &mapping))
+        .await?;
     Ok(Json(true))
 }
 
@@ -1184,12 +1519,108 @@ async fn delete_sync_mapping(
     app.me.admin()?;
     let trk = crate::sync::model::SyncTarget::parse(&tracker_str)
         .ok_or_else(|| AppError::bad_request(format!("Invalid tracker: {tracker_str}")))?;
-    let deleted = app.db.call(move |conn| crate::sync::mapping::delete_mapping(conn, &series_id, trk)).await?;
+    let deleted = app
+        .db
+        .call(move |conn| crate::sync::mapping::delete_mapping(conn, &series_id, trk))
+        .await?;
     Ok(Json(deleted))
 }
 
-async fn get_sync_schedule(Me(app): Me) -> Result<Json<crate::sync::scheduler::SyncScheduleConfig>> {
-    let cfg = app.db.call(|conn| Ok(crate::sync::scheduler::get_schedule_config(conn))).await?;
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ManualMappingPayload {
+    komga_series_id: String,
+    tracker: String,
+    tracker_id: String,
+    edition_id: Option<String>,
+    tracker_title: Option<String>,
+}
+
+async fn post_sync_manual_mapping(
+    Me(app): Me,
+    Json(payload): Json<ManualMappingPayload>,
+) -> Result<Json<crate::sync::model::TrackerMapping>> {
+    app.me.admin()?;
+    let trk = crate::sync::model::SyncTarget::parse(&payload.tracker)
+        .ok_or_else(|| AppError::bad_request(format!("Invalid tracker: {}", payload.tracker)))?;
+    let mapping = app
+        .db
+        .call(move |conn| {
+            crate::sync::mapping::set_manual_override(
+                conn,
+                &payload.komga_series_id,
+                trk,
+                &payload.tracker_id,
+                payload.edition_id.as_deref(),
+                payload.tracker_title.as_deref(),
+            )
+        })
+        .await?;
+    Ok(Json(mapping))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResetMappingPayload {
+    komga_series_id: String,
+    tracker: String,
+}
+
+async fn post_sync_reset_mapping(
+    Me(app): Me,
+    Json(payload): Json<ResetMappingPayload>,
+) -> Result<Json<bool>> {
+    app.me.admin()?;
+    let trk = crate::sync::model::SyncTarget::parse(&payload.tracker)
+        .ok_or_else(|| AppError::bad_request(format!("Invalid tracker: {}", payload.tracker)))?;
+    app.db
+        .call(move |conn| {
+            crate::sync::mapping::clear_manual_override(conn, &payload.komga_series_id, trk)
+        })
+        .await?;
+    Ok(Json(true))
+}
+
+async fn get_sync_unresolved_diagnostics(
+    Me(app): Me,
+) -> Result<Json<Vec<crate::sync::model::UnresolvedTitleDiagnostic>>> {
+    let unres = app
+        .db
+        .call(|conn| crate::sync::mapping::list_unresolved_mappings(conn))
+        .await?;
+    let diagnostics: Vec<crate::sync::model::UnresolvedTitleDiagnostic> = unres
+        .into_iter()
+        .map(|m| crate::sync::model::UnresolvedTitleDiagnostic {
+            komga_series_id: m.komga_series_id.clone(),
+            komga_title: m
+                .tracker_title
+                .clone()
+                .unwrap_or_else(|| m.komga_series_id.clone()),
+            tracker: m.tracker,
+            reason: match m.confidence {
+                crate::sync::model::MappingConfidence::Ambiguous => {
+                    "Multiple candidates found; manual selection required".to_string()
+                }
+                crate::sync::model::MappingConfidence::NeedsMapping => {
+                    "Series found but specific edition mapping is missing".to_string()
+                }
+                _ => "Unresolved mapping".to_string(),
+            },
+            candidates: vec![],
+            confidence: m.confidence,
+            source: m.mapping_source,
+        })
+        .collect();
+    Ok(Json(diagnostics))
+}
+
+async fn get_sync_schedule(
+    Me(app): Me,
+) -> Result<Json<crate::sync::scheduler::SyncScheduleConfig>> {
+    let cfg = app
+        .db
+        .call(|conn| Ok(crate::sync::scheduler::get_schedule_config(conn)))
+        .await?;
     Ok(Json(cfg))
 }
 
@@ -1198,12 +1629,19 @@ async fn put_sync_schedule(
     Json(cfg): Json<crate::sync::scheduler::SyncScheduleConfig>,
 ) -> Result<Json<bool>> {
     app.me.admin()?;
-    app.db.call(move |conn| crate::sync::scheduler::set_schedule_config(conn, &cfg)).await?;
+    app.db
+        .call(move |conn| crate::sync::scheduler::set_schedule_config(conn, &cfg))
+        .await?;
     Ok(Json(true))
 }
 
-async fn get_tracked_catalog(Me(app): Me) -> Result<Json<Vec<crate::sync::catalog::TrackedCatalogEntry>>> {
-    let entries = app.db.call(|conn| crate::sync::catalog::list_tracked(conn)).await?;
+async fn get_tracked_catalog(
+    Me(app): Me,
+) -> Result<Json<Vec<crate::sync::catalog::TrackedCatalogEntry>>> {
+    let entries = app
+        .db
+        .call(|conn| crate::sync::catalog::list_tracked(conn))
+        .await?;
     Ok(Json(entries))
 }
 
@@ -1250,7 +1688,9 @@ async fn put_tracked_auto_acquire(
     Json(payload): Json<ToggleFlagPayload>,
 ) -> Result<Json<bool>> {
     app.me.admin()?;
-    app.db.call(move |conn| crate::sync::catalog::set_auto_acquire(conn, id, payload.enabled)).await?;
+    app.db
+        .call(move |conn| crate::sync::catalog::set_auto_acquire(conn, id, payload.enabled))
+        .await?;
     Ok(Json(true))
 }
 
@@ -1260,7 +1700,9 @@ async fn put_tracked_status(
     Json(payload): Json<ToggleFlagPayload>,
 ) -> Result<Json<bool>> {
     app.me.admin()?;
-    app.db.call(move |conn| crate::sync::catalog::set_tracked(conn, id, payload.enabled)).await?;
+    app.db
+        .call(move |conn| crate::sync::catalog::set_tracked(conn, id, payload.enabled))
+        .await?;
     Ok(Json(true))
 }
 
@@ -1269,25 +1711,59 @@ mod tests {
     use super::*;
 
     fn headers(pairs: &[(&'static str, &str)]) -> HeaderMap {
-        pairs.iter().map(|(name, value)| (header::HeaderName::from_static(name), value.parse().unwrap())).collect()
+        pairs
+            .iter()
+            .map(|(name, value)| {
+                (
+                    header::HeaderName::from_static(name),
+                    value.parse().unwrap(),
+                )
+            })
+            .collect()
     }
 
     #[test]
     fn requests_from_other_sites_are_told_apart() {
         // Where the browser labels a request, the label decides.
-        assert!(from_elsewhere(&headers(&[("sec-fetch-site", "cross-site")])));
-        assert!(from_elsewhere(&headers(&[("sec-fetch-site", "same-site"), ("origin", "https://mango.example.org"), ("host", "mango.example.org")])));
-        assert!(!from_elsewhere(&headers(&[("sec-fetch-site", "same-origin")])));
+        assert!(from_elsewhere(&headers(&[(
+            "sec-fetch-site",
+            "cross-site"
+        )])));
+        assert!(from_elsewhere(&headers(&[
+            ("sec-fetch-site", "same-site"),
+            ("origin", "https://mango.example.org"),
+            ("host", "mango.example.org")
+        ])));
+        assert!(!from_elsewhere(&headers(&[(
+            "sec-fetch-site",
+            "same-origin"
+        )])));
         assert!(!from_elsewhere(&headers(&[("sec-fetch-site", "none")])));
 
         // Over plain HTTP there is no label, and the page it comes from has to be Mango's own.
         let at = ("host", "10.0.0.1:8787");
-        assert!(!from_elsewhere(&headers(&[("origin", "http://10.0.0.1:8787"), at])));
-        assert!(from_elsewhere(&headers(&[("origin", "http://other.example.org"), at])));
-        assert!(from_elsewhere(&headers(&[("origin", "http://10.0.0.1:3000"), at])), "another port is another site's page");
+        assert!(!from_elsewhere(&headers(&[
+            ("origin", "http://10.0.0.1:8787"),
+            at
+        ])));
+        assert!(from_elsewhere(&headers(&[
+            ("origin", "http://other.example.org"),
+            at
+        ])));
+        assert!(
+            from_elsewhere(&headers(&[("origin", "http://10.0.0.1:3000"), at])),
+            "another port is another site's page"
+        );
         assert!(from_elsewhere(&headers(&[("origin", "null"), at])));
-        let proxied = [("origin", "http://mango.example.org"), ("host", "127.0.0.1:8787"), ("x-forwarded-host", "mango.example.org")];
-        assert!(!from_elsewhere(&headers(&proxied)), "behind a proxy that names Mango its own way");
+        let proxied = [
+            ("origin", "http://mango.example.org"),
+            ("host", "127.0.0.1:8787"),
+            ("x-forwarded-host", "mango.example.org"),
+        ];
+        assert!(
+            !from_elsewhere(&headers(&proxied)),
+            "behind a proxy that names Mango its own way"
+        );
 
         // A reading app or a script sends neither, and is not a page at all.
         assert!(!from_elsewhere(&headers(&[at])));
@@ -1295,9 +1771,18 @@ mod tests {
 
     #[test]
     fn gzip_goes_to_who_reads_it() {
-        assert!(reads_gzip(&headers(&[("accept-encoding", "gzip, deflate, br")])));
-        assert!(reads_gzip(&headers(&[("accept-encoding", "br;q=1.0, GZIP;q=0.5")])));
-        assert!(!reads_gzip(&headers(&[("accept-encoding", "br, gzip;q=0")])));
+        assert!(reads_gzip(&headers(&[(
+            "accept-encoding",
+            "gzip, deflate, br"
+        )])));
+        assert!(reads_gzip(&headers(&[(
+            "accept-encoding",
+            "br;q=1.0, GZIP;q=0.5"
+        )])));
+        assert!(!reads_gzip(&headers(&[(
+            "accept-encoding",
+            "br, gzip;q=0"
+        )])));
         assert!(!reads_gzip(&headers(&[("accept-encoding", "identity")])));
         assert!(!reads_gzip(&headers(&[])));
     }
@@ -1306,7 +1791,10 @@ mod tests {
     fn a_mark_is_known_again() {
         let mark = "W/\"abc\"";
         assert!(names("W/\"abc\"", mark));
-        assert!(names("\"other\", \"abc\"", mark), "one of several, and strong for weak");
+        assert!(
+            names("\"other\", \"abc\"", mark),
+            "one of several, and strong for weak"
+        );
         assert!(names("*", mark));
         assert!(!names("\"abd\"", mark));
         assert!(!names("", mark));

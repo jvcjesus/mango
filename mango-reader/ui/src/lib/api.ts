@@ -444,6 +444,8 @@ export interface OwnershipSummary {
   ownedChaptersCount: number;
   totalSourceChapters?: number | null;
   sourceReleaseType: 'volume' | 'chapter' | 'mixed' | 'empty';
+  authoritativeTotalVolumes?: number | null;
+  authoritativeTotalChapters?: number | null;
   explanation?: string | null;
 }
 
@@ -471,14 +473,19 @@ export type SyncTarget = 'anilist' | 'mangabaka';
 
 export type SyncResultCategory =
   | 'updated'
-  | 'no_change'
+  | 'would_update'
   | 'dry_run_would_update'
+  | 'no_change'
+  | 'tracker_ahead'
+  | 'skipped_untouched'
   | 'skipped_no_mapping'
+  | 'ambiguous_mapping'
   | 'skipped_ambiguous_mapping'
   | 'skipped_unsafe_progress'
-  | 'tracker_ahead'
   | 'auth_error'
   | 'network_error'
+  | 'unsupported'
+  | 'verification_failed'
   | 'rate_limited'
   | 'remote_error';
 
@@ -491,6 +498,7 @@ export interface SyncRecord {
   trackerMediaId?: string | null;
   oldProgress?: number | null;
   newProgress?: number | null;
+  dimension?: string | null;
   statusChange?: string | null;
   category: SyncResultCategory;
   message: string;
@@ -499,8 +507,16 @@ export interface SyncRecord {
 
 export interface SyncSummary {
   totalSeries: number;
+  inspectedSeries?: number;
+  untouchedSeries?: number;
+  eligibleSeries?: number;
+  anilistMapped?: number;
+  mangabakaMapped?: number;
+  unresolvedMappings?: number;
+  ambiguousMappings?: number;
   updated: number;
   noChange: number;
+  trackerAhead?: number;
   dryRunUpdates: number;
   skipped: number;
   errors: number;
@@ -513,8 +529,22 @@ export interface TrackerMapping {
   tracker: SyncTarget;
   trackerId: string;
   trackerTitle?: string | null;
+  editionId?: string | null;
+  mappingSource?: string;
+  confidence?: string;
   manualOverride: boolean;
+  lastValidated?: number | null;
   updatedAt: number;
+}
+
+export interface UnresolvedTitleDiagnostic {
+  komgaSeriesId: string;
+  komgaTitle: string;
+  tracker: SyncTarget;
+  reason: string;
+  candidates: string[];
+  confidence: string;
+  source: string;
 }
 
 export const runSyncDryRun = (target?: string, libraryId?: string) =>
@@ -537,6 +567,21 @@ export const saveSyncMapping = (mapping: TrackerMapping) =>
 
 export const deleteSyncMapping = (seriesId: string, tracker: string) =>
   send<boolean>('DELETE', `/sync/mappings/${encodeURIComponent(seriesId)}/${encodeURIComponent(tracker)}`);
+
+export const getUnresolvedDiagnostics = () =>
+  get<UnresolvedTitleDiagnostic[]>('/sync/diagnostics/unresolved');
+
+export const setManualSyncMapping = (payload: {
+  komgaSeriesId: string;
+  tracker: string;
+  trackerId: string;
+  editionId?: string | null;
+  trackerTitle?: string | null;
+}) =>
+  send<TrackerMapping>('POST', '/sync/mappings/manual', payload);
+
+export const resetSyncMapping = (komgaSeriesId: string, tracker: string) =>
+  send<boolean>('POST', '/sync/mappings/reset', { komgaSeriesId, tracker });
 
 export interface SyncScheduleConfig {
   enabled: boolean;
