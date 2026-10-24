@@ -1,7 +1,9 @@
 <script lang="ts">
   import { get, message, send, type CatalogItem, type Installed, type Store } from '../lib/api';
+  import { confirm } from '../lib/confirm.svelte';
   import Icon from '../lib/Icon.svelte';
   import Notice from '../lib/Notice.svelte';
+  import { toast } from '../lib/toast.svelte';
   import { ago, langName, whenVisible } from '../lib/util';
 
   const PAGE = 60;
@@ -18,9 +20,6 @@
   let nsfw = $state(false);
   // What is being worked on, by a key such as "install:pkg", so its button can say so.
   let busy = $state<Record<string, boolean>>({});
-  // A destructive button asks once more before it acts.
-  let sure = $state('');
-  let asked = 0;
 
   const updates = $derived(installed.filter((e) => e.updateAvailable).length);
 
@@ -30,20 +29,11 @@
     try {
       await work();
     } catch (e) {
-      error = message(e);
+      const msg = message(e);
+      error = msg;
+      toast.error(msg);
     }
     busy[key] = false;
-  }
-
-  function confirmed(key: string): boolean {
-    if (sure === key) {
-      sure = '';
-      return true;
-    }
-    sure = key;
-    const mine = ++asked;
-    setTimeout(() => mine === asked && (sure = ''), 4000);
-    return false;
   }
 
   async function loadCatalog(fresh: boolean) {
@@ -75,17 +65,77 @@
     event.preventDefault();
     attempt('add', async () => {
       await send('POST', '/stores', { url: url.trim() });
+      toast.success('Store added');
       url = '';
       await loadAll();
     });
   }
 
-  const refreshStore = (store: Store) => attempt(`refresh:${store.id}`, async () => { await send('POST', `/stores/${store.id}/refresh`); await loadAll(); });
-  const acceptKey = (store: Store) => confirmed(`key:${store.id}`) && attempt(`key:${store.id}`, async () => { await send('POST', `/stores/${store.id}/accept-key`); await loadAll(); });
-  const removeStore = (store: Store) => confirmed(`store:${store.id}`) && attempt(`store:${store.id}`, async () => { await send('DELETE', `/stores/${store.id}`); await loadAll(); });
-  const install = (pkg: string, store?: number | null) => attempt(`install:${pkg}`, async () => { await send('POST', `/extensions/${pkg}/install${store ? `?store=${store}` : ''}`); await loadAll(); });
-  const remove = (pkg: string) => confirmed(`remove:${pkg}`) && attempt(`remove:${pkg}`, async () => { await send('DELETE', `/extensions/${pkg}`); await loadAll(); });
-  const updateAll = () => attempt('update-all', async () => { await send('POST', '/extensions/update-all'); await loadAll(); });
+  const refreshStore = (store: Store) =>
+    attempt(`refresh:${store.id}`, async () => {
+      await send('POST', `/stores/${store.id}/refresh`);
+      toast.success(`Checked ${store.name}`);
+      await loadAll();
+    });
+
+  const acceptKey = async (store: Store) => {
+    const ok = await confirm({
+      title: 'Trust New Store Signing Key?',
+      message: `Store "${store.name}" is using a new signing key. Only trust this if the store announced the key change; otherwise someone may be altering extensions.`,
+      confirmText: 'Trust new key',
+      danger: true,
+    });
+    if (!ok) return;
+    attempt(`key:${store.id}`, async () => {
+      await send('POST', `/stores/${store.id}/accept-key`);
+      toast.success(`Accepted key for ${store.name}`);
+      await loadAll();
+    });
+  };
+
+  const removeStore = async (store: Store) => {
+    const ok = await confirm({
+      title: 'Remove Extension Store?',
+      message: `Remove "${store.name}"? Extensions installed from this store will no longer receive updates.`,
+      confirmText: 'Remove store',
+      danger: true,
+    });
+    if (!ok) return;
+    attempt(`store:${store.id}`, async () => {
+      await send('DELETE', `/stores/${store.id}`);
+      toast.info(`Removed store ${store.name}`);
+      await loadAll();
+    });
+  };
+
+  const install = (pkg: string, store?: number | null, name?: string) =>
+    attempt(`install:${pkg}`, async () => {
+      await send('POST', `/extensions/${pkg}/install${store ? `?store=${store}` : ''}`);
+      toast.success(`Installed ${name ?? pkg}`);
+      await loadAll();
+    });
+
+  const remove = async (pkg: string, name: string) => {
+    const ok = await confirm({
+      title: 'Remove Extension?',
+      message: `Uninstall "${name}"? Sources provided by this extension will become unavailable.`,
+      confirmText: 'Uninstall',
+      danger: true,
+    });
+    if (!ok) return;
+    attempt(`remove:${pkg}`, async () => {
+      await send('DELETE', `/extensions/${pkg}`);
+      toast.info(`Uninstalled ${name}`);
+      await loadAll();
+    });
+  };
+
+  const updateAll = () =>
+    attempt('update-all', async () => {
+      await send('POST', '/extensions/update-all');
+      toast.success('Updated extensions');
+      await loadAll();
+    });
 
   function langs(list: string[]): string {
     const shown = list.slice(0, 3).map(langName).join(', ');
@@ -113,11 +163,29 @@
               {#if store.error && !store.keyChanged}<span>Last check failed: {store.error}</span>{/if}
             </span>
             <span class="tools">
-              <button class="btn icon" aria-label="Check {store.name} for new versions" disabled={busy[`refresh:${store.id}`]} onclick={() => refreshStore(store)}>
-                <Icon name="refresh" />
+              <button
+                class="btn icon"
+                aria-label="Check {store.name} for new versions"
+                disabled={busy[`refresh:${store.id}`]}
+                onclick={() => refreshStore(store)}
+              >
+                {#if busy[`refresh:${store.id}`]}
+                  <span class="spin"><Icon name="spinner" size={16} stroke={3} /></span>
+                {:else}
+                  <Icon name="refresh" />
+                {/if}
               </button>
-              <button class="btn" disabled={busy[`store:${store.id}`]} onclick={() => removeStore(store)}>
-                <Icon name="trash" size={18} />{sure === `store:${store.id}` ? 'Really remove?' : 'Remove'}
+              <button
+                class="btn"
+                disabled={busy[`store:${store.id}`]}
+                onclick={() => removeStore(store)}
+              >
+                {#if busy[`store:${store.id}`]}
+                  <span class="spin"><Icon name="spinner" size={16} stroke={3} /></span>
+                {:else}
+                  <Icon name="trash" size={18} />
+                {/if}
+                Remove
               </button>
             </span>
             {#if store.keyChanged}
@@ -130,7 +198,10 @@
                 <code>pinned {store.signingKey}</code>
                 <code>offered {store.offeredKey}</code>
                 <button class="btn" disabled={busy[`key:${store.id}`]} onclick={() => acceptKey(store)}>
-                  {sure === `key:${store.id}` ? 'Really trust the new key?' : 'Accept the new key'}
+                  {#if busy[`key:${store.id}`]}
+                    <span class="spin"><Icon name="spinner" size={16} stroke={3} /></span>
+                  {/if}
+                  Accept the new key
                 </button>
               </div>
             {/if}
@@ -170,12 +241,26 @@
                 {#if ext.contentWarning >= 3}<span class="tag">18+</span>{/if}
                 <a class="btn icon" href="#/extension/{ext.pkg}" aria-label="Settings for {ext.name}" title="Settings"><Icon name="sliders" size={18} /></a>
                 {#if ext.updateAvailable}
-                  <button class="btn spot" disabled={busy[`install:${ext.pkg}`]} onclick={() => install(ext.pkg, ext.storeId)}>
+                  <button
+                    class="btn spot"
+                    disabled={busy[`install:${ext.pkg}`]}
+                    onclick={() => install(ext.pkg, ext.storeId, ext.name)}
+                  >
+                    {#if busy[`install:${ext.pkg}`]}
+                      <span class="spin"><Icon name="spinner" size={16} stroke={3} /></span>
+                    {/if}
                     {busy[`install:${ext.pkg}`] ? 'Updating…' : `Update to ${ext.availableVersion}`}
                   </button>
                 {/if}
-                <button class="btn" disabled={busy[`remove:${ext.pkg}`]} onclick={() => remove(ext.pkg)}>
-                  {sure === `remove:${ext.pkg}` ? 'Really remove?' : 'Remove'}
+                <button
+                  class="btn"
+                  disabled={busy[`remove:${ext.pkg}`]}
+                  onclick={() => remove(ext.pkg, ext.name)}
+                >
+                  {#if busy[`remove:${ext.pkg}`]}
+                    <span class="spin"><Icon name="spinner" size={16} stroke={3} /></span>
+                  {/if}
+                  Remove
                 </button>
               </span>
             </li>
@@ -211,7 +296,14 @@
               </span>
               <span class="tools">
                 {#if item.contentWarning >= 3}<span class="tag">18+</span>{/if}
-                <button class="btn go" disabled={!item.installable || busy[`install:${item.pkg}`]} onclick={() => install(item.pkg, item.storeId)}>
+                <button
+                  class="btn go"
+                  disabled={!item.installable || busy[`install:${item.pkg}`]}
+                  onclick={() => install(item.pkg, item.storeId, item.name)}
+                >
+                  {#if busy[`install:${item.pkg}`]}
+                    <span class="spin"><Icon name="spinner" size={16} stroke={3} /></span>
+                  {/if}
                   {!item.installable ? 'APK only' : busy[`install:${item.pkg}`] ? 'Installing…' : 'Install'}
                 </button>
               </span>

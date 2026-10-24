@@ -2,6 +2,7 @@
   import { get, message, send, type Installed, type Source, type SourcePref } from '../lib/api';
   import Icon from '../lib/Icon.svelte';
   import Notice from '../lib/Notice.svelte';
+  import { toast } from '../lib/toast.svelte';
   import { langName } from '../lib/util';
 
   let { pkg }: { pkg: string } = $props();
@@ -75,11 +76,14 @@
         prefs = got.preferences;
         delete drafts[pref.position];
       }
+      toast.success(pref.title ? `Saved "${pref.title}"` : 'Setting saved');
     } catch (e) {
+      const msg = message(e);
       if (open === id) {
-        trouble = message(e);
+        trouble = msg;
         drawn += 1;
       }
+      toast.error(msg);
     }
     saving = false;
   }
@@ -200,7 +204,12 @@
                                 disabled={off}
                               />
                             </label>
-                            <button class="btn ink" disabled={off || drafts[pref.position] === undefined}>Save</button>
+                            <button class="btn ink" disabled={off || drafts[pref.position] === undefined}>
+                              {#if saving}
+                                <span class="spin"><Icon name="spinner" size={16} stroke={3} /></span>
+                              {/if}
+                              Save
+                            </button>
                           </form>
                         {/if}
                       </div>
