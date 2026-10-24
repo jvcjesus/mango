@@ -2,6 +2,7 @@
   import { ApiError, get, message, send } from '../lib/api';
   import Icon from '../lib/Icon.svelte';
   import Notice from '../lib/Notice.svelte';
+  import { toast } from '../lib/toast.svelte';
 
   type Source = { id: string; name: string; titles: number; installed: boolean; pkg: string | null; storeId: number | null; extension: string | null };
   type Preview = { titles: number; inLibrary: number; chapters: number; readChapters: number; tracked: number; categories: string[]; sources: Source[]; unreadable: number };
@@ -23,6 +24,7 @@
   let preview = $state<Preview | null>(null);
   let status = $state<Status | null>(null);
   let busy = $state(false);
+  let uploading = $state(false);
   let error = $state<string | null>(null);
   let installing = $state<Record<string, boolean>>({});
 
@@ -54,11 +56,18 @@
   }
 
   async function start() {
+    if (uploading) return;
+    uploading = true;
     error = null;
     try {
       status = await upload<Status>('/import');
+      toast.info('Starting backup import…');
     } catch (e) {
-      error = message(e);
+      const msg = message(e);
+      error = msg;
+      toast.error(msg);
+    } finally {
+      uploading = false;
     }
   }
 
@@ -112,7 +121,15 @@
         <li><strong>{preview.tracked}</strong> titles with tracker links</li>
         {#if preview.unreadable}<li><strong>{preview.unreadable}</strong> entries that cannot be read and will be skipped</li>{/if}
       </ul>
-      <button class="btn big spot" onclick={start}>Import<Icon name="arrow" size={18} stroke={3} /></button>
+      <button class="btn big spot" disabled={uploading} onclick={start}>
+        {#if uploading}
+          <span class="spin"><Icon name="spinner" size={18} stroke={3} /></span>
+        {/if}
+        {uploading ? 'Uploading…' : 'Import'}
+        {#if !uploading}
+          <Icon name="arrow" size={18} stroke={3} />
+        {/if}
+      </button>
     </section>
   {/if}
 

@@ -7,6 +7,7 @@
   import { route } from '../lib/router.svelte';
   import SourceFilters from '../lib/SourceFilters.svelte';
   import TitleCard from '../lib/TitleCard.svelte';
+  import { toast } from '../lib/toast.svelte';
   import { langName, whenVisible } from '../lib/util';
 
   type Tab = 'popular' | 'latest' | 'search';
@@ -87,12 +88,16 @@
   }
 
   async function toggle(card: Card) {
-    card.inLibrary = !card.inLibrary;
+    const nextState = !card.inLibrary;
+    card.inLibrary = nextState;
     try {
-      await send('PUT', `/manga/${card.id}/library`, { inLibrary: card.inLibrary });
+      await send('PUT', `/manga/${card.id}/library`, { inLibrary: nextState });
+      toast.success(nextState ? `Added "${card.title}" to library` : `Removed "${card.title}" from library`);
     } catch (e) {
-      card.inLibrary = !card.inLibrary;
-      error = message(e);
+      card.inLibrary = !nextState;
+      const msg = message(e);
+      error = msg;
+      toast.error(msg);
     }
   }
 

@@ -1,9 +1,11 @@
 <script lang="ts">
   import { get, message, send, type Comparison, type MigrateSide } from '../lib/api';
+  import { confirm } from '../lib/confirm.svelte';
   import Cover from '../lib/Cover.svelte';
   import Icon from '../lib/Icon.svelte';
   import Notice from '../lib/Notice.svelte';
   import { go } from '../lib/router.svelte';
+  import { toast } from '../lib/toast.svelte';
   import { langName } from '../lib/util';
 
   type Choice = 'chapters' | 'categories' | 'tracks' | 'keep';
@@ -34,13 +36,26 @@
   load();
 
   async function move() {
+    if (!seen || busy) return;
+    const ok = await confirm({
+      title: options.keep ? 'Copy Progress to New Source?' : 'Move Title to New Source?',
+      message: options.keep
+        ? `Copy reading progress and categories from "${seen.from.title}" to "${seen.to.title}"? Both will stay in your library.`
+        : `Move reading progress and categories from "${seen.from.title}" to "${seen.to.title}"? The old title will be removed from your library.`,
+      confirmText: options.keep ? 'Copy' : 'Move',
+      danger: !options.keep,
+    });
+    if (!ok) return;
     busy = true;
     error = null;
     try {
       await send('POST', `/manga/${from}/migrate/${to}`, options);
+      toast.success(options.keep ? 'Copied title progress' : 'Moved title to new source');
       go(`/title/${to}`, true);
     } catch (e) {
-      error = message(e);
+      const msg = message(e);
+      error = msg;
+      toast.error(msg);
       busy = false;
     }
   }
@@ -111,7 +126,15 @@
         <p><strong>{count(seen.from.downloaded, 'saved chapter stays', 'saved chapters stay')} with the old title.</strong> Delete them on its page first if you want the space back.</p>
       {/if}
       <div class="tools">
-        <button class="btn big spot" disabled={busy} onclick={move}>{options.keep ? 'Copy' : 'Move'}<Icon name="arrow" size={18} stroke={3} /></button>
+        <button class="btn big spot" disabled={busy} onclick={move}>
+          {#if busy}
+            <span class="spin"><Icon name="spinner" size={18} stroke={3} /></span>
+          {/if}
+          {options.keep ? 'Copy' : 'Move'}
+          {#if !busy}
+            <Icon name="arrow" size={18} stroke={3} />
+          {/if}
+        </button>
         <a class="btn big" href="#/search?q={encodeURIComponent(seen.from.title)}&for={from}">Pick another</a>
       </div>
     </section>

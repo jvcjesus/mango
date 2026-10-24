@@ -7,6 +7,7 @@
   import { browseLangs } from '../lib/prefs.svelte';
   import { go, route } from '../lib/router.svelte';
   import TitleCard from '../lib/TitleCard.svelte';
+  import { toast } from '../lib/toast.svelte';
   import { langName } from '../lib/util';
 
   // Each source is asked on its own, a few at a time. One that is slow or broken
@@ -78,12 +79,16 @@
   onDestroy(() => keep('search', $state.snapshot({ key: `${q}|${from}`, rows, scope, left })));
 
   async function toggle(card: Card) {
-    card.inLibrary = !card.inLibrary;
+    const nextState = !card.inLibrary;
+    card.inLibrary = nextState;
     try {
-      await send('PUT', `/manga/${card.id}/library`, { inLibrary: card.inLibrary });
+      await send('PUT', `/manga/${card.id}/library`, { inLibrary: nextState });
+      toast.success(nextState ? `Added "${card.title}" to library` : `Removed "${card.title}" from library`);
     } catch (e) {
-      card.inLibrary = !card.inLibrary;
-      error = message(e);
+      card.inLibrary = !nextState;
+      const msg = message(e);
+      error = msg;
+      toast.error(msg);
     }
   }
 

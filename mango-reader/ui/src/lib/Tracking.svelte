@@ -1,7 +1,9 @@
 <script lang="ts">
   import { get, message, send, type Track, type Tracker, type TrackerMatch, type TrackingView } from './api';
+  import { confirm } from './confirm.svelte';
   import Icon from './Icon.svelte';
   import Notice from './Notice.svelte';
+  import { toast } from './toast.svelte';
 
   // A title's links to trackers. Read once the page is up, so the title never waits for
   // it; and no tracker is asked anything until something here is pressed.
@@ -43,7 +45,18 @@
 
   const edit = (t: Tracker, change: Partial<Pick<Track, 'status' | 'score' | 'lastChapterRead'>>) => act(t, () => send<Track>('PUT', path(t), change));
   const refresh = (t: Tracker) => act(t, () => send<Track>('POST', path(t) + '/refresh'));
-  const unlink = (t: Tracker) => act(t, () => send('DELETE', path(t)).then(() => null));
+
+  async function unlink(t: Tracker) {
+    const ok = await confirm({
+      title: 'Unlink Tracker?',
+      message: `Remove the link to ${t.name}? Your reading progress will no longer be sent to ${t.name}.`,
+      confirmText: 'Unlink',
+      danger: true,
+    });
+    if (!ok) return;
+    await act(t, () => send('DELETE', path(t)).then(() => null));
+    toast.info(`Unlinked from ${t.name}`);
+  }
 
   // ---------- finding the title on a tracker ----------
 
