@@ -235,7 +235,7 @@ fn archive_stem(name: &str) -> Option<&str> {
     (extension.eq_ignore_ascii_case("cbz") || extension.eq_ignore_ascii_case("zip")).then_some(stem)
 }
 
-fn is_image(name: &str) -> bool {
+pub(crate) fn is_image(name: &str) -> bool {
     name.rsplit_once('.').is_some_and(|(_, extension)| IMAGES.iter().any(|known| extension.eq_ignore_ascii_case(known)))
 }
 

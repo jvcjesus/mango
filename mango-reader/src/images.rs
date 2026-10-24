@@ -401,12 +401,21 @@ fn turned(exif: &[u8]) -> bool {
     (0..count).map(|i| ifd + 2 + i * 12).any(|entry| u16_at(entry) == Some(0x0112) && u16_at(entry + 8).is_some_and(|value| value > 1))
 }
 
-/// One page out of a CBZ. Pages are its entries in name order; ComicInfo.xml is not one.
+/// One page out of a CBZ. Pages are its image entries in natural name order; ComicInfo.xml and metadata are excluded.
 fn read_cbz(path: &Path, index: usize) -> Option<Vec<u8>> {
     let mut archive = zip::ZipArchive::new(fs::File::open(path).ok()?).ok()?;
-    let mut names: Vec<String> =
-        archive.file_names().filter(|name| !name.ends_with('/') && !name.eq_ignore_ascii_case("ComicInfo.xml")).map(str::to_owned).collect();
-    names.sort();
+    let mut names: Vec<String> = archive
+        .file_names()
+        .filter(|name| {
+            !name.ends_with('/')
+                && !name.starts_with("__MACOSX/")
+                && !name.rsplit('/').next().is_some_and(|file| file.starts_with('.'))
+                && !name.eq_ignore_ascii_case("ComicInfo.xml")
+                && crate::local::is_image(name)
+        })
+        .map(str::to_owned)
+        .collect();
+    names.sort_by(|a, b| crate::local::natural_cmp(a, b));
     let mut bytes = Vec::new();
     archive.by_name(names.get(index)?).ok()?.read_to_end(&mut bytes).ok()?;
     Some(bytes)
@@ -559,6 +568,41 @@ mod tests {
         assert_eq!(sweep(&dir, 2000), 1200, "under the cap nothing goes");
         assert_eq!(sweep(&dir, 1000), 800);
         assert!(!dir.join("pages/1/0").exists() && dir.join("pages/1/1").exists() && dir.join("cover").exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn cbz_reads_in_natural_order_and_ignores_metadata() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("mango-cbz-{:08x}", fnv(&format!("{:?}", Instant::now()))));
+        fs::create_dir_all(&dir).unwrap();
+        let cbz_path = dir.join("test.cbz");
+
+        let file = fs::File::create(&cbz_path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default();
+
+        // Write entries out of natural order and include macOS metadata + non-images
+        zip.start_file("__MACOSX/._001.jpg", options).unwrap();
+        zip.write_all(b"apple-double").unwrap();
+        zip.start_file("ComicInfo.xml", options).unwrap();
+        zip.write_all(b"<ComicInfo></ComicInfo>").unwrap();
+        zip.start_file("10.jpg", options).unwrap();
+        zip.write_all(b"page10").unwrap();
+        zip.start_file("1.jpg", options).unwrap();
+        zip.write_all(b"page1").unwrap();
+        zip.start_file("2.jpg", options).unwrap();
+        zip.write_all(b"page2").unwrap();
+        zip.start_file(".DS_Store", options).unwrap();
+        zip.write_all(b"ds-store").unwrap();
+        zip.finish().unwrap();
+
+        // Index 0 should be 1.jpg, index 1 should be 2.jpg, index 2 should be 10.jpg
+        assert_eq!(read_cbz(&cbz_path, 0), Some(b"page1".to_vec()));
+        assert_eq!(read_cbz(&cbz_path, 1), Some(b"page2".to_vec()));
+        assert_eq!(read_cbz(&cbz_path, 2), Some(b"page10".to_vec()));
+        assert_eq!(read_cbz(&cbz_path, 3), None);
+
         fs::remove_dir_all(&dir).unwrap();
     }
 }
