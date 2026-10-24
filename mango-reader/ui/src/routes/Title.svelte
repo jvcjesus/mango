@@ -9,19 +9,19 @@
   import { back } from '../lib/router.svelte';
   import { toast } from '../lib/toast.svelte';
   import Tracking from '../lib/Tracking.svelte';
-  import { ago, chapterShort, langName, STATUS } from '../lib/util';
+  import { ago, chapterShort, langName, parseVolume, volumeHeading, STATUS } from '../lib/util';
 
   const WEEK = 7 * 86400;
 
   type Sort = 'source' | 'number' | 'date';
-  type View = { sort: Sort; down: boolean };
+  type View = { sort: Sort; down: boolean; volumes: boolean };
 
   const SORTS: [Sort, string][] = [
     ['source', 'Source order'],
     ['number', 'Number'],
     ['date', 'Date'],
   ];
-  const DEFAULT: View = { sort: 'source', down: true };
+  const DEFAULT: View = { sort: 'source', down: true, volumes: false };
 
   type Show = 'all' | 'unread' | 'downloaded' | 'bookmarked';
 
@@ -73,6 +73,31 @@
       list.sort((a, b) => key(b) - key(a));
     }
     return view.down ? list : list.reverse();
+  });
+  const hasVolumes = $derived(chapters.some((c) => parseVolume(c.name) !== null));
+  type VolumeGroup = { volume: number | null; label: string; chapters: Chapter[] };
+  const volumeGroups = $derived.by<VolumeGroup[]>(() => {
+    if (!view.volumes) {
+      return [{ volume: null, label: '', chapters: listed }];
+    }
+    const map = new Map<number | null, Chapter[]>();
+    for (const c of listed) {
+      const vol = parseVolume(c.name);
+      const list = map.get(vol) ?? [];
+      list.push(c);
+      map.set(vol, list);
+    }
+    const entries = Array.from(map.entries());
+    entries.sort(([a], [b]) => {
+      if (a === null) return 1;
+      if (b === null) return -1;
+      return view.down ? b - a : a - b;
+    });
+    return entries.map(([vol, chs]) => ({
+      volume: vol,
+      label: volumeHeading(vol),
+      chapters: chs,
+    }));
   });
   const nothing = $derived(
     !chapters.length ? 'No chapters yet.' : show === 'unread' && !from ? 'Every chapter is read.' : 'No chapter fits the filter.',
@@ -242,8 +267,20 @@
   }
 </script>
 
-<!-- A chapter's menu closes when anything else is pressed. -->
-<svelte:window onclick={(e) => opened !== null && !(e.target as Element).closest?.('.own') && (opened = null)} />
+<!-- Menus close when clicking outside or pressing Escape. -->
+<svelte:window
+  onclick={(e) => {
+    const el = e.target as Element;
+    if (opened !== null && !el.closest?.('.own')) opened = null;
+    if (menu && !el.closest?.('.menu')) menu = false;
+  }}
+  onkeydown={(e) => {
+    if (e.key === 'Escape') {
+      opened = null;
+      menu = false;
+    }
+  }}
+/>
 
 <div class="page">
   <Notice {loading} {error} retry={load} />
@@ -254,6 +291,19 @@
         <Icon name="back" stroke={3} />
       </a>
       <div class="tools">
+        {#if title.webUrl}
+          <a
+            class="btn lift"
+            href={title.webUrl}
+            target="_blank"
+            rel="noreferrer noopener"
+            aria-label="Open on the source site"
+            title="Open in WebView / Website"
+          >
+            <Icon name="globe" size={18} stroke={3} />
+            <span class="site-label">Website</span>
+          </a>
+        {/if}
         <button
           class="btn lift spot-on"
           aria-pressed={title.inLibrary}
@@ -271,6 +321,11 @@
           <button class="btn icon lift" aria-label="More actions" aria-expanded={menu} onclick={() => (menu = !menu)}><Icon name="more" fill /></button>
           {#if menu}
             <div class="panel sheet">
+              {#if title.webUrl}
+                <a class="btn" href={title.webUrl} target="_blank" rel="noreferrer noopener">
+                  <Icon name="globe" size={18} stroke={3} />Open in WebView / Website
+                </a>
+              {/if}
               <button class="btn" onclick={refresh}><Icon name="refresh" size={18} />Refresh from the source</button>
               <button class="btn" onclick={() => mark(chapters, true)}><Icon name="check" size={18} />Mark all read</button>
               <button class="btn" onclick={() => mark(chapters, false)}>Mark all unread</button>
@@ -397,73 +452,99 @@
                 </select>
               </label>
             {/if}
+            {#if hasVolumes}
+              <button
+                class="btn pill"
+                class:spot={view.volumes}
+                aria-pressed={view.volumes}
+                onclick={() => setView({ volumes: !view.volumes })}
+              >
+                Volumes
+              </button>
+            {/if}
           </div>
         {/if}
 
         <Notice loading={refreshing} error={refreshError} retry={refresh} />
         {#if note}<p role="status"><strong>{note}</strong> <a class="link" href="#/downloads">See downloads</a></p>{/if}
 
-        <ul class="rows">
-          {#each listed as chapter (chapter.id)}
-            <li class:done={chapter.read}>
-              <a class="main" href="#/read/{chapter.id}">
-                <strong>
-                  {#if chapter.bookmark}<span class="kept"><Icon name="bookmark" size={14} fill /><span class="sr">Bookmarked.</span></span>{/if}
-                  {chapter.name}
-                </strong>
-                <span>{about(chapter)}</span>
-              </a>
-              {#if isNew(chapter)}
-                <span class="tag spot">New</span>
-              {:else if !chapter.read && chapter.lastPageRead > 0 && chapter.pageCount}
-                <span class="meter" aria-hidden="true"><span style:width="{Math.round(((chapter.lastPageRead + 1) / chapter.pageCount) * 100)}%"></span></span>
-              {/if}
-              {#if chapter.downloaded}
-                <button
-                  class="btn icon"
-                  aria-label="Delete the saved file of {chapter.name}"
-                  disabled={busyChapter[chapter.id]}
-                  onclick={() => deleteFile(chapter)}
-                >
-                  {#if busyChapter[chapter.id]}
-                    <span class="spin"><Icon name="spinner" size={18} stroke={3} /></span>
-                  {:else}
-                    <Icon name="trash" />
-                  {/if}
-                </button>
-              {:else}
-                <button
-                  class="btn icon"
-                  aria-label="Download {chapter.name}"
-                  disabled={busyChapter[chapter.id]}
-                  onclick={() => download([chapter])}
-                >
-                  {#if busyChapter[chapter.id]}
-                    <span class="spin"><Icon name="spinner" size={18} stroke={3} /></span>
-                  {:else}
-                    <Icon name="download" />
-                  {/if}
-                </button>
-              {/if}
-              <!-- What is seldom wanted waits behind one button, so a row keeps to two. -->
-              <div class="menu own">
-                <button class="btn icon" aria-label="More for {chapter.name}" aria-expanded={opened === chapter.id} onclick={() => (opened = opened === chapter.id ? null : chapter.id)}>
-                  <Icon name="more" fill />
-                </button>
-                {#if opened === chapter.id}
-                  <div class="panel sheet">
-                    <button class="btn" onclick={() => mark([chapter], !chapter.read)}>
-                      <Icon name="check" size={18} stroke={3} />{chapter.read ? 'Mark unread' : 'Mark read'}
-                    </button>
-                    <button class="btn" onclick={() => bookmark(chapter)}>
-                      <Icon name="bookmark" size={18} fill={chapter.bookmark} />{chapter.bookmark ? 'Take the bookmark off' : 'Bookmark'}
-                    </button>
-                  </div>
+        {#each volumeGroups as grp (grp.label || 'all')}
+          {#if grp.label}
+            <div class="volume-header">
+              <h3 class="display">{grp.label}</h3>
+              <span class="tag">{grp.chapters.length} {grp.chapters.length === 1 ? 'chapter' : 'chapters'}</span>
+            </div>
+          {/if}
+          <ul class="rows">
+            {#each grp.chapters as chapter (chapter.id)}
+              <li class:done={chapter.read}>
+                <a class="main" href="#/read/{chapter.id}">
+                  <strong>
+                    {#if chapter.bookmark}<span class="kept"><Icon name="bookmark" size={14} fill /><span class="sr">Bookmarked.</span></span>{/if}
+                    {#if parseVolume(chapter.name) !== null && !view.volumes}
+                      <span class="tag vol">Vol. {parseVolume(chapter.name)}</span>
+                    {/if}
+                    {chapter.name}
+                  </strong>
+                  <span>{about(chapter)}</span>
+                </a>
+                {#if isNew(chapter)}
+                  <span class="tag spot">New</span>
+                {:else if !chapter.read && chapter.lastPageRead > 0 && chapter.pageCount}
+                  <span class="meter" aria-hidden="true"><span style:width="{Math.round(((chapter.lastPageRead + 1) / chapter.pageCount) * 100)}%"></span></span>
                 {/if}
-              </div>
-            </li>
-          {/each}
-        </ul>
+                {#if chapter.downloaded}
+                  <button
+                    class="btn icon"
+                    aria-label="Delete the saved file of {chapter.name}"
+                    disabled={busyChapter[chapter.id]}
+                    onclick={() => deleteFile(chapter)}
+                  >
+                    {#if busyChapter[chapter.id]}
+                      <span class="spin"><Icon name="spinner" size={18} stroke={3} /></span>
+                    {:else}
+                      <Icon name="trash" />
+                    {/if}
+                  </button>
+                {:else}
+                  <button
+                    class="btn icon"
+                    aria-label="Download {chapter.name}"
+                    disabled={busyChapter[chapter.id]}
+                    onclick={() => download([chapter])}
+                  >
+                    {#if busyChapter[chapter.id]}
+                      <span class="spin"><Icon name="spinner" size={18} stroke={3} /></span>
+                    {:else}
+                      <Icon name="download" />
+                    {/if}
+                  </button>
+                {/if}
+                <!-- What is seldom wanted waits behind one button, so a row keeps to two. -->
+                <div class="menu own">
+                  <button class="btn icon" aria-label="More for {chapter.name}" aria-expanded={opened === chapter.id} onclick={() => (opened = opened === chapter.id ? null : chapter.id)}>
+                    <Icon name="more" fill />
+                  </button>
+                  {#if opened === chapter.id}
+                    <div class="panel sheet">
+                      {#if title.webUrl}
+                        <a class="btn" href={title.webUrl} target="_blank" rel="noreferrer noopener">
+                          <Icon name="globe" size={18} stroke={3} />Open on site
+                        </a>
+                      {/if}
+                      <button class="btn" onclick={() => mark([chapter], !chapter.read)}>
+                        <Icon name="check" size={18} stroke={3} />{chapter.read ? 'Mark unread' : 'Mark read'}
+                      </button>
+                      <button class="btn" onclick={() => bookmark(chapter)}>
+                        <Icon name="bookmark" size={18} fill={chapter.bookmark} />{chapter.bookmark ? 'Take the bookmark off' : 'Bookmark'}
+                      </button>
+                    </div>
+                  {/if}
+                </div>
+              </li>
+            {/each}
+          </ul>
+        {/each}
         {#if !refreshing && listed.length === 0}
           <Notice>{nothing}</Notice>
         {/if}
@@ -725,5 +806,38 @@
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
+  }
+
+  .volume-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 12px;
+    margin-top: 16px;
+    background: var(--surface);
+    border: 3px solid var(--ink);
+    box-shadow: 2px 2px 0 var(--ink);
+  }
+
+  .volume-header h3 {
+    margin: 0;
+    font-size: 14px;
+    letter-spacing: 0.08em;
+  }
+
+  .tag.vol {
+    display: inline-block;
+    margin-right: 6px;
+    padding: 1px 6px;
+    font-size: 11px;
+    font-weight: 900;
+    background: var(--surface);
+    border: 1.5px solid var(--ink);
+  }
+
+  @media (max-width: 640px) {
+    .site-label {
+      display: none;
+    }
   }
 </style>

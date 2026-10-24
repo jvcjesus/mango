@@ -132,6 +132,18 @@
       {/if}
     </div>
     <div class="tools">
+      {#if source?.baseUrl}
+        <a
+          class="btn"
+          href={source.baseUrl}
+          target="_blank"
+          rel="noreferrer noopener"
+          aria-label="Open source in WebView / website"
+          title="Open in WebView / Website"
+        >
+          <Icon name="globe" size={18} stroke={3} />WebView
+        </a>
+      {/if}
       {#if id !== '0'}
         <button class="btn" aria-expanded={filtering} onclick={toggleFilters}>
           <Icon name="filter" size={18} />Filter{tab === 'search' && changes.length ? ' on' : ''}

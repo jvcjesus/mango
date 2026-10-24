@@ -49,6 +49,27 @@ export function chapterShort(chapter: { number: number; name: string }): string 
   return chapter.number >= 0 ? `Ch. ${+chapter.number.toFixed(2)}` : chapter.name;
 }
 
+/** Parses volume number from a chapter name like "Vol. 1 Ch. 5" or "Volume 2 - 14", if present. */
+export function parseVolume(name: string): number | null {
+  if (!name) return null;
+  const volMatch = name.match(/(?:^|[^\w])vol(?:ume)?\.?\s*(\d+(?:\.\d+)?)/i);
+  if (volMatch && volMatch[1]) {
+    const val = parseFloat(volMatch[1]);
+    return isNaN(val) ? null : val;
+  }
+  const vMatch = name.match(/(?:^|[^\w])v\.?\s*(\d+(?:\.\d+)?)(?=[^\w]|$)/i);
+  if (vMatch && vMatch[1]) {
+    const val = parseFloat(vMatch[1]);
+    return isNaN(val) ? null : val;
+  }
+  return null;
+}
+
+/** Formats a volume number for display (e.g. "Volume 1", "Vol. 2"). */
+export function volumeHeading(vol: number | null): string {
+  return vol !== null ? `VOLUME ${vol}` : 'OTHER CHAPTERS';
+}
+
 /** Runs `run` each time the element comes near the viewport. For lists that load as they are scrolled. */
 export function whenVisible(node: HTMLElement, run: () => void) {
   let current = run;

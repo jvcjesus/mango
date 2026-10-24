@@ -589,7 +589,13 @@
       </div>
     </div>
   {:else if !ready}
-    <div class="center" role="status">Opening…</div>
+    <div class="center reader-loading" role="status" aria-live="polite">
+      <div class="panel reader-card">
+        <span class="spin"><Icon name="spinner" size={32} stroke={3} /></span>
+        <strong class="display">Opening {info?.chapter ? info.chapter.name : 'chapter'}…</strong>
+        <span class="muted">Loading pages</span>
+      </div>
+    </div>
   {:else if paged}
     <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
     <div
@@ -1126,6 +1132,21 @@
 
   .seg button:focus-visible {
     outline-offset: -5px;
+  }
+
+  .reader-card {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 12px;
+    padding: 24px 32px;
+    text-align: center;
+    box-shadow: 4px 4px 0 var(--ink);
+  }
+
+  .reader-card strong {
+    font-size: 16px;
+    overflow-wrap: anywhere;
   }
 
   @media (max-width: 700px) {

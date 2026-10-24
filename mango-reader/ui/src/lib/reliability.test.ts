@@ -193,3 +193,48 @@ describe('toast action handler', () => {
     expect(toast.toasts.length).toBe(0);
   });
 });
+
+describe('volume parsing and grouping', () => {
+  it('correctly parses volume numbers from varied naming schemes', async () => {
+    const { parseVolume, volumeHeading } = await import('./util');
+
+    expect(parseVolume('Vol. 1 Ch. 2')).toBe(1);
+    expect(parseVolume('Vol. 2.5 Ch. 10')).toBe(2.5);
+    expect(parseVolume('Volume 10 - Chapter 100')).toBe(10);
+    expect(parseVolume('v03 c15')).toBe(3);
+    expect(parseVolume('Chapter 1 (Vol 2)')).toBe(2);
+    expect(parseVolume('[Group] Series Vol. 5 Chapter 20')).toBe(5);
+    expect(parseVolume('Chapter 42')).toBeNull();
+    expect(parseVolume('Episode 5')).toBeNull();
+    expect(parseVolume('Oneshot')).toBeNull();
+    expect(parseVolume('')).toBeNull();
+
+    expect(volumeHeading(1)).toBe('VOLUME 1');
+    expect(volumeHeading(2.5)).toBe('VOLUME 2.5');
+    expect(volumeHeading(null)).toBe('OTHER CHAPTERS');
+  });
+
+  it('groups and sorts chapters by volume properly', async () => {
+    const { parseVolume } = await import('./util');
+
+    const sampleChapters = [
+      { id: 1, name: 'Vol. 2 Ch. 15', number: 15 },
+      { id: 2, name: 'Vol. 2 Ch. 14', number: 14 },
+      { id: 3, name: 'Vol. 1 Ch. 10', number: 10 },
+      { id: 4, name: 'Vol. 1 Ch. 9', number: 9 },
+      { id: 5, name: 'Bonus Chapter', number: -1 },
+    ];
+
+    const map = new Map<number | null, typeof sampleChapters>();
+    for (const c of sampleChapters) {
+      const vol = parseVolume(c.name);
+      const list = map.get(vol) ?? [];
+      list.push(c);
+      map.set(vol, list);
+    }
+
+    expect(map.get(2)?.length).toBe(2);
+    expect(map.get(1)?.length).toBe(2);
+    expect(map.get(null)?.length).toBe(1);
+  });
+});

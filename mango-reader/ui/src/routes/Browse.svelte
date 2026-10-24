@@ -82,6 +82,18 @@
       <span>{source.id === '0' ? 'Files in your local folder' : langName(source.lang)}{source.hidden ? ' · hidden' : ''}</span>
     </a>
     <span class="tools">
+      {#if source.baseUrl}
+        <a
+          class="btn icon"
+          href={source.baseUrl}
+          target="_blank"
+          rel="noreferrer noopener"
+          aria-label="Open {source.name} in WebView / website"
+          title="Open in WebView / Website"
+        >
+          <Icon name="globe" size={16} />
+        </a>
+      {/if}
       <button
         class="btn icon spot-on"
         aria-pressed={source.pinned}
