@@ -781,5 +781,35 @@ mod tests {
 
         let vol_place = place_in(Path::new("/tmp"), &vol_job);
         assert_eq!(vol_place.file_name().unwrap().to_str().unwrap(), "Volume 1 [Stick].cbz");
+
+        // Case D: Fractional Volume artifact (e.g. v12.5)
+        let frac_job = Job {
+            chapter: 13,
+            attempts: 0,
+            source: "MangaDot".into(),
+            title: "Blue Lock".into(),
+            name: "Series v12.5".into(),
+            number: 12.5,
+            scanlator: None,
+            author: None,
+            artist: None,
+            genre: None,
+            summary: None,
+            lang: Some("en".into()),
+            volume: Some(12.5),
+            release_type: crate::release::ReleaseType::Volume,
+            chapter_number: None,
+        };
+        let frac_xml = comic_info(&frac_job, 100);
+        assert!(frac_xml.contains("<Volume>12.5</Volume>"));
+        assert!(!frac_xml.contains("<Number>"), "Fractional volume must not emit fake chapter Number");
+        assert_eq!(
+            crate::pipeline::publisher::canonical_release_name(&frac_job.title, true, 12.5),
+            "Blue Lock v12.5"
+        );
+        assert_eq!(
+            crate::pipeline::publisher::canonical_release_name(&vol_job.title, true, 1.0),
+            "Blue Lock v01"
+        );
     }
 }

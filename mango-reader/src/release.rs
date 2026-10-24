@@ -109,8 +109,12 @@ pub fn parse_volume(name: &str) -> Option<f64> {
                 || after_trimmed.starts_with('#')
                 || after_trimmed.starts_with('-');
             let in_brackets = i > 0 && ['[', '(', '{', '<'].contains(&(bytes[i - 1] as char));
+            let is_end_or_meta = after_trimmed.is_empty()
+                || after_trimmed.starts_with('[')
+                || after_trimmed.starts_with('(')
+                || after_trimmed.starts_with('{');
 
-            if i == 0 || in_brackets || followed_by_chapter {
+            if i == 0 || in_brackets || followed_by_chapter || is_end_or_meta {
                 return Some(val);
             }
         }
@@ -191,6 +195,10 @@ mod tests {
         assert_eq!(parse_volume("Vol. 0 Ch. 0.5"), Some(0.0));
         assert_eq!(parse_volume("Vol. 2.5 Ch. 10"), Some(2.5));
         assert_eq!(parse_volume("[Group] Series Vol. 5 Chapter 20"), Some(5.0));
+        assert_eq!(parse_volume("Series v01"), Some(1.0));
+        assert_eq!(parse_volume("[Group] Series v02"), Some(2.0));
+        assert_eq!(parse_volume("Series v12.5"), Some(12.5));
+        assert_eq!(parse_volume("[Group] Series v01 [Digital]"), Some(1.0));
 
         // Rejections: unrelated numbers, revisions, or pure chapter strings
         assert_eq!(parse_volume("Chapter 1"), None);
@@ -245,5 +253,23 @@ mod tests {
         assert_eq!(rel7.release_type, ReleaseType::Volume);
         assert_eq!(rel7.volume, Some(0.0));
         assert_eq!(rel7.chapter_number, None);
+
+        // Canonical format Series v01
+        let rel8 = parse_release("Blue Lock v01", 1.0);
+        assert_eq!(rel8.release_type, ReleaseType::Volume);
+        assert_eq!(rel8.volume, Some(1.0));
+        assert_eq!(rel8.chapter_number, None, "True volume must never receive fake chapter number");
+
+        // Fractional volume Series v12.5
+        let rel9 = parse_release("Series v12.5", 12.5);
+        assert_eq!(rel9.release_type, ReleaseType::Volume);
+        assert_eq!(rel9.volume, Some(12.5));
+        assert_eq!(rel9.chapter_number, None);
+
+        // Group release with tags
+        let rel10 = parse_release("[Group] Series v02 [Digital]", 2.0);
+        assert_eq!(rel10.release_type, ReleaseType::Volume);
+        assert_eq!(rel10.volume, Some(2.0));
+        assert_eq!(rel10.chapter_number, None);
     }
 }
