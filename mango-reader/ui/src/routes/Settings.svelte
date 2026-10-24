@@ -1,5 +1,6 @@
 <script lang="ts">
   import { get, message, send, type Category, type Tracker } from '../lib/api';
+  import { confirm } from '../lib/confirm.svelte';
   import { COVERS, display, MENUS, setDisplay, SIZES } from '../lib/display.svelte';
   import Icon, { type IconName } from '../lib/Icon.svelte';
   import Notice from '../lib/Notice.svelte';
@@ -9,6 +10,7 @@
   import { route } from '../lib/router.svelte';
   import { session, signOut } from '../lib/session.svelte';
   import { againTour } from '../lib/guide.svelte';
+  import { toast } from '../lib/toast.svelte';
   import { ago } from '../lib/util';
   import { checkVersion, version as about } from '../lib/version.svelte';
   import { activeName, contrast, isHex, palette, PRESETS, saveTheme, sound, SPOTS, theme, type Theme } from '../lib/theme.svelte';
@@ -127,19 +129,24 @@
   let fresh = $state('');
   let editing = $state<number | null>(null);
   let renamed = $state('');
-  let doomed = $state<number | null>(null);
+  let categoryBusy = $state(false);
 
   async function loadCategories() {
     categories = (await get<{ categories: Category[] }>('/categories')).categories;
   }
 
   async function attempt(work: () => Promise<unknown>) {
+    categoryBusy = true;
     error = null;
     try {
       await work();
       await loadCategories();
     } catch (e) {
-      error = message(e);
+      const msg = message(e);
+      error = msg;
+      toast.error(msg);
+    } finally {
+      categoryBusy = false;
     }
   }
 
@@ -147,6 +154,7 @@
     event.preventDefault();
     attempt(async () => {
       await send('POST', '/categories', { name: fresh });
+      toast.success(`Added category "${fresh}"`);
       fresh = '';
     });
   }
@@ -155,24 +163,32 @@
     event.preventDefault();
     attempt(async () => {
       await send('PUT', `/categories/${id}`, { name: renamed });
+      toast.success('Category renamed');
       editing = null;
     });
   }
 
   function move(index: number, by: number) {
+    if (categoryBusy) return;
     const ids = categories.map((c) => c.id);
     const [id] = ids.splice(index, 1);
     ids.splice(index + by, 0, id);
     attempt(() => send('PUT', '/categories', { ids }));
   }
 
-  function remove(id: number) {
-    if (doomed !== id) {
-      doomed = id;
-      return;
-    }
-    doomed = null;
-    attempt(() => send('DELETE', `/categories/${id}`));
+  async function remove(id: number) {
+    const cat = categories.find((c) => c.id === id);
+    const ok = await confirm({
+      title: 'Delete Category?',
+      message: `Delete category "${cat?.name ?? 'category'}"? Titles in this category will not be deleted.`,
+      confirmText: 'Delete',
+      danger: true,
+    });
+    if (!ok) return;
+    attempt(async () => {
+      await send('DELETE', `/categories/${id}`);
+      toast.info('Category deleted');
+    });
   }
 
   // Only the Library group shows categories, so they are read when it first opens.
@@ -291,15 +307,21 @@
   /** The account whose new password is being typed, and the one about to be removed. */
   let rekeyed = $state<number | null>(null);
   let rekey = $state('');
-  let leaving = $state<number | null>(null);
+  let userBusy = $state(false);
+  let inviteBusy = $state(false);
 
   async function withUsers(work: () => Promise<unknown>) {
+    userBusy = true;
     usersError = null;
     try {
       await work();
       users = (await get<{ users: Account[] }>('/users')).users;
     } catch (e) {
-      usersError = message(e);
+      const msg = message(e);
+      usersError = msg;
+      toast.error(msg);
+    } finally {
+      userBusy = false;
     }
   }
 
@@ -307,6 +329,7 @@
     event.preventDefault();
     withUsers(async () => {
       await send('POST', '/users', newcomer);
+      toast.success(`Created account "${newcomer.name}"`);
       newcomer = { name: '', password: '', admin: false };
     });
   }
@@ -315,18 +338,41 @@
     event.preventDefault();
     withUsers(async () => {
       await send('PUT', `/users/${id}`, { password: rekey });
+      toast.success('Password changed');
       rekeyed = null;
       rekey = '';
     });
   }
 
-  function removeUser(id: number) {
-    if (leaving !== id) {
-      leaving = id;
-      return;
-    }
-    leaving = null;
-    withUsers(() => send('DELETE', `/users/${id}`));
+  async function removeUser(id: number) {
+    const user = users.find((u) => u.id === id);
+    const ok = await confirm({
+      title: 'Delete User Account?',
+      message: `Delete account "${user?.name ?? 'user'}"? Their library and history will be permanently deleted.`,
+      confirmText: 'Delete account',
+      danger: true,
+    });
+    if (!ok) return;
+    withUsers(async () => {
+      await send('DELETE', `/users/${id}`);
+      toast.info(`Deleted user account "${user?.name ?? ''}"`);
+    });
+  }
+
+  async function toggleAdmin(user: Account) {
+    const ok = await confirm({
+      title: user.admin ? 'Revoke Admin Access?' : 'Grant Admin Access?',
+      message: user.admin
+        ? `Remove admin privileges from "${user.name}"?`
+        : `Make "${user.name}" an administrator with full access to accounts and settings?`,
+      confirmText: user.admin ? 'Revoke admin' : 'Make admin',
+      danger: user.admin,
+    });
+    if (!ok) return;
+    withUsers(async () => {
+      await send('PUT', `/users/${user.id}`, { admin: !user.admin });
+      toast.success(`Updated permissions for "${user.name}"`);
+    });
   }
 
   let askedUsers = false;
@@ -351,12 +397,17 @@
   const inviteLink = $derived(made?.code ? `${location.origin}${location.pathname}#/join/${made.code}` : '');
 
   async function withInvites(work: () => Promise<unknown>) {
+    inviteBusy = true;
     invitesError = null;
     try {
       await work();
       invites = (await get<{ invites: Invite[] }>('/invites')).invites;
     } catch (e) {
-      invitesError = message(e);
+      const msg = message(e);
+      invitesError = msg;
+      toast.error(msg);
+    } finally {
+      inviteBusy = false;
     }
   }
 
@@ -364,14 +415,39 @@
     event.preventDefault();
     withInvites(async () => {
       made = await send<Invite>('POST', '/invites', { note: invitee });
+      toast.success('Created invitation link');
       invitee = '';
       linkCopied = false;
     });
   }
 
-  function removeInvite(id: number) {
+  async function removeInvite(id: number) {
+    const ok = await confirm({
+      title: 'Revoke Invitation?',
+      message: 'Revoke this invitation? It will no longer allow anyone to create an account.',
+      confirmText: 'Revoke',
+      danger: true,
+    });
+    if (!ok) return;
     if (made?.id === id) made = null;
-    withInvites(() => send('DELETE', `/invites/${id}`));
+    withInvites(async () => {
+      await send('DELETE', `/invites/${id}`);
+      toast.info('Invitation revoked');
+    });
+  }
+
+  async function signOutTracker(t: Tracker) {
+    const ok = await confirm({
+      title: `Sign out of ${t.name}?`,
+      message: `Sign out of ${t.name}? Reading progress will no longer synchronize with ${t.name}.`,
+      confirmText: 'Sign out',
+      danger: true,
+    });
+    if (!ok) return;
+    tracking(t, async () => {
+      await send('DELETE', `/trackers/${t.id}/login`);
+      toast.info(`Signed out of ${t.name}`);
+    });
   }
 
   async function copyInvite() {
@@ -394,16 +470,22 @@
   let solver = $state({ url: '', timeoutSecs: 60 });
   let solverError = $state<string | null>(null);
   let solverSaved = $state(false);
+  let savingSolver = $state(false);
 
   async function saveSolver(event: SubmitEvent) {
     event.preventDefault();
     solverError = null;
     solverSaved = false;
+    savingSolver = true;
     try {
       solver = await send('PUT', '/solver', solver);
       solverSaved = true;
+      toast.success('Solver settings saved');
     } catch (e) {
       solverError = message(e);
+      toast.error(solverError);
+    } finally {
+      savingSolver = false;
     }
   }
 
@@ -658,16 +740,21 @@
                 {#if editing === c.id}
                   <form class="main rename" onsubmit={(e) => rename(e, c.id)}>
                     <label class="field"><span class="sr">New name for {c.name}</span><input bind:value={renamed} required maxlength="60" /></label>
-                    <button class="btn ink">Save</button>
+                    <button class="btn ink" disabled={savingSolver}>
+                {#if savingSolver}
+                  <span class="spin"><Icon name="spinner" size={16} stroke={3} /></span>
+                {/if}
+                Save
+              </button>
                     <button class="btn" type="button" onclick={() => (editing = null)}>Cancel</button>
                   </form>
                 {:else}
                   <span class="main"><strong>{c.name}</strong></span>
                   <span class="tools">
-                    <button class="btn icon" aria-label="Move {c.name} up" disabled={index === 0} onclick={() => move(index, -1)}><Icon name="up" /></button>
-                    <button class="btn icon" aria-label="Move {c.name} down" disabled={index === categories.length - 1} onclick={() => move(index, 1)}><Icon name="down" /></button>
-                    <button class="btn" onclick={() => ((editing = c.id), (renamed = c.name))}>Rename</button>
-                    <button class="btn" onclick={() => remove(c.id)}><Icon name="trash" size={18} />{doomed === c.id ? 'Really remove?' : 'Remove'}</button>
+                    <button class="btn icon" aria-label="Move {c.name} up" disabled={index === 0 || categoryBusy} onclick={() => move(index, -1)}><Icon name="up" /></button>
+                    <button class="btn icon" aria-label="Move {c.name} down" disabled={index === categories.length - 1 || categoryBusy} onclick={() => move(index, 1)}><Icon name="down" /></button>
+                    <button class="btn" disabled={categoryBusy} onclick={() => ((editing = c.id), (renamed = c.name))}>Rename</button>
+                    <button class="btn" disabled={categoryBusy} onclick={() => remove(c.id)}><Icon name="trash" size={18} />Remove</button>
                   </span>
                 {/if}
               </li>
@@ -675,7 +762,12 @@
           </ul>
           <form class="set" onsubmit={add}>
             <label class="field grow"><span class="sr">Name of a new category</span><Icon name="plus" size={18} stroke={3} /><input bind:value={fresh} placeholder="New category" required maxlength="60" /></label>
-            <button class="btn ink">Add category</button>
+            <button class="btn ink" disabled={categoryBusy}>
+              {#if categoryBusy}
+                <span class="spin"><Icon name="spinner" size={16} stroke={3} /></span>
+              {/if}
+              Add category
+            </button>
           </form>
         </section>
 
@@ -788,7 +880,12 @@
                 <span class="sr">Seconds a check may take</span>
                 <input type="number" bind:value={solver.timeoutSecs} min="5" max="300" title="Seconds a check may take" />
               </label>
-              <button class="btn ink">Save</button>
+              <button class="btn ink" disabled={savingSolver}>
+                {#if savingSolver}
+                  <span class="spin"><Icon name="spinner" size={16} stroke={3} /></span>
+                {/if}
+                Save
+              </button>
             </form>
             {#if solverError || solverSaved}
               <div class="set stack">
@@ -837,7 +934,7 @@
                   <strong>Signed in{t.userName ? ` as ${t.userName}` : ''}</strong>
                   <span>Link a title from its own page. Reading a chapter then moves it along on {t.name}.</span>
                 </div>
-                <div class="how"><button class="btn" disabled={working === t.id} onclick={() => tracking(t, () => send('DELETE', `/trackers/${t.id}/login`))}>Sign out</button></div>
+                <div class="how"><button class="btn" disabled={working === t.id} onclick={() => signOutTracker(t)}>Sign out</button></div>
               </div>
             {:else if t.login === 'password'}
               <form class="set" onsubmit={(e) => signIn(e, t)}>
@@ -981,11 +1078,11 @@
                     <div class="how">
                       <button class="btn" onclick={() => ((rekeyed = user.id), (rekey = ''))}>New password</button>
                       {#if user.id !== 1}
-                        <button class="btn" onclick={() => withUsers(() => send('PUT', `/users/${user.id}`, { admin: !user.admin }))}>
+                        <button class="btn" disabled={userBusy} onclick={() => toggleAdmin(user)}>
                           {user.admin ? 'Make reader' : 'Make admin'}
                         </button>
-                        <button class="btn" class:ink={leaving === user.id} onclick={() => removeUser(user.id)}>
-                          {leaving === user.id ? 'Remove with its library?' : 'Remove'}
+                        <button class="btn" disabled={userBusy} onclick={() => removeUser(user.id)}>
+                          Remove
                         </button>
                       {/if}
                     </div>
@@ -1009,7 +1106,12 @@
                   />
                 </label>
                 <label class="check"><input type="checkbox" bind:checked={newcomer.admin} />Admin</label>
-                <button class="btn ink">Add account</button>
+                <button class="btn ink" disabled={userBusy}>
+                  {#if userBusy}
+                    <span class="spin"><Icon name="spinner" size={16} stroke={3} /></span>
+                  {/if}
+                  Add account
+                </button>
               </form>
               {#if usersError}
                 <div class="set stack"><Notice error={usersError} /></div>
@@ -1049,7 +1151,7 @@
                       <span>{inviteState(invite)}</span>
                     </div>
                     <div class="how">
-                      <button class="btn" onclick={() => removeInvite(invite.id)}>{invite.usedAt ? 'Forget' : 'Take back'}</button>
+                      <button class="btn" disabled={inviteBusy} onclick={() => removeInvite(invite.id)}>{invite.usedAt ? 'Forget' : 'Take back'}</button>
                     </div>
                   </div>
                 {/each}
@@ -1058,7 +1160,12 @@
                     <span class="sr">Who the invitation is for</span>
                     <input type="text" bind:value={invitee} placeholder="Who it is for: only admins see this" autocomplete="off" maxlength="80" />
                   </label>
-                  <button class="btn ink">Make an invitation</button>
+                  <button class="btn ink" disabled={inviteBusy}>
+                    {#if inviteBusy}
+                      <span class="spin"><Icon name="spinner" size={16} stroke={3} /></span>
+                    {/if}
+                    Make an invitation
+                  </button>
                 </form>
                 {#if invitesError}
                   <div class="set stack"><Notice error={invitesError} /></div>

@@ -11,6 +11,7 @@
   import { filterOf, FITS, KINDS, merge, MODES, owned, profile, setProfile, zone, type Kind, type Mode, type Own, type Prefs } from '../lib/reader';
   import { pref, prefs, setPref } from '../lib/prefs.svelte';
   import { go, route, up } from '../lib/router.svelte';
+  import { toast } from '../lib/toast.svelte';
   import Zones from '../lib/Zones.svelte';
 
   let { id }: { id: number } = $props();
@@ -153,9 +154,14 @@
       info = await get<ReaderInfo>(`/chapters/${id}`);
       own = owned(info);
       if (info.chapter.pageCount) open(info.chapter.pageCount);
-      open((await counting).count);
+      const got = await counting;
+      open(got.count);
     } catch (e) {
-      if (!ready) error = message(e);
+      if (!ready) {
+        error = message(e);
+      } else {
+        toast.error('Could not load all pages: ' + message(e));
+      }
     }
   }
   load();
