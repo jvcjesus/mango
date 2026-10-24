@@ -522,15 +522,15 @@ impl Pipeline {
         if config.mangabaka_enabled && is_volume {
             let mb_client = MangaBakaClient::new(self.http.clone(), config.mangabaka_url.clone(), mb_token);
             match mb_client.fetch_volume_enrichment(&job.title, release_num).await {
-                Ok(Some(enrichment)) => {
+                Ok(mangabaka::MangaBakaOutcome::Success(enrichment)) => {
                     match MangaBakaClient::enrich_cbz_archive(source_cbz, &enrichment) {
-                        Ok(true) => mangabaka_status = "enriched".to_string(),
+                        Ok(true) => mangabaka_status = format!("enriched: vol {}", enrichment.volume),
                         Ok(false) => mangabaka_status = "enrichment skipped (no ComicInfo)".to_string(),
                         Err(e) => mangabaka_status = format!("enrichment failed: {e}"),
                     }
                 }
-                Ok(None) => mangabaka_status = "not found in catalog".to_string(),
-                Err(e) => mangabaka_status = format!("catalog search failed: {e}"),
+                Ok(outcome) => mangabaka_status = outcome.description(),
+                Err(e) => mangabaka_status = format!("enrichment query error: {e}"),
             }
         }
 
