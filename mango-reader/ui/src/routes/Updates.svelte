@@ -3,6 +3,7 @@
   import Icon from '../lib/Icon.svelte';
   import { keep, recall } from '../lib/keep';
   import Notice from '../lib/Notice.svelte';
+  import { toast } from '../lib/toast.svelte';
   import { ago, dayKey, dayLabel } from '../lib/util';
 
   // What was here last time shows at once; the list is then asked for again.
@@ -12,6 +13,8 @@
   let error = $state<string | null>(null);
   let note = $state('');
   let showErrors = $state(false);
+  let starting = $state(false);
+  let downloadingItems = $state<Record<number, boolean>>({});
 
   const running = $derived(data?.status.running ?? false);
   const days = $derived.by(() => {
@@ -45,21 +48,36 @@
   });
 
   async function run() {
+    if (starting || running) return;
+    starting = true;
     note = '';
     try {
       const status = await send<Updates['status']>('POST', '/updates/run');
       if (data) data.status = status;
+      toast.info('Checking library titles for updates…');
     } catch (e) {
-      error = message(e);
+      const msg = message(e);
+      error = msg;
+      toast.error(msg);
+    } finally {
+      starting = false;
     }
   }
 
   async function download(item: UpdateItem) {
+    if (downloadingItems[item.chapterId]) return;
+    downloadingItems[item.chapterId] = true;
     try {
       await send('POST', '/downloads', { chapters: [item.chapterId] });
-      note = `${item.title}, ${item.chapterName}: queued for download.`;
+      const text = `${item.title}, ${item.chapterName}: queued for download.`;
+      note = text;
+      toast.info(text, { action: { label: 'See downloads', run: () => (location.hash = '#/downloads') } });
     } catch (e) {
-      error = message(e);
+      const msg = message(e);
+      error = msg;
+      toast.error(msg);
+    } finally {
+      downloadingItems[item.chapterId] = false;
     }
   }
 </script>
@@ -71,9 +89,13 @@
       {#if data?.status.finishedAt && !running}
         <strong>Checked {ago(data.status.finishedAt)}: {data.status.found} new{data.status.failed ? `, ${data.status.failed} failed` : ''}{data.status.waiting ? `, ${data.status.waiting} not due yet` : ''}</strong>
       {/if}
-      <button class="btn big spot" disabled={running} onclick={run}>
-        <Icon name="refresh" size={18} stroke={3} />
-        {running && data ? `Checking ${data.status.done} / ${data.status.total}` : 'Update now'}
+      <button class="btn big spot" disabled={running || starting} onclick={run}>
+        {#if running || starting}
+          <span class="spin"><Icon name="spinner" size={18} stroke={3} /></span>
+        {:else}
+          <Icon name="refresh" size={18} stroke={3} />
+        {/if}
+        {running && data ? `Checking ${data.status.done} / ${data.status.total}` : starting ? 'Starting…' : 'Update now'}
       </button>
     </div>
   </div>
@@ -110,7 +132,18 @@
             </a>
             <span class="tools">
               {#if !item.downloaded}
-                <button class="btn icon" aria-label="Download {item.chapterName} of {item.title}" onclick={() => download(item)}><Icon name="download" /></button>
+                <button
+                  class="btn icon"
+                  aria-label="Download {item.chapterName} of {item.title}"
+                  disabled={downloadingItems[item.chapterId]}
+                  onclick={() => download(item)}
+                >
+                  {#if downloadingItems[item.chapterId]}
+                    <span class="spin"><Icon name="spinner" size={16} stroke={3} /></span>
+                  {:else}
+                    <Icon name="download" />
+                  {/if}
+                </button>
               {/if}
               <a class="btn" href="#/read/{item.chapterId}">Read<Icon name="arrow" size={18} stroke={3} /></a>
             </span>
