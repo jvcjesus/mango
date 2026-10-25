@@ -7,13 +7,26 @@
 //! - Never decreases progress: `target = max(existing_anilist, komga)`.
 //! - Only marks COMPLETED if authoritative total is known and reached.
 
-use super::model::{
-    KomgaSeriesProgress, SyncRecord, SyncResultCategory, SyncTarget, TrackerMapping,
+use super::{
+    eligibility::evaluate_completion_predicate,
+    model::{KomgaSeriesProgress, SyncRecord, SyncResultCategory, SyncTarget, TrackerMapping},
 };
 use crate::{
     db::now,
     trackers::{Kind, Trackers, anilist},
 };
+
+fn anilist_status_name(status: i32) -> &'static str {
+    match status {
+        1 => "CURRENT",
+        2 => "COMPLETED",
+        3 => "PAUSED",
+        4 => "DROPPED",
+        5 => "PLANNING",
+        6 => "REPEATING",
+        _ => "UNKNOWN",
+    }
+}
 
 pub async fn sync_series_to_anilist(
     trackers: &Trackers,
@@ -154,28 +167,37 @@ pub async fn sync_series_to_anilist(
     // 5. Apply never-decrease rule: target = max(existing, komga)
     let target_prog = old_progress.max(komga_prog);
 
-    // Completion rule: only mark series COMPLETED if authoritative total is known and reached
-    let is_completed = if total_units > 0 && target_prog >= total_units as f64 {
-        true
-    } else if progress.is_series_completed && total_units > 0 {
-        true
+    // Completion predicate: strictly conservative
+    let is_completed = evaluate_completion_predicate(progress, total_units, target_prog);
+
+    // Status transition rules:
+    // - PAUSED (3) or DROPPED (4): NEVER automatically override
+    // - Completed: strictly conservative predicate, never regress completed
+    // - PLANNING (5) -> CURRENT (1): when meaningful Komga reading begins
+    let new_status = if old_status == 3 || old_status == 4 {
+        old_status
+    } else if is_completed {
+        2 // COMPLETED
+    } else if old_status == 2 {
+        2 // Never regress COMPLETED
+    } else if old_status == 5 && (komga_prog > 0.0 || progress.completed_books > 0) {
+        1 // CURRENT (Reading)
     } else {
-        false
+        old_status
     };
 
-    let new_status = if is_completed { 2 } else { 1 }; // 2 = COMPLETED, 1 = CURRENT
     let status_change = if new_status != old_status {
-        Some(if new_status == 2 {
-            "COMPLETED".to_string()
-        } else {
-            "CURRENT".to_string()
-        })
+        Some(format!(
+            "{} -> {}",
+            anilist_status_name(old_status),
+            anilist_status_name(new_status)
+        ))
     } else {
         None
     };
 
     let needs_progress_update = target_prog > old_progress;
-    let needs_status_update = is_completed && old_status != 2;
+    let needs_status_update = new_status != old_status;
 
     if !needs_progress_update && !needs_status_update {
         let (cat, msg) = if old_progress > komga_prog {

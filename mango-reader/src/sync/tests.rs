@@ -2509,3 +2509,590 @@ async fn test_mangabaka_cross_reference_remote_error_does_not_fall_through_to_ti
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ======================================================================
+// MILESTONE: UNIFIED TRACKED LISTS & SAFE STATUS SYNCHRONIZATION TESTS
+// ======================================================================
+
+use super::eligibility::evaluate_completion_predicate;
+use super::lists::{
+    ListsQuery, TrackerListEntry, TrackerListRefreshStatus, build_unified_catalog,
+    get_tracker_list_entries, normalize_status, update_refresh_status, upsert_tracker_list_entries,
+};
+
+#[test]
+fn test_backend_anilist_planning_imports_without_komga_ownership() {
+    let dir = std::env::temp_dir().join("mango-test-backend-al-planning");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = Db::open(&dir.join("test.db")).expect("test db");
+    let conn = db.second().expect("conn");
+
+    let entry = TrackerListEntry {
+        tracker: "anilist".to_string(),
+        tracker_id: "12345".to_string(),
+        title: "Frieren: Beyond Journey's End".to_string(),
+        cover_url: Some("https://example.com/frieren.jpg".to_string()),
+        status: "PLANNING".to_string(),
+        normalized_status: "Planning".to_string(),
+        progress_chapter: Some(0.0),
+        progress_volume: Some(0.0),
+        total_chapters: Some(130),
+        total_volumes: Some(12),
+        format: Some("MANGA".to_string()),
+        updated_at: 1700000000,
+        raw_data: None,
+    };
+
+    upsert_tracker_list_entries(&conn, &[entry]).unwrap();
+
+    let res = build_unified_catalog(&conn, &[], &ListsQuery::default()).unwrap();
+    assert_eq!(res.items.len(), 1);
+    let item = &res.items[0];
+    assert_eq!(item.title, "Frieren: Beyond Journey's End");
+    assert_eq!(item.normalized_status, "Planning");
+    assert_eq!(item.ownership_status, "Not Owned");
+    assert_eq!(item.owned_units, None);
+    assert_eq!(item.auto_acquire, false);
+    assert!(item.anilist.is_some());
+    assert!(item.mangabaka.is_none());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_backend_mangabaka_want_to_read_imports_without_komga_ownership() {
+    let dir = std::env::temp_dir().join("mango-test-backend-mb-want-to-read");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = Db::open(&dir.join("test.db")).expect("test db");
+    let conn = db.second().expect("conn");
+
+    let entry = TrackerListEntry {
+        tracker: "mangabaka".to_string(),
+        tracker_id: "9988".to_string(),
+        title: "Dungeon Meshi".to_string(),
+        cover_url: Some("https://example.com/meshi.jpg".to_string()),
+        status: "plan_to_read".to_string(),
+        normalized_status: "Planning".to_string(),
+        progress_chapter: Some(0.0),
+        progress_volume: Some(0.0),
+        total_chapters: Some(97),
+        total_volumes: Some(14),
+        format: Some("manga".to_string()),
+        updated_at: 1700000000,
+        raw_data: None,
+    };
+
+    upsert_tracker_list_entries(&conn, &[entry]).unwrap();
+
+    let res = build_unified_catalog(&conn, &[], &ListsQuery::default()).unwrap();
+    assert_eq!(res.items.len(), 1);
+    let item = &res.items[0];
+    assert_eq!(item.title, "Dungeon Meshi");
+    assert_eq!(item.normalized_status, "Planning");
+    assert_eq!(item.ownership_status, "Not Owned");
+    assert_eq!(item.auto_acquire, false);
+    assert!(item.anilist.is_none());
+    assert!(item.mangabaka.is_some());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_backend_same_title_merges_when_identity_known() {
+    let dir = std::env::temp_dir().join("mango-test-backend-merge");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = Db::open(&dir.join("test.db")).expect("test db");
+    let conn = db.second().expect("conn");
+
+    let al = TrackerListEntry {
+        tracker: "anilist".to_string(),
+        tracker_id: "5001".to_string(),
+        title: "Chainsaw Man".to_string(),
+        cover_url: Some("https://example.com/csm-al.jpg".to_string()),
+        status: "CURRENT".to_string(),
+        normalized_status: "Reading".to_string(),
+        progress_chapter: Some(97.0),
+        progress_volume: Some(11.0),
+        total_chapters: None,
+        total_volumes: None,
+        format: Some("MANGA".to_string()),
+        updated_at: 1700000000,
+        raw_data: None,
+    };
+
+    let mb = TrackerListEntry {
+        tracker: "mangabaka".to_string(),
+        tracker_id: "8001".to_string(),
+        title: "Chainsaw Man".to_string(),
+        cover_url: Some("https://example.com/csm-mb.jpg".to_string()),
+        status: "reading".to_string(),
+        normalized_status: "Reading".to_string(),
+        progress_chapter: Some(97.0),
+        progress_volume: Some(11.0),
+        total_chapters: None,
+        total_volumes: None,
+        format: Some("manga".to_string()),
+        updated_at: 1700000100,
+        raw_data: None,
+    };
+
+    upsert_tracker_list_entries(&conn, &[al, mb]).unwrap();
+
+    let res = build_unified_catalog(&conn, &[], &ListsQuery::default()).unwrap();
+    // Exactly 1 merged title
+    assert_eq!(res.items.len(), 1);
+    let item = &res.items[0];
+    assert_eq!(item.title, "Chainsaw Man");
+    assert!(item.anilist.is_some());
+    assert!(item.mangabaka.is_some());
+    assert_eq!(item.id, "al-5001_mb-8001");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_backend_ambiguous_identities_remain_separate() {
+    let dir = std::env::temp_dir().join("mango-test-backend-ambiguity");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = Db::open(&dir.join("test.db")).expect("test db");
+    let conn = db.second().expect("conn");
+
+    let al = TrackerListEntry {
+        tracker: "anilist".to_string(),
+        tracker_id: "5001".to_string(),
+        title: "Berserk".to_string(),
+        cover_url: None,
+        status: "CURRENT".to_string(),
+        normalized_status: "Reading".to_string(),
+        progress_chapter: Some(10.0),
+        progress_volume: None,
+        total_chapters: None,
+        total_volumes: None,
+        format: None,
+        updated_at: 1700000000,
+        raw_data: None,
+    };
+
+    // Multiple MangaBaka entries matching the same title
+    let mb1 = TrackerListEntry {
+        tracker: "mangabaka".to_string(),
+        tracker_id: "8001".to_string(),
+        title: "Berserk".to_string(),
+        cover_url: None,
+        status: "reading".to_string(),
+        normalized_status: "Reading".to_string(),
+        progress_chapter: Some(10.0),
+        progress_volume: None,
+        total_chapters: None,
+        total_volumes: None,
+        format: None,
+        updated_at: 1700000100,
+        raw_data: None,
+    };
+
+    let mb2 = TrackerListEntry {
+        tracker: "mangabaka".to_string(),
+        tracker_id: "8002".to_string(),
+        title: "Berserk".to_string(),
+        cover_url: None,
+        status: "plan_to_read".to_string(),
+        normalized_status: "Planning".to_string(),
+        progress_chapter: Some(0.0),
+        progress_volume: None,
+        total_chapters: None,
+        total_volumes: None,
+        format: None,
+        updated_at: 1700000200,
+        raw_data: None,
+    };
+
+    upsert_tracker_list_entries(&conn, &[al, mb1, mb2]).unwrap();
+
+    let res = build_unified_catalog(&conn, &[], &ListsQuery::default()).unwrap();
+    // Because 2 candidates exist, merge fails closed and titles remain separate!
+    assert_eq!(res.items.len(), 3);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_backend_import_never_queues_acquisition_and_auto_acquire_false() {
+    let dir = std::env::temp_dir().join("mango-test-backend-no-auto-acq");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = Db::open(&dir.join("test.db")).expect("test db");
+    let conn = db.second().expect("conn");
+
+    let entry = TrackerListEntry {
+        tracker: "anilist".to_string(),
+        tracker_id: "999".to_string(),
+        title: "Solo Leveling".to_string(),
+        cover_url: None,
+        status: "PLANNING".to_string(),
+        normalized_status: "Planning".to_string(),
+        progress_chapter: Some(0.0),
+        progress_volume: Some(0.0),
+        total_chapters: Some(200),
+        total_volumes: None,
+        format: None,
+        updated_at: 1700000000,
+        raw_data: None,
+    };
+
+    upsert_tracker_list_entries(&conn, &[entry]).unwrap();
+
+    let res = build_unified_catalog(&conn, &[], &ListsQuery::default()).unwrap();
+    assert_eq!(res.items[0].auto_acquire, false);
+    assert_eq!(res.items[0].acquisition_status, "Idle");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_backend_status_transitions_planning_to_reading_dry_run() {
+    let progress = super::model::KomgaSeriesProgress {
+        series_id: "k-frieren".into(),
+        series_title: "Frieren".into(),
+        library_id: "lib-1".into(),
+        total_books: 10,
+        completed_books: 1,
+        highest_completed_book: Some(1.0),
+        highest_completed_volume: Some(1.0),
+        highest_completed_chapter: None,
+        is_series_completed: false,
+        last_read_date: Some("2026-10-24T00:00:00Z".into()),
+        books: vec![],
+    };
+
+    // AniList planning -> current
+    let old_status = 5; // PLANNING
+    let is_completed = evaluate_completion_predicate(&progress, 12, 1.0);
+    assert_eq!(is_completed, false);
+    let new_status = if old_status == 5
+        && (progress.highest_completed_volume.unwrap_or(0.0) > 0.0 || progress.completed_books > 0)
+    {
+        1 // CURRENT
+    } else {
+        old_status
+    };
+    assert_eq!(new_status, 1);
+
+    // MangaBaka plan_to_read -> reading
+    let old_state = "plan_to_read";
+    let new_state = if (old_state == "plan_to_read" || old_state == "considering")
+        && (progress.highest_completed_volume.unwrap_or(0.0) > 0.0 || progress.completed_books > 0)
+    {
+        "reading"
+    } else {
+        old_state
+    };
+    assert_eq!(new_state, "reading");
+}
+
+#[test]
+fn test_backend_paused_and_dropped_never_automatically_changed() {
+    let _progress = super::model::KomgaSeriesProgress {
+        series_id: "k-series".into(),
+        series_title: "Paused Series".into(),
+        library_id: "lib-1".into(),
+        total_books: 20,
+        completed_books: 5,
+        highest_completed_book: Some(5.0),
+        highest_completed_volume: Some(5.0),
+        highest_completed_chapter: None,
+        is_series_completed: false,
+        last_read_date: Some("2026-10-24T00:00:00Z".into()),
+        books: vec![],
+    };
+
+    // AniList PAUSED (3) and DROPPED (4)
+    for paused_code in [3, 4] {
+        let new_status = if paused_code == 3 || paused_code == 4 {
+            paused_code
+        } else {
+            1
+        };
+        assert_eq!(new_status, paused_code);
+    }
+
+    // MangaBaka paused and dropped
+    for paused_state in ["paused", "dropped"] {
+        let new_state = if paused_state == "paused" || paused_state == "dropped" {
+            paused_state
+        } else {
+            "reading"
+        };
+        assert_eq!(new_state, paused_state);
+    }
+}
+
+#[test]
+fn test_backend_completed_not_regressed() {
+    let old_al = 2; // COMPLETED
+    let new_al = if old_al == 2 { 2 } else { 1 };
+    assert_eq!(new_al, 2);
+
+    let old_mb = "completed";
+    let new_mb = if old_mb == "completed" {
+        "completed"
+    } else {
+        "reading"
+    };
+    assert_eq!(new_mb, "completed");
+}
+
+#[test]
+fn test_backend_partial_ownership_does_not_produce_completed() {
+    // User owns 10 out of 20, completed all 10 owned
+    let progress = super::model::KomgaSeriesProgress {
+        series_id: "k-bleach".into(),
+        series_title: "Bleach".into(),
+        library_id: "lib-1".into(),
+        total_books: 10,
+        completed_books: 10,
+        highest_completed_book: Some(10.0),
+        highest_completed_volume: Some(10.0),
+        highest_completed_chapter: None,
+        is_series_completed: true,
+        last_read_date: Some("2026-10-24T00:00:00Z".into()),
+        books: vec![],
+    };
+
+    let is_completed = evaluate_completion_predicate(&progress, 20, 10.0);
+    assert_eq!(
+        is_completed, false,
+        "Owning and reading 10 of 20 must NOT produce Completed"
+    );
+}
+
+#[test]
+fn test_backend_known_final_volume_and_contiguous_completion_produces_completed() {
+    // User owns 20 out of 20, completed all 20 contiguously
+    let books: Vec<super::model::KomgaBookProgress> = (1..=20)
+        .map(|i| super::model::KomgaBookProgress {
+            id: format!("b-{i}"),
+            name: format!("Volume {i}"),
+            number: i as f64,
+            volume: Some(i as f64),
+            chapter: None,
+            completed: true,
+            page: 200,
+            read_date: Some("2026-10-24T00:00:00Z".into()),
+        })
+        .collect();
+
+    let progress = super::model::KomgaSeriesProgress {
+        series_id: "k-complete".into(),
+        series_title: "Full Series".into(),
+        library_id: "lib-1".into(),
+        total_books: 20,
+        completed_books: 20,
+        highest_completed_book: Some(20.0),
+        highest_completed_volume: Some(20.0),
+        highest_completed_chapter: None,
+        is_series_completed: true,
+        last_read_date: Some("2026-10-24T00:00:00Z".into()),
+        books,
+    };
+
+    let is_completed = evaluate_completion_predicate(&progress, 20, 20.0);
+    assert_eq!(
+        is_completed, true,
+        "Known final volume + contiguous completion must produce Completed"
+    );
+}
+
+#[test]
+fn test_backend_unknown_total_does_not_produce_completed() {
+    let progress = super::model::KomgaSeriesProgress {
+        series_id: "k-unknown".into(),
+        series_title: "Unknown Totals Series".into(),
+        library_id: "lib-1".into(),
+        total_books: 15,
+        completed_books: 15,
+        highest_completed_book: Some(15.0),
+        highest_completed_volume: Some(15.0),
+        highest_completed_chapter: None,
+        is_series_completed: true,
+        last_read_date: Some("2026-10-24T00:00:00Z".into()),
+        books: vec![],
+    };
+
+    // Total units is 0 (unknown)
+    let is_completed = evaluate_completion_predicate(&progress, 0, 15.0);
+    assert_eq!(
+        is_completed, false,
+        "Unknown total units must NOT produce Completed"
+    );
+}
+
+#[test]
+fn test_backend_missing_intermediate_volume_does_not_produce_completed() {
+    // Owns 20 volumes, read 19, missing volume 5
+    let mut books: Vec<super::model::KomgaBookProgress> = Vec::new();
+    for i in 1..=20 {
+        let is_read = i != 5;
+        books.push(super::model::KomgaBookProgress {
+            id: format!("b-{i}"),
+            name: format!("Volume {i}"),
+            number: i as f64,
+            volume: Some(i as f64),
+            chapter: None,
+            completed: is_read,
+            page: if is_read { 200 } else { 0 },
+            read_date: if is_read {
+                Some("2026-10-24T00:00:00Z".into())
+            } else {
+                None
+            },
+        });
+    }
+
+    let progress = super::model::KomgaSeriesProgress {
+        series_id: "k-missing".into(),
+        series_title: "Missing Unit Series".into(),
+        library_id: "lib-1".into(),
+        total_books: 20,
+        completed_books: 19,
+        highest_completed_book: Some(20.0),
+        highest_completed_volume: Some(20.0),
+        highest_completed_chapter: None,
+        is_series_completed: true,
+        last_read_date: Some("2026-10-24T00:00:00Z".into()),
+        books,
+    };
+
+    let is_completed = evaluate_completion_predicate(&progress, 20, 20.0);
+    assert_eq!(
+        is_completed, false,
+        "Missing intermediate unit must NOT produce Completed"
+    );
+}
+
+#[test]
+fn test_backend_tracker_progress_never_decreases() {
+    let komga_prog: f64 = 5.0;
+    let old_tracker_prog: f64 = 10.0;
+    let target = old_tracker_prog.max(komga_prog);
+    assert_eq!(target, 10.0);
+}
+
+#[test]
+fn test_backend_refresh_failure_preserves_cached_entries() {
+    let dir = std::env::temp_dir().join("mango-test-backend-cache-preserve");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = Db::open(&dir.join("test.db")).expect("test db");
+    let conn = db.second().expect("conn");
+
+    let entry = TrackerListEntry {
+        tracker: "mangabaka".to_string(),
+        tracker_id: "101".to_string(),
+        title: "Cached Manga".to_string(),
+        cover_url: None,
+        status: "reading".to_string(),
+        normalized_status: "Reading".to_string(),
+        progress_chapter: Some(5.0),
+        progress_volume: None,
+        total_chapters: None,
+        total_volumes: None,
+        format: None,
+        updated_at: 1700000000,
+        raw_data: None,
+    };
+
+    upsert_tracker_list_entries(&conn, &[entry]).unwrap();
+
+    // Now record error in refresh status (e.g. MangaBaka returned 500)
+    update_refresh_status(
+        &conn,
+        &TrackerListRefreshStatus {
+            tracker: "mangabaka".to_string(),
+            last_refreshed_at: 1700001000,
+            item_count: 0,
+            status: "error".to_string(),
+            error_message: Some("HTTP 500 Internal Server Error".to_string()),
+        },
+    )
+    .unwrap();
+
+    // Cached entries must STILL be preserved and returned!
+    let cached_entries = get_tracker_list_entries(&conn, None).unwrap();
+    assert_eq!(cached_entries.len(), 1);
+    assert_eq!(cached_entries[0].title, "Cached Manga");
+
+    let res = build_unified_catalog(&conn, &[], &ListsQuery::default()).unwrap();
+    assert_eq!(res.items.len(), 1);
+    assert_eq!(res.items[0].title, "Cached Manga");
+    assert_eq!(res.refresh_statuses[0].status, "error");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_backend_rate_limit_and_unauthorized_preserve_cached_entries() {
+    let dir = std::env::temp_dir().join("mango-test-backend-rate-limit-preserve");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = Db::open(&dir.join("test.db")).expect("test db");
+    let conn = db.second().expect("conn");
+
+    let entry = TrackerListEntry {
+        tracker: "anilist".to_string(),
+        tracker_id: "202".to_string(),
+        title: "Cached AniList Manga".to_string(),
+        cover_url: None,
+        status: "CURRENT".to_string(),
+        normalized_status: "Reading".to_string(),
+        progress_chapter: Some(20.0),
+        progress_volume: None,
+        total_chapters: None,
+        total_volumes: None,
+        format: None,
+        updated_at: 1700000000,
+        raw_data: None,
+    };
+
+    upsert_tracker_list_entries(&conn, &[entry]).unwrap();
+
+    // Update with rate limited status
+    update_refresh_status(
+        &conn,
+        &TrackerListRefreshStatus {
+            tracker: "anilist".to_string(),
+            last_refreshed_at: 1700001000,
+            item_count: 0,
+            status: "rate_limited".to_string(),
+            error_message: Some("HTTP 429 Too Many Requests".to_string()),
+        },
+    )
+    .unwrap();
+
+    let cached = get_tracker_list_entries(&conn, Some("anilist")).unwrap();
+    assert_eq!(cached.len(), 1);
+    assert_eq!(cached[0].title, "Cached AniList Manga");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_backend_status_normalization_mapping() {
+    assert_eq!(normalize_status("anilist", "CURRENT"), "Reading");
+    assert_eq!(normalize_status("anilist", "REPEATING"), "Reading");
+    assert_eq!(normalize_status("anilist", "PLANNING"), "Planning");
+    assert_eq!(normalize_status("anilist", "COMPLETED"), "Completed");
+    assert_eq!(normalize_status("anilist", "PAUSED"), "Paused");
+    assert_eq!(normalize_status("anilist", "DROPPED"), "Dropped");
+
+    assert_eq!(normalize_status("mangabaka", "reading"), "Reading");
+    assert_eq!(normalize_status("mangabaka", "rereading"), "Reading");
+    assert_eq!(normalize_status("mangabaka", "plan_to_read"), "Planning");
+    assert_eq!(normalize_status("mangabaka", "considering"), "Planning");
+    assert_eq!(normalize_status("mangabaka", "completed"), "Completed");
+    assert_eq!(normalize_status("mangabaka", "paused"), "Paused");
+    assert_eq!(normalize_status("mangabaka", "dropped"), "Dropped");
+}

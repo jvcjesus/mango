@@ -10,6 +10,7 @@ pub mod catalog;
 pub mod eligibility;
 pub mod identity;
 pub mod komga_reader;
+pub mod lists;
 pub mod mangabaka;
 pub mod mapping;
 pub mod model;

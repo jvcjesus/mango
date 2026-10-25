@@ -627,3 +627,85 @@ export const setTrackedAutoAcquire = (id: number, enabled: boolean) =>
 
 export const setTrackedStatus = (id: number, enabled: boolean) =>
   send<boolean>('PUT', `/catalog/tracked/${id}/tracked`, { enabled });
+
+export interface TrackerItemDetail {
+  trackerId: string;
+  status: string;
+  normalizedStatus: string;
+  progressChapter?: number | null;
+  progressVolume?: number | null;
+  totalChapters?: number | null;
+  totalVolumes?: number | null;
+  updatedAt: number;
+}
+
+export interface UnifiedTrackedItem {
+  id: string;
+  title: string;
+  coverUrl?: string | null;
+  normalizedStatus: string;
+  format?: string | null;
+  anilist?: TrackerItemDetail | null;
+  mangabaka?: TrackerItemDetail | null;
+  ownershipStatus: string; // "Owned" | "Partially Owned" | "Not Owned" | "Unknown"
+  ownedUnits?: number | null;
+  totalUnits?: number | null;
+  komgaSeriesId?: string | null;
+  acquisitionStatus: string;
+  autoAcquire: boolean;
+  updatedAt: number;
+}
+
+export interface TrackerListRefreshStatus {
+  tracker: string;
+  lastRefreshedAt: number;
+  itemCount: number;
+  status: string;
+  errorMessage?: string | null;
+}
+
+export interface UnifiedCatalogSummary {
+  total: number;
+  reading: number;
+  planning: number;
+  completed: number;
+  paused: number;
+  dropped: number;
+  owned: number;
+  partiallyOwned: number;
+  notOwned: number;
+}
+
+export interface UnifiedCatalogResponse {
+  items: UnifiedTrackedItem[];
+  refreshStatuses: TrackerListRefreshStatus[];
+  summary: UnifiedCatalogSummary;
+}
+
+export interface ListsQuery {
+  status?: string;
+  ownership?: string;
+  tracker?: string;
+  q?: string;
+  sort?: string;
+}
+
+export interface ListsRefreshReport {
+  refreshedTrackers: string[];
+  errors: string[];
+  statuses: TrackerListRefreshStatus[];
+}
+
+export const getLists = (query?: ListsQuery) => {
+  const params = new URLSearchParams();
+  if (query?.status) params.set('status', query.status);
+  if (query?.ownership) params.set('ownership', query.ownership);
+  if (query?.tracker) params.set('tracker', query.tracker);
+  if (query?.q) params.set('q', query.q);
+  if (query?.sort) params.set('sort', query.sort);
+  const qs = params.toString();
+  return get<UnifiedCatalogResponse>(`/lists${qs ? `?${qs}` : ''}`);
+};
+
+export const refreshLists = (tracker?: string | null) =>
+  send<ListsRefreshReport>('POST', '/lists/refresh', { tracker: tracker ?? null });

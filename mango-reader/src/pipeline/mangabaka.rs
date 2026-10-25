@@ -56,6 +56,74 @@ pub struct MangaBakaLibraryEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MangaBakaLibraryItem {
+    pub series_id: i64,
+    pub title: String,
+    pub cover_url: Option<String>,
+    pub state: String, // "reading", "plan_to_read", "considering", "completed", "paused", "dropped", "rereading"
+    pub progress_chapter: Option<f64>,
+    pub progress_volume: Option<f64>,
+    pub total_chapters: Option<i64>,
+    pub total_volumes: Option<i64>,
+    pub format: Option<String>,
+    pub series_status: Option<String>,
+    pub updated_at: i64,
+}
+
+fn extract_mb_series_title(series_node: &serde_json::Value) -> String {
+    if let Some(t) = series_node.get("title").and_then(|v| v.as_str()) {
+        if !t.trim().is_empty() {
+            return t.trim().to_string();
+        }
+    }
+    if let Some(titles) = series_node.get("titles").and_then(|v| v.as_array()) {
+        for item in titles {
+            let traits = item.get("traits").and_then(|v| v.as_array());
+            let is_official = traits.map_or(false, |tr| {
+                tr.iter().any(|t| t.as_str() == Some("official"))
+            });
+            let lang = item.get("language").and_then(|v| v.as_str());
+            if is_official || lang == Some("en") || lang == Some("english") {
+                if let Some(t) = item.get("title").and_then(|v| v.as_str()) {
+                    if !t.trim().is_empty() {
+                        return t.trim().to_string();
+                    }
+                }
+            }
+        }
+        for item in titles {
+            if let Some(t) = item.get("title").and_then(|v| v.as_str()) {
+                if !t.trim().is_empty() {
+                    return t.trim().to_string();
+                }
+            }
+        }
+    }
+    format!(
+        "MangaBaka Series {}",
+        series_node.get("id").and_then(|v| v.as_i64()).unwrap_or(0)
+    )
+}
+
+fn extract_mb_series_cover(series_node: &serde_json::Value) -> Option<String> {
+    if let Some(cover) = series_node.get("cover") {
+        if let Some(s) = cover.as_str() {
+            return Some(s.to_string());
+        }
+        if let Some(obj) = cover.as_object() {
+            for key in ["x250", "x350", "x500", "raw"] {
+                if let Some(u) = obj.get(key).and_then(|v| v.as_str()) {
+                    if !u.trim().is_empty() {
+                        return Some(u.trim().to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MangaBakaEnrichment {
     pub series_id: i64,
     pub collection_id: String,
@@ -124,7 +192,10 @@ impl MangaBakaClient {
         } else {
             let base = self.base_url.trim_end_matches('/');
             let clean = endpoint.trim_start_matches('/');
-            if base.ends_with("/v1") && clean.starts_with("v1/") {
+            if clean.starts_with("v2/") && base.ends_with("/v1") {
+                let root = &base[..base.len() - 3];
+                format!("{root}/{clean}")
+            } else if base.ends_with("/v1") && clean.starts_with("v1/") {
                 format!("{base}/{}", &clean[3..])
             } else {
                 format!("{base}/{clean}")
@@ -458,7 +529,9 @@ impl MangaBakaClient {
                 .or_else(|| raw.get("progress_chapter")),
         );
         let status = data_node
-            .get("status")
+            .get("state")
+            .or_else(|| data_node.get("status"))
+            .or_else(|| raw.get("state"))
             .or_else(|| raw.get("status"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
@@ -482,15 +555,16 @@ impl MangaBakaClient {
         }))
     }
 
-    /// Mutates the authenticated user's library progress on MangaBaka.
+    /// Mutates the authenticated user's library progress and/or status on MangaBaka.
     ///
-    /// Calls `PATCH /v1/my/library/{mangabaka_id}` with dimension-specific payload:
-    /// `{"progress_volume": completed}` or `{"progress_chapter": completed}`.
-    pub async fn update_my_library_progress(
+    /// Calls `PATCH /v1/my/library/{mangabaka_id}` with payload:
+    /// `{"progress_volume": completed, "progress_chapter": completed, "state": state}`.
+    pub async fn update_my_library_entry(
         &self,
         mangabaka_id: i64,
         progress_volume: Option<f64>,
         progress_chapter: Option<f64>,
+        state: Option<&str>,
     ) -> Result<()> {
         let endpoint = format!("/my/library/{mangabaka_id}");
         let mut body = serde_json::Map::new();
@@ -499,6 +573,9 @@ impl MangaBakaClient {
         }
         if let Some(ch) = progress_chapter {
             body.insert("progress_chapter".to_string(), serde_json::json!(ch));
+        }
+        if let Some(st) = state {
+            body.insert("state".to_string(), serde_json::json!(st));
         }
 
         let resp = match self
@@ -553,6 +630,172 @@ impl MangaBakaClient {
         }
 
         Ok(())
+    }
+
+    /// Mutates the authenticated user's library progress on MangaBaka.
+    ///
+    /// Calls `PATCH /v1/my/library/{mangabaka_id}` with dimension-specific payload.
+    pub async fn update_my_library_progress(
+        &self,
+        mangabaka_id: i64,
+        progress_volume: Option<f64>,
+        progress_chapter: Option<f64>,
+    ) -> Result<()> {
+        self.update_my_library_entry(mangabaka_id, progress_volume, progress_chapter, None)
+            .await
+    }
+
+    /// Fetches the authenticated user's complete personal library from MangaBaka.
+    ///
+    /// Calls `GET /v2/my/library` with pagination, using `x-api-key: <PAT>` only.
+    pub async fn fetch_my_library(&self) -> Result<Vec<MangaBakaLibraryItem>> {
+        let mut items = Vec::new();
+        let mut page = 1;
+        let limit = 50;
+
+        loop {
+            let endpoint = format!("/v2/my/library?page={page}&limit={limit}");
+            let resp = match self
+                .authenticated_request(reqwest::Method::GET, &endpoint)?
+                .send()
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => {
+                    return Err(AppError::new(
+                        502,
+                        "mangabaka_network_error",
+                        format!("Failed to reach MangaBaka library endpoint: {e}"),
+                    ));
+                }
+            };
+
+            if resp.status() == reqwest::StatusCode::UNAUTHORIZED
+                || resp.status() == reqwest::StatusCode::FORBIDDEN
+            {
+                return Err(AppError::new(
+                    401,
+                    "mangabaka_unauthorized",
+                    "MangaBaka API token invalid or rejected",
+                ));
+            }
+
+            if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+                return Err(AppError::new(
+                    429,
+                    "mangabaka_rate_limited",
+                    "MangaBaka rate limited (HTTP 429); retry later",
+                ));
+            }
+
+            if !resp.status().is_success() {
+                return Err(AppError::new(
+                    resp.status().as_u16(),
+                    "mangabaka_error",
+                    format!(
+                        "MangaBaka returned HTTP {} for personal library",
+                        resp.status()
+                    ),
+                ));
+            }
+
+            let raw: serde_json::Value = resp.json().await.map_err(|e| {
+                AppError::internal(format!(
+                    "Failed to parse MangaBaka personal library JSON: {e}"
+                ))
+            })?;
+
+            let data_array = raw
+                .get("data")
+                .and_then(|d| d.as_array())
+                .cloned()
+                .unwrap_or_default();
+
+            if data_array.is_empty() {
+                break;
+            }
+
+            for node in &data_array {
+                let entry_node = node.get("entry").unwrap_or(node);
+                let series_node = node.get("series");
+
+                let state = entry_node
+                    .get("state")
+                    .or_else(|| entry_node.get("status"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("reading")
+                    .to_string();
+
+                let progress_chapter = entry_node
+                    .get("progress_chapter")
+                    .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|i| i as f64)));
+                let progress_volume = entry_node
+                    .get("progress_volume")
+                    .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|i| i as f64)));
+
+                let series_id = series_node
+                    .and_then(|s| s.get("id"))
+                    .and_then(|v| v.as_i64())
+                    .or_else(|| entry_node.get("series_id").and_then(|v| v.as_i64()))
+                    .unwrap_or(0);
+
+                if series_id == 0 {
+                    continue;
+                }
+
+                let title = series_node
+                    .map(extract_mb_series_title)
+                    .unwrap_or_else(|| format!("MangaBaka Series {series_id}"));
+
+                let cover_url = series_node.and_then(extract_mb_series_cover);
+
+                let total_chapters = series_node
+                    .and_then(|s| s.get("total_chapters"))
+                    .and_then(|v| v.as_i64());
+                let total_volumes = series_node
+                    .and_then(|s| s.get("final_volume"))
+                    .and_then(|v| v.as_i64());
+                let format = series_node
+                    .and_then(|s| s.get("type"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                let series_status = series_node
+                    .and_then(|s| s.get("status"))
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+
+                items.push(MangaBakaLibraryItem {
+                    series_id,
+                    title,
+                    cover_url,
+                    state,
+                    progress_chapter,
+                    progress_volume,
+                    total_chapters,
+                    total_volumes,
+                    format,
+                    series_status,
+                    updated_at: crate::db::now(),
+                });
+            }
+
+            // Pagination check
+            let has_next = raw
+                .get("pagination")
+                .and_then(|p| p.get("next"))
+                .is_some_and(|n| !n.is_null());
+
+            if !has_next || data_array.len() < limit {
+                break;
+            }
+
+            page += 1;
+            if page > 100 {
+                break;
+            }
+        }
+
+        Ok(items)
     }
 
     /// Tests connection and validates credentials against MangaBaka using `GET /v1/my/profile`.

@@ -13,9 +13,12 @@
 //! 7. Immediate post-mutation verification readback (`verified == requested` -> `Updated` vs `VerificationFailed`).
 //! 8. `x-api-key` header authentication without credential leakage.
 
-use super::model::{
-    KomgaSeriesProgress, MappingConfidence, SyncRecord, SyncResultCategory, SyncTarget,
-    TrackerMapping,
+use super::{
+    eligibility::evaluate_completion_predicate,
+    model::{
+        KomgaSeriesProgress, MappingConfidence, SyncRecord, SyncResultCategory, SyncTarget,
+        TrackerMapping,
+    },
 };
 use crate::{db::now, pipeline::mangabaka::MangaBakaClient};
 
@@ -183,53 +186,103 @@ pub async fn sync_series_to_mangabaka(
         };
     };
 
-    // 5. Read current progress for dimension
+    // 5. Read current progress for dimension and status
     let current_mb_prog = if is_volume {
         entry.progress_volume.unwrap_or(0.0)
     } else {
         entry.progress_chapter.unwrap_or(0.0)
     };
 
-    // 6. Never decrease progress
-    if komga_prog == current_mb_prog && current_mb_prog > 0.0 {
-        return SyncRecord {
-            id: record_id,
-            timestamp: now(),
-            komga_series_id: series_id.clone(),
-            komga_series_title: series_title.clone(),
-            tracker: SyncTarget::MangaBaka,
-            tracker_media_id: Some(mangabaka_id.to_string()),
-            old_progress: Some(current_mb_prog),
-            new_progress: Some(current_mb_prog),
-            dimension: Some(dimension.to_string()),
-            status_change: None,
-            category: SyncResultCategory::NoChange,
-            message: format!("MangaBaka is already up to date ({dim_unit} {current_mb_prog})"),
-            is_dry_run: dry_run,
-        };
-    }
+    let old_state = entry.status.as_deref().unwrap_or("reading");
 
-    if komga_prog < current_mb_prog {
-        return SyncRecord {
-            id: record_id,
-            timestamp: now(),
-            komga_series_id: series_id.clone(),
-            komga_series_title: series_title.clone(),
-            tracker: SyncTarget::MangaBaka,
-            tracker_media_id: Some(mangabaka_id.to_string()),
-            old_progress: Some(current_mb_prog),
-            new_progress: Some(komga_prog),
-            dimension: Some(dimension.to_string()),
-            status_change: None,
-            category: SyncResultCategory::TrackerAhead,
-            message: format!(
-                "MangaBaka is ahead of Komga ({dim_unit} {current_mb_prog} > {dim_unit} {komga_prog}); keeping current progress"
-            ),
-            is_dry_run: dry_run,
-        };
-    }
+    let total_units: Option<i64> = if let Some(map) = mapping {
+        if let Some(col_id) = &map.edition_id {
+            client
+                .fetch_collection_total_works(col_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|t| t as i64)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
-    if komga_prog == 0.0 && current_mb_prog == 0.0 {
+    let is_completed = if let Some(tot) = total_units {
+        evaluate_completion_predicate(progress, tot, komga_prog)
+    } else {
+        false
+    };
+
+    // Status transition rules:
+    // - PAUSED or DROPPED: NEVER automatically override
+    // - COMPLETED: conservative predicate only; never regress
+    // - PLAN_TO_READ / CONSIDERING: transition to READING when reading begins
+    let new_state = if old_state == "paused" || old_state == "dropped" {
+        old_state
+    } else if is_completed {
+        "completed"
+    } else if old_state == "completed" {
+        "completed"
+    } else if (old_state == "plan_to_read" || old_state == "considering")
+        && (komga_prog > 0.0 || progress.completed_books > 0)
+    {
+        "reading"
+    } else {
+        old_state
+    };
+
+    let status_change = if new_state != old_state {
+        Some(format!("{old_state} -> {new_state}"))
+    } else {
+        None
+    };
+
+    let needs_progress_update = komga_prog > current_mb_prog;
+    let needs_status_update = new_state != old_state;
+
+    // 6. Check if no changes are required
+    if !needs_progress_update && !needs_status_update {
+        if komga_prog == current_mb_prog && current_mb_prog > 0.0 {
+            return SyncRecord {
+                id: record_id,
+                timestamp: now(),
+                komga_series_id: series_id.clone(),
+                komga_series_title: series_title.clone(),
+                tracker: SyncTarget::MangaBaka,
+                tracker_media_id: Some(mangabaka_id.to_string()),
+                old_progress: Some(current_mb_prog),
+                new_progress: Some(current_mb_prog),
+                dimension: Some(dimension.to_string()),
+                status_change: None,
+                category: SyncResultCategory::NoChange,
+                message: format!("MangaBaka is already up to date ({dim_unit} {current_mb_prog})"),
+                is_dry_run: dry_run,
+            };
+        }
+
+        if komga_prog < current_mb_prog {
+            return SyncRecord {
+                id: record_id,
+                timestamp: now(),
+                komga_series_id: series_id.clone(),
+                komga_series_title: series_title.clone(),
+                tracker: SyncTarget::MangaBaka,
+                tracker_media_id: Some(mangabaka_id.to_string()),
+                old_progress: Some(current_mb_prog),
+                new_progress: Some(komga_prog),
+                dimension: Some(dimension.to_string()),
+                status_change: None,
+                category: SyncResultCategory::TrackerAhead,
+                message: format!(
+                    "MangaBaka is ahead of Komga ({dim_unit} {current_mb_prog} > {dim_unit} {komga_prog}); keeping current progress"
+                ),
+                is_dry_run: dry_run,
+            };
+        }
+
         return SyncRecord {
             id: record_id,
             timestamp: now(),
@@ -249,6 +302,10 @@ pub async fn sync_series_to_mangabaka(
 
     // 7. Dry-run mode: return WouldUpdate with ZERO PATCH requests
     if dry_run {
+        let status_desc = status_change
+            .as_ref()
+            .map(|s| format!(" (status -> {s})"))
+            .unwrap_or_default();
         return SyncRecord {
             id: record_id,
             timestamp: now(),
@@ -259,28 +316,30 @@ pub async fn sync_series_to_mangabaka(
             old_progress: Some(current_mb_prog),
             new_progress: Some(komga_prog),
             dimension: Some(dimension.to_string()),
-            status_change: if progress.is_series_completed {
-                Some("COMPLETED".to_string())
-            } else {
-                None
-            },
+            status_change,
             category: SyncResultCategory::WouldUpdate,
             message: format!(
-                "Dry run: would update MangaBaka {dimension} progress from {dim_unit} {current_mb_prog} to {dim_unit} {komga_prog}"
+                "Dry run: would update MangaBaka {dimension} progress from {dim_unit} {current_mb_prog} to {dim_unit} {komga_prog}{status_desc}"
             ),
             is_dry_run: true,
         };
     }
 
-    // 8. Live mutation: PATCH dimension-specific field
+    // 8. Live mutation: PATCH dimension-specific field and optional state
     let (vol_arg, ch_arg) = if is_volume {
         (Some(komga_prog), None)
     } else {
         (None, Some(komga_prog))
     };
 
+    let state_arg = if needs_status_update {
+        Some(new_state)
+    } else {
+        None
+    };
+
     if let Err(err) = client
-        .update_my_library_progress(mangabaka_id, vol_arg, ch_arg)
+        .update_my_library_entry(mangabaka_id, vol_arg, ch_arg, state_arg)
         .await
     {
         let status = err.status.as_u16();
@@ -303,7 +362,7 @@ pub async fn sync_series_to_mangabaka(
             old_progress: Some(current_mb_prog),
             new_progress: Some(komga_prog),
             dimension: Some(dimension.to_string()),
-            status_change: None,
+            status_change,
             category,
             message: format!("Failed to update MangaBaka progress: {}", err.message),
             is_dry_run: false,
@@ -319,7 +378,18 @@ pub async fn sync_series_to_mangabaka(
                 verified_entry.progress_chapter.unwrap_or(0.0)
             };
 
-            if (verified_prog - komga_prog).abs() < 0.001 {
+            let prog_matches = (verified_prog - komga_prog).abs() < 0.001;
+            let status_matches = if needs_status_update {
+                verified_entry.status.as_deref() == Some(new_state)
+            } else {
+                true
+            };
+
+            if prog_matches && status_matches {
+                let status_desc = status_change
+                    .as_ref()
+                    .map(|s| format!(" (status: {s})"))
+                    .unwrap_or_default();
                 SyncRecord {
                     id: record_id,
                     timestamp: now(),
@@ -330,14 +400,10 @@ pub async fn sync_series_to_mangabaka(
                     old_progress: Some(current_mb_prog),
                     new_progress: Some(komga_prog),
                     dimension: Some(dimension.to_string()),
-                    status_change: if progress.is_series_completed {
-                        Some("COMPLETED".to_string())
-                    } else {
-                        None
-                    },
+                    status_change,
                     category: SyncResultCategory::Updated,
                     message: format!(
-                        "Successfully updated MangaBaka {dimension} progress from {dim_unit} {current_mb_prog} to {dim_unit} {komga_prog}"
+                        "Successfully updated MangaBaka {dimension} progress from {dim_unit} {current_mb_prog} to {dim_unit} {komga_prog}{status_desc}"
                     ),
                     is_dry_run: false,
                 }

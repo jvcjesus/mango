@@ -2,12 +2,12 @@
 //! since AniList only sends tokens to addresses registered with it.
 
 use super::{
-    ask, judge, label, plain, said, sign_in, signed_out, text, tracker_error, year, Account, Entry,
-    Found, Kind, Track,
+    Account, Entry, Found, Kind, Track, ask, judge, label, plain, said, sign_in, signed_out, text,
+    tracker_error, year,
 };
 use crate::error::{AppError, Result};
 use reqwest::Client;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 const API: &str = "https://graphql.anilist.co";
 const STATUSES: [(i32, &str); 6] = [
@@ -26,6 +26,7 @@ const FIND: &str = "query ($user: Int, $media: Int) { Page { mediaList(userId: $
     id status progress progressVolumes score(format: POINT_100) media { chapters volumes } } } }";
 const SAVE: &str = "mutation ($media: Int, $status: MediaListStatus, $progress: Int, $progressVolumes: Int, $score: Int) {
     SaveMediaListEntry(mediaId: $media, status: $status, progress: $progress, progressVolumes: $progressVolumes, scoreRaw: $score) { id } }";
+const USER_LIST: &str = "query ($userId: Int, $page: Int) { Page(page: $page, perPage: 50) { pageInfo { total hasNextPage } mediaList(userId: $userId, type: MANGA, sort: UPDATED_TIME_DESC) { id mediaId status progress progressVolumes score(format: POINT_100) updatedAt media { id title { userPreferred english romaji native } coverImage { extraLarge large medium } format status chapters volumes siteUrl } } } }";
 
 fn request(
     http: &Client,
@@ -175,4 +176,122 @@ pub(crate) async fn save(http: &Client, account: &Account, track: &Track) -> Res
         None,
     )
     .await
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct AniListMangaListEntry {
+    pub id: i64,
+    pub media_id: i64,
+    pub title: String,
+    pub cover_url: Option<String>,
+    pub status: String, // "CURRENT", "PLANNING", "COMPLETED", "PAUSED", "DROPPED", "REPEATING"
+    pub progress_chapter: f64,
+    pub progress_volume: f64,
+    pub total_chapters: Option<i64>,
+    pub total_volumes: Option<i64>,
+    pub format: Option<String>,
+    pub media_status: Option<String>,
+    pub updated_at: i64,
+}
+
+pub(crate) async fn fetch_user_manga_list(
+    http: &Client,
+    account: &Account,
+) -> Result<Vec<AniListMangaListEntry>> {
+    let user: i64 = account
+        .user_id
+        .parse()
+        .map_err(|_| signed_out(Kind::AniList))?;
+
+    let mut entries = Vec::new();
+    let mut page = 1;
+
+    loop {
+        let data = graphql(
+            http,
+            Some(&account.token),
+            USER_LIST,
+            json!({ "userId": user, "page": page }),
+        )
+        .await?;
+
+        let page_node = &data["Page"];
+        let list = page_node["mediaList"].as_array();
+        let Some(items) = list else {
+            break;
+        };
+        if items.is_empty() {
+            break;
+        }
+
+        for item in items {
+            let id = item["id"].as_i64().unwrap_or(0);
+            let media_id = item["mediaId"].as_i64().unwrap_or(0);
+            if media_id == 0 {
+                continue;
+            }
+            let status = text(&item["status"]);
+            let progress = item["progress"].as_f64().unwrap_or(0.0);
+            let progress_volumes = item["progressVolumes"].as_f64().unwrap_or(0.0);
+            let updated_at = item["updatedAt"]
+                .as_i64()
+                .unwrap_or_else(|| crate::db::now());
+
+            let media = &item["media"];
+            let mut title = text(&media["title"]["userPreferred"]);
+            if title.is_empty() {
+                title = text(&media["title"]["english"]);
+            }
+            if title.is_empty() {
+                title = text(&media["title"]["romaji"]);
+            }
+            if title.is_empty() {
+                title = format!("AniList Media {}", media_id);
+            }
+
+            let cover_url = media["coverImage"]["extraLarge"]
+                .as_str()
+                .or_else(|| media["coverImage"]["large"].as_str())
+                .or_else(|| media["coverImage"]["medium"].as_str())
+                .map(|s| s.to_string());
+
+            let format = label(&media["format"]);
+            let format_str = if format.is_empty() {
+                None
+            } else {
+                Some(format)
+            };
+            let media_status = media["status"].as_str().map(|s| s.to_string());
+            let total_chapters = media["chapters"].as_i64();
+            let total_volumes = media["volumes"].as_i64();
+
+            entries.push(AniListMangaListEntry {
+                id,
+                media_id,
+                title,
+                cover_url,
+                status,
+                progress_chapter: progress,
+                progress_volume: progress_volumes,
+                total_chapters,
+                total_volumes,
+                format: format_str,
+                media_status,
+                updated_at,
+            });
+        }
+
+        let has_next = page_node["pageInfo"]["hasNextPage"]
+            .as_bool()
+            .unwrap_or(false);
+        if !has_next {
+            break;
+        }
+        page += 1;
+        if page > 100 {
+            break;
+        }
+    }
+
+    Ok(entries)
 }

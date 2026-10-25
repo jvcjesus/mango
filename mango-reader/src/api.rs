@@ -238,6 +238,8 @@ pub fn router(state: Spaces) -> Router {
             put(put_tracked_auto_acquire),
         )
         .route("/catalog/tracked/{id}/tracked", put(put_tracked_status))
+        .route("/lists", get(get_lists))
+        .route("/lists/refresh", post(post_lists_refresh))
         .layer(middleware::from_fn_with_state(state.clone(), auth::require));
     let api = Router::new()
         .nest("/auth", auth::routes())
@@ -1742,6 +1744,51 @@ async fn put_tracked_status(
         .call(move |conn| crate::sync::catalog::set_tracked(conn, id, payload.enabled))
         .await?;
     Ok(Json(true))
+}
+
+async fn get_lists(
+    Me(app): Me,
+    Query(query): Query<crate::sync::lists::ListsQuery>,
+) -> Result<Json<crate::sync::lists::UnifiedCatalogResponse>> {
+    let (cfg, _, komga_api_key) = app
+        .pipeline
+        .load_internal_config()
+        .await
+        .unwrap_or_default();
+    let komga_client = crate::pipeline::komga::KomgaClient::new(
+        app.trackers.http().clone(),
+        cfg.komga_url,
+        komga_api_key,
+    );
+
+    let komga_progress = crate::sync::komga_reader::fetch_all_series_progress(
+        &komga_client,
+        cfg.komga_library_id.as_deref(),
+    )
+    .await
+    .unwrap_or_default();
+
+    let res = app
+        .db
+        .call(move |conn| crate::sync::lists::build_unified_catalog(conn, &komga_progress, &query))
+        .await?;
+
+    Ok(Json(res))
+}
+
+async fn post_lists_refresh(
+    Me(app): Me,
+    Json(payload): Json<crate::sync::lists::RefreshListsPayload>,
+) -> Result<Json<crate::sync::lists::ListsRefreshReport>> {
+    let report = crate::sync::lists::refresh_tracker_lists(
+        &app.db,
+        &app.trackers,
+        &app.pipeline,
+        payload.tracker.as_deref(),
+    )
+    .await?;
+
+    Ok(Json(report))
 }
 
 #[cfg(test)]

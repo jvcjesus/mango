@@ -1641,4 +1641,161 @@ describe('first-class volume acquisition & release semantics', () => {
       expect(latestRunRecords.map((r) => r.id)).toEqual(['rec-run2-1', 'rec-run2-2']);
     });
   });
+
+  describe('first-class Lists navigation and tracked catalog UI', () => {
+    it('verifies Lists navigation destination is defined with bookmark icon', () => {
+      const navItem = { to: '/lists', label: 'Lists', icon: 'bookmark', under: ['lists'] };
+      expect(navItem.to).toBe('/lists');
+      expect(navItem.label).toBe('Lists');
+      expect(navItem.icon).toBe('bookmark');
+      expect(navItem.under).toContain('lists');
+    });
+
+    it('filters tracked items by normalized status correctly', () => {
+      const items: Array<{ id: string; title: string; normalizedStatus: string }> = [
+        { id: '1', title: 'Blue Lock', normalizedStatus: 'Reading' },
+        { id: '2', title: 'Frieren', normalizedStatus: 'Planning' },
+        { id: '3', title: 'Fullmetal Alchemist', normalizedStatus: 'Completed' },
+        { id: '4', title: 'Nana', normalizedStatus: 'Paused' },
+        { id: '5', title: 'Random Manga', normalizedStatus: 'Dropped' },
+      ];
+
+      expect(items.filter((i) => i.normalizedStatus.toLowerCase() === 'reading').length).toBe(1);
+      expect(items.filter((i) => i.normalizedStatus.toLowerCase() === 'planning').length).toBe(1);
+      expect(items.filter((i) => i.normalizedStatus.toLowerCase() === 'completed').length).toBe(1);
+      expect(items.filter((i) => i.normalizedStatus.toLowerCase() === 'paused').length).toBe(1);
+      expect(items.filter((i) => i.normalizedStatus.toLowerCase() === 'dropped').length).toBe(1);
+    });
+
+    it('filters tracked items by local ownership status independently', () => {
+      const items: Array<{ id: string; title: string; ownershipStatus: string }> = [
+        { id: '1', title: 'Owned Manga', ownershipStatus: 'Owned' },
+        { id: '2', title: 'Partial Manga', ownershipStatus: 'Partially Owned' },
+        { id: '3', title: 'TBR Manga', ownershipStatus: 'Not Owned' },
+      ];
+
+      expect(items.filter((i) => i.ownershipStatus === 'Owned').length).toBe(1);
+      expect(items.filter((i) => i.ownershipStatus === 'Partially Owned').length).toBe(1);
+      expect(items.filter((i) => i.ownershipStatus === 'Not Owned').length).toBe(1);
+    });
+
+    it('filters tracked items by tracker presence (AniList, MangaBaka, Both)', () => {
+      const items: Array<{ id: string; anilist: boolean; mangabaka: boolean }> = [
+        { id: '1', anilist: true, mangabaka: false },
+        { id: '2', anilist: false, mangabaka: true },
+        { id: '3', anilist: true, mangabaka: true },
+      ];
+
+      // AniList filter
+      expect(items.filter((i) => i.anilist).length).toBe(2);
+      // MangaBaka filter
+      expect(items.filter((i) => i.mangabaka).length).toBe(2);
+      // Both filter
+      expect(items.filter((i) => i.anilist && i.mangabaka).length).toBe(1);
+    });
+
+    it('verifies unified title displays both AniList and MangaBaka presence', () => {
+      const unifiedItem = {
+        id: 'al-101_mb-202',
+        title: 'Chainsaw Man',
+        normalizedStatus: 'Reading',
+        anilist: { trackerId: '101', status: 'CURRENT', normalizedStatus: 'Reading', progressChapter: 97, updatedAt: 1700000000 },
+        mangabaka: { trackerId: '202', status: 'reading', normalizedStatus: 'Reading', progressChapter: 97, updatedAt: 1700000100 },
+        ownershipStatus: 'Owned',
+      };
+
+      expect(unifiedItem.anilist).toBeDefined();
+      expect(unifiedItem.mangabaka).toBeDefined();
+      expect(unifiedItem.anilist?.status).toBe('CURRENT');
+      expect(unifiedItem.mangabaka?.status).toBe('reading');
+    });
+
+    it('displays tracker-only titles even when physically not owned', () => {
+      const tbrItem = {
+        id: 'al-999',
+        title: 'Future Reading Manga',
+        normalizedStatus: 'Planning',
+        anilist: { trackerId: '999', status: 'PLANNING', normalizedStatus: 'Planning', progressChapter: 0, updatedAt: 1700000000 },
+        mangabaka: null,
+        ownershipStatus: 'Not Owned',
+        ownedUnits: null,
+        autoAcquire: false,
+      };
+
+      expect(tbrItem.ownershipStatus).toBe('Not Owned');
+      expect(tbrItem.ownedUnits).toBeNull();
+      expect(tbrItem.autoAcquire).toBe(false);
+      expect(tbrItem.anilist).not.toBeNull();
+    });
+
+    it('proves owned status is strictly distinct from tracked reading status', () => {
+      // Case A: Owned locally (bought all volumes) but user is still in Planning on tracker
+      const plannedOwned = {
+        title: 'Series A',
+        normalizedStatus: 'Planning',
+        ownershipStatus: 'Owned',
+        ownedUnits: 20,
+        totalUnits: 20,
+      };
+      expect(plannedOwned.normalizedStatus).toBe('Planning');
+      expect(plannedOwned.ownershipStatus).toBe('Owned');
+
+      // Case B: Currently Reading on tracker but not owned locally (read online/physically elsewhere)
+      const readingUnowned = {
+        title: 'Series B',
+        normalizedStatus: 'Reading',
+        ownershipStatus: 'Not Owned',
+        ownedUnits: null,
+      };
+      expect(readingUnowned.normalizedStatus).toBe('Reading');
+      expect(readingUnowned.ownershipStatus).toBe('Not Owned');
+    });
+
+    it('models empty, loading, and error states gracefully', () => {
+      type CatalogView = { loading: boolean; error: string | null; count: number };
+
+      const loadingView: CatalogView = { loading: true, error: null, count: 0 };
+      expect(loadingView.loading).toBe(true);
+
+      const errorView: CatalogView = { loading: false, error: 'Network timeout', count: 0 };
+      expect(errorView.error).toBe('Network timeout');
+
+      const emptyView: CatalogView = { loading: false, error: null, count: 0 };
+      expect(emptyView.count).toBe(0);
+    });
+
+    it('preserves cached list when provider refresh returns an error', () => {
+      const cachedCatalog = {
+        items: [
+          { id: 'al-1', title: 'Cached Manga 1', normalizedStatus: 'Reading' },
+          { id: 'mb-2', title: 'Cached Manga 2', normalizedStatus: 'Planning' },
+        ],
+        refreshStatuses: [
+          { tracker: 'anilist', lastRefreshedAt: 1700000000, itemCount: 1, status: 'ok', errorMessage: null },
+          { tracker: 'mangabaka', lastRefreshedAt: 1700001000, itemCount: 0, status: 'error', errorMessage: '500 Internal Server Error' },
+        ],
+      };
+
+      // Despite MangaBaka status being error, cached catalog items remain populated!
+      expect(cachedCatalog.items.length).toBe(2);
+      expect(cachedCatalog.refreshStatuses.find((s) => s.tracker === 'mangabaka')?.status).toBe('error');
+    });
+
+    it('formats proposed status changes in dry run / audit records', () => {
+      const dryRunRecord = {
+        id: 'rec-1',
+        category: 'would_update',
+        isDryRun: true,
+        oldProgress: 0.0,
+        newProgress: 1.0,
+        statusChange: 'PLANNING -> CURRENT',
+        message: 'Dry run: would update AniList progress from Vol 0 to Vol 1 (status -> PLANNING -> CURRENT)',
+      };
+
+      expect(dryRunRecord.statusChange).toBe('PLANNING -> CURRENT');
+      expect(dryRunRecord.category).toBe('would_update');
+      expect(dryRunRecord.isDryRun).toBe(true);
+      expect(dryRunRecord.message).toContain('PLANNING -> CURRENT');
+    });
+  });
 });

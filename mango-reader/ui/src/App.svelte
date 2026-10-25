@@ -19,6 +19,7 @@
   import History from './routes/History.svelte';
   import Import from './routes/Import.svelte';
   import Library from './routes/Library.svelte';
+  import Lists from './routes/Lists.svelte';
   import Migrate from './routes/Migrate.svelte';
   import Reader from './routes/Reader.svelte';
   import Search from './routes/Search.svelte';
@@ -30,6 +31,7 @@
   // `under` lists the first path segments that light the entry up.
   const NAV: { to: string; label: string; icon: IconName; under: string[] }[] = [
     { to: '/', label: 'Library', icon: 'book', under: [''] },
+    { to: '/lists', label: 'Lists', icon: 'bookmark', under: ['lists'] },
     { to: '/updates', label: 'Updates', icon: 'refresh', under: ['updates'] },
     { to: '/browse', label: 'Browse', icon: 'globe', under: ['browse', 'source', 'search', 'extensions', 'extension'] },
     { to: '/downloads', label: 'Downloads', icon: 'download', under: ['downloads'] },
@@ -128,6 +130,8 @@
     <main>
       {#if area === ''}
         <Library />
+      {:else if area === 'lists'}
+        <Lists />
       {:else if area === 'browse'}
         <Browse />
       {:else if area === 'updates'}
