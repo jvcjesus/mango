@@ -15,6 +15,14 @@
     getAcquisitionSettings,
     putAcquisitionSettings,
     testTorBoxConnection,
+    getAcquisitionProfiles,
+    createAcquisitionProfile,
+    updateAcquisitionProfile,
+    deleteAcquisitionProfile,
+    duplicateAcquisitionProfile,
+    getSourceHealthReports,
+    type AcquisitionProfile,
+    type SourceHealthReport,
     type AcquisitionConfig,
     type Category,
     type KomgaLibrary,
@@ -646,10 +654,137 @@
         nyaaUrlInput = acq.nyaaUrl ?? 'https://nyaa.si';
         nyaaCategoryInput = acq.nyaaCategory ?? '3_1';
       }
+
+      loadProfiles();
+      loadSourceHealth();
     } catch (e) {
       pipelineError = message(e);
     } finally {
       pipelineLoading = false;
+    }
+  }
+
+  // ---------- Acquisition Profiles & Sources ----------
+  let profiles = $state<AcquisitionProfile[]>([]);
+  let profilesLoading = $state(false);
+  let sourceHealthReports = $state<SourceHealthReport[]>([]);
+  let sourcesHealthLoading = $state(false);
+  let editingProfile = $state<AcquisitionProfile | null>(null);
+  let isNewProfile = $state(false);
+
+  async function loadProfiles() {
+    profilesLoading = true;
+    try {
+      profiles = await getAcquisitionProfiles();
+    } catch (e) {
+      // ignore
+    } finally {
+      profilesLoading = false;
+    }
+  }
+
+  async function loadSourceHealth() {
+    sourcesHealthLoading = true;
+    try {
+      sourceHealthReports = await getSourceHealthReports();
+    } catch (e) {
+      // ignore
+    } finally {
+      sourcesHealthLoading = false;
+    }
+  }
+
+  function startNewProfile() {
+    isNewProfile = true;
+    editingProfile = {
+      id: '',
+      name: '',
+      isDefault: false,
+      language: 'en',
+      preferredReleaseType: 'volume',
+      sourceSelection: 'smart',
+      preferredSources: ['nyaa', 'mangadot'],
+      preferredUploaders: [],
+      minSeeders: 1,
+      preferDigital: true,
+      trustedOnly: false,
+      collectionPolicy: 'smart',
+      maxUnnecessaryDuplicateCoverage: 3,
+      maxAcquisitionSizeBytes: null,
+      maxPlanSizeBytes: null,
+      qualityPreference: 'best',
+      allowMixedCollections: false,
+      allowZeroSeeders: 'no',
+      allowUnsupportedEditions: false,
+      autoAcquire: false,
+      createdAt: 0,
+      updatedAt: 0,
+    };
+  }
+
+  function startEditProfile(prof: AcquisitionProfile) {
+    isNewProfile = false;
+    editingProfile = { ...prof };
+  }
+
+  async function saveEditingProfile() {
+    if (!editingProfile || !editingProfile.name.trim()) {
+      toast.error('Profile name is required');
+      return;
+    }
+    try {
+      if (isNewProfile) {
+        await createAcquisitionProfile(editingProfile);
+        toast.success(`Created profile "${editingProfile.name}"`);
+      } else {
+        await updateAcquisitionProfile(editingProfile.id, editingProfile);
+        toast.success(`Updated profile "${editingProfile.name}"`);
+      }
+      editingProfile = null;
+      await loadProfiles();
+    } catch (e) {
+      toast.error(message(e));
+    }
+  }
+
+  async function handleDuplicateProfile(id: string) {
+    try {
+      const dup = await duplicateAcquisitionProfile(id);
+      toast.success(`Duplicated profile as "${dup.name}"`);
+      await loadProfiles();
+    } catch (e) {
+      toast.error(message(e));
+    }
+  }
+
+  async function handleDeleteProfile(prof: AcquisitionProfile) {
+    if (prof.isDefault) {
+      toast.error('Cannot delete the default profile');
+      return;
+    }
+    const ok = await confirm({
+      title: `Delete profile "${prof.name}"?`,
+      message: 'Any series assigned to this profile will revert to the default profile.',
+      confirm: 'Delete',
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      await deleteAcquisitionProfile(prof.id);
+      toast.success(`Deleted profile "${prof.name}"`);
+      await loadProfiles();
+    } catch (e) {
+      toast.error(message(e));
+    }
+  }
+
+  async function handleSetDefaultProfile(prof: AcquisitionProfile) {
+    try {
+      await updateAcquisitionProfile(prof.id, { isDefault: true });
+      toast.success(`Set "${prof.name}" as default profile`);
+      await loadProfiles();
+    } catch (e) {
+      toast.error(message(e));
     }
   }
 
@@ -1755,6 +1890,123 @@
             </div>
           </section>
 
+          <section class="card">
+            <div class="card-header-flex">
+              <div>
+                <h3>Acquisition Profiles</h3>
+                <span class="muted">Define preferences, release types, quality standards, and budget constraints for automated missing-content planning.</span>
+              </div>
+              <button class="btn pill icon-text" onclick={startNewProfile}>
+                <Icon name="plus" size={16} /> New Profile
+              </button>
+            </div>
+
+            {#if profilesLoading}
+              <p class="muted">Loading acquisition profiles…</p>
+            {:else if profiles.length === 0}
+              <p class="muted">No profiles found.</p>
+            {:else}
+              <div class="profiles-grid">
+                {#each profiles as prof (prof.id)}
+                  <div class="profile-card" class:default-card={prof.isDefault}>
+                    <div class="profile-card-header">
+                      <div>
+                        <strong>{prof.name}</strong>
+                        {#if prof.isDefault}
+                          <span class="tag spot" style="margin-left: 0.5rem;">DEFAULT</span>
+                        {/if}
+                      </div>
+                      <div class="profile-actions">
+                        <button class="btn pill icon-text" onclick={() => startEditProfile(prof)}>
+                          <Icon name="pencil" size={14} /> Edit
+                        </button>
+                        <button class="btn pill icon-text" onclick={() => handleDuplicateProfile(prof.id)}>
+                          <Icon name="copy" size={14} /> Duplicate
+                        </button>
+                        {#if !prof.isDefault}
+                          <button class="btn pill" onclick={() => handleSetDefaultProfile(prof)} title="Make Default">
+                            Set Default
+                          </button>
+                          <button class="btn pill danger icon" onclick={() => handleDeleteProfile(prof)} title="Delete Profile">
+                            <Icon name="trash" size={14} />
+                          </button>
+                        {/if}
+                      </div>
+                    </div>
+
+                    <div class="profile-attrs-table">
+                      <div class="attr-row">
+                        <span class="attr-k">Language</span>
+                        <span class="attr-v">{prof.language === 'en' ? 'English' : prof.language === 'zh' ? 'Chinese' : prof.language}</span>
+                      </div>
+                      <div class="attr-row">
+                        <span class="attr-k">Release Preference</span>
+                        <span class="attr-v capitalize">{prof.preferredReleaseType} releases</span>
+                      </div>
+                      <div class="attr-row">
+                        <span class="attr-k">Source Selection</span>
+                        <span class="attr-v capitalize">{prof.sourceSelection}</span>
+                      </div>
+                      <div class="attr-row">
+                        <span class="attr-k">Minimum Seeders</span>
+                        <span class="attr-v">{prof.minSeeders}</span>
+                      </div>
+                      <div class="attr-row">
+                        <span class="attr-k">Prefer Digital</span>
+                        <span class="attr-v">{prof.preferDigital ? 'Yes' : 'No'}</span>
+                      </div>
+                      <div class="attr-row">
+                        <span class="attr-k">Trusted Only</span>
+                        <span class="attr-v">{prof.trustedOnly ? 'Yes' : 'No'}</span>
+                      </div>
+                      <div class="attr-row">
+                        <span class="attr-k">Collection Policy</span>
+                        <span class="attr-v capitalize">{prof.collectionPolicy.replace('_', ' ')}</span>
+                      </div>
+                      <div class="attr-row">
+                        <span class="attr-k">Auto-acquire</span>
+                        <span class="attr-v"><span class="tag">OFF (Disabled)</span></span>
+                      </div>
+                    </div>
+                  </div>
+                {/each}
+              </div>
+            {/if}
+          </section>
+
+          <section class="card">
+            <h3>Acquisition Sources & Health</h3>
+            <span class="muted">Operational health, discovery capabilities, and uploader reliability across configured acquisition providers.</span>
+
+            <div class="sources-health-list">
+              {#each sourceHealthReports as src (src.sourceId)}
+                <div class="source-health-card">
+                  <div class="source-health-header">
+                    <strong>{src.name}</strong>
+                    <span class="status-badge status-{src.status === 'healthy' ? 'valid' : src.status === 'degraded' ? 'not_configured' : 'failed'}">
+                      {src.status.toUpperCase()}
+                    </span>
+                  </div>
+                  <div class="source-health-meta">
+                    <span>Volumes: <strong>{src.supportsVolumes ? 'Yes' : 'No'}</strong></span>
+                    <span>Collections: <strong>{src.supportsCollections ? 'Yes' : 'No'}</strong></span>
+                    <span>Chapters: <strong>{src.supportsChapters ? 'Yes' : 'No'}</strong></span>
+                    <span>Backend: <strong>{src.requiresExternalBackend ? 'TorBox External' : 'Internal Reader'}</strong></span>
+                    {#if src.lastResponseTimeMs}
+                      <span>Avg Ping: <strong>{src.lastResponseTimeMs}ms</strong></span>
+                    {/if}
+                    {#if src.lastSuccessAt}
+                      <span>Last Success: <strong>{ago(src.lastSuccessAt * 1000)}</strong></span>
+                    {/if}
+                  </div>
+                  {#if src.lastError}
+                    <div class="event-error" style="margin-top: 0.5rem;">{src.lastError}</div>
+                  {/if}
+                </div>
+              {/each}
+            </div>
+          </section>
+
           <div class="action-bar">
             <button class="btn spot" onclick={savePipeline} disabled={pipelineSaving}>
               <Icon name="check" size={18} />
@@ -2452,6 +2704,110 @@
   </div>
 </div>
 
+{#if editingProfile}
+  <!-- svelte-ignore a11y_click_events_have_key_events -->
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <div class="modal-backdrop" onclick={() => (editingProfile = null)}>
+    <div class="modal-content profile-editor-modal" onclick={(e) => e.stopPropagation()}>
+      <div class="modal-header">
+        <h3>{isNewProfile ? 'New Acquisition Profile' : `Edit Profile: ${editingProfile.name}`}</h3>
+        <button class="btn icon close-btn" onclick={() => (editingProfile = null)} aria-label="Close">
+          <Icon name="close" size={18} />
+        </button>
+      </div>
+
+      <div class="modal-body stack-fields">
+        <label class="field">
+          <span class="label">Profile Name</span>
+          <input type="text" class="input" bind:value={editingProfile.name} placeholder="e.g. High Quality Manga" />
+        </label>
+
+        <div class="field-row-split">
+          <label class="field">
+            <span class="label">Language</span>
+            <select class="input" bind:value={editingProfile.language}>
+              <option value="en">English (en)</option>
+              <option value="zh">Chinese (zh)</option>
+              <option value="any">Any Language</option>
+            </select>
+          </label>
+          <label class="field">
+            <span class="label">Release Preference</span>
+            <select class="input" bind:value={editingProfile.preferredReleaseType}>
+              <option value="volume">Complete Volumes</option>
+              <option value="chapter">Chapters</option>
+              <option value="any">Any Compatible</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="field-row-split">
+          <label class="field">
+            <span class="label">Collection Policy</span>
+            <select class="input" bind:value={editingProfile.collectionPolicy}>
+              <option value="smart">Smart (Batch when >= 3 missing)</option>
+              <option value="prefer_collections">Prefer Collections</option>
+              <option value="prefer_individual">Prefer Individual Volumes</option>
+              <option value="never_collections">Never Collections</option>
+            </select>
+          </label>
+          <label class="field">
+            <span class="label">Minimum Seeders</span>
+            <input type="number" class="input" min="0" max="100" bind:value={editingProfile.minSeeders} />
+          </label>
+        </div>
+
+        <div class="field-row-split">
+          <label class="field">
+            <span class="label">Max Duplicate Volumes Allowed</span>
+            <input type="number" class="input" min="0" max="50" bind:value={editingProfile.maxUnnecessaryDuplicateCoverage} />
+          </label>
+          <label class="field">
+            <span class="label">Zero Seeder Policy</span>
+            <select class="input" bind:value={editingProfile.allowZeroSeeders}>
+              <option value="no">Disallow (Reject 0 seeders)</option>
+              <option value="ask">Review Recommended</option>
+              <option value="yes">Allow</option>
+            </select>
+          </label>
+        </div>
+
+        <div class="checkbox-row-group">
+          <label class="checkbox-label">
+            <input type="checkbox" bind:checked={editingProfile.preferDigital} />
+            <span>Prefer Digital releases over physical scans</span>
+          </label>
+          <label class="checkbox-label">
+            <input type="checkbox" bind:checked={editingProfile.trustedOnly} />
+            <span>Trusted uploaders only</span>
+          </label>
+          <label class="checkbox-label">
+            <input type="checkbox" bind:checked={editingProfile.allowMixedCollections} />
+            <span>Allow mixed volume + chapter collections</span>
+          </label>
+          <label class="checkbox-label">
+            <input type="checkbox" bind:checked={editingProfile.allowUnsupportedEditions} />
+            <span>Allow variant editions (Full Color, Deluxe, etc.)</span>
+          </label>
+        </div>
+
+        <div class="disabled-feature-notice">
+          <Icon name="info" size={16} />
+          <span>Auto-acquire remains strictly OFF in this milestone. Autonomous acquisition is disabled.</span>
+        </div>
+      </div>
+
+      <div class="modal-footer">
+        <button class="btn" onclick={() => (editingProfile = null)}>Cancel</button>
+        <button class="btn spot" onclick={saveEditingProfile}>
+          <Icon name="check" size={16} />
+          {isNewProfile ? 'Create Profile' : 'Save Changes'}
+        </button>
+      </div>
+    </div>
+  </div>
+{/if}
+
 <style>
   .layout {
     display: grid;
@@ -3104,5 +3460,183 @@
 
   .rec-msg {
     font-size: 11px;
+  }
+
+  /* Acquisition Profiles & Sources */
+  .card-header-flex {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 1rem;
+    margin-bottom: 1rem;
+  }
+
+  .profiles-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    gap: 1rem;
+    margin-top: 1rem;
+  }
+
+  .profile-card {
+    background: var(--card-bg, rgba(255, 255, 255, 0.03));
+    border: 1px solid var(--border-color, rgba(255, 255, 255, 0.1));
+    border-radius: 8px;
+    padding: 1rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+  }
+
+  .profile-card.default-card {
+    border-color: var(--spot, #ff7a00);
+    box-shadow: 0 0 8px rgba(255, 122, 0, 0.15);
+  }
+
+  .profile-card-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    border-bottom: 1px solid var(--border-color, rgba(255, 255, 255, 0.08));
+    padding-bottom: 0.5rem;
+  }
+
+  .profile-actions {
+    display: flex;
+    gap: 0.35rem;
+  }
+
+  .profile-attrs-table {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    font-size: 0.85rem;
+  }
+
+  .attr-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+
+  .attr-k {
+    color: var(--muted, #888);
+  }
+
+  .attr-v {
+    font-weight: 500;
+  }
+
+  .sources-health-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    margin-top: 1rem;
+  }
+
+  .source-health-card {
+    background: var(--card-bg, rgba(255, 255, 255, 0.03));
+    border: 1px solid var(--border-color, rgba(255, 255, 255, 0.1));
+    border-radius: 6px;
+    padding: 0.75rem 1rem;
+  }
+
+  .source-health-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 0.5rem;
+  }
+
+  .source-health-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 1.25rem;
+    font-size: 0.82rem;
+    color: var(--muted, #888);
+  }
+
+  /* Modal */
+  .modal-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.7);
+    backdrop-filter: blur(4px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+    padding: 1rem;
+  }
+
+  .profile-editor-modal {
+    background: var(--bg, #18181b);
+    border: 1px solid var(--border-color, rgba(255, 255, 255, 0.15));
+    border-radius: 10px;
+    width: 100%;
+    max-width: 560px;
+    max-height: 90vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    box-shadow: 0 16px 36px rgba(0, 0, 0, 0.4);
+  }
+
+  .modal-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 1rem 1.25rem;
+    border-bottom: 1px solid var(--border-color, rgba(255, 255, 255, 0.1));
+  }
+
+  .modal-body {
+    padding: 1.25rem;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+  }
+
+  .modal-footer {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.75rem;
+    padding: 1rem 1.25rem;
+    border-top: 1px solid var(--border-color, rgba(255, 255, 255, 0.1));
+    background: rgba(0, 0, 0, 0.2);
+  }
+
+  .field-row-split {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+  }
+
+  .checkbox-row-group {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    margin-top: 0.5rem;
+  }
+
+  .checkbox-label {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.88rem;
+    cursor: pointer;
+  }
+
+  .disabled-feature-notice {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.65rem 0.85rem;
+    background: rgba(255, 122, 0, 0.08);
+    border: 1px solid rgba(255, 122, 0, 0.25);
+    border-radius: 6px;
+    font-size: 0.82rem;
+    color: var(--spot, #ff7a00);
   }
 </style>

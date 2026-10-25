@@ -907,3 +907,175 @@ export const getAcquisitionHistory = (mangaId?: number, limit?: number) => {
   const qs = params.toString();
   return get<AcquisitionHistoryRecord[]>(`/acquisition/history${qs ? `?${qs}` : ''}`);
 };
+
+// ---------- Acquisition Profiles, Intelligence & Missing Content Planner ----------
+
+export interface AcquisitionProfile {
+  id: string;
+  name: string;
+  isDefault: boolean;
+  language: string;
+  preferredReleaseType: string;
+  sourceSelection: string;
+  preferredSources: string[];
+  preferredUploaders: string[];
+  minSeeders: number;
+  preferDigital: boolean;
+  trustedOnly: boolean;
+  collectionPolicy: string;
+  maxUnnecessaryDuplicateCoverage: number;
+  maxAcquisitionSizeBytes?: number | null;
+  maxPlanSizeBytes?: number | null;
+  qualityPreference: string;
+  allowMixedCollections: boolean;
+  allowZeroSeeders: string;
+  allowUnsupportedEditions: boolean;
+  autoAcquire: boolean;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface UnitStatusEntry {
+  unit: number;
+  state: 'owned' | 'acquiring' | 'missing' | 'unavailable' | 'unknown';
+  evidence: string;
+  bookId?: string | null;
+}
+
+export interface MissingContentSummary {
+  mangaId: number;
+  title: string;
+  totalKnownVolumes: number;
+  ownedVolumes: number[];
+  missingVolumes: number[];
+  acquiringVolumes: number[];
+  unavailableVolumes: number[];
+  unknownVolumes: number[];
+  volumeEntries: UnitStatusEntry[];
+  totalKnownChapters: number;
+  ownedChapters: number[];
+  missingChapters: number[];
+  acquiringChapters: number[];
+  isFullyOwned: boolean;
+  hasMissing: boolean;
+  explanation: string;
+}
+
+export interface CandidateExplanation {
+  candidateId: string;
+  candidateTitle: string;
+  provider: string;
+  whyRecommended: string[];
+  whyLower: string[];
+}
+
+export interface NormalizedAcquisitionCandidate {
+  seriesIdentity: string;
+  provider: string;
+  providerReleaseId: string;
+  title: string;
+  releaseUnit: AcquisitionReleaseUnit;
+  releaseNumber?: number | null;
+  releaseRange?: [number, number] | null;
+  language: string;
+  edition?: string | null;
+  format?: string | null;
+  uploader?: string | null;
+  size?: number | null;
+  publishedAt?: number | null;
+  availability: string;
+  health: {
+    seeders?: number | null;
+    leechers?: number | null;
+    sourceHealthy: boolean;
+    uploaderReliabilityPercent?: number | null;
+  };
+  qualitySignals: {
+    isDigital: boolean;
+    isTrusted: boolean;
+    isPreferredUploader: boolean;
+    editionRecognized: boolean;
+    editionPenalty: number;
+  };
+  ownedUnits: number[];
+  missingUnits: number[];
+  confidence: string;
+  score: number;
+  providerMetadata: any;
+}
+
+export interface AcquisitionPlanItem {
+  candidate: NormalizedAcquisitionCandidate;
+  unitsCovered: number[];
+  duplicateUnits: number[];
+  explanation: CandidateExplanation;
+}
+
+export interface AcquisitionPlan {
+  id: string;
+  mangaId: number;
+  seriesTitle: string;
+  profileId: string;
+  profileName: string;
+  missingUnits: number[];
+  selectedItems: AcquisitionPlanItem[];
+  alternatives: NormalizedAcquisitionCandidate[];
+  confidence: string;
+  state: string;
+  staleReason?: string | null;
+  totalEstimatedSize: number;
+  totalAcquisitionsCount: number;
+  missingUnitsCoveredCount: number;
+  isDryRun: boolean;
+  createdAt: number;
+  refreshedAt: number;
+}
+
+export interface GlobalPlanSummary {
+  totalSeriesAnalyzed: number;
+  seriesPlanned: AcquisitionPlan[];
+  totalVolumesToAcquire: number;
+  totalCollectionsCount: number;
+  totalIndividualCount: number;
+  estimatedTotalBytes: number;
+  unavailableVolumesCount: number;
+  needsReviewCount: number;
+  alreadySatisfiedCount: number;
+}
+
+export interface SourceHealthReport {
+  sourceId: string;
+  name: string;
+  supportsVolumes: boolean;
+  supportsChapters: boolean;
+  supportsCollections: boolean;
+  requiresExternalBackend: boolean;
+  status: string;
+  successCount: number;
+  failureCount: number;
+  lastResponseTimeMs?: number | null;
+  lastError?: string | null;
+  lastSuccessAt?: number | null;
+  exactMatchCount: number;
+  totalCandidatesFound: number;
+  uploaderStats: Record<string, { validAcquisitions: number; attemptedAcquisitions: number; reliabilityPercent: number }>;
+  updatedAt: number;
+}
+
+export const getAcquisitionProfiles = () => get<AcquisitionProfile[]>('/settings/profiles');
+export const createAcquisitionProfile = (profile: Partial<AcquisitionProfile>) => send<AcquisitionProfile>('POST', '/settings/profiles', profile);
+export const getAcquisitionProfile = (id: string) => get<AcquisitionProfile>(`/settings/profiles/${encodeURIComponent(id)}`);
+export const updateAcquisitionProfile = (id: string, patch: Partial<AcquisitionProfile>) => send<AcquisitionProfile>('PUT', `/settings/profiles/${encodeURIComponent(id)}`, patch);
+export const deleteAcquisitionProfile = (id: string) => send<boolean>('DELETE', `/settings/profiles/${encodeURIComponent(id)}`);
+export const duplicateAcquisitionProfile = (id: string, name?: string) => send<AcquisitionProfile>('POST', `/settings/profiles/${encodeURIComponent(id)}/duplicate`, { name });
+
+export const getTitleProfile = (id: number) => get<AcquisitionProfile>(`/titles/${id}/profile`);
+export const setTitleProfile = (id: number, profileId: string | null) => send<AcquisitionProfile>('PUT', `/titles/${id}/profile`, { profileId });
+
+export const getTitleMissingContent = (id: number) => get<MissingContentSummary>(`/titles/${id}/missing-content`);
+export const planTitleMissingContent = (id: number, dryRun: boolean = true) => send<AcquisitionPlan>('POST', `/titles/${id}/plan`, { dryRun });
+export const getTitlePlan = (id: number) => get<AcquisitionPlan | null>(`/titles/${id}/plan`);
+
+export const getGlobalMissingContent = () => get<MissingContentSummary[]>('/acquisition/missing');
+export const planAllMissingContent = () => send<GlobalPlanSummary>('POST', '/acquisition/plan-all', {});
+export const getSourceHealthReports = () => get<SourceHealthReport[]>('/acquisition/sources/health');

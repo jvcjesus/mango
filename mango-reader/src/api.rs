@@ -230,6 +230,35 @@ pub fn router(state: Spaces) -> Router {
             post(test_torbox_connection),
         )
         .route("/acquisition/history", get(get_acquisition_history))
+        .route(
+            "/settings/profiles",
+            get(get_acquisition_profiles).post(post_create_acquisition_profile),
+        )
+        .route(
+            "/settings/profiles/{id}",
+            get(get_acquisition_profile)
+                .put(put_update_acquisition_profile)
+                .delete(delete_acquisition_profile),
+        )
+        .route(
+            "/settings/profiles/{id}/duplicate",
+            post(post_duplicate_acquisition_profile),
+        )
+        .route(
+            "/titles/{id}/profile",
+            get(get_title_acquisition_profile).put(put_title_acquisition_profile),
+        )
+        .route(
+            "/titles/{id}/missing-content",
+            get(get_title_missing_content),
+        )
+        .route(
+            "/titles/{id}/plan",
+            get(get_title_plan).post(post_title_plan),
+        )
+        .route("/acquisition/missing", get(get_global_missing))
+        .route("/acquisition/plan-all", post(post_plan_all))
+        .route("/acquisition/sources/health", get(get_acquisition_sources_health))
         .route("/sync/dry-run", post(sync_dry_run))
         .route("/sync/run", post(sync_run))
         .route("/sync/status", get(sync_status))
@@ -1590,6 +1619,139 @@ async fn get_acquisition_history(
 ) -> Result<Json<Vec<crate::acquisition::AcquisitionHistoryRecord>>> {
     let history = app.acquisition.list_history(query.manga_id, query.limit).await?;
     Ok(Json(history))
+}
+
+async fn get_acquisition_profiles(
+    Me(app): Me,
+) -> Result<Json<Vec<crate::acquisition::profiles::AcquisitionProfile>>> {
+    let profiles = app.acquisition.list_profiles().await?;
+    Ok(Json(profiles))
+}
+
+async fn post_create_acquisition_profile(
+    Me(app): Me,
+    Json(profile): Json<crate::acquisition::profiles::AcquisitionProfile>,
+) -> Result<Json<crate::acquisition::profiles::AcquisitionProfile>> {
+    let created = app.acquisition.create_profile(profile).await?;
+    Ok(Json(created))
+}
+
+async fn get_acquisition_profile(
+    Me(app): Me,
+    Path(id): Path<String>,
+) -> Result<Json<Option<crate::acquisition::profiles::AcquisitionProfile>>> {
+    let profile = app.acquisition.get_profile(id).await?;
+    Ok(Json(profile))
+}
+
+async fn put_update_acquisition_profile(
+    Me(app): Me,
+    Path(id): Path<String>,
+    Json(patch): Json<crate::acquisition::profiles::ProfilePatch>,
+) -> Result<Json<crate::acquisition::profiles::AcquisitionProfile>> {
+    let updated = app.acquisition.update_profile(id, patch).await?;
+    Ok(Json(updated))
+}
+
+async fn delete_acquisition_profile(
+    Me(app): Me,
+    Path(id): Path<String>,
+) -> Result<Json<bool>> {
+    app.acquisition.delete_profile(id).await?;
+    Ok(Json(true))
+}
+
+#[derive(Deserialize)]
+struct DuplicateProfilePayload {
+    name: Option<String>,
+}
+
+async fn post_duplicate_acquisition_profile(
+    Me(app): Me,
+    Path(id): Path<String>,
+    Json(payload): Json<Option<DuplicateProfilePayload>>,
+) -> Result<Json<crate::acquisition::profiles::AcquisitionProfile>> {
+    let name = payload.and_then(|p| p.name);
+    let dup = app.acquisition.duplicate_profile(id, name).await?;
+    Ok(Json(dup))
+}
+
+#[derive(Deserialize)]
+struct TitleProfilePayload {
+    #[serde(rename = "profileId")]
+    profile_id: Option<String>,
+}
+
+async fn get_title_acquisition_profile(
+    Me(app): Me,
+    Path(id): Path<i64>,
+) -> Result<Json<crate::acquisition::profiles::AcquisitionProfile>> {
+    let prof = app.acquisition.get_manga_profile(id).await?;
+    Ok(Json(prof))
+}
+
+async fn put_title_acquisition_profile(
+    Me(app): Me,
+    Path(id): Path<i64>,
+    Json(payload): Json<TitleProfilePayload>,
+) -> Result<Json<crate::acquisition::profiles::AcquisitionProfile>> {
+    app.acquisition.set_manga_profile(id, payload.profile_id).await?;
+    let prof = app.acquisition.get_manga_profile(id).await?;
+    Ok(Json(prof))
+}
+
+async fn get_title_missing_content(
+    Me(app): Me,
+    Path(id): Path<i64>,
+) -> Result<Json<crate::acquisition::missing::MissingContentSummary>> {
+    let summary = app.acquisition.get_title_missing_content(id).await?;
+    Ok(Json(summary))
+}
+
+#[derive(Deserialize, Default)]
+struct TitlePlanPayload {
+    #[serde(default)]
+    #[serde(rename = "dryRun")]
+    dry_run: Option<bool>,
+}
+
+async fn post_title_plan(
+    Me(app): Me,
+    Path(id): Path<i64>,
+    Json(payload): Json<Option<TitlePlanPayload>>,
+) -> Result<Json<crate::acquisition::planner::AcquisitionPlan>> {
+    let dry_run = payload.and_then(|p| p.dry_run).unwrap_or(false);
+    let plan = app.acquisition.plan_title_missing_content(id, dry_run).await?;
+    Ok(Json(plan))
+}
+
+async fn get_title_plan(
+    Me(app): Me,
+    Path(id): Path<i64>,
+) -> Result<Json<Option<crate::acquisition::planner::AcquisitionPlan>>> {
+    let plan = app.acquisition.get_title_plan(id).await?;
+    Ok(Json(plan))
+}
+
+async fn get_global_missing(
+    Me(app): Me,
+) -> Result<Json<Vec<crate::acquisition::missing::MissingContentSummary>>> {
+    let summaries = app.acquisition.get_global_missing_content().await?;
+    Ok(Json(summaries))
+}
+
+async fn post_plan_all(
+    Me(app): Me,
+) -> Result<Json<crate::acquisition::planner::GlobalPlanSummary>> {
+    let summary = app.acquisition.plan_all_missing_content().await?;
+    Ok(Json(summary))
+}
+
+async fn get_acquisition_sources_health(
+    Me(app): Me,
+) -> Result<Json<Vec<crate::acquisition::intelligence::SourceHealthReport>>> {
+    let reports = app.acquisition.get_source_health_reports().await?;
+    Ok(Json(reports))
 }
 
 #[derive(Deserialize, Default)]

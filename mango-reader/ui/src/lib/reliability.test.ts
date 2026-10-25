@@ -2101,6 +2101,133 @@ describe('first-class volume acquisition & release semantics', () => {
 
       expect(collectionChildJob.collectionId).toBe('col-8888');
       expect(collectionChildJob.collectionName).toBe('Blue Lock v01-03');
+
+      // 6. Acquisition Profiles, Missing-Content Engine & Dry-Run Planner UI contracts
+      const defaultProfile: import('./api').AcquisitionProfile = {
+        id: 'default',
+        name: 'Default Manga',
+        isDefault: true,
+        language: 'en',
+        preferredReleaseType: 'volume',
+        sourceSelection: 'smart',
+        preferredSources: ['nyaa', 'mangadot'],
+        preferredUploaders: [],
+        minSeeders: 1,
+        preferDigital: true,
+        trustedOnly: false,
+        collectionPolicy: 'smart',
+        maxUnnecessaryDuplicateCoverage: 3,
+        maxAcquisitionSizeBytes: null,
+        maxPlanSizeBytes: null,
+        qualityPreference: 'best',
+        allowMixedCollections: false,
+        allowZeroSeeders: 'no',
+        allowUnsupportedEditions: false,
+        autoAcquire: false,
+        createdAt: 1700000000,
+        updatedAt: 1700000000,
+      };
+
+      expect(defaultProfile.isDefault).toBe(true);
+      expect(defaultProfile.autoAcquire).toBe(false);
+
+      const missingSummary: import('./api').MissingContentSummary = {
+        mangaId: 1,
+        title: 'Blue Lock',
+        totalKnownVolumes: 39,
+        ownedVolumes: Array.from({ length: 38 }, (_, i) => i + 1),
+        missingVolumes: [39],
+        acquiringVolumes: [],
+        unavailableVolumes: [],
+        unknownVolumes: [],
+        volumeEntries: [
+          { unit: 39, state: 'missing', evidence: 'Known from catalog (1..=39)', bookId: null },
+        ],
+        totalKnownChapters: 0,
+        ownedChapters: [],
+        missingChapters: [],
+        acquiringChapters: [],
+        isFullyOwned: false,
+        hasMissing: true,
+        explanation: '38/39 volumes owned (1 missing, 0 acquiring)',
+      };
+
+      expect(missingSummary.hasMissing).toBe(true);
+      expect(missingSummary.missingVolumes).toEqual([39]);
+
+      const plan: import('./api').AcquisitionPlan = {
+        id: 'plan_1_1700000000',
+        mangaId: 1,
+        seriesTitle: 'Blue Lock',
+        profileId: 'default',
+        profileName: 'Default Manga',
+        missingUnits: [39],
+        selectedItems: [
+          {
+            candidate: {
+              seriesIdentity: 'Blue Lock',
+              provider: 'nyaa',
+              providerReleaseId: 'item-39',
+              title: 'Blue Lock v39 (Digital) [Stick]',
+              releaseUnit: { type: 'volume', value: 39 },
+              releaseNumber: 39,
+              releaseRange: null,
+              language: 'en',
+              edition: null,
+              format: 'Digital CBZ',
+              uploader: 'Stick',
+              size: 312000000,
+              publishedAt: 1700000000,
+              availability: 'available',
+              health: { seeders: 12, leechers: 1, sourceHealthy: true, uploaderReliabilityPercent: 100 },
+              qualitySignals: { isDigital: true, isTrusted: true, isPreferredUploader: false, editionRecognized: false, editionPenalty: 0 },
+              ownedUnits: [],
+              missingUnits: [39],
+              confidence: 'high',
+              score: 95,
+              providerMetadata: {},
+            },
+            unitsCovered: [39],
+            duplicateUnits: [],
+            explanation: {
+              candidateId: 'item-39',
+              candidateTitle: 'Blue Lock v39 (Digital) [Stick]',
+              provider: 'nyaa',
+              whyRecommended: ['✓ Exact missing volume 39', '✓ Digital release', '✓ 12 healthy seeders'],
+              whyLower: [],
+            },
+          },
+        ],
+        alternatives: [],
+        confidence: 'high',
+        state: 'ready',
+        staleReason: null,
+        totalEstimatedSize: 312000000,
+        totalAcquisitionsCount: 1,
+        missingUnitsCoveredCount: 1,
+        isDryRun: true,
+        createdAt: 1700000000,
+        refreshedAt: 1700000000,
+      };
+
+      expect(plan.isDryRun).toBe(true);
+      expect(plan.confidence).toBe('high');
+      expect(plan.selectedItems[0].explanation.whyRecommended).toContain('✓ Digital release');
+
+      const globalPlan: import('./api').GlobalPlanSummary = {
+        totalSeriesAnalyzed: 14,
+        seriesPlanned: [plan],
+        totalVolumesToAcquire: 1,
+        totalCollectionsCount: 0,
+        totalIndividualCount: 1,
+        estimatedTotalBytes: 312000000,
+        unavailableVolumesCount: 0,
+        needsReviewCount: 0,
+        alreadySatisfiedCount: 13,
+      };
+
+      expect(globalPlan.totalSeriesAnalyzed).toBe(14);
+      expect(globalPlan.totalVolumesToAcquire).toBe(1);
     });
   });
 });

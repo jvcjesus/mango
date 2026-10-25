@@ -9,6 +9,11 @@ use crate::acquisition::{
     AcquireCollectionRequest, AcquisitionCandidate, AcquisitionConfig, AcquisitionHistoryRecord,
     AcquisitionRelease, AcquisitionReleaseUnit, CollectionInspection, CollectionUnitEntry,
 };
+use crate::acquisition::candidates::NormalizedAcquisitionCandidate;
+use crate::acquisition::intelligence::SourceHealthReport;
+use crate::acquisition::missing::MissingContentSummary;
+use crate::acquisition::planner::{AcquisitionPlan, GlobalPlanSummary};
+use crate::acquisition::profiles::{AcquisitionProfile, ProfilePatch};
 use crate::db::Db;
 use crate::error::{AppError, Result};
 use reqwest::Client;
@@ -948,5 +953,246 @@ impl AcquisitionService {
                 Ok(rows)
             })
             .await
+    }
+
+    // Profile Management
+    pub async fn list_profiles(&self) -> Result<Vec<AcquisitionProfile>> {
+        self.db.call(|conn| crate::acquisition::profiles::list_profiles(conn)).await
+    }
+
+    pub async fn get_profile(&self, id: String) -> Result<Option<AcquisitionProfile>> {
+        self.db.call(move |conn| crate::acquisition::profiles::get_profile_by_id(conn, &id)).await
+    }
+
+    pub async fn create_profile(&self, profile: AcquisitionProfile) -> Result<AcquisitionProfile> {
+        self.db.call(move |conn| crate::acquisition::profiles::create_profile(conn, profile)).await
+    }
+
+    pub async fn update_profile(&self, id: String, patch: ProfilePatch) -> Result<AcquisitionProfile> {
+        self.db.call(move |conn| crate::acquisition::profiles::update_profile(conn, &id, patch)).await
+    }
+
+    pub async fn delete_profile(&self, id: String) -> Result<()> {
+        self.db.call(move |conn| crate::acquisition::profiles::delete_profile(conn, &id)).await
+    }
+
+    pub async fn duplicate_profile(&self, id: String, new_name: Option<String>) -> Result<AcquisitionProfile> {
+        self.db.call(move |conn| crate::acquisition::profiles::duplicate_profile(conn, &id, new_name)).await
+    }
+
+    pub async fn get_manga_profile(&self, manga_id: i64) -> Result<AcquisitionProfile> {
+        self.db.call(move |conn| crate::acquisition::profiles::get_profile_for_manga(conn, manga_id)).await
+    }
+
+    pub async fn set_manga_profile(&self, manga_id: i64, profile_id: Option<String>) -> Result<()> {
+        self.db.call(move |conn| crate::acquisition::profiles::set_manga_profile(conn, manga_id, profile_id.as_deref())).await
+    }
+
+    // Missing Content Engine
+    pub async fn get_title_missing_content(&self, manga_id: i64) -> Result<MissingContentSummary> {
+        let (title, _) = self.get_title_and_aliases(manga_id).await?;
+        let ownership_opt = if let Some(pipeline) = &self.pipeline {
+            Some(pipeline.ownership.get_title_ownership(manga_id, &title).await)
+        } else {
+            None
+        };
+        self.db.call(move |conn| {
+            Ok(crate::acquisition::missing::resolve_missing_content_for_title(
+                conn,
+                ownership_opt.as_ref(),
+                manga_id,
+                &title,
+            ))
+        }).await
+    }
+
+    // Acquisition Planner
+    pub async fn plan_title_missing_content(&self, manga_id: i64, dry_run: bool) -> Result<AcquisitionPlan> {
+        let missing_summary = self.get_title_missing_content(manga_id).await?;
+        let profile = self.get_manga_profile(manga_id).await?;
+
+        if missing_summary.missing_volumes.is_empty() {
+            return Ok(crate::acquisition::planner::generate_plan(
+                manga_id,
+                &missing_summary.title,
+                &profile,
+                &missing_summary,
+                &[],
+                &std::collections::HashMap::new(),
+                dry_run,
+            ));
+        }
+
+        // Query candidates from discovery sources
+        let (config, _) = self.load_internal_config().await?;
+        let mut normalized_candidates = Vec::new();
+
+        if config.nyaa_enabled {
+            let start = std::time::Instant::now();
+            match self.search_candidates(manga_id, None, None, None, None, None, None).await {
+                Ok(cands) => {
+                    let dur_ms = start.elapsed().as_millis() as u64;
+                    let count = cands.len();
+                    let exact = cands.iter().filter(|c| c.smart_score.as_ref().map_or(false, |s| s.identity >= 20.0)).count();
+                    let _ = self.db.call(move |conn| {
+                        crate::acquisition::intelligence::record_discovery_success(conn, "nyaa", count, exact, dur_ms)
+                    }).await;
+
+                    for c in cands {
+                        normalized_candidates.push(NormalizedAcquisitionCandidate::from_nyaa_candidate(
+                            &missing_summary.title,
+                            &c,
+                            &profile.preferred_uploaders,
+                            &profile.language,
+                        ));
+                    }
+                }
+                Err(e) => {
+                    let err_str = e.to_string();
+                    let _ = self.db.call(move |conn| {
+                        crate::acquisition::intelligence::record_discovery_failure(conn, "nyaa", &err_str)
+                    }).await;
+                }
+            }
+        }
+
+        // Check if there are local reader/MangaDot volume-labelled releases
+        let title_for_db = missing_summary.title.clone();
+        let lang_for_db = profile.language.clone();
+        let md_cands = self.db.call(move |conn| {
+            let mut list = Vec::new();
+            if let Ok(mut stmt) = conn.prepare("SELECT name FROM chapters WHERE manga_id = ?1") {
+                if let Ok(rows) = stmt.query_map([manga_id], |r| r.get::<_, String>(0)) {
+                    for name in rows.flatten() {
+                        if let Some(v) = crate::release::parse_volume(&name) {
+                            list.push(NormalizedAcquisitionCandidate::from_mangadot_release(
+                                &title_for_db,
+                                v,
+                                &name,
+                                None,
+                                &lang_for_db,
+                            ));
+                        }
+                    }
+                }
+            }
+            Ok(list)
+        }).await.unwrap_or_default();
+        normalized_candidates.extend(md_cands);
+
+        // Fetch source health map
+        let health_reports = self.get_source_health_reports().await.unwrap_or_default();
+        let mut source_health_map = std::collections::HashMap::new();
+        for h in health_reports {
+            source_health_map.insert(h.source_id, h.status);
+        }
+
+        let plan = crate::acquisition::planner::generate_plan(
+            manga_id,
+            &missing_summary.title,
+            &profile,
+            &missing_summary,
+            &normalized_candidates,
+            &source_health_map,
+            dry_run,
+        );
+
+        if !dry_run {
+            let plan_to_save = plan.clone();
+            self.db.call(move |conn| crate::acquisition::planner::save_plan(conn, &plan_to_save)).await?;
+        }
+
+        Ok(plan)
+    }
+
+    pub async fn get_title_plan(&self, manga_id: i64) -> Result<Option<AcquisitionPlan>> {
+        let (title, _) = self.get_title_and_aliases(manga_id).await?;
+        let mut current_owned_volumes = Vec::new();
+        if let Some(pipeline) = &self.pipeline {
+            let own = pipeline.ownership.get_title_ownership(manga_id, &title).await;
+            for v in own.volumes {
+                if v.status == crate::pipeline::ownership::OwnershipStatus::Owned {
+                    current_owned_volumes.push(v.volume);
+                }
+            }
+        }
+        self.db.call(move |conn| {
+            crate::acquisition::planner::get_plan_for_manga(conn, manga_id, &current_owned_volumes)
+        }).await
+    }
+
+    pub async fn get_global_missing_content(&self) -> Result<Vec<MissingContentSummary>> {
+        let library_titles = self.db.call(|conn| {
+            let mut stmt = conn.prepare("SELECT id FROM manga WHERE in_library = 1 ORDER BY title ASC")?;
+            let ids = stmt.query_map([], |r| r.get::<_, i64>(0))?.filter_map(std::result::Result::ok).collect::<Vec<_>>();
+            Ok(ids)
+        }).await?;
+
+        let mut summaries = Vec::new();
+        for id in library_titles {
+            if let Ok(summary) = self.get_title_missing_content(id).await {
+                summaries.push(summary);
+            }
+        }
+        Ok(summaries)
+    }
+
+    pub async fn plan_all_missing_content(&self) -> Result<GlobalPlanSummary> {
+        let library_titles = self.db.call(|conn| {
+            let mut stmt = conn.prepare("SELECT id FROM manga WHERE in_library = 1 ORDER BY title ASC")?;
+            let ids = stmt.query_map([], |r| r.get::<_, i64>(0))?.filter_map(std::result::Result::ok).collect::<Vec<_>>();
+            Ok(ids)
+        }).await?;
+
+        let mut planned = Vec::new();
+        let mut total_vols = 0;
+        let mut total_colls = 0;
+        let mut total_indiv = 0;
+        let mut total_bytes = 0;
+        let mut unavail = 0;
+        let mut needs_rev = 0;
+        let mut satisfied = 0;
+
+        for id in &library_titles {
+            if let Ok(plan) = self.plan_title_missing_content(*id, true).await {
+                if plan.state == "completed" {
+                    satisfied += 1;
+                } else {
+                    if plan.confidence != "high" {
+                        needs_rev += 1;
+                    }
+                    if plan.selected_items.is_empty() {
+                        unavail += plan.missing_units.len();
+                    } else {
+                        for item in &plan.selected_items {
+                            if item.candidate.release_unit.is_collection() {
+                                total_colls += 1;
+                            } else {
+                                total_indiv += 1;
+                            }
+                            total_vols += item.units_covered.len();
+                            total_bytes += item.candidate.size.unwrap_or(0);
+                        }
+                    }
+                    planned.push(plan);
+                }
+            }
+        }
+
+        Ok(GlobalPlanSummary {
+            total_series_analyzed: library_titles.len(),
+            series_planned: planned,
+            total_volumes_to_acquire: total_vols,
+            total_collections_count: total_colls,
+            total_individual_count: total_indiv,
+            estimated_total_bytes: total_bytes,
+            unavailable_volumes_count: unavail,
+            needs_review_count: needs_rev,
+            already_satisfied_count: satisfied,
+        })
+    }
+
+    pub async fn get_source_health_reports(&self) -> Result<Vec<SourceHealthReport>> {
+        self.db.call(|conn| crate::acquisition::intelligence::get_all_source_health(conn)).await
     }
 }

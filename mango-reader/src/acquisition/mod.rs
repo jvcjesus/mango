@@ -6,7 +6,13 @@
 //! 3. Candidate normalization, conservative volume/chapter classification, and deterministic ranking
 //! 4. Seamless handoff into the existing native Mango downstream acquisition pipeline
 
+pub mod candidates;
+pub mod intelligence;
+pub mod missing;
 pub mod nyaa;
+pub mod planner;
+pub mod profiles;
+pub mod providers;
 pub mod service;
 pub mod torbox;
 #[cfg(test)]

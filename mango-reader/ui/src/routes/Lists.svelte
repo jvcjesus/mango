@@ -2,10 +2,12 @@
   import {
     getLists,
     refreshLists,
+    planAllMissingContent,
     message,
     type UnifiedTrackedItem,
     type UnifiedCatalogResponse,
     type TrackerListRefreshStatus,
+    type GlobalPlanSummary,
   } from '../lib/api';
   import Cover from '../lib/Cover.svelte';
   import Icon from '../lib/Icon.svelte';
@@ -33,6 +35,24 @@
 
   // Selected title for modal
   let selectedItem = $state<UnifiedTrackedItem | null>(null);
+
+  // Global Plan All Dry-Run state
+  let planningAll = $state(false);
+  let globalPlanModalOpen = $state(false);
+  let globalPlanSummary = $state<GlobalPlanSummary | null>(null);
+
+  async function handlePlanAll() {
+    planningAll = true;
+    try {
+      const summary = await planAllMissingContent();
+      globalPlanSummary = summary;
+      globalPlanModalOpen = true;
+    } catch (e) {
+      toast.error(`Plan All failed: ${message(e)}`);
+    } finally {
+      planningAll = false;
+    }
+  }
 
   async function loadData() {
     error = null;
@@ -279,6 +299,15 @@
       </div>
 
       <div class="actions">
+        <button
+          class="btn pill icon-text"
+          onclick={handlePlanAll}
+          disabled={planningAll}
+          aria-label="Plan All Missing Content (Dry Run)"
+        >
+          <Icon name={planningAll ? 'spinner' : 'puzzle'} size={18} />
+          <span>{planningAll ? 'Planning…' : 'Plan All (Dry Run)'}</span>
+        </button>
         <button
           class="btn refresh-btn"
           onclick={handleRefresh}
@@ -619,6 +648,91 @@
 
       <div class="modal-footer">
         <button class="btn" onclick={() => (selectedItem = null)}>Close</button>
+      </div>
+    </div>
+  </div>
+{/if}
+
+{#if globalPlanModalOpen && globalPlanSummary}
+  <!-- svelte-ignore a11y_click_events_have_key_events -->
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <div class="modal-backdrop" onclick={() => (globalPlanModalOpen = false)}>
+    <div class="modal-content global-plan-modal" onclick={(e) => e.stopPropagation()}>
+      <div class="modal-header">
+        <div>
+          <h3>Plan All Missing Content (Dry Run)</h3>
+          <span class="muted">{globalPlanSummary.totalSeriesAnalyzed} series analyzed across library & tracked catalog</span>
+        </div>
+        <button class="btn icon close-btn" onclick={() => (globalPlanModalOpen = false)} aria-label="Close">
+          <Icon name="close" size={18} />
+        </button>
+      </div>
+
+      <div class="modal-body">
+        <div class="summary-stats-grid">
+          <div class="stat-card">
+            <span class="stat-num">{globalPlanSummary.totalVolumesToAcquire}</span>
+            <span class="stat-label">Volumes Would Acquire</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-num">{globalPlanSummary.totalCollectionsCount}</span>
+            <span class="stat-label">Collections</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-num">{globalPlanSummary.totalIndividualCount}</span>
+            <span class="stat-label">Individual Releases</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-num">{(globalPlanSummary.estimatedTotalBytes / (1024 * 1024 * 1024)).toFixed(1)} GiB</span>
+            <span class="stat-label">Estimated Size</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-num">{globalPlanSummary.alreadySatisfiedCount}</span>
+            <span class="stat-label">Already Satisfied</span>
+          </div>
+          <div class="stat-card">
+            <span class="stat-num">{globalPlanSummary.needsReviewCount}</span>
+            <span class="stat-label">Needs Review</span>
+          </div>
+        </div>
+
+        <div class="dry-run-safety-box" style="margin-top: 1rem;">
+          <Icon name="check" size={16} />
+          <div>
+            <strong>Dry Run Mode:</strong>
+            <span>No external downloads are initiated. No torrents submitted to TorBox. Execution remains strictly manual.</span>
+          </div>
+        </div>
+
+        <h4 style="margin-top: 1.25rem; margin-bottom: 0.5rem;">Series Plans ({globalPlanSummary.seriesPlanned.length})</h4>
+        {#if globalPlanSummary.seriesPlanned.length === 0}
+          <p class="muted">No series currently have unfulfilled missing content plans.</p>
+        {:else}
+          <div class="series-planned-list">
+            {#each globalPlanSummary.seriesPlanned as plan (plan.id)}
+              <div class="series-plan-item">
+                <div class="plan-item-top">
+                  <strong>{plan.seriesTitle}</strong>
+                  <span class="tag {plan.confidence === 'high' ? 'spot' : 'warn'}">
+                    {plan.confidence === 'high' ? 'HIGH CONFIDENCE' : 'REVIEW RECOMMENDED'}
+                  </span>
+                </div>
+                <div class="plan-item-sub">
+                  <span>Missing: <strong>{plan.missingUnits.length} volumes</strong></span>
+                  <span>Would acquire: <strong>{plan.selectedItems.length} releases</strong> ({plan.missingUnitsCoveredCount} vols covered)</span>
+                  {#if plan.totalEstimatedSize > 0}
+                    <span>Est: <strong>{(plan.totalEstimatedSize / (1024 * 1024 * 1024)).toFixed(2)} GiB</strong></span>
+                  {/if}
+                  <span>Profile: <em>{plan.profileName}</em></span>
+                </div>
+              </div>
+            {/each}
+          </div>
+        {/if}
+      </div>
+
+      <div class="modal-footer">
+        <button class="btn spot" onclick={() => (globalPlanModalOpen = false)}>Close</button>
       </div>
     </div>
   </div>
@@ -1103,5 +1217,83 @@
     justify-content: flex-end;
     padding: 12px 20px;
     border-top: 1px solid var(--shade);
+  }
+
+  /* Global Plan Modal */
+  .global-plan-modal {
+    max-width: 720px;
+  }
+
+  .summary-stats-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(105px, 1fr));
+    gap: 0.75rem;
+    margin-bottom: 1rem;
+  }
+
+  .stat-card {
+    background: var(--card-bg, rgba(255, 255, 255, 0.03));
+    border: 1px solid var(--border-color, rgba(255, 255, 255, 0.1));
+    border-radius: 8px;
+    padding: 0.75rem 0.5rem;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    text-align: center;
+    gap: 0.25rem;
+  }
+
+  .stat-num {
+    font-size: 1.25rem;
+    font-weight: 700;
+    color: var(--spot, #ff7a00);
+  }
+
+  .stat-label {
+    font-size: 0.75rem;
+    color: var(--muted, #888);
+  }
+
+  .dry-run-safety-box {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.75rem;
+    padding: 0.75rem 1rem;
+    background: rgba(255, 122, 0, 0.08);
+    border: 1px solid rgba(255, 122, 0, 0.25);
+    border-radius: 6px;
+    font-size: 0.82rem;
+  }
+
+  .series-planned-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    max-height: 340px;
+    overflow-y: auto;
+  }
+
+  .series-plan-item {
+    background: var(--card-bg, rgba(255, 255, 255, 0.03));
+    border: 1px solid var(--border-color, rgba(255, 255, 255, 0.1));
+    border-radius: 6px;
+    padding: 0.75rem 1rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+  }
+
+  .plan-item-top {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+
+  .plan-item-sub {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 1rem;
+    font-size: 0.82rem;
+    color: var(--muted, #888);
   }
 </style>

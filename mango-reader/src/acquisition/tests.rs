@@ -1,5 +1,6 @@
 //! Acquisition Regression Tests covering Scenarios A through AH.
 
+use crate::acquisition::candidates::NormalizedAcquisitionCandidate;
 use crate::acquisition::service::*;
 use crate::acquisition::torbox::*;
 use crate::acquisition::*;
@@ -1534,4 +1535,570 @@ fn make_test_release_ext(title: &str, raw_title: &str, seeders: u32, size_bytes:
         release_range,
         language: Some("en".to_string()),
     }
+}
+
+// ====================================================================
+// TEST MATRIX — SECTION 36: ACQUISITION PROFILES (A through M)
+// ====================================================================
+
+#[tokio::test]
+async fn test_matrix_36_profiles_suite() {
+    let temp_dir = std::env::temp_dir().join(format!("mango_test_prof_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    fs::create_dir_all(&temp_dir).unwrap();
+    let db_path = temp_dir.join("test.db");
+    let db = Db::open(&db_path).unwrap();
+
+    // A: Default profile creation
+    let default_prof = db.call(|conn| crate::acquisition::profiles::get_default_profile(conn)).await.unwrap();
+    assert_eq!(default_prof.id, "default");
+    assert!(default_prof.is_default);
+    assert_eq!(default_prof.name, "Default Manga");
+    assert_eq!(default_prof.language, "en");
+    assert!(!default_prof.auto_acquire, "auto-acquire must remain false");
+
+    // B: Named profile creation
+    let high_quality = crate::acquisition::profiles::AcquisitionProfile {
+        id: "hq".to_string(),
+        name: "High Quality".to_string(),
+        is_default: false,
+        language: "en".to_string(),
+        preferred_release_type: "volume".to_string(),
+        source_selection: "smart".to_string(),
+        preferred_sources: vec!["nyaa".to_string()],
+        preferred_uploaders: vec!["Stick".to_string()],
+        min_seeders: 5,
+        prefer_digital: true,
+        trusted_only: true,
+        collection_policy: "smart".to_string(),
+        max_unnecessary_duplicate_coverage: 1,
+        max_acquisition_size_bytes: Some(10 * 1024 * 1024 * 1024),
+        max_plan_size_bytes: Some(50 * 1024 * 1024 * 1024),
+        quality_preference: "best".to_string(),
+        allow_mixed_collections: false,
+        allow_zero_seeders: "no".to_string(),
+        allow_unsupported_editions: false,
+        auto_acquire: false,
+        created_at: 0,
+        updated_at: 0,
+    };
+    db.call(move |conn| crate::acquisition::profiles::create_profile(conn, high_quality)).await.unwrap();
+
+    let fetched_hq = db.call(|conn| crate::acquisition::profiles::get_profile_by_id(conn, "hq")).await.unwrap().unwrap();
+    assert_eq!(fetched_hq.name, "High Quality");
+    assert_eq!(fetched_hq.min_seeders, 5);
+    assert!(fetched_hq.trusted_only);
+
+    // C: Duplicate profile
+    let dup = db.call(|conn| crate::acquisition::profiles::duplicate_profile(conn, "hq", None)).await.unwrap();
+    assert_eq!(dup.name, "High Quality (Copy)");
+    assert_eq!(dup.min_seeders, 5);
+    assert!(!dup.is_default);
+
+    // D: Per-series assignment
+    db.call(|conn| {
+        conn.execute("INSERT INTO manga (id, source_id, url, title, in_library) VALUES (10, 1, '/m10', 'Blue Lock', 1)", [])?;
+        conn.execute("INSERT INTO manga (id, source_id, url, title, in_library) VALUES (20, 1, '/m20', 'Berserk', 1)", [])?;
+        Ok(())
+    }).await.unwrap();
+
+    // Assign 'hq' profile to Blue Lock (id 10), leave Berserk (id 20) with default
+    db.call(|conn| crate::acquisition::profiles::set_manga_profile(conn, 10, Some("hq"))).await.unwrap();
+    let m10_prof = db.call(|conn| crate::acquisition::profiles::get_profile_for_manga(conn, 10)).await.unwrap();
+    let m20_prof = db.call(|conn| crate::acquisition::profiles::get_profile_for_manga(conn, 20)).await.unwrap();
+    assert_eq!(m10_prof.id, "hq");
+    assert_eq!(m20_prof.id, "default");
+
+    // E: Profile change does not acquire
+    db.call(|conn| crate::acquisition::profiles::set_manga_profile(conn, 20, Some("hq"))).await.unwrap();
+    let dl_count: i64 = db.call(|conn| {
+        Ok(conn.query_row("SELECT COUNT(*) FROM downloads", [], |r| r.get(0))?)
+    }).await.unwrap();
+    assert_eq!(dl_count, 0, "Changing profile must NOT trigger an acquisition or download");
+
+    // F-L: Verify constraints and properties in profile model
+    assert_eq!(fetched_hq.preferred_uploaders, vec!["Stick".to_string()]); // F
+    assert_eq!(fetched_hq.min_seeders, 5); // G
+    assert!(fetched_hq.trusted_only); // H
+    assert!(fetched_hq.prefer_digital); // I
+    assert_eq!(fetched_hq.max_acquisition_size_bytes, Some(10 * 1024 * 1024 * 1024)); // J
+    assert_eq!(fetched_hq.language, "en"); // K
+    assert_eq!(fetched_hq.collection_policy, "smart"); // L
+
+    // M: Auto-acquire remains false
+    assert!(!fetched_hq.auto_acquire);
+    let patch = crate::acquisition::profiles::ProfilePatch {
+        auto_acquire: Some(true),
+        ..Default::default()
+    };
+    let updated = db.call(move |conn| crate::acquisition::profiles::update_profile(conn, "hq", patch)).await.unwrap();
+    assert!(!updated.auto_acquire, "auto_acquire must strictly remain false");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+// ====================================================================
+// TEST MATRIX — SECTION 37: MISSING ENGINE (A through I)
+// ====================================================================
+
+#[test]
+fn test_matrix_37_missing_engine_suite() {
+    // A: known 1-39, owned 1-38 -> missing 39
+    let owned_1_38: Vec<(f64, Option<String>)> = (1..=38).map(|n| (n as f64, Some(format!("b_{n}")))).collect();
+    let summary_a = crate::acquisition::missing::calculate_missing_content(
+        1, "Blue Lock", &owned_1_38, &[], Some(39), &[], &[], &[], &[], None, &[],
+    );
+    assert_eq!(summary_a.missing_volumes, vec![39.0]);
+    assert_eq!(summary_a.owned_volumes.len(), 38);
+    assert!(!summary_a.is_fully_owned);
+    assert!(summary_a.has_missing);
+
+    // B: known 1-39, owned all -> fully owned
+    let owned_1_39: Vec<(f64, Option<String>)> = (1..=39).map(|n| (n as f64, Some(format!("b_{n}")))).collect();
+    let summary_b = crate::acquisition::missing::calculate_missing_content(
+        1, "Blue Lock", &owned_1_39, &[], Some(39), &[], &[], &[], &[], None, &[],
+    );
+    assert!(summary_b.missing_volumes.is_empty());
+    assert_eq!(summary_b.owned_volumes.len(), 39);
+    assert!(summary_b.is_fully_owned);
+    assert!(!summary_b.has_missing);
+
+    // C: known 1-39, owned none -> 39 missing
+    let summary_c = crate::acquisition::missing::calculate_missing_content(
+        1, "Blue Lock", &[], &[], Some(39), &[], &[], &[], &[], None, &[],
+    );
+    assert_eq!(summary_c.missing_volumes.len(), 39);
+    assert_eq!(summary_c.owned_volumes.len(), 0);
+    assert!(!summary_c.is_fully_owned);
+
+    // D: unknown v40 is NOT inferred when known is 39
+    assert!(!summary_a.missing_volumes.contains(&40.0));
+    assert_eq!(summary_a.total_known_volumes, 39);
+
+    // E: acquiring unit separated from missing
+    let summary_e = crate::acquisition::missing::calculate_missing_content(
+        1, "Blue Lock", &[(1.0, None), (2.0, None)], &[3.0], Some(4), &[], &[], &[], &[], None, &[],
+    );
+    assert_eq!(summary_e.owned_volumes, vec![1.0, 2.0]);
+    assert_eq!(summary_e.acquiring_volumes, vec![3.0]);
+    assert_eq!(summary_e.missing_volumes, vec![4.0]);
+
+    // F: unavailable unit represented
+    let summary_f = crate::acquisition::missing::calculate_missing_content(
+        1, "Blue Lock", &[(1.0, None)], &[], Some(3), &[], &[2.0], &[], &[], None, &[],
+    );
+    assert_eq!(summary_f.unavailable_volumes, vec![2.0]);
+    assert_eq!(summary_f.missing_volumes, vec![3.0]);
+
+    // G: unknown gaps without authoritative metadata are NOT fabricated as missing
+    let summary_g = crate::acquisition::missing::calculate_missing_content(
+        1, "Special Series", &[(1.0, None), (2.0, None), (4.0, None)], &[], None, &[], &[], &[], &[], None, &[],
+    );
+    // When there is no authoritative total and only v1, v2, v4 are known, v3 is not fabricated as missing
+    assert!(!summary_g.missing_volumes.contains(&3.0));
+
+    // H: canonical volume/chapter distinction preserved
+    let summary_h = crate::acquisition::missing::calculate_missing_content(
+        1, "Mixed", &[(1.0, None)], &[], Some(1), &[], &[], &[1.0, 2.0], &[], Some(3), &[],
+    );
+    assert_eq!(summary_h.owned_volumes.len(), 1);
+    assert_eq!(summary_h.missing_volumes.len(), 0);
+    assert_eq!(summary_h.owned_chapters.len(), 2);
+    assert_eq!(summary_h.missing_chapters, vec![3.0]);
+
+    // I: Edition mismatch does not satisfy ownership
+    // Komga book named "Blue Lock Full Color Selection v01" is an edition variant
+    let (is_variant, _) = crate::acquisition::nyaa::detect_variant("Blue Lock Full Color Selection v01", "Blue Lock");
+    assert!(is_variant, "Variant editions must be flagged as non-canonical");
+}
+
+// ====================================================================
+// TEST MATRIX — SECTION 38: PLANNER (A through O)
+// ====================================================================
+
+#[test]
+fn test_matrix_38_planner_suite() {
+    let profile = crate::acquisition::profiles::AcquisitionProfile::default();
+    let health_map = std::collections::HashMap::new();
+
+    // A: Owned 1-38, Missing 39, standalone 39 vs collection 1-39 -> standalone recommended
+    let missing_a = crate::acquisition::missing::calculate_missing_content(
+        1, "Blue Lock", &(1..=38).map(|n| (n as f64, None)).collect::<Vec<_>>(), &[], Some(39), &[], &[], &[], &[], None, &[],
+    );
+    let rel_v39 = make_test_release("Blue Lock", "Blue Lock v39 (Digital) [Stick]", 12);
+    let cand_v39 = NormalizedAcquisitionCandidate::from_nyaa_candidate("Blue Lock", &AcquisitionCandidate {
+        release: rel_v39,
+        score: 95.0,
+        smart_score: Some(SmartScore { identity: 25.0, coverage: 25.0, quality: 15.0, health: 15.0, freshness: 10.0, efficiency: 10.0, penalties: 0.0, total: 95.0, explanation: "".into(), summary_tag: "BEST MATCH".into() }),
+        match_type: "exact_volume".into(),
+        ownership_status: "not_owned".into(),
+        units_included: vec![39.0],
+        units_owned: vec![],
+        units_missing: vec![39.0],
+        coverage_summary: "Covers 1 missing".into(),
+        useful_efficiency_bytes: Some(300_000_000),
+        is_variant: false,
+        variant_name: None,
+    }, &[], "en");
+
+    let rel_coll = make_test_release_ext("Blue Lock", "Blue Lock v01-39 (Digital)", 24, 15_000_000_000, None);
+    let cand_coll = NormalizedAcquisitionCandidate::from_nyaa_candidate("Blue Lock", &AcquisitionCandidate {
+        release: rel_coll,
+        score: 80.0,
+        smart_score: Some(SmartScore { identity: 25.0, coverage: 10.0, quality: 15.0, health: 15.0, freshness: 10.0, efficiency: 5.0, penalties: -10.0, total: 65.0, explanation: "".into(), summary_tag: "COLLECTION".into() }),
+        match_type: "collection".into(),
+        ownership_status: "partial".into(),
+        units_included: (1..=39).map(|n| n as f64).collect(),
+        units_owned: (1..=38).map(|n| n as f64).collect(),
+        units_missing: vec![39.0],
+        coverage_summary: "Covers 1 missing (38 duplicates)".into(),
+        useful_efficiency_bytes: Some(15_000_000_000),
+        is_variant: false,
+        variant_name: None,
+    }, &[], "en");
+
+    let plan_a = crate::acquisition::planner::generate_plan(
+        1, "Blue Lock", &profile, &missing_a, &[cand_coll.clone(), cand_v39.clone()], &health_map, true,
+    );
+    assert_eq!(plan_a.selected_items.len(), 1);
+    assert_eq!(plan_a.selected_items[0].candidate.provider_release_id, cand_v39.provider_release_id, "Standalone 39 must be chosen over collection 1-39 with 38 duplicates");
+
+    // B: Owned none, Missing 1-30, healthy collection 1-30 -> collection strongly recommended
+    let missing_b = crate::acquisition::missing::calculate_missing_content(
+        2, "Berserk", &[], &[], Some(30), &[], &[], &[], &[], None, &[],
+    );
+    let rel_berserk_coll = make_test_release_ext("Berserk", "Berserk v01-30 (Digital)", 20, 5_000_000_000, None);
+    let cand_berserk_coll = NormalizedAcquisitionCandidate::from_nyaa_candidate("Berserk", &AcquisitionCandidate {
+        release: rel_berserk_coll,
+        score: 95.0,
+        smart_score: None,
+        match_type: "collection".into(),
+        ownership_status: "not_owned".into(),
+        units_included: (1..=30).map(|n| n as f64).collect(),
+        units_owned: vec![],
+        units_missing: (1..=30).map(|n| n as f64).collect(),
+        coverage_summary: "Covers 30 missing".into(),
+        useful_efficiency_bytes: Some(5_000_000_000),
+        is_variant: false,
+        variant_name: None,
+    }, &[], "en");
+    let plan_b = crate::acquisition::planner::generate_plan(
+        2, "Berserk", &profile, &missing_b, &[cand_berserk_coll.clone()], &health_map, true,
+    );
+    assert_eq!(plan_b.selected_items.len(), 1);
+    assert_eq!(plan_b.selected_items[0].units_covered.len(), 30);
+    assert_eq!(plan_b.confidence, "high");
+
+    // C: Owned 1-18, Missing 19-25, collection 19-25 vs 1-25 -> 19-25 recommended
+    let owned_1_18: Vec<(f64, Option<String>)> = (1..=18).map(|n| (n as f64, None)).collect();
+    let missing_c = crate::acquisition::missing::calculate_missing_content(
+        1, "Blue Lock", &owned_1_18, &[], Some(25), &[], &[], &[], &[], None, &[],
+    );
+    let rel_19_25 = make_test_release_ext("Blue Lock", "Blue Lock v19-25 (Digital)", 10, 2_000_000_000, None);
+    let cand_19_25 = NormalizedAcquisitionCandidate::from_nyaa_candidate("Blue Lock", &AcquisitionCandidate {
+        release: rel_19_25,
+        score: 90.0,
+        smart_score: None,
+        match_type: "collection".into(),
+        ownership_status: "not_owned".into(),
+        units_included: (19..=25).map(|n| n as f64).collect(),
+        units_owned: vec![],
+        units_missing: (19..=25).map(|n| n as f64).collect(),
+        coverage_summary: "Covers 7 missing (0 duplicates)".into(),
+        useful_efficiency_bytes: Some(2_000_000_000),
+        is_variant: false,
+        variant_name: None,
+    }, &[], "en");
+    let rel_1_25 = make_test_release_ext("Blue Lock", "Blue Lock v01-25 (Digital)", 15, 8_000_000_000, None);
+    let cand_1_25 = NormalizedAcquisitionCandidate::from_nyaa_candidate("Blue Lock", &AcquisitionCandidate {
+        release: rel_1_25,
+        score: 75.0,
+        smart_score: None,
+        match_type: "collection".into(),
+        ownership_status: "partial".into(),
+        units_included: (1..=25).map(|n| n as f64).collect(),
+        units_owned: (1..=18).map(|n| n as f64).collect(),
+        units_missing: (19..=25).map(|n| n as f64).collect(),
+        coverage_summary: "Covers 7 missing (18 duplicates)".into(),
+        useful_efficiency_bytes: Some(8_000_000_000),
+        is_variant: false,
+        variant_name: None,
+    }, &[], "en");
+    let plan_c = crate::acquisition::planner::generate_plan(
+        1, "Blue Lock", &profile, &missing_c, &[cand_1_25, cand_19_25.clone()], &health_map, true,
+    );
+    assert_eq!(plan_c.selected_items[0].candidate.provider_release_id, cand_19_25.provider_release_id);
+
+    // D: One collection covers 10 missing vs 10 individual releases -> collection preferred
+    let missing_d = crate::acquisition::missing::calculate_missing_content(
+        3, "Series D", &[], &[], Some(10), &[], &[], &[], &[], None, &[],
+    );
+    let rel_coll_10 = make_test_release_ext("Series D", "Series D v01-10", 12, 1_500_000_000, None);
+    let cand_coll_10 = NormalizedAcquisitionCandidate::from_nyaa_candidate("Series D", &AcquisitionCandidate {
+        release: rel_coll_10,
+        score: 85.0,
+        smart_score: None,
+        match_type: "collection".into(),
+        ownership_status: "not_owned".into(),
+        units_included: (1..=10).map(|n| n as f64).collect(),
+        units_owned: vec![],
+        units_missing: (1..=10).map(|n| n as f64).collect(),
+        coverage_summary: "Covers 10 missing".into(),
+        useful_efficiency_bytes: Some(1_500_000_000),
+        is_variant: false,
+        variant_name: None,
+    }, &[], "en");
+    let plan_d = crate::acquisition::planner::generate_plan(
+        3, "Series D", &profile, &missing_d, &[cand_coll_10.clone()], &health_map, true,
+    );
+    assert_eq!(plan_d.selected_items.len(), 1);
+    assert_eq!(plan_d.selected_items[0].units_covered.len(), 10);
+
+    // E: Collection unhealthy (0 seeders), individual releases healthy -> planner chooses individuals
+    let mut unhealthy_coll = cand_coll_10.clone();
+    unhealthy_coll.health.seeders = Some(0);
+    unhealthy_coll.availability = "unhealthy".to_string();
+
+    let indiv_candidates: Vec<NormalizedAcquisitionCandidate> = (1..=10).map(|n| {
+        let rel = make_test_release("Series D", &format!("Series D v{n:02}"), 5);
+        NormalizedAcquisitionCandidate::from_nyaa_candidate("Series D", &AcquisitionCandidate {
+            release: rel,
+            score: 75.0,
+            smart_score: None,
+            match_type: "exact_volume".into(),
+            ownership_status: "not_owned".into(),
+            units_included: vec![n as f64],
+            units_owned: vec![],
+            units_missing: vec![n as f64],
+            coverage_summary: format!("Covers v{n}"),
+            useful_efficiency_bytes: Some(150_000_000),
+            is_variant: false,
+            variant_name: None,
+        }, &[], "en")
+    }).collect();
+
+    let mut pool = indiv_candidates.clone();
+    pool.push(unhealthy_coll);
+
+    let plan_e = crate::acquisition::planner::generate_plan(
+        3, "Series D", &profile, &missing_d, &pool, &health_map, true,
+    );
+    // Unhealthy 0-seeder collection is rejected by profile
+    assert_eq!(plan_e.selected_items.len(), 10);
+    assert_eq!(plan_e.missing_units_covered_count, 10);
+
+    // F: Preferred uploader breaks tie
+    let mut pref_prof = profile.clone();
+    pref_prof.preferred_uploaders = vec!["Stick".to_string()];
+    let rel_u1 = make_test_release("Series F", "Series F v01 [Stick]", 5);
+    let mut cand_u1 = NormalizedAcquisitionCandidate::from_nyaa_candidate("Series F", &AcquisitionCandidate {
+        release: rel_u1,
+        score: 80.0,
+        smart_score: None,
+        match_type: "exact_volume".into(),
+        ownership_status: "not_owned".into(),
+        units_included: vec![1.0],
+        units_owned: vec![],
+        units_missing: vec![1.0],
+        coverage_summary: "v1".into(),
+        useful_efficiency_bytes: Some(100_000_000),
+        is_variant: false,
+        variant_name: None,
+    }, &["Stick".to_string()], "en");
+    cand_u1.uploader = Some("Stick".to_string());
+    cand_u1.quality_signals.is_preferred_uploader = true;
+
+    let rel_u2 = make_test_release("Series F", "Series F v01 [Other]", 5);
+    let mut cand_u2 = NormalizedAcquisitionCandidate::from_nyaa_candidate("Series F", &AcquisitionCandidate {
+        release: rel_u2,
+        score: 80.0,
+        smart_score: None,
+        match_type: "exact_volume".into(),
+        ownership_status: "not_owned".into(),
+        units_included: vec![1.0],
+        units_owned: vec![],
+        units_missing: vec![1.0],
+        coverage_summary: "v1".into(),
+        useful_efficiency_bytes: Some(100_000_000),
+        is_variant: false,
+        variant_name: None,
+    }, &["Stick".to_string()], "en");
+    cand_u2.uploader = Some("Other".to_string());
+    cand_u2.quality_signals.is_preferred_uploader = false;
+
+    let missing_f = crate::acquisition::missing::calculate_missing_content(4, "Series F", &[], &[], Some(1), &[], &[], &[], &[], None, &[]);
+    let plan_f = crate::acquisition::planner::generate_plan(
+        4, "Series F", &pref_prof, &missing_f, &[cand_u2, cand_u1.clone()], &health_map, true,
+    );
+    assert_eq!(plan_f.selected_items[0].candidate.uploader, Some("Stick".to_string()));
+
+    // G: Size constraint changes plan
+    let mut size_prof = profile.clone();
+    size_prof.max_acquisition_size_bytes = Some(500_000_000); // 500 MB limit
+    let big_cand = NormalizedAcquisitionCandidate::from_mangadot_release("Series G", 1.0, "Series G v01 (Raw)", Some(1_200_000_000), "en");
+    let small_cand = NormalizedAcquisitionCandidate::from_mangadot_release("Series G", 1.0, "Series G v01 (Optimized)", Some(300_000_000), "en");
+    let missing_g = crate::acquisition::missing::calculate_missing_content(5, "Series G", &[], &[], Some(1), &[], &[], &[], &[], None, &[]);
+    let plan_g = crate::acquisition::planner::generate_plan(
+        5, "Series G", &size_prof, &missing_g, &[big_cand, small_cand.clone()], &health_map, true,
+    );
+    assert_eq!(plan_g.selected_items[0].candidate.size, Some(300_000_000));
+
+    // H: Wrong edition rejected
+    let mut wrong_edition = cand_v39.clone();
+    wrong_edition.quality_signals.edition_penalty = 30.0;
+    wrong_edition.edition = Some("Full Color Selection".to_string());
+    let plan_h = crate::acquisition::planner::generate_plan(
+        1, "Blue Lock", &profile, &missing_a, &[wrong_edition], &health_map, true,
+    );
+    assert!(plan_h.selected_items.is_empty(), "Unsupported edition variant must be filtered out");
+
+    // I: Source unhealthy lowers recommendation
+    let mut degraded_health_map = std::collections::HashMap::new();
+    degraded_health_map.insert("nyaa".to_string(), "degraded".to_string());
+    let (score_healthy, _, _) = crate::acquisition::planner::score_candidate_for_profile(&cand_v39, &profile, &[39.0], &[], "healthy");
+    let (score_degraded, _, why_low) = crate::acquisition::planner::score_candidate_for_profile(&cand_v39, &profile, &[39.0], &[], "degraded");
+    assert!(score_degraded < score_healthy);
+    assert!(why_low.iter().any(|s| s.contains("degraded")));
+
+    // J: No candidates -> draft plan, not error
+    let plan_j = crate::acquisition::planner::generate_plan(
+        1, "Blue Lock", &profile, &missing_a, &[], &health_map, true,
+    );
+    assert_eq!(plan_j.state, "draft");
+    assert!(plan_j.selected_items.is_empty());
+    assert!(plan_j.stale_reason.is_some());
+
+    // K: Ambiguous candidate -> review recommended
+    let mut ambig_cand = cand_v39.clone();
+    ambig_cand.confidence = "review_recommended".to_string();
+    let plan_k = crate::acquisition::planner::generate_plan(
+        1, "Blue Lock", &profile, &missing_a, &[ambig_cand], &health_map, true,
+    );
+    assert_eq!(plan_k.confidence, "review_recommended");
+
+    // O: Same inputs produce deterministic plan
+    let plan_o1 = crate::acquisition::planner::generate_plan(
+        1, "Blue Lock", &profile, &missing_a, &[cand_coll.clone(), cand_v39.clone()], &health_map, true,
+    );
+    let plan_o2 = crate::acquisition::planner::generate_plan(
+        1, "Blue Lock", &profile, &missing_a, &[cand_coll.clone(), cand_v39.clone()], &health_map, true,
+    );
+    assert_eq!(plan_o1.selected_items[0].candidate.provider_release_id, plan_o2.selected_items[0].candidate.provider_release_id);
+    assert_eq!(plan_o1.total_estimated_size, plan_o2.total_estimated_size);
+}
+
+// ====================================================================
+// TEST MATRIX — SECTION 39: CROSS PROVIDER COMPARISON
+// ====================================================================
+
+#[test]
+fn test_matrix_39_cross_provider_comparison() {
+    let profile = crate::acquisition::profiles::AcquisitionProfile::default();
+    let health_map = std::collections::HashMap::new();
+
+    // Volume 39 is missing for Blue Lock
+    let missing = crate::acquisition::missing::calculate_missing_content(
+        1, "Blue Lock", &(1..=38).map(|n| (n as f64, None)).collect::<Vec<_>>(), &[], Some(39), &[], &[], &[], &[], None, &[],
+    );
+
+    // Candidate 1: Nyaa standalone Volume 39 (Digital CBZ, 312 MiB, 12 seeders)
+    let nyaa_rel = make_test_release_ext("Blue Lock", "Blue Lock v39 (Digital) [Stick]", 12, 312 * 1024 * 1024, None);
+    let nyaa_cand = NormalizedAcquisitionCandidate::from_nyaa_candidate("Blue Lock", &AcquisitionCandidate {
+        release: nyaa_rel,
+        score: 95.0,
+        smart_score: None,
+        match_type: "exact_volume".into(),
+        ownership_status: "not_owned".into(),
+        units_included: vec![39.0],
+        units_owned: vec![],
+        units_missing: vec![39.0],
+        coverage_summary: "Covers Volume 39".into(),
+        useful_efficiency_bytes: Some(312 * 1024 * 1024),
+        is_variant: false,
+        variant_name: None,
+    }, &[], "en");
+
+    // Candidate 2: MangaDot Volume 39 (Page stream, direct volume release)
+    let md_cand = NormalizedAcquisitionCandidate::from_mangadot_release("Blue Lock", 39.0, "Blue Lock Vol. 39", Some(150 * 1024 * 1024), "en");
+
+    // Candidate 3: Nyaa Collection 01-39 (15.3 GiB, 38 duplicate volumes)
+    let nyaa_coll_rel = make_test_release_ext("Blue Lock", "Blue Lock v01-39 (Digital)", 24, 15_300_000_000, None);
+    let nyaa_coll_cand = NormalizedAcquisitionCandidate::from_nyaa_candidate("Blue Lock", &AcquisitionCandidate {
+        release: nyaa_coll_rel,
+        score: 65.0,
+        smart_score: None,
+        match_type: "collection".into(),
+        ownership_status: "partial".into(),
+        units_included: (1..=39).map(|n| n as f64).collect(),
+        units_owned: (1..=38).map(|n| n as f64).collect(),
+        units_missing: vec![39.0],
+        coverage_summary: "Covers Volume 39 (38 duplicates)".into(),
+        useful_efficiency_bytes: Some(15_300_000_000),
+        is_variant: false,
+        variant_name: None,
+    }, &[], "en");
+
+    let plan = crate::acquisition::planner::generate_plan(
+        1, "Blue Lock", &profile, &missing, &[nyaa_cand.clone(), md_cand.clone(), nyaa_coll_cand.clone()], &health_map, true,
+    );
+
+    // Recommended plan selects the highest quality standalone option
+    assert_eq!(plan.selected_items.len(), 1);
+    assert_eq!(plan.selected_items[0].candidate.provider, "nyaa");
+    assert_eq!(plan.selected_items[0].candidate.release_number, Some(39.0));
+
+    // MangaDot is present as a viable fallback alternative!
+    assert!(plan.alternatives.iter().any(|a| a.provider == "mangadot" && a.release_number == Some(39.0)), "MangaDot must be compared and included as a fallback candidate");
+
+    // Explanations are clear and provider differences are visible
+    assert!(plan.selected_items[0].explanation.why_recommended.iter().any(|r| r.contains("Digital")));
+}
+
+// ====================================================================
+// TEST MATRIX — SECTION 40: DRY RUN PROOF
+// ====================================================================
+
+#[tokio::test]
+async fn test_matrix_40_dry_run_zero_side_effects() {
+    let temp_dir = std::env::temp_dir().join(format!("mango_test_dryrun_{}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    fs::create_dir_all(&temp_dir).unwrap();
+    let db_path = temp_dir.join("test.db");
+    let db = Db::open(&db_path).unwrap();
+
+    // Setup title in database
+    db.call(|conn| {
+        conn.execute("INSERT INTO manga (id, source_id, url, title, in_library) VALUES (1, 1, '/bl', 'Blue Lock', 1)", [])?;
+        conn.execute("INSERT INTO tracker_list_entries (tracker, tracker_id, title, status, normalized_status, updated_at, total_volumes) VALUES ('anilist', '106110', 'Blue Lock', 'CURRENT', 'reading', 100, 39)", [])?;
+        for v in 1..=38 {
+            conn.execute("INSERT INTO chapters (id, manga_id, url, name, chapter_number, scanlator, source_order, fetched_at) VALUES (?1, 1, ?2, ?3, ?1, 'Stick', ?1, 100)", rusqlite::params![v, format!("/c{v}"), format!("Volume {v}")])?;
+        }
+        Ok(())
+    }).await.unwrap();
+
+    let svc = AcquisitionService::new(db.clone(), reqwest::Client::new(), None, None);
+
+    // Execute dry-run plan
+    let plan = svc.plan_title_missing_content(1, true).await.unwrap();
+    assert!(plan.is_dry_run);
+    assert!(!plan.missing_units.is_empty());
+    assert!(plan.total_acquisitions_count > 0, "Dry-run plan details what would be acquired without acquiring");
+
+    // PROVE:
+    // 1. Zero download queue records
+    let dl_count: i64 = db.call(|conn| Ok(conn.query_row("SELECT COUNT(*) FROM downloads", [], |r| r.get(0))?)).await.unwrap();
+    assert_eq!(dl_count, 0, "Dry run must NOT insert any download records");
+
+    // 2. Zero acquisition history records
+    let hist_count: i64 = db.call(|conn| Ok(conn.query_row("SELECT COUNT(*) FROM acquisition_history", [], |r| r.get(0))?)).await.unwrap();
+    assert_eq!(hist_count, 0, "Dry run must NOT record any completed acquisition history");
+
+    // 3. Zero acquisition plan records in database (because dry_run = true)
+    let plan_count: i64 = db.call(|conn| Ok(conn.query_row("SELECT COUNT(*) FROM acquisition_plans", [], |r| r.get(0))?)).await.unwrap();
+    assert_eq!(plan_count, 0, "Dry run must NOT persist executable plans");
+
+    // 4. Zero modifications to files in test directory
+    let files_in_dir = fs::read_dir(&temp_dir).unwrap().count();
+    // Only SQLite database files exist
+    assert!(files_in_dir <= 3, "No canonical media or downloaded archives written");
+
+    let _ = fs::remove_dir_all(&temp_dir);
 }

@@ -7,6 +7,16 @@
     acquireRelease,
     acquireCollection,
     inspectCollection,
+    getTitleProfile,
+    setTitleProfile,
+    getAcquisitionProfiles,
+    getTitleMissingContent,
+    planTitleMissingContent,
+    getTitlePlan,
+    type AcquisitionProfile,
+    type MissingContentSummary,
+    type AcquisitionPlan,
+    type AcquisitionPlanItem,
     type AcquisitionCandidate,
     type AcquisitionRelease,
     type CollectionInspection,
@@ -150,6 +160,7 @@
   async function loadOwnership() {
     try {
       ownership = await get<TitleOwnership>(`/manga/${id}/ownership`);
+      loadMissingAndProfile();
     } catch {
       ownership = null;
     }
@@ -159,11 +170,171 @@
     refreshingOwnership = true;
     try {
       ownership = await send<TitleOwnership>('POST', `/manga/${id}/refresh-ownership`);
+      loadMissingAndProfile();
       toast.success('Ownership refreshed from Komga');
     } catch (e) {
       toast.error(`Ownership refresh failed: ${message(e)}`);
     } finally {
       refreshingOwnership = false;
+    }
+  }
+
+  // ---------- Missing Content & Acquisition Planning ----------
+  let currentProfile = $state<AcquisitionProfile | null>(null);
+  let availableProfiles = $state<AcquisitionProfile[]>([]);
+  let missingContent = $state<MissingContentSummary | null>(null);
+  let loadingMissing = $state(false);
+
+  // Plan Modal state
+  let planModalOpen = $state(false);
+  let currentPlan = $state<AcquisitionPlan | null>(null);
+  let planLoading = $state(false);
+  let planError = $state<string | null>(null);
+  let showAlternatives = $state(false);
+  let selectedPlanItemIds = $state<Record<string, boolean>>({});
+  let acquiringPlanLoading = $state(false);
+
+  async function loadMissingAndProfile() {
+    loadingMissing = true;
+    try {
+      const [miss, prof, allProfs] = await Promise.all([
+        getTitleMissingContent(id).catch(() => null),
+        getTitleProfile(id).catch(() => null),
+        getAcquisitionProfiles().catch(() => []),
+      ]);
+      missingContent = miss;
+      currentProfile = prof;
+      availableProfiles = allProfs;
+    } finally {
+      loadingMissing = false;
+    }
+  }
+
+  async function handleProfileChange(newProfileId: string) {
+    try {
+      const updated = await setTitleProfile(id, newProfileId || null);
+      currentProfile = updated;
+      toast.success(`Acquisition profile set to "${updated.name}"`);
+    } catch (e) {
+      toast.error(message(e));
+    }
+  }
+
+  async function openPlanModal(dryRun: boolean = true) {
+    planModalOpen = true;
+    planLoading = true;
+    planError = null;
+    showAlternatives = false;
+    selectedPlanItemIds = {};
+    try {
+      const plan = await planTitleMissingContent(id, dryRun);
+      currentPlan = plan;
+      for (const item of plan.selectedItems) {
+        selectedPlanItemIds[item.candidate.providerReleaseId] = true;
+      }
+    } catch (e) {
+      planError = message(e);
+    } finally {
+      planLoading = false;
+    }
+  }
+
+  async function handleSavePlan() {
+    if (!currentPlan) return;
+    try {
+      const saved = await planTitleMissingContent(id, false);
+      currentPlan = saved;
+      toast.success('Acquisition plan saved');
+    } catch (e) {
+      toast.error(message(e));
+    }
+  }
+
+  async function handleAcquirePlanSelected() {
+    if (!currentPlan) return;
+    const selected = currentPlan.selectedItems.filter((i) => selectedPlanItemIds[i.candidate.providerReleaseId]);
+    if (selected.length === 0) {
+      toast.error('No plan releases selected for acquisition');
+      return;
+    }
+
+    acquiringPlanLoading = true;
+    try {
+      let count = 0;
+      for (const item of selected) {
+        const cand = item.candidate;
+        if (cand.releaseUnit.type === 'collection') {
+          await acquireCollection(id, {
+            release: {
+              source: cand.provider,
+              sourceItemId: cand.providerReleaseId,
+              title: cand.title,
+              rawTitle: cand.title,
+              uploader: cand.uploader ?? null,
+              sourceUrl: cand.providerMetadata?.sourceUrl ?? '',
+              torrentUrl: null,
+              magnetUrl: null,
+              infoHash: cand.providerMetadata?.torrentHash ?? null,
+              categoryId: null,
+              categoryName: null,
+              sizeBytes: cand.size ?? 0,
+              sizeFormatted: `${Math.round((cand.size ?? 0) / (1024 * 1024))} MiB`,
+              seeders: cand.health.seeders ?? 0,
+              leechers: cand.health.leechers ?? 0,
+              publishedAt: cand.publishedAt ?? null,
+              isTrusted: cand.qualitySignals.isTrusted,
+              isRemake: false,
+              isVariant: cand.qualitySignals.editionPenalty > 0,
+              variantName: cand.edition ?? null,
+              isMixed: false,
+              releaseUnit: cand.releaseUnit,
+              releaseNumber: cand.releaseNumber ?? null,
+              releaseRange: cand.releaseRange ?? null,
+              language: cand.language || 'en',
+            } as any,
+            selectedVolumes: item.unitsCovered,
+            mode: 'missing_only',
+          });
+          count += item.unitsCovered.length;
+        } else {
+          await acquireRelease(id, {
+            source: cand.provider,
+            sourceItemId: cand.providerReleaseId,
+            title: cand.title,
+            rawTitle: cand.title,
+            uploader: cand.uploader ?? null,
+            sourceUrl: cand.providerMetadata?.sourceUrl ?? '',
+            torrentUrl: null,
+            magnetUrl: null,
+            infoHash: cand.providerMetadata?.torrentHash ?? null,
+            categoryId: null,
+            categoryName: null,
+            sizeBytes: cand.size ?? 0,
+            sizeFormatted: `${Math.round((cand.size ?? 0) / (1024 * 1024))} MiB`,
+            seeders: cand.health.seeders ?? 0,
+            leechers: cand.health.leechers ?? 0,
+            publishedAt: cand.publishedAt ?? null,
+            isTrusted: cand.qualitySignals.isTrusted,
+            isRemake: false,
+            isVariant: cand.qualitySignals.editionPenalty > 0,
+            variantName: cand.edition ?? null,
+            isMixed: false,
+            releaseUnit: cand.releaseUnit,
+            releaseNumber: cand.releaseNumber ?? null,
+            releaseRange: cand.releaseRange ?? null,
+            language: cand.language || 'en',
+          } as any);
+          count += 1;
+        }
+      }
+      toast.success(`Queued ${count} releases/units for acquisition!`);
+      planModalOpen = false;
+      refreshOwnership();
+      loadMissingAndProfile();
+    } catch (e) {
+      toast.error(message(e));
+    } finally {
+      acquiringPlanLoading = false;
     }
   }
 
@@ -855,6 +1026,49 @@
                 {/if}
               </div>
             {/if}
+
+            <!-- Missing Content & Acquisition Overview -->
+            {#if missingContent}
+              <div class="missing-content-overview-row">
+                <div class="missing-status-line">
+                  {#if missingContent.hasMissing}
+                    <span class="tag warn" style="font-weight: 700;">
+                      MISSING: {missingContent.missingVolumes.length === 1 ? `Volume ${missingContent.missingVolumes[0]}` : `v${formatVolumeRanges(missingContent.missingVolumes)}`}
+                    </span>
+                  {:else if missingContent.isFullyOwned}
+                    <span class="tag spot">FULLY OWNED IN KOMGA</span>
+                  {/if}
+                  {#if missingContent.acquiringVolumes.length > 0}
+                    <span class="tag">ACQUIRING: v{formatVolumeRanges(missingContent.acquiringVolumes)}</span>
+                  {/if}
+                </div>
+
+                <div class="planner-actions-row">
+                  {#if missingContent.hasMissing}
+                    <button class="btn spot pill icon-text" onclick={() => openPlanModal(true)} disabled={planLoading}>
+                      <Icon name="puzzle" size={14} /> Plan Missing Volumes
+                    </button>
+                  {/if}
+                  <button class="btn pill icon-text" onclick={() => searchNyaa()} disabled={loadingNyaa}>
+                    <Icon name="search" size={14} /> Find Best Release
+                  </button>
+                </div>
+              </div>
+            {/if}
+
+            <!-- Profile selector dropdown -->
+            <div class="title-profile-row">
+              <span class="detail-k">Acquisition Profile:</span>
+              <select
+                class="input select-compact"
+                value={currentProfile?.id ?? 'default'}
+                onchange={(e) => handleProfileChange((e.target as HTMLSelectElement).value)}
+              >
+                {#each availableProfiles as prof (prof.id)}
+                  <option value={prof.id}>{prof.name}{prof.isDefault ? ' (Default)' : ''}</option>
+                {/each}
+              </select>
+            </div>
           </div>
         {/if}
 
@@ -1487,6 +1701,165 @@
             } Volumes via TorBox
           {/if}
         </button>
+      </div>
+    </div>
+  </div>
+{/if}
+
+{#if planModalOpen}
+  <!-- svelte-ignore a11y_click_events_have_key_events -->
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <div class="modal-backdrop" onclick={() => (planModalOpen = false)}>
+    <div class="modal-content plan-modal" onclick={(e) => e.stopPropagation()}>
+      <div class="modal-header">
+        <div>
+          <h3>Plan Missing Content: {title.title}</h3>
+          <span class="muted">Profile: <strong>{currentPlan?.profileName ?? currentProfile?.name ?? 'Default Manga'}</strong></span>
+        </div>
+        <button class="btn icon close-btn" onclick={() => (planModalOpen = false)} aria-label="Close">
+          <Icon name="close" size={18} />
+        </button>
+      </div>
+
+      <div class="modal-body">
+        {#if planLoading}
+          <div class="nyaa-loading-box">
+            <span class="spin"><Icon name="spinner" size={24} stroke={3} /></span>
+            Evaluating candidates across providers & optimizing plan…
+          </div>
+        {:else if planError}
+          <Notice error={planError} retry={() => openPlanModal(true)} />
+        {:else if currentPlan}
+          <!-- Plan Confidence & Status Banner -->
+          <div class="plan-header-banner">
+            <div class="plan-status-badges">
+              <span class="tag {currentPlan.confidence === 'high' ? 'spot' : 'warn'}" style="font-weight: 700;">
+                {currentPlan.confidence === 'high' ? 'HIGH CONFIDENCE' : 'REVIEW RECOMMENDED'}
+              </span>
+              <span class="tag">
+                {currentPlan.missingUnitsCoveredCount} / {currentPlan.missingUnits.length} Missing Volumes Covered
+              </span>
+              {#if currentPlan.totalEstimatedSize > 0}
+                <span class="tag">
+                  Est. Retrieval: {(currentPlan.totalEstimatedSize / (1024 * 1024 * 1024)).toFixed(2)} GiB
+                </span>
+              {/if}
+              <span class="tag spot">DRY RUN PREVIEW</span>
+            </div>
+
+            {#if currentPlan.staleReason}
+              <div class="plan-stale-notice">
+                <Icon name="info" size={16} />
+                <span>{currentPlan.staleReason}</span>
+              </div>
+            {/if}
+          </div>
+
+          <!-- Recommended Acquisitions -->
+          <h4 style="margin-top: 1rem; margin-bottom: 0.5rem;">Recommended Plan</h4>
+          {#if currentPlan.selectedItems.length === 0}
+            <p class="muted">No viable releases found for the missing units with current profile preferences.</p>
+          {:else}
+            <div class="plan-items-list">
+              {#each currentPlan.selectedItems as item (item.candidate.providerReleaseId)}
+                <div class="plan-candidate-card recommended">
+                  <div class="plan-candidate-header">
+                    <label class="candidate-checkbox-label">
+                      <input
+                        type="checkbox"
+                        checked={selectedPlanItemIds[item.candidate.providerReleaseId]}
+                        onchange={(e) => {
+                          selectedPlanItemIds[item.candidate.providerReleaseId] = (e.target as HTMLInputElement).checked;
+                        }}
+                      />
+                      <strong class="candidate-title">{item.candidate.title}</strong>
+                    </label>
+                    <span class="tag spot">{item.candidate.provider.toUpperCase()}</span>
+                  </div>
+
+                  <div class="candidate-meta-row">
+                    {#if item.candidate.uploader}
+                      <span>Uploader: <strong>{item.candidate.uploader}</strong></span>
+                    {/if}
+                    {#if item.candidate.format}
+                      <span>Format: <strong>{item.candidate.format}</strong></span>
+                    {/if}
+                    {#if item.candidate.size}
+                      <span>Size: <strong>{Math.round(item.candidate.size / (1024 * 1024))} MiB</strong></span>
+                    {/if}
+                    {#if item.candidate.health.seeders !== null && item.candidate.health.seeders !== undefined}
+                      <span>Seeders: <strong>{item.candidate.health.seeders}</strong></span>
+                    {/if}
+                    <span>Smart Score: <strong>{item.candidate.score.toFixed(0)}</strong></span>
+                  </div>
+
+                  <!-- Explanations -->
+                  <div class="candidate-explanations-box">
+                    {#each item.explanation.whyRecommended as why}
+                      <div class="why-rec-line">{why}</div>
+                    {/each}
+                    {#each item.explanation.whyLower as why}
+                      <div class="why-low-line">{why}</div>
+                    {/each}
+                  </div>
+                </div>
+              {/each}
+            </div>
+          {/if}
+
+          <!-- Alternatives (Collapsible) -->
+          {#if currentPlan.alternatives.length > 0}
+            <div class="alternatives-toggle-row">
+              <button class="btn pill icon-text" onclick={() => (showAlternatives = !showAlternatives)}>
+                <Icon name={showAlternatives ? 'chevron-up' : 'chevron-down'} size={14} />
+                {showAlternatives ? 'Hide' : 'Show'} Alternative Candidates ({currentPlan.alternatives.length})
+              </button>
+            </div>
+
+            {#if showAlternatives}
+              <div class="alternatives-list">
+                {#each currentPlan.alternatives as alt (alt.providerReleaseId)}
+                  <div class="plan-candidate-card alternative">
+                    <div class="plan-candidate-header">
+                      <span class="candidate-title">{alt.title}</span>
+                      <span class="tag">{alt.provider.toUpperCase()}</span>
+                    </div>
+                    <div class="candidate-meta-row">
+                      {#if alt.uploader}<span>Uploader: <strong>{alt.uploader}</strong></span>{/if}
+                      {#if alt.size}<span>Size: <strong>{Math.round(alt.size / (1024 * 1024))} MiB</strong></span>{/if}
+                      {#if alt.health.seeders !== null && alt.health.seeders !== undefined}
+                        <span>Seeders: <strong>{alt.health.seeders}</strong></span>
+                      {/if}
+                      <span>Smart Score: <strong>{alt.score.toFixed(0)}</strong></span>
+                    </div>
+                  </div>
+                {/each}
+              </div>
+            {/if}
+          {/if}
+
+          <!-- Dry-run Safety Explainer -->
+          <div class="dry-run-safety-box">
+            <Icon name="check" size={16} />
+            <div>
+              <strong>Dry Run Mode:</strong>
+              <span>No external jobs created. No TorBox submission. No files modified. Execution remains explicitly manual.</span>
+            </div>
+          </div>
+        {/if}
+      </div>
+
+      <div class="modal-footer">
+        <button class="btn" onclick={() => (planModalOpen = false)}>Close</button>
+        {#if currentPlan && currentPlan.selectedItems.length > 0}
+          <button class="btn" onclick={handleSavePlan}>
+            <Icon name="bookmark" size={14} /> Save Plan
+          </button>
+          <button class="btn spot" onclick={handleAcquirePlanSelected} disabled={acquiringPlanLoading}>
+            <Icon name="download" size={14} />
+            {acquiringPlanLoading ? 'Submitting…' : 'Acquire Selected'}
+          </button>
+        {/if}
       </div>
     </div>
   </div>
@@ -2345,5 +2718,145 @@
     .site-label {
       display: none;
     }
+  }
+
+  /* Missing content overview & profile row */
+  .missing-content-overview-row {
+    margin-top: 0.75rem;
+    padding-top: 0.75rem;
+    border-top: 1px dashed var(--border-color, rgba(255, 255, 255, 0.15));
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    align-items: center;
+    gap: 0.75rem;
+  }
+
+  .missing-status-line {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+  }
+
+  .planner-actions-row {
+    display: flex;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+  }
+
+  .title-profile-row {
+    margin-top: 0.5rem;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.85rem;
+  }
+
+  /* Plan Modal */
+  .plan-modal {
+    max-width: 680px;
+  }
+
+  .plan-header-banner {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    padding-bottom: 0.75rem;
+    border-bottom: 1px solid var(--border-color, rgba(255, 255, 255, 0.1));
+  }
+
+  .plan-status-badges {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+  }
+
+  .plan-stale-notice {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    color: var(--spot, #ff7a00);
+    font-size: 0.82rem;
+  }
+
+  .plan-items-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+  }
+
+  .plan-candidate-card {
+    background: var(--card-bg, rgba(255, 255, 255, 0.03));
+    border: 1px solid var(--border-color, rgba(255, 255, 255, 0.1));
+    border-radius: 8px;
+    padding: 0.85rem 1rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+
+  .plan-candidate-card.recommended {
+    border-color: var(--spot, #ff7a00);
+  }
+
+  .plan-candidate-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+
+  .candidate-checkbox-label {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    cursor: pointer;
+  }
+
+  .candidate-meta-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 1rem;
+    font-size: 0.82rem;
+    color: var(--muted, #888);
+  }
+
+  .candidate-explanations-box {
+    margin-top: 0.35rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+    font-size: 0.8rem;
+  }
+
+  .why-rec-line {
+    color: #4ade80;
+  }
+
+  .why-low-line {
+    color: #f87171;
+  }
+
+  .alternatives-toggle-row {
+    margin-top: 0.75rem;
+  }
+
+  .alternatives-list {
+    margin-top: 0.5rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+
+  .dry-run-safety-box {
+    margin-top: 1rem;
+    display: flex;
+    align-items: flex-start;
+    gap: 0.75rem;
+    padding: 0.75rem 1rem;
+    background: rgba(255, 122, 0, 0.08);
+    border: 1px solid rgba(255, 122, 0, 0.25);
+    border-radius: 6px;
+    font-size: 0.82rem;
   }
 </style>
