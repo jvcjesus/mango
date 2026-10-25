@@ -404,6 +404,7 @@ export interface PipelineConfig {
   optimizer_status?: OptimizerValidationResult | null;
   bundled_optimizer_present?: boolean;
   resolved_optimizer_bin?: string | null;
+  mangabaka_validated?: boolean | null;
 }
 
 export interface PipelineEvent {

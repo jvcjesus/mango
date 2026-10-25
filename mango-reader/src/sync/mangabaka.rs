@@ -137,6 +137,8 @@ pub async fn sync_series_to_mangabaka(
             let category = if status == 401 || status == 403 || err.code == "mangabaka_unauthorized"
             {
                 SyncResultCategory::AuthError
+            } else if status == 429 || err.code == "mangabaka_rate_limited" {
+                SyncResultCategory::RateLimited
             } else if status == 502 || err.code == "mangabaka_network_error" {
                 SyncResultCategory::NetworkError
             } else {
@@ -284,6 +286,8 @@ pub async fn sync_series_to_mangabaka(
         let status = err.status.as_u16();
         let category = if status == 401 || status == 403 || err.code == "mangabaka_unauthorized" {
             SyncResultCategory::AuthError
+        } else if status == 429 || err.code == "mangabaka_rate_limited" {
+            SyncResultCategory::RateLimited
         } else if status == 502 || err.code == "mangabaka_network_error" {
             SyncResultCategory::NetworkError
         } else {

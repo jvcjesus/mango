@@ -329,6 +329,23 @@ struct MockMangaBakaState {
     last_patch_body: Arc<Mutex<Option<serde_json::Value>>>,
 }
 
+fn check_simultaneous_auth(headers: &HeaderMap) -> Option<axum::response::Response> {
+    if headers.contains_key("authorization") && headers.contains_key("x-api-key") {
+        return Some(
+            (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "message": "Cannot use both Authorization and x-api-key headers simultaneously",
+                    "status": 400,
+                    "code": null
+                })),
+            )
+                .into_response(),
+        );
+    }
+    None
+}
+
 async fn start_mock_mangabaka(
     initial_entries: Vec<(i64, Option<f64>, Option<f64>, String)>,
 ) -> (String, MockMangaBakaState) {
@@ -346,7 +363,10 @@ async fn start_mock_mangabaka(
     let app = Router::new()
         .route(
             "/source/anilist/{id}",
-            get(|Path(id): Path<String>| async move {
+            get(|headers: HeaderMap, Path(id): Path<String>| async move {
+                if let Some(err) = check_simultaneous_auth(&headers) {
+                    return err;
+                }
                 if id == "101" {
                     (
                         StatusCode::OK,
@@ -370,6 +390,9 @@ async fn start_mock_mangabaka(
                 move |headers: HeaderMap, Path(id): Path<String>| {
                     let state = state.clone();
                     async move {
+                        if let Some(err) = check_simultaneous_auth(&headers) {
+                            return err;
+                        }
                         let token = headers.get("x-api-key").and_then(|v| v.to_str().ok());
                         if token == Some("invalid-token") {
                             return StatusCode::UNAUTHORIZED.into_response();
@@ -409,6 +432,9 @@ async fn start_mock_mangabaka(
                       Json(body): Json<serde_json::Value>| {
                     let state = state.clone();
                     async move {
+                        if let Some(err) = check_simultaneous_auth(&headers) {
+                            return err;
+                        }
                         state.patch_calls.fetch_add(1, Ordering::SeqCst);
                         *state.last_patch_body.lock().unwrap() = Some(body.clone());
 
@@ -462,9 +488,27 @@ async fn start_mock_mangabaka(
         .route(
             "/series/search",
             get(
-                |axum::extract::Query(params): axum::extract::Query<
+                |headers: HeaderMap,
+                 axum::extract::Query(params): axum::extract::Query<
                     std::collections::HashMap<String, String>,
                 >| async move {
+                    if let Some(err) = check_simultaneous_auth(&headers) {
+                        return err;
+                    }
+                    let token = headers.get("x-api-key").and_then(|v| v.to_str().ok());
+                    if token == Some("invalid-token") {
+                        return StatusCode::UNAUTHORIZED.into_response();
+                    }
+                    if token == Some("bad-request-token") {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "message": "Parameter rejected by MangaBaka API",
+                                "status": 400
+                            })),
+                        )
+                            .into_response();
+                    }
                     let q = params
                         .get("query")
                         .or_else(|| params.get("q"))
@@ -513,7 +557,10 @@ async fn start_mock_mangabaka(
         )
         .route(
             "/series/{id}/collections",
-            get(|Path(_id): Path<String>| async move {
+            get(|headers: HeaderMap, Path(_id): Path<String>| async move {
+                if let Some(err) = check_simultaneous_auth(&headers) {
+                    return err;
+                }
                 (
                     StatusCode::OK,
                     Json(serde_json::json!({
@@ -1742,6 +1789,164 @@ async fn test_pandora_hearts_real_world_validation() {
     // Zero mutations performed
     assert_eq!(state.patch_calls.load(Ordering::SeqCst), 0);
     assert_eq!(state.post_calls.load(Ordering::SeqCst), 0);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn test_mangabaka_never_sends_simultaneous_auth_headers() {
+    let (url, _state) = start_mock_mangabaka(vec![(202, Some(5.0), None, "reading".into())]).await;
+    let client = MangaBakaClient::new(
+        reqwest::Client::new(),
+        Some(url.clone()),
+        Some("valid-token".into()),
+    );
+
+    // 1. Connection validation: must succeed without mutual auth rejection
+    let conn_res = client.test_connection().await;
+    assert!(
+        conn_res.is_ok(),
+        "test_connection must succeed with valid token: {conn_res:?}"
+    );
+
+    // 2. Series search: must succeed without mutual auth rejection
+    let search_res = client.match_series("Berserk").await.unwrap();
+    assert!(matches!(
+        search_res,
+        crate::pipeline::mangabaka::MangaBakaSeriesMatch::Found { id: 202, .. }
+    ));
+
+    // 3. AniList cross-reference: must succeed without mutual auth rejection
+    let xref_res = client.resolve_from_anilist(101).await.unwrap();
+    assert!(xref_res.is_some());
+    assert_eq!(xref_res.unwrap().mangabaka_id, 202);
+
+    // 4. Library entry read: must succeed without mutual auth rejection
+    let lib_res = client.get_my_library_entry(202).await.unwrap();
+    assert!(lib_res.is_some());
+    assert_eq!(lib_res.unwrap().progress_volume, Some(5.0));
+
+    // 5. Library progress update (PATCH): must succeed without mutual auth rejection
+    let update_res = client
+        .update_my_library_progress(202, Some(6.0), None)
+        .await;
+    assert!(
+        update_res.is_ok(),
+        "update_my_library_progress must succeed with valid token: {update_res:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_mangabaka_mock_server_rejects_simultaneous_auth() {
+    let (url, _state) = start_mock_mangabaka(vec![]).await;
+    let http = reqwest::Client::new();
+
+    // Directly send a request with BOTH Authorization and x-api-key headers
+    let resp = http
+        .get(format!("{url}/series/search?query=Berserk"))
+        .header("Authorization", "Bearer test-token")
+        .header("x-api-key", "test-token")
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(
+        body.get("message").and_then(|v| v.as_str()),
+        Some("Cannot use both Authorization and x-api-key headers simultaneously")
+    );
+}
+
+#[tokio::test]
+async fn test_mangabaka_validate_connection_handles_400_and_401() {
+    let (url, _state) = start_mock_mangabaka(vec![]).await;
+
+    // 1. Valid token succeeds
+    let valid_client = MangaBakaClient::new(
+        reqwest::Client::new(),
+        Some(url.clone()),
+        Some("valid-token".into()),
+    );
+    let res = valid_client.test_connection().await;
+    assert!(res.is_ok(), "Valid token must succeed");
+    assert!(res.unwrap().contains("successful"));
+
+    // 2. HTTP 401: Invalid token classified as mangabaka_unauthorized
+    let invalid_client = MangaBakaClient::new(
+        reqwest::Client::new(),
+        Some(url.clone()),
+        Some("invalid-token".into()),
+    );
+    let err401 = invalid_client.test_connection().await.unwrap_err();
+    assert_eq!(err401.code, "mangabaka_unauthorized");
+    assert_eq!(err401.status.as_u16(), 401);
+
+    // 3. HTTP 400: Bad request parameter classified as mangabaka_bad_request, NOT unauthorized
+    let bad_client = MangaBakaClient::new(
+        reqwest::Client::new(),
+        Some(url.clone()),
+        Some("bad-request-token".into()),
+    );
+    let err400 = bad_client.test_connection().await.unwrap_err();
+    assert_eq!(err400.code, "mangabaka_bad_request");
+    assert_eq!(err400.status.as_u16(), 400);
+    assert!(
+        err400
+            .message
+            .contains("Parameter rejected by MangaBaka API")
+    );
+}
+
+#[tokio::test]
+async fn test_mangabaka_status_presentation_distinguishes_token_from_validation() {
+    let dir = std::env::temp_dir().join(format!("mango-mb-status-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = Db::open(&dir.join("test.db")).expect("test db");
+
+    let pipeline = crate::pipeline::Pipeline::new(db.clone());
+
+    // Initial state: no token configured, mangabaka_validated is None
+    let cfg0 = pipeline.load_config().await.unwrap();
+    assert!(!cfg0.has_mangabaka_token);
+    assert_eq!(cfg0.mangabaka_validated, None);
+
+    // Save token
+    let mut patch = cfg0.clone();
+    patch.mangabaka_token = Some("secret-token".into());
+    pipeline.save_config(patch).await.unwrap();
+
+    // After setting token: token is configured, but validation is not yet run (unverified)
+    let cfg1 = pipeline.load_config().await.unwrap();
+    assert!(cfg1.has_mangabaka_token);
+    assert_eq!(cfg1.mangabaka_validated, None);
+
+    // Simulate successful validation
+    db.call(|conn| crate::db::set_state(conn, "pipeline.mangabaka_validated", "valid"))
+        .await
+        .unwrap();
+    let cfg2 = pipeline.load_config().await.unwrap();
+    assert!(cfg2.has_mangabaka_token);
+    assert_eq!(cfg2.mangabaka_validated, Some(true));
+
+    // Simulate validation failure (e.g. HTTP 400 Bad Request)
+    db.call(|conn| {
+        crate::db::set_state(
+            conn,
+            "pipeline.mangabaka_validated",
+            "error: MangaBaka request rejected (HTTP 400)",
+        )
+    })
+    .await
+    .unwrap();
+    let cfg3 = pipeline.load_config().await.unwrap();
+    // Stored token is NOT erased when validation fails!
+    assert!(
+        cfg3.has_mangabaka_token,
+        "Token must be preserved on validation failure"
+    );
+    assert_eq!(cfg3.mangabaka_validated, Some(false));
 
     let _ = std::fs::remove_dir_all(&dir);
 }

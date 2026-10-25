@@ -655,13 +655,15 @@
     mangabakaTesting = true;
     mangabakaTestResult = null;
     try {
-      const res = await send<{ message: string }>('POST', '/pipeline/test-mangabaka', {
+      const res = await send<{ message: string; validated?: boolean }>('POST', '/pipeline/test-mangabaka', {
         url: mangabakaUrlInput.trim() || null,
         token: mangabakaTokenInput.trim() || null,
       });
       mangabakaTestResult = { ok: true, message: res.message };
+      if (pipeline) pipeline.mangabaka_validated = true;
     } catch (e) {
       mangabakaTestResult = { ok: false, message: message(e) };
+      if (pipeline) pipeline.mangabaka_validated = false;
     } finally {
       mangabakaTesting = false;
     }
@@ -1309,7 +1311,7 @@
             <div class="set stack">
               <div class="what">
                 <strong>MangaBaka API Token</strong>
-                <span>Optional Bearer token for higher rate limits. Leave as "********" to keep existing token.</span>
+                <span>MangaBaka API key for user library progress sync and enrichment. Leave as "********" to keep existing token.</span>
               </div>
               <div class="how wide">
                 <label class="field grow">
@@ -1760,9 +1762,23 @@
             <span class="status-badge {trackers.find(x => x.name === 'AniList')?.signedIn ? 'status-valid' : 'status-not_configured'}">
               AniList: {trackers.find(x => x.name === 'AniList')?.signedIn ? 'Signed In' : 'Not Signed In'}
             </span>
-            <span class="status-badge {pipeline.has_mangabaka_token ? 'status-valid' : 'status-not_configured'}">
-              MangaBaka: {pipeline.has_mangabaka_token ? 'Token Configured' : 'No Token'}
-            </span>
+            {#if !pipeline.has_mangabaka_token}
+              <span class="status-badge status-not_configured">
+                MangaBaka: No Token
+              </span>
+            {:else if mangabakaTestResult ? mangabakaTestResult.ok : pipeline.mangabaka_validated === true}
+              <span class="status-badge status-valid">
+                MangaBaka: Validated
+              </span>
+            {:else if mangabakaTestResult ? !mangabakaTestResult.ok : pipeline.mangabaka_validated === false}
+              <span class="status-badge status-missing">
+                MangaBaka: Validation Failed
+              </span>
+            {:else}
+              <span class="status-badge status-not_configured">
+                MangaBaka: Token Configured (Unverified)
+              </span>
+            {/if}
             {#if syncRunning}
               <span class="status-badge status-valid">Sync in progress…</span>
             {/if}

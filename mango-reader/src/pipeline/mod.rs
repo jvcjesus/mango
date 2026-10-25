@@ -99,6 +99,8 @@ pub struct PipelineConfig {
     pub bundled_optimizer_present: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resolved_optimizer_bin: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mangabaka_validated: Option<bool>,
 }
 
 impl Default for PipelineConfig {
@@ -128,6 +130,7 @@ impl Default for PipelineConfig {
             optimizer_status: None,
             bundled_optimizer_present: false,
             resolved_optimizer_bin: None,
+            mangabaka_validated: None,
         }
     }
 }
@@ -218,6 +221,7 @@ impl Pipeline {
             optimizer_status: Some(optimizer_status),
             bundled_optimizer_present: bundled_present,
             resolved_optimizer_bin: resolved_bin.map(|p| p.to_string_lossy().to_string()),
+            mangabaka_validated: raw_cfg.mangabaka_validated,
         })
     }
 
@@ -278,6 +282,16 @@ impl Pipeline {
 
                 let mangabaka_token = crate::db::state(conn, "pipeline.mangabaka_token")?;
                 let komga_api_key = crate::db::state(conn, "pipeline.komga_api_key")?;
+                let mangabaka_val_state = crate::db::state(conn, "pipeline.mangabaka_validated")?;
+                let mangabaka_validated = if mangabaka_token.is_some() {
+                    match mangabaka_val_state.as_deref() {
+                        Some("valid") => Some(true),
+                        Some(s) if s.starts_with("error") => Some(false),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
 
                 let cfg = PipelineConfig {
                     enabled,
@@ -304,6 +318,7 @@ impl Pipeline {
                     optimizer_status: None,
                     bundled_optimizer_present: false,
                     resolved_optimizer_bin: None,
+                    mangabaka_validated,
                 };
 
                 Ok((cfg, mangabaka_token, komga_api_key))
@@ -404,8 +419,10 @@ impl Pipeline {
                     let trimmed = token.trim();
                     if trimmed == "CLEAR" {
                         crate::db::forget_state(conn, "pipeline.mangabaka_token")?;
+                        crate::db::forget_state(conn, "pipeline.mangabaka_validated")?;
                     } else if !trimmed.is_empty() && trimmed != "********" {
                         crate::db::set_state(conn, "pipeline.mangabaka_token", trimmed)?;
+                        crate::db::forget_state(conn, "pipeline.mangabaka_validated")?;
                     }
                 }
 

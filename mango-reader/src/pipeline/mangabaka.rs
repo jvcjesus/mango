@@ -138,7 +138,9 @@ impl MangaBakaClient {
             .header("User-Agent", "Mango/1.0");
 
         if let Some(token) = &self.token {
-            req = req.header("Authorization", format!("Bearer {token}"));
+            // MangaBaka API strictly forbids sending both `Authorization` and `x-api-key` simultaneously
+            // (returning HTTP 400 `Cannot use both Authorization and x-api-key headers simultaneously`).
+            // Production MangaBaka API authentication uses solely the `x-api-key` header.
             req = req.header("x-api-key", token);
         }
 
@@ -192,10 +194,11 @@ impl MangaBakaClient {
         }
 
         if resp.status() == reqwest::StatusCode::BAD_REQUEST {
+            let body = resp.text().await.unwrap_or_default();
             return Err(AppError::new(
                 400,
                 "mangabaka_bad_request",
-                "MangaBaka cross-reference request rejected (HTTP 400)",
+                format!("MangaBaka cross-reference request rejected (HTTP 400): {body}"),
             ));
         }
 
@@ -290,6 +293,23 @@ impl MangaBakaClient {
                 401,
                 "mangabaka_unauthorized",
                 "MangaBaka API token invalid or rejected",
+            ));
+        }
+
+        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(AppError::new(
+                429,
+                "mangabaka_rate_limited",
+                "MangaBaka rate limited (HTTP 429); retry later",
+            ));
+        }
+
+        if resp.status() == reqwest::StatusCode::BAD_REQUEST {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(AppError::new(
+                400,
+                "mangabaka_bad_request",
+                format!("MangaBaka library request rejected (HTTP 400): {body}"),
             ));
         }
 
@@ -404,6 +424,23 @@ impl MangaBakaClient {
             ));
         }
 
+        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(AppError::new(
+                429,
+                "mangabaka_rate_limited",
+                "MangaBaka rate limited (HTTP 429); retry later",
+            ));
+        }
+
+        if resp.status() == reqwest::StatusCode::BAD_REQUEST {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(AppError::new(
+                400,
+                "mangabaka_bad_request",
+                format!("MangaBaka library request rejected (HTTP 400): {body}"),
+            ));
+        }
+
         if !resp.status().is_success() {
             return Err(AppError::new(
                 resp.status().as_u16(),
@@ -440,15 +477,44 @@ impl MangaBakaClient {
             ));
         }
 
-        if !resp.status().is_success() {
+        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
             return Err(AppError::new(
-                resp.status().as_u16(),
-                "mangabaka_error",
-                format!("MangaBaka answered HTTP {}", resp.status()),
+                429,
+                "mangabaka_rate_limited",
+                "MangaBaka rate limited (HTTP 429); retry later",
             ));
         }
 
-        Ok("MangaBaka API connection successful".to_string())
+        if resp.status() == reqwest::StatusCode::BAD_REQUEST {
+            let body = resp.text().await.unwrap_or_default();
+            let msg = if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+                json.get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(&body)
+                    .to_string()
+            } else if !body.trim().is_empty() {
+                body.trim().to_string()
+            } else {
+                "Bad Request (HTTP 400)".to_string()
+            };
+            return Err(AppError::new(
+                400,
+                "mangabaka_bad_request",
+                format!("MangaBaka request rejected (HTTP 400): {msg}"),
+            ));
+        }
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(AppError::new(
+                status.as_u16(),
+                "mangabaka_error",
+                format!("MangaBaka answered HTTP {status}: {body}"),
+            ));
+        }
+
+        Ok("MangaBaka API connection and authentication successful".to_string())
     }
 
     /// Resolves an exact series match on MangaBaka, failing closed if ambiguous or missing.

@@ -1500,5 +1500,63 @@ describe('first-class volume acquisition & release semantics', () => {
       expect(trackedItem.origins).toContain('mango');
       expect(trackedItem.origins).toContain('anilist');
     });
+
+    it('distinguishes MangaBaka token configuration from connection validation', () => {
+      type PipelineConfig = import('./api').PipelineConfig;
+
+      function getMangaBakaStatus(
+        cfg: PipelineConfig,
+        testResult?: { ok: boolean; message: string } | null,
+      ): { text: string; badgeClass: string } {
+        if (!cfg.has_mangabaka_token) {
+          return { text: 'MangaBaka: No Token', badgeClass: 'status-not_configured' };
+        }
+        if (testResult ? testResult.ok : cfg.mangabaka_validated === true) {
+          return { text: 'MangaBaka: Validated', badgeClass: 'status-valid' };
+        }
+        if (testResult ? !testResult.ok : cfg.mangabaka_validated === false) {
+          return { text: 'MangaBaka: Validation Failed', badgeClass: 'status-missing' };
+        }
+        return { text: 'MangaBaka: Token Configured (Unverified)', badgeClass: 'status-not_configured' };
+      }
+
+      // 1. No token configured
+      const noTokenCfg = { has_mangabaka_token: false } as PipelineConfig;
+      expect(getMangaBakaStatus(noTokenCfg)).toEqual({
+        text: 'MangaBaka: No Token',
+        badgeClass: 'status-not_configured',
+      });
+
+      // 2. Token configured, not yet tested (unverified)
+      const unverifiedCfg = { has_mangabaka_token: true, mangabaka_validated: null } as PipelineConfig;
+      expect(getMangaBakaStatus(unverifiedCfg)).toEqual({
+        text: 'MangaBaka: Token Configured (Unverified)',
+        badgeClass: 'status-not_configured',
+      });
+
+      // 3. Token configured, validation succeeded
+      const validatedCfg = { has_mangabaka_token: true, mangabaka_validated: true } as PipelineConfig;
+      expect(getMangaBakaStatus(validatedCfg)).toEqual({
+        text: 'MangaBaka: Validated',
+        badgeClass: 'status-valid',
+      });
+
+      // 4. Token configured, validation failed (e.g. HTTP 400 Bad Request)
+      const failedCfg = { has_mangabaka_token: true, mangabaka_validated: false } as PipelineConfig;
+      expect(getMangaBakaStatus(failedCfg)).toEqual({
+        text: 'MangaBaka: Validation Failed',
+        badgeClass: 'status-missing',
+      });
+
+      // 5. Active test result in UI overrides stored state
+      expect(getMangaBakaStatus(unverifiedCfg, { ok: true, message: 'Connected' })).toEqual({
+        text: 'MangaBaka: Validated',
+        badgeClass: 'status-valid',
+      });
+      expect(getMangaBakaStatus(validatedCfg, { ok: false, message: 'Bad Request' })).toEqual({
+        text: 'MangaBaka: Validation Failed',
+        badgeClass: 'status-missing',
+      });
+    });
   });
 });

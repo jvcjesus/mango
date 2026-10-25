@@ -1393,11 +1393,33 @@ async fn test_pipeline_mangabaka(
     Json(payload): Json<TestPipelinePayload>,
 ) -> Result<Json<Value>> {
     app.me.admin()?;
-    let msg = app
+    match app
         .pipeline
         .test_mangabaka(payload.url, payload.token)
-        .await?;
-    Ok(Json(json!({ "message": msg })))
+        .await
+    {
+        Ok(msg) => {
+            let _ = app
+                .db
+                .call(|conn| crate::db::set_state(conn, "pipeline.mangabaka_validated", "valid"))
+                .await;
+            Ok(Json(json!({ "message": msg, "validated": true })))
+        }
+        Err(e) => {
+            let err_msg = e.message.clone();
+            let _ = app
+                .db
+                .call(move |conn| {
+                    crate::db::set_state(
+                        conn,
+                        "pipeline.mangabaka_validated",
+                        &format!("error: {err_msg}"),
+                    )
+                })
+                .await;
+            Err(e)
+        }
+    }
 }
 
 async fn test_pipeline_komga(
