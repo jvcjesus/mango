@@ -118,8 +118,8 @@ impl MangaBakaClient {
         }
     }
 
-    fn request_builder(&self, method: reqwest::Method, endpoint: &str) -> reqwest::RequestBuilder {
-        let url = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
+    fn resolve_url(&self, endpoint: &str) -> String {
+        if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
             endpoint.to_string()
         } else {
             let base = self.base_url.trim_end_matches('/');
@@ -129,22 +129,49 @@ impl MangaBakaClient {
             } else {
                 format!("{base}/{clean}")
             }
-        };
+        }
+    }
 
-        let mut req = self
+    /// Builds a public request with NO authentication headers.
+    ///
+    /// Per the official MangaBaka OpenAPI specification, catalog endpoints
+    /// (`/series/search`, `/series/{id}`, `/collections/{id}/works`, `/source/anilist/{id}`)
+    /// are public (`security: none`) and must not carry user authentication tokens.
+    fn public_request(&self, method: reqwest::Method, endpoint: &str) -> reqwest::RequestBuilder {
+        let url = self.resolve_url(endpoint);
+        self.http
+            .request(method, url)
+            .header("Accept", "application/json")
+            .header("User-Agent", "Mango/1.0")
+    }
+
+    /// Builds an authenticated request using the user's Personal Access Token (PAT).
+    ///
+    /// Per the official MangaBaka OpenAPI specification, authenticated user endpoints
+    /// (`/my/profile`, `/my/library`, `/my/library/{id}`) require user credentials.
+    /// In accordance with the OpenAPI `components.securitySchemes.x-api-key`,
+    /// authentication is provided strictly via the `x-api-key: <token>` header.
+    /// Never sends `Authorization` to prevent mutual exclusivity errors.
+    fn authenticated_request(
+        &self,
+        method: reqwest::Method,
+        endpoint: &str,
+    ) -> Result<reqwest::RequestBuilder> {
+        let token = self.token.as_ref().ok_or_else(|| {
+            AppError::new(
+                401,
+                "mangabaka_unauthorized",
+                "MangaBaka API token is not configured",
+            )
+        })?;
+
+        let url = self.resolve_url(endpoint);
+        Ok(self
             .http
             .request(method, url)
             .header("Accept", "application/json")
-            .header("User-Agent", "Mango/1.0");
-
-        if let Some(token) = &self.token {
-            // MangaBaka API strictly forbids sending both `Authorization` and `x-api-key` simultaneously
-            // (returning HTTP 400 `Cannot use both Authorization and x-api-key headers simultaneously`).
-            // Production MangaBaka API authentication uses solely the `x-api-key` header.
-            req = req.header("x-api-key", token);
-        }
-
-        req
+            .header("User-Agent", "Mango/1.0")
+            .header("x-api-key", token))
     }
 
     /// Resolves MangaBaka series ID and title from an AniList media ID.
@@ -157,7 +184,7 @@ impl MangaBakaClient {
     ) -> Result<Option<MangaBakaCrossReference>> {
         let endpoint = format!("/source/anilist/{anilist_id}");
         let resp = match self
-            .request_builder(reqwest::Method::GET, &endpoint)
+            .public_request(reqwest::Method::GET, &endpoint)
             .send()
             .await
         {
@@ -268,7 +295,7 @@ impl MangaBakaClient {
     ) -> Result<Option<MangaBakaLibraryEntry>> {
         let endpoint = format!("/my/library/{mangabaka_id}");
         let resp = match self
-            .request_builder(reqwest::Method::GET, &endpoint)
+            .authenticated_request(reqwest::Method::GET, &endpoint)?
             .send()
             .await
         {
@@ -399,7 +426,7 @@ impl MangaBakaClient {
         }
 
         let resp = match self
-            .request_builder(reqwest::Method::PATCH, &endpoint)
+            .authenticated_request(reqwest::Method::PATCH, &endpoint)?
             .json(&serde_json::Value::Object(body))
             .send()
             .await
@@ -452,20 +479,19 @@ impl MangaBakaClient {
         Ok(())
     }
 
-    /// Tests whether MangaBaka is reachable and answering.
+    /// Tests connection and validates credentials against MangaBaka using `GET /v1/my/profile`.
+    ///
+    /// Per the official MangaBaka API specification, `GET /v1/my/profile` is a stable, authenticated
+    /// user endpoint that verifies PAT validity. It is read-only and performs no tracker mutation.
     pub async fn test_connection(&self) -> Result<String> {
-        let resp = self
-            .request_builder(reqwest::Method::GET, "/series/search")
-            .query(&[("q", "test")])
-            .send()
-            .await
-            .map_err(|e| {
-                AppError::new(
-                    502,
-                    "mangabaka_offline",
-                    format!("Cannot reach MangaBaka: {e}"),
-                )
-            })?;
+        let req = self.authenticated_request(reqwest::Method::GET, "/my/profile")?;
+        let resp = req.send().await.map_err(|e| {
+            AppError::new(
+                502,
+                "mangabaka_offline",
+                format!("Cannot reach MangaBaka: {e}"),
+            )
+        })?;
 
         if resp.status() == reqwest::StatusCode::UNAUTHORIZED
             || resp.status() == reqwest::StatusCode::FORBIDDEN
@@ -482,6 +508,14 @@ impl MangaBakaClient {
                 429,
                 "mangabaka_rate_limited",
                 "MangaBaka rate limited (HTTP 429); retry later",
+            ));
+        }
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(AppError::new(
+                404,
+                "mangabaka_not_found",
+                "MangaBaka user profile endpoint not found (HTTP 404)",
             ));
         }
 
@@ -514,7 +548,25 @@ impl MangaBakaClient {
             ));
         }
 
-        Ok("MangaBaka API connection and authentication successful".to_string())
+        let body_text = resp.text().await.unwrap_or_default();
+        let username = serde_json::from_str::<serde_json::Value>(&body_text)
+            .ok()
+            .and_then(|v| {
+                v.get("data").and_then(|d| {
+                    d.get("preferred_username")
+                        .or_else(|| d.get("nickname"))
+                        .and_then(|u| u.as_str())
+                        .map(|s| s.to_string())
+                })
+            });
+
+        if let Some(user) = username {
+            Ok(format!(
+                "MangaBaka API connection and authentication successful (authenticated as {user})"
+            ))
+        } else {
+            Ok("MangaBaka API connection and authentication successful".to_string())
+        }
     }
 
     /// Resolves an exact series match on MangaBaka, failing closed if ambiguous or missing.
@@ -527,7 +579,7 @@ impl MangaBakaClient {
         let wanted_norm = normalize_title(trimmed_series);
 
         let resp = match self
-            .request_builder(reqwest::Method::GET, "/series/search")
+            .public_request(reqwest::Method::GET, "/series/search")
             .query(&[("q", trimmed_series)])
             .send()
             .await
@@ -645,7 +697,7 @@ impl MangaBakaClient {
     pub async fn match_collection(&self, series_id: i64) -> Result<MangaBakaCollectionMatch> {
         let collections_url = format!("/series/{series_id}/collections");
         let c_resp = match self
-            .request_builder(reqwest::Method::GET, &collections_url)
+            .public_request(reqwest::Method::GET, &collections_url)
             .send()
             .await
         {
@@ -752,7 +804,7 @@ impl MangaBakaClient {
     pub async fn fetch_collection_total_works(&self, collection_id: &str) -> Result<Option<u32>> {
         let works_url = format!("/collections/{collection_id}/works?page=1&per_page=1");
         let resp = match self
-            .request_builder(reqwest::Method::GET, &works_url)
+            .public_request(reqwest::Method::GET, &works_url)
             .send()
             .await
         {
@@ -845,7 +897,7 @@ impl MangaBakaClient {
         // 2. Fetch normalized series metadata for authors/artists/genres/publishers
         let series_url = format!("/series/{matched_series_id}");
         let (writers, pencillers, genres, publisher) = match self
-            .request_builder(reqwest::Method::GET, &series_url)
+            .public_request(reqwest::Method::GET, &series_url)
             .send()
             .await
         {
@@ -929,11 +981,7 @@ impl MangaBakaClient {
             }
             pages_checked += 1;
 
-            let w_resp = match self
-                .request_builder(reqwest::Method::GET, &url)
-                .send()
-                .await
-            {
+            let w_resp = match self.public_request(reqwest::Method::GET, &url).send().await {
                 Ok(r) if r.status().is_success() => r,
                 _ => break,
             };
@@ -1386,6 +1434,26 @@ mod tests {
                         ],
                         "pagination": {}
                     }))
+                }),
+            )
+            .route(
+                "/my/profile",
+                get(|headers: axum::http::HeaderMap| async move {
+                    if headers.contains_key("x-api-key") {
+                        (
+                            StatusCode::OK,
+                            Json(json!({
+                                "status": 200,
+                                "data": {
+                                    "id": "usr_test",
+                                    "preferred_username": "tester"
+                                }
+                            })),
+                        )
+                            .into_response()
+                    } else {
+                        StatusCode::UNAUTHORIZED.into_response()
+                    }
                 }),
             );
 

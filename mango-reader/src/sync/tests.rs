@@ -326,7 +326,10 @@ struct MockMangaBakaState {
     library: Arc<Mutex<std::collections::HashMap<i64, (Option<f64>, Option<f64>, String)>>>,
     patch_calls: Arc<AtomicUsize>,
     post_calls: Arc<AtomicUsize>,
+    profile_calls: Arc<AtomicUsize>,
+    search_calls: Arc<AtomicUsize>,
     last_patch_body: Arc<Mutex<Option<serde_json::Value>>>,
+    public_request_had_auth_header: Arc<std::sync::atomic::AtomicBool>,
 }
 
 fn check_simultaneous_auth(headers: &HeaderMap) -> Option<axum::response::Response> {
@@ -357,15 +360,67 @@ async fn start_mock_mangabaka(
         library: Arc::new(Mutex::new(map)),
         patch_calls: Arc::new(AtomicUsize::new(0)),
         post_calls: Arc::new(AtomicUsize::new(0)),
+        profile_calls: Arc::new(AtomicUsize::new(0)),
+        search_calls: Arc::new(AtomicUsize::new(0)),
         last_patch_body: Arc::new(Mutex::new(None)),
+        public_request_had_auth_header: Arc::new(std::sync::atomic::AtomicBool::new(false)),
     };
 
-    let app = Router::new()
-        .route(
-            "/source/anilist/{id}",
-            get(|headers: HeaderMap, Path(id): Path<String>| async move {
+    let profile_handler = {
+        let state = state.clone();
+        move |headers: HeaderMap| {
+            let state = state.clone();
+            async move {
                 if let Some(err) = check_simultaneous_auth(&headers) {
                     return err;
+                }
+                state.profile_calls.fetch_add(1, Ordering::SeqCst);
+                let token = headers.get("x-api-key").and_then(|v| v.to_str().ok());
+                match token {
+                    None => StatusCode::UNAUTHORIZED.into_response(),
+                    Some("invalid-token") => StatusCode::UNAUTHORIZED.into_response(),
+                    Some("forbidden-token") => StatusCode::FORBIDDEN.into_response(),
+                    Some("rate-limited-token") => StatusCode::TOO_MANY_REQUESTS.into_response(),
+                    Some("not-found-token") => StatusCode::NOT_FOUND.into_response(),
+                    Some("bad-request-token") => (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "message": "Parameter rejected by MangaBaka API",
+                            "status": 400
+                        })),
+                    )
+                        .into_response(),
+                    Some(_) => (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "status": 200,
+                            "data": {
+                                "id": "usr_test123",
+                                "preferred_username": "reader_dev",
+                                "nickname": "Reader Dev",
+                                "picture": null,
+                                "updated_at": "2026-10-24T12:00:00Z"
+                            }
+                        })),
+                    )
+                        .into_response(),
+                }
+            }
+        }
+    };
+
+    let anilist_handler = {
+        let state = state.clone();
+        move |headers: HeaderMap, Path(id): Path<String>| {
+            let state = state.clone();
+            async move {
+                if let Some(err) = check_simultaneous_auth(&headers) {
+                    return err;
+                }
+                if headers.contains_key("x-api-key") || headers.contains_key("authorization") {
+                    state
+                        .public_request_had_auth_header
+                        .store(true, Ordering::SeqCst);
                 }
                 if id == "101" {
                     (
@@ -381,8 +436,116 @@ async fn start_mock_mangabaka(
                 } else {
                     StatusCode::NOT_FOUND.into_response()
                 }
-            }),
-        )
+            }
+        }
+    };
+
+    let search_handler = {
+        let state = state.clone();
+        move |headers: HeaderMap,
+              axum::extract::Query(params): axum::extract::Query<
+            std::collections::HashMap<String, String>,
+        >| {
+            let state = state.clone();
+            async move {
+                if let Some(err) = check_simultaneous_auth(&headers) {
+                    return err;
+                }
+                if headers.contains_key("x-api-key") || headers.contains_key("authorization") {
+                    state
+                        .public_request_had_auth_header
+                        .store(true, Ordering::SeqCst);
+                }
+                state.search_calls.fetch_add(1, Ordering::SeqCst);
+                // Real MangaBaka API strictly validates query parameters and rejects unrecognized keys like "query"
+                if params.contains_key("query") {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "message": "Validation error: Unrecognized key: \"query\"",
+                            "status": 400,
+                            "code": null
+                        })),
+                    )
+                        .into_response();
+                }
+                let q = params.get("q").map(|s| s.as_str()).unwrap_or("");
+                if q == "Error 400" {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "error": "Invalid search parameter" })),
+                    )
+                        .into_response()
+                } else if q == "Error 429" {
+                    StatusCode::TOO_MANY_REQUESTS.into_response()
+                } else if q == "Berserk" {
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "data": [{ "id": 202, "title": "Berserk" }]
+                        })),
+                    )
+                        .into_response()
+                } else if q == "Pandora Hearts" {
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "data": [{ "id": 303, "title": "Pandora Hearts" }]
+                        })),
+                    )
+                        .into_response()
+                } else if q == "Ambiguous Title" {
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "data": [
+                                { "id": 1, "title": "Ambiguous Title" },
+                                { "id": 2, "title": "Ambiguous Title" }
+                            ]
+                        })),
+                    )
+                        .into_response()
+                } else {
+                    (StatusCode::OK, Json(serde_json::json!({ "data": [] }))).into_response()
+                }
+            }
+        }
+    };
+
+    let collections_handler = {
+        let state = state.clone();
+        move |headers: HeaderMap, Path(_id): Path<String>| {
+            let state = state.clone();
+            async move {
+                if let Some(err) = check_simultaneous_auth(&headers) {
+                    return err;
+                }
+                if headers.contains_key("x-api-key") || headers.contains_key("authorization") {
+                    state
+                        .public_request_had_auth_header
+                        .store(true, Ordering::SeqCst);
+                }
+                (
+                    StatusCode::OK,
+                    Json(serde_json::json!({
+                        "data": [{
+                            "id": "col-std",
+                            "edition": "Standard Edition",
+                            "language": "en",
+                            "medium": "digital"
+                        }]
+                    })),
+                )
+                    .into_response()
+            }
+        }
+    };
+
+    let app = Router::new()
+        .route("/my/profile", get(profile_handler.clone()))
+        .route("/v1/my/profile", get(profile_handler))
+        .route("/source/anilist/{id}", get(anilist_handler.clone()))
+        .route("/v1/source/anilist/{id}", get(anilist_handler))
         .route(
             "/my/library/{id}",
             get({
@@ -485,103 +648,10 @@ async fn start_mock_mangabaka(
                 }
             }),
         )
-        .route(
-            "/series/search",
-            get(
-                |headers: HeaderMap,
-                 axum::extract::Query(params): axum::extract::Query<
-                    std::collections::HashMap<String, String>,
-                >| async move {
-                    if let Some(err) = check_simultaneous_auth(&headers) {
-                        return err;
-                    }
-                    // Real MangaBaka API strictly validates query parameters and rejects unrecognized keys like "query"
-                    if params.contains_key("query") {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            Json(serde_json::json!({
-                                "message": "Validation error: Unrecognized key: \"query\"",
-                                "status": 400,
-                                "code": null
-                            })),
-                        )
-                            .into_response();
-                    }
-                    let token = headers.get("x-api-key").and_then(|v| v.to_str().ok());
-                    if token == Some("invalid-token") {
-                        return StatusCode::UNAUTHORIZED.into_response();
-                    }
-                    if token == Some("bad-request-token") {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            Json(serde_json::json!({
-                                "message": "Parameter rejected by MangaBaka API",
-                                "status": 400
-                            })),
-                        )
-                            .into_response();
-                    }
-                    let q = params.get("q").map(|s| s.as_str()).unwrap_or("");
-                    if q == "Error 400" {
-                        (
-                            StatusCode::BAD_REQUEST,
-                            Json(serde_json::json!({ "error": "Invalid search parameter" })),
-                        )
-                            .into_response()
-                    } else if q == "Error 429" {
-                        StatusCode::TOO_MANY_REQUESTS.into_response()
-                    } else if q == "Berserk" {
-                        (
-                            StatusCode::OK,
-                            Json(serde_json::json!({
-                                "data": [{ "id": 202, "title": "Berserk" }]
-                            })),
-                        )
-                            .into_response()
-                    } else if q == "Pandora Hearts" {
-                        (
-                            StatusCode::OK,
-                            Json(serde_json::json!({
-                                "data": [{ "id": 303, "title": "Pandora Hearts" }]
-                            })),
-                        )
-                            .into_response()
-                    } else if q == "Ambiguous Title" {
-                        (
-                            StatusCode::OK,
-                            Json(serde_json::json!({
-                                "data": [
-                                    { "id": 1, "title": "Ambiguous Title" },
-                                    { "id": 2, "title": "Ambiguous Title" }
-                                ]
-                            })),
-                        )
-                            .into_response()
-                    } else {
-                        (StatusCode::OK, Json(serde_json::json!({ "data": [] }))).into_response()
-                    }
-                },
-            ),
-        )
-        .route(
-            "/series/{id}/collections",
-            get(|headers: HeaderMap, Path(_id): Path<String>| async move {
-                if let Some(err) = check_simultaneous_auth(&headers) {
-                    return err;
-                }
-                (
-                    StatusCode::OK,
-                    Json(serde_json::json!({
-                        "data": [{
-                            "id": "col-std",
-                            "edition": "Standard Edition",
-                            "language": "en"
-                        }]
-                    })),
-                )
-                    .into_response()
-            }),
-        );
+        .route("/series/search", get(search_handler.clone()))
+        .route("/v1/series/search", get(search_handler))
+        .route("/series/{id}/collections", get(collections_handler.clone()))
+        .route("/v1/series/{id}/collections", get(collections_handler));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
@@ -1849,9 +1919,9 @@ async fn test_mangabaka_mock_server_rejects_simultaneous_auth() {
     let (url, _state) = start_mock_mangabaka(vec![]).await;
     let http = reqwest::Client::new();
 
-    // Directly send a request with BOTH Authorization and x-api-key headers
+    // Directly send a request with BOTH Authorization and x-api-key headers to /my/profile
     let resp = http
-        .get(format!("{url}/series/search?q=Berserk"))
+        .get(format!("{url}/my/profile"))
         .header("Authorization", "Bearer test-token")
         .header("x-api-key", "test-token")
         .send()
@@ -1868,14 +1938,13 @@ async fn test_mangabaka_mock_server_rejects_simultaneous_auth() {
 
 #[tokio::test]
 async fn test_mangabaka_search_rejects_query_parameter_and_requires_q() {
-    let (url, _state) = start_mock_mangabaka(vec![]).await;
+    let (url, state) = start_mock_mangabaka(vec![]).await;
     let http = reqwest::Client::new();
 
     // 1. Direct request sending `query=Berserk` must be rejected with HTTP 400
     //    matching real MangaBaka production behavior: `Validation error: Unrecognized key: "query"`
     let resp_query = http
         .get(format!("{url}/series/search?query=Berserk"))
-        .header("x-api-key", "valid-token")
         .send()
         .await
         .unwrap();
@@ -1889,7 +1958,6 @@ async fn test_mangabaka_search_rejects_query_parameter_and_requires_q() {
     // 2. Direct request sending BOTH `q=Berserk&query=Berserk` must also be rejected with HTTP 400
     let resp_both = http
         .get(format!("{url}/series/search?q=Berserk&query=Berserk"))
-        .header("x-api-key", "valid-token")
         .send()
         .await
         .unwrap();
@@ -1900,10 +1968,9 @@ async fn test_mangabaka_search_rejects_query_parameter_and_requires_q() {
         Some("Validation error: Unrecognized key: \"query\"")
     );
 
-    // 3. Direct request sending `q=Berserk` succeeds with HTTP 200
+    // 3. Direct request sending `q=Berserk` without auth succeeds with HTTP 200 (public endpoint)
     let resp_q = http
         .get(format!("{url}/series/search?q=Berserk"))
-        .header("x-api-key", "valid-token")
         .send()
         .await
         .unwrap();
@@ -1911,19 +1978,12 @@ async fn test_mangabaka_search_rejects_query_parameter_and_requires_q() {
     let body_q: serde_json::Value = resp_q.json().await.unwrap();
     assert_eq!(body_q["data"][0]["title"].as_str(), Some("Berserk"));
 
-    // 4. MangaBakaClient::test_connection() must send `q=test` (no `query`) and succeed
+    // 4. MangaBakaClient::match_series() must send `q=Berserk` (no `query`) and succeed
     let client = MangaBakaClient::new(
         reqwest::Client::new(),
         Some(url.clone()),
         Some("valid-token".into()),
     );
-    let test_conn_res = client.test_connection().await;
-    assert!(
-        test_conn_res.is_ok(),
-        "test_connection must send q only and succeed: {test_conn_res:?}"
-    );
-
-    // 5. MangaBakaClient::match_series() must send `q=Berserk` (no `query`) and succeed
     let match_res = client.match_series("Berserk").await.unwrap();
     assert!(
         matches!(
@@ -1932,13 +1992,59 @@ async fn test_mangabaka_search_rejects_query_parameter_and_requires_q() {
         ),
         "match_series must send q only and find series: {match_res:?}"
     );
+
+    // 5. Verify that public request did NOT send any auth header even when token was configured on client!
+    assert!(
+        !state.public_request_had_auth_header.load(Ordering::SeqCst),
+        "Public catalog request must not send user authentication headers"
+    );
+}
+
+#[tokio::test]
+async fn test_mangabaka_public_endpoints_require_no_authentication() {
+    let (url, state) = start_mock_mangabaka(vec![]).await;
+    let client_no_token = MangaBakaClient::new(reqwest::Client::new(), Some(url.clone()), None);
+
+    // 1. Series search succeeds without token
+    let search_res = client_no_token.match_series("Berserk").await.unwrap();
+    assert!(matches!(
+        search_res,
+        crate::pipeline::mangabaka::MangaBakaSeriesMatch::Found { id: 202, .. }
+    ));
+
+    // 2. AniList cross-reference succeeds without token
+    let xref_res = client_no_token.resolve_from_anilist(101).await.unwrap();
+    assert!(xref_res.is_some());
+    assert_eq!(xref_res.unwrap().mangabaka_id, 202);
+
+    // 3. Collection match succeeds without token
+    let col_res = client_no_token.match_collection(202).await.unwrap();
+    assert!(matches!(
+        col_res,
+        crate::pipeline::mangabaka::MangaBakaCollectionMatch::Found { .. }
+    ));
+
+    // 4. Verify no auth headers were ever sent on public requests
+    assert!(
+        !state.public_request_had_auth_header.load(Ordering::SeqCst),
+        "Public endpoints must not carry auth headers"
+    );
+
+    // 5. Authenticated endpoints fail without token
+    let lib_err = client_no_token.get_my_library_entry(202).await.unwrap_err();
+    assert_eq!(lib_err.code, "mangabaka_unauthorized");
+    assert_eq!(lib_err.status.as_u16(), 401);
+
+    let conn_err = client_no_token.test_connection().await.unwrap_err();
+    assert_eq!(conn_err.code, "mangabaka_unauthorized");
+    assert_eq!(conn_err.status.as_u16(), 401);
 }
 
 #[tokio::test]
 async fn test_mangabaka_validate_connection_handles_400_and_401() {
-    let (url, _state) = start_mock_mangabaka(vec![]).await;
+    let (url, state) = start_mock_mangabaka(vec![]).await;
 
-    // 1. Valid token succeeds
+    // 1. Valid token succeeds using GET /v1/my/profile
     let valid_client = MangaBakaClient::new(
         reqwest::Client::new(),
         Some(url.clone()),
@@ -1946,7 +2052,12 @@ async fn test_mangabaka_validate_connection_handles_400_and_401() {
     );
     let res = valid_client.test_connection().await;
     assert!(res.is_ok(), "Valid token must succeed");
-    assert!(res.unwrap().contains("successful"));
+    let msg = res.unwrap();
+    assert!(msg.contains("successful"));
+    assert!(msg.contains("reader_dev"));
+    // Proves it used /my/profile and did NOT perform a catalog search
+    assert_eq!(state.profile_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(state.search_calls.load(Ordering::SeqCst), 0);
 
     // 2. HTTP 401: Invalid token classified as mangabaka_unauthorized
     let invalid_client = MangaBakaClient::new(
@@ -1958,7 +2069,37 @@ async fn test_mangabaka_validate_connection_handles_400_and_401() {
     assert_eq!(err401.code, "mangabaka_unauthorized");
     assert_eq!(err401.status.as_u16(), 401);
 
-    // 3. HTTP 400: Bad request parameter classified as mangabaka_bad_request, NOT unauthorized
+    // 3. HTTP 403: Forbidden token classified as mangabaka_unauthorized
+    let forbidden_client = MangaBakaClient::new(
+        reqwest::Client::new(),
+        Some(url.clone()),
+        Some("forbidden-token".into()),
+    );
+    let err403 = forbidden_client.test_connection().await.unwrap_err();
+    assert_eq!(err403.code, "mangabaka_unauthorized");
+    assert_eq!(err403.status.as_u16(), 401);
+
+    // 4. HTTP 429: Rate limited token classified as mangabaka_rate_limited
+    let rate_limited_client = MangaBakaClient::new(
+        reqwest::Client::new(),
+        Some(url.clone()),
+        Some("rate-limited-token".into()),
+    );
+    let err429 = rate_limited_client.test_connection().await.unwrap_err();
+    assert_eq!(err429.code, "mangabaka_rate_limited");
+    assert_eq!(err429.status.as_u16(), 429);
+
+    // 5. HTTP 404: Not found endpoint classified as mangabaka_not_found
+    let not_found_client = MangaBakaClient::new(
+        reqwest::Client::new(),
+        Some(url.clone()),
+        Some("not-found-token".into()),
+    );
+    let err404 = not_found_client.test_connection().await.unwrap_err();
+    assert_eq!(err404.code, "mangabaka_not_found");
+    assert_eq!(err404.status.as_u16(), 404);
+
+    // 6. HTTP 400: Bad request parameter classified as mangabaka_bad_request, NOT unauthorized
     let bad_client = MangaBakaClient::new(
         reqwest::Client::new(),
         Some(url.clone()),
@@ -1972,6 +2113,12 @@ async fn test_mangabaka_validate_connection_handles_400_and_401() {
             .message
             .contains("Parameter rejected by MangaBaka API")
     );
+
+    // 7. No token configured on client: immediately returns mangabaka_unauthorized without network call
+    let no_token_client = MangaBakaClient::new(reqwest::Client::new(), Some(url.clone()), None);
+    let err_no_tok = no_token_client.test_connection().await.unwrap_err();
+    assert_eq!(err_no_tok.code, "mangabaka_unauthorized");
+    assert_eq!(err_no_tok.status.as_u16(), 401);
 }
 
 #[tokio::test]
