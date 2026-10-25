@@ -72,18 +72,59 @@ async fn test_scenario_i_torbox_test_connection() {
 
 #[tokio::test]
 async fn test_scenario_j_torbox_submit_torrent() {
+    let captured = Arc::new(std::sync::Mutex::new(None));
+    let captured_clone = Arc::clone(&captured);
+
     let app = Router::new().route(
         "/v1/api/torrents/createtorrent",
-        post(|| async {
-            Json(json!({
-                "success": true,
-                "error": null,
-                "detail": "Torrent created successfully.",
-                "data": {
-                    "torrent_id": 98765,
-                    "hash": "abcdef1234567890abcdef1234567890abcdef12"
+        post(move |req: axum::extract::Request| {
+            let captured = Arc::clone(&captured_clone);
+            async move {
+                let method = req.method().to_string();
+                let uri = req.uri().to_string();
+                let headers = req.headers().clone();
+                let body_bytes = axum::body::to_bytes(req.into_body(), usize::MAX).await.unwrap();
+
+                let content_type = headers
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
+                let auth_header = headers
+                    .get(axum::http::header::AUTHORIZATION)
+                    .and_then(|v| v.to_str().ok())
+                    .map(|s| s.to_string());
+
+                *captured.lock().unwrap() = Some((method, uri, content_type.clone(), auth_header, body_bytes.to_vec()));
+
+                // Strictly fail closed if request is not multipart/form-data with a boundary
+                let is_multipart = content_type
+                    .as_deref()
+                    .map(|ct| ct.starts_with("multipart/form-data; boundary="))
+                    .unwrap_or(false);
+
+                if !is_multipart {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(json!({
+                            "success": false,
+                            "error": "Expected multipart/form-data; boundary=..."
+                        })),
+                    );
                 }
-            }))
+
+                (
+                    StatusCode::OK,
+                    Json(json!({
+                        "success": true,
+                        "error": null,
+                        "detail": "Torrent created successfully.",
+                        "data": {
+                            "torrent_id": 98765,
+                            "hash": "abcdef1234567890abcdef1234567890abcdef12"
+                        }
+                    })),
+                )
+            }
         }),
     );
 
@@ -99,6 +140,7 @@ async fn test_scenario_j_torbox_submit_torrent() {
         Some("valid-token".to_string()),
     );
 
+    let expected_magnet = "magnet:?xt=urn:btih:abcdef1234567890abcdef1234567890abcdef12&dn=Berserk%20v01&tr=http%3A%2F%2Ftracker.example.com%2Fannounce";
     let rel = AcquisitionRelease {
         source: "nyaa".to_string(),
         source_item_id: "1".to_string(),
@@ -107,7 +149,7 @@ async fn test_scenario_j_torbox_submit_torrent() {
         uploader: Some("danke-Empire".to_string()),
         source_url: "https://nyaa.si/view/1".to_string(),
         torrent_url: None,
-        magnet_url: Some("magnet:?xt=urn:btih:abcdef1234567890abcdef1234567890abcdef12&dn=Berserk".to_string()),
+        magnet_url: Some(expected_magnet.to_string()),
         info_hash: Some("abcdef1234567890abcdef1234567890abcdef12".to_string()),
         category_id: Some("3_1".to_string()),
         category_name: Some("Literature - English".to_string()),
@@ -127,9 +169,105 @@ async fn test_scenario_j_torbox_submit_torrent() {
         language: Some("en".to_string()),
     };
 
-    let info = client.submit(&rel).await.unwrap();
+    let info = client.submit(&rel).await.expect("client.submit must succeed with multipart/form-data");
     assert_eq!(info.external_job_id, "98765");
     assert_eq!(info.torrent_hash.as_deref(), Some("abcdef1234567890abcdef1234567890abcdef12"));
+
+    let (method, uri, content_type, auth_header, body_bytes) = captured
+        .lock()
+        .unwrap()
+        .take()
+        .expect("Mock server should have captured a request");
+
+    // 1. Request method is POST
+    assert_eq!(method, "POST");
+
+    // 2. Path is /v1/api/torrents/createtorrent
+    assert_eq!(uri, "/v1/api/torrents/createtorrent");
+
+    // 3. Authorization remains Bearer authentication
+    assert_eq!(auth_header.as_deref(), Some("Bearer valid-token"));
+
+    // 4. Content-Type begins with multipart/form-data; boundary=
+    let ct = content_type.expect("Content-Type header must be present");
+    assert!(
+        ct.starts_with("multipart/form-data; boundary="),
+        "Content-Type must start with 'multipart/form-data; boundary=', was: {ct}"
+    );
+
+    // 5 & 6. Multipart body contains field named exactly 'magnet' with complete uncorrupted magnet URI
+    let body_str = String::from_utf8_lossy(&body_bytes);
+    assert!(
+        body_str.contains("name=\"magnet\""),
+        "Multipart body must contain field named 'magnet':\n{body_str}"
+    );
+    assert!(
+        body_str.contains(expected_magnet),
+        "Multipart body must contain complete magnet URI with &dn= and &tr= without corruption:\n{body_str}"
+    );
+    assert!(
+        body_str.contains("name=\"seed\""),
+        "Multipart body should preserve seed option"
+    );
+    assert!(
+        body_str.contains("name=\"allow_zip\""),
+        "Multipart body should preserve allow_zip option"
+    );
+
+    // 7. Token is never logged or included in errors/debug output
+    let debug_repr = format!("{client:?}");
+    assert!(
+        !debug_repr.contains("valid-token"),
+        "TorBoxClient Debug must not leak token: {debug_repr}"
+    );
+    assert!(
+        debug_repr.contains("has_token: true"),
+        "TorBoxClient Debug should safely reflect has_token"
+    );
+}
+
+#[tokio::test]
+async fn test_scenario_j_torbox_submit_fails_if_urlencoded() {
+    let app = Router::new().route(
+        "/v1/api/torrents/createtorrent",
+        post(|headers: axum::http::HeaderMap| async move {
+            let ct = headers
+                .get(axum::http::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("");
+            if !ct.starts_with("multipart/form-data; boundary=") {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "success": false,
+                        "error": "Expected multipart/form-data; boundary=..."
+                    })),
+                );
+            }
+            (
+                StatusCode::OK,
+                Json(json!({ "success": true, "data": { "torrent_id": 123 } })),
+            )
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    // Manually verify that application/x-www-form-urlencoded is rejected with BAD_REQUEST
+    let raw_client = reqwest::Client::new();
+    let res = raw_client
+        .post(format!("http://127.0.0.1:{port}/v1/api/torrents/createtorrent"))
+        .header("Authorization", "Bearer valid-token")
+        .form(&[("magnet", "magnet:?xt=urn:btih:123")])
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

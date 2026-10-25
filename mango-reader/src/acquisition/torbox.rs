@@ -205,16 +205,19 @@ impl TorBoxClient {
             .ok_or_else(|| TorBoxError::TorrentFailed("Release does not contain a magnet URL or infoHash".to_string()))?;
 
         let url = format!("{}/torrents/createtorrent", self.base_url);
-        let params = [("magnet", magnet), ("seed", "1"), ("allow_zip", "false")];
+        let form = reqwest::multipart::Form::new()
+            .text("magnet", magnet.to_string())
+            .text("seed", "1")
+            .text("allow_zip", "false");
 
         let resp = self
             .http
             .post(&url)
             .bearer_auth(token)
-            .form(&params)
+            .multipart(form)
             .send()
             .await
-            .map_err(|e| TorBoxError::NetworkError(e.to_string()))?;
+            .map_err(|e| TorBoxError::NetworkError(format!("Failed to submit torrent to TorBox: {e}")))?;
 
         let status = resp.status();
         if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
