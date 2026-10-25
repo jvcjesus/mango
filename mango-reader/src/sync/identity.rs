@@ -105,20 +105,31 @@ pub async fn resolve_anilist_identity(
     Ok(None)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdentityResolutionResult {
+    Resolved(TrackerMapping),
+    Ambiguous(Vec<String>),
+    NotFound,
+    ApiError(String),
+    RateLimited,
+    AuthError(String),
+    NetworkError(String),
+}
+
 /// Resolves a MangaBaka identity and standard digital edition for a Komga series with fail-closed precision.
 pub async fn resolve_mangabaka_identity(
     conn: &Connection,
     mb_client: &MangaBakaClient,
     komga_series_id: &str,
     komga_title: &str,
-) -> Result<Option<TrackerMapping>> {
+) -> Result<IdentityResolutionResult> {
     // 1. Check existing mapping table (manual override or resolved mapping)
     if let Some(existing) = get_mapping(conn, komga_series_id, SyncTarget::MangaBaka)? {
-        if existing.manual_override {
-            return Ok(Some(existing));
+        if existing.manual_override || existing.confidence == MappingConfidence::Resolved {
+            return Ok(IdentityResolutionResult::Resolved(existing));
         }
-        if existing.confidence == MappingConfidence::Resolved {
-            return Ok(Some(existing));
+        if existing.confidence == MappingConfidence::Ambiguous {
+            return Ok(IdentityResolutionResult::Ambiguous(vec![]));
         }
     }
 
@@ -136,21 +147,38 @@ pub async fn resolve_mangabaka_identity(
         });
 
     if let Some(anilist_id) = anilist_id_opt {
-        if let Ok(Some(xref)) = mb_client.resolve_from_anilist(anilist_id).await {
-            let mapping = TrackerMapping {
-                komga_series_id: komga_series_id.to_string(),
-                tracker: SyncTarget::MangaBaka,
-                tracker_id: xref.mangabaka_id.to_string(),
-                tracker_title: xref.title.or_else(|| Some(komga_title.to_string())),
-                edition_id: None,
-                mapping_source: MappingSource::CrossReference,
-                confidence: MappingConfidence::Resolved,
-                manual_override: false,
-                last_validated: Some(now()),
-                updated_at: now(),
-            };
-            save_mapping(conn, &mapping)?;
-            return Ok(Some(mapping));
+        match mb_client.resolve_from_anilist(anilist_id).await {
+            Ok(Some(xref)) => {
+                let mapping = TrackerMapping {
+                    komga_series_id: komga_series_id.to_string(),
+                    tracker: SyncTarget::MangaBaka,
+                    tracker_id: xref.mangabaka_id.to_string(),
+                    tracker_title: xref.title.or_else(|| Some(komga_title.to_string())),
+                    edition_id: None,
+                    mapping_source: MappingSource::CrossReference,
+                    confidence: MappingConfidence::Resolved,
+                    manual_override: false,
+                    last_validated: Some(now()),
+                    updated_at: now(),
+                };
+                save_mapping(conn, &mapping)?;
+                return Ok(IdentityResolutionResult::Resolved(mapping));
+            }
+            Ok(None) => {
+                // Cross-reference returned 404: fall through to exact title search
+            }
+            Err(e) if e.status == 429 || e.code == "mangabaka_rate_limited" => {
+                return Ok(IdentityResolutionResult::RateLimited);
+            }
+            Err(e) if e.status == 401 || e.status == 403 || e.code == "mangabaka_unauthorized" => {
+                return Ok(IdentityResolutionResult::AuthError(e.message));
+            }
+            Err(e) if e.status == 400 || e.code == "mangabaka_bad_request" => {
+                return Ok(IdentityResolutionResult::ApiError(e.message));
+            }
+            Err(e) => {
+                return Ok(IdentityResolutionResult::NetworkError(e.message));
+            }
         }
     }
 
@@ -174,16 +202,24 @@ pub async fn resolve_mangabaka_identity(
                 updated_at: now(),
             };
             save_mapping(conn, &ambiguous_mapping)?;
-            return Ok(None);
+            return Ok(IdentityResolutionResult::Ambiguous(candidates));
         }
-        MangaBakaSeriesMatch::NotFound => return Ok(None),
+        MangaBakaSeriesMatch::NotFound => return Ok(IdentityResolutionResult::NotFound),
+        MangaBakaSeriesMatch::ApiError(e) => {
+            tracing::warn!("MangaBaka API error for {komga_title}: {e}");
+            return Ok(IdentityResolutionResult::ApiError(e));
+        }
+        MangaBakaSeriesMatch::RateLimited => {
+            tracing::warn!("MangaBaka rate limited during search for {komga_title}");
+            return Ok(IdentityResolutionResult::RateLimited);
+        }
         MangaBakaSeriesMatch::AuthError(e) => {
             tracing::warn!("MangaBaka auth error: {e}");
-            return Ok(None);
+            return Ok(IdentityResolutionResult::AuthError(e));
         }
         MangaBakaSeriesMatch::NetworkError(e) => {
             tracing::warn!("MangaBaka network error: {e}");
-            return Ok(None);
+            return Ok(IdentityResolutionResult::NetworkError(e));
         }
     };
 
@@ -218,7 +254,7 @@ pub async fn resolve_mangabaka_identity(
     };
 
     save_mapping(conn, &mapping)?;
-    Ok(Some(mapping))
+    Ok(IdentityResolutionResult::Resolved(mapping))
 }
 
 /// Diagnoses unresolved or ambiguous titles.

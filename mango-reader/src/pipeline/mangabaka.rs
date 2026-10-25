@@ -20,6 +20,8 @@ pub enum MangaBakaSeriesMatch {
     Found { id: i64, title: String },
     Ambiguous(Vec<String>),
     NotFound,
+    ApiError(String),
+    RateLimited,
     AuthError(String),
     NetworkError(String),
 }
@@ -178,6 +180,22 @@ impl MangaBakaClient {
                 401,
                 "mangabaka_unauthorized",
                 "MangaBaka API token invalid or rejected",
+            ));
+        }
+
+        if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(AppError::new(
+                429,
+                "mangabaka_rate_limited",
+                "MangaBaka rate limited (HTTP 429); retry later",
+            ));
+        }
+
+        if resp.status() == reqwest::StatusCode::BAD_REQUEST {
+            return Err(AppError::new(
+                400,
+                "mangabaka_bad_request",
+                "MangaBaka cross-reference request rejected (HTTP 400)",
             ));
         }
 
@@ -400,7 +418,8 @@ impl MangaBakaClient {
     /// Tests whether MangaBaka is reachable and answering.
     pub async fn test_connection(&self) -> Result<String> {
         let resp = self
-            .request_builder(reqwest::Method::GET, "/series/search?q=test")
+            .request_builder(reqwest::Method::GET, "/series/search")
+            .query(&[("query", "test"), ("q", "test")])
             .send()
             .await
             .map_err(|e| {
@@ -443,7 +462,7 @@ impl MangaBakaClient {
 
         let resp = match self
             .request_builder(reqwest::Method::GET, "/series/search")
-            .query(&[("q", trimmed_series)])
+            .query(&[("query", trimmed_series), ("q", trimmed_series)])
             .send()
             .await
         {
@@ -456,6 +475,21 @@ impl MangaBakaClient {
                     "HTTP {}",
                     r.status()
                 )));
+            }
+            Ok(r) if r.status() == reqwest::StatusCode::BAD_REQUEST => {
+                let status = r.status();
+                let body = r.text().await.unwrap_or_default();
+                let sanitized_msg = if body.trim().is_empty() {
+                    format!("HTTP {status} Bad Request")
+                } else {
+                    format!("HTTP {status} Bad Request: {body}")
+                };
+                tracing::warn!("MANGABAKA: search returned HTTP 400: {sanitized_msg}");
+                return Ok(MangaBakaSeriesMatch::ApiError(sanitized_msg));
+            }
+            Ok(r) if r.status() == reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                tracing::warn!("MANGABAKA: rate limited (HTTP 429)");
+                return Ok(MangaBakaSeriesMatch::RateLimited);
             }
             Ok(r) => {
                 tracing::warn!("MANGABAKA: search returned HTTP {}", r.status());
@@ -733,6 +767,12 @@ impl MangaBakaClient {
                 return Ok(MangaBakaOutcome::SeriesNotFound(series.to_string()));
             }
             MangaBakaSeriesMatch::AuthError(e) => return Ok(MangaBakaOutcome::AuthError(e)),
+            MangaBakaSeriesMatch::ApiError(e) => return Ok(MangaBakaOutcome::NetworkError(e)),
+            MangaBakaSeriesMatch::RateLimited => {
+                return Ok(MangaBakaOutcome::NetworkError(
+                    "Rate limited (HTTP 429)".into(),
+                ));
+            }
             MangaBakaSeriesMatch::NetworkError(e) => return Ok(MangaBakaOutcome::NetworkError(e)),
         };
 

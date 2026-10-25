@@ -206,7 +206,7 @@ pub struct KomgaSeriesProgress {
     pub books: Vec<KomgaBookProgress>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TrackerMapping {
     pub komga_series_id: String,
