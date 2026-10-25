@@ -1,5 +1,34 @@
 <script lang="ts">
-  import { get, message, send, runSyncDryRun, runSync, getSyncStatus, getSyncHistory, getSyncSchedule, saveSyncSchedule, getUnresolvedDiagnostics, setManualSyncMapping, resetSyncMapping, type Category, type KomgaLibrary, type PipelineConfig, type PipelineEvent, type PathValidationResult, type OptimizerValidationResult, type ValidatePathsResponse, type Tracker, type SyncRecord, type SyncSummary, type SyncScheduleConfig, type UnresolvedTitleDiagnostic } from '../lib/api';
+  import {
+    get,
+    message,
+    send,
+    runSyncDryRun,
+    runSync,
+    getSyncStatus,
+    getSyncHistory,
+    getSyncSchedule,
+    saveSyncSchedule,
+    getUnresolvedDiagnostics,
+    setManualSyncMapping,
+    resetSyncMapping,
+    getAcquisitionSettings,
+    putAcquisitionSettings,
+    testTorBoxConnection,
+    type AcquisitionConfig,
+    type Category,
+    type KomgaLibrary,
+    type PipelineConfig,
+    type PipelineEvent,
+    type PathValidationResult,
+    type OptimizerValidationResult,
+    type ValidatePathsResponse,
+    type Tracker,
+    type SyncRecord,
+    type SyncSummary,
+    type SyncScheduleConfig,
+    type UnresolvedTitleDiagnostic,
+  } from '../lib/api';
   import { confirm } from '../lib/confirm.svelte';
   import { COVERS, display, MENUS, setDisplay, SIZES } from '../lib/display.svelte';
   import Icon, { type IconName } from '../lib/Icon.svelte';
@@ -552,6 +581,25 @@
   let bundledOptimizerPresent = $state(false);
   let resolvedOptimizerBin = $state<string | null>(null);
 
+  // ---------- acquisition providers (Nyaa / TorBox) ----------
+  let acquisition = $state<AcquisitionConfig>({
+    torboxEnabled: false,
+    torboxUrl: 'https://api.torbox.app/v1/api',
+    hasTorboxToken: false,
+    nyaaEnabled: true,
+    nyaaUrl: 'https://nyaa.si',
+    nyaaCategory: '3_1',
+  });
+  let torboxEnabledInput = $state(false);
+  let torboxUrlInput = $state('https://api.torbox.app/v1/api');
+  let torboxTokenInput = $state('');
+  let torboxTesting = $state(false);
+  let torboxTestResult = $state<{ ok: boolean; message: string } | null>(null);
+
+  let nyaaEnabledInput = $state(true);
+  let nyaaUrlInput = $state('https://nyaa.si');
+  let nyaaCategoryInput = $state('3_1');
+
   let askedPipeline = false;
   $effect(() => {
     if (tab.id !== 'pipeline' || askedPipeline || !session.admin) return;
@@ -563,9 +611,10 @@
     pipelineLoading = true;
     pipelineError = null;
     try {
-      const [cfg, evts] = await Promise.all([
+      const [cfg, evts, acq] = await Promise.all([
         get<PipelineConfig>('/pipeline/config'),
         get<PipelineEvent[]>('/pipeline/events'),
+        getAcquisitionSettings().catch(() => null),
       ]);
       pipeline = cfg;
       pipelineEvents = evts;
@@ -587,6 +636,16 @@
       optimizerStatus = cfg.optimizer_status ?? null;
       bundledOptimizerPresent = cfg.bundled_optimizer_present ?? false;
       resolvedOptimizerBin = cfg.resolved_optimizer_bin ?? null;
+
+      if (acq) {
+        acquisition = acq;
+        torboxEnabledInput = acq.torboxEnabled ?? false;
+        torboxUrlInput = acq.torboxUrl ?? 'https://api.torbox.app/v1/api';
+        torboxTokenInput = acq.hasTorboxToken ? '********' : '';
+        nyaaEnabledInput = acq.nyaaEnabled ?? true;
+        nyaaUrlInput = acq.nyaaUrl ?? 'https://nyaa.si';
+        nyaaCategoryInput = acq.nyaaCategory ?? '3_1';
+      }
     } catch (e) {
       pipelineError = message(e);
     } finally {
@@ -640,7 +699,18 @@
         image_quality: Number(imageQualityInput) || 90,
         min_savings_percent: Number(minSavingsPercentInput) >= 0 ? Number(minSavingsPercentInput) : 10,
       };
-      await send('PUT', '/pipeline/config', patch);
+      const acqPatch: AcquisitionConfigPatch = {
+        torboxEnabled: torboxEnabledInput,
+        torboxUrl: torboxUrlInput.trim() || undefined,
+        torboxToken: torboxTokenInput === 'CLEAR' ? '' : (torboxTokenInput && torboxTokenInput !== '********' ? torboxTokenInput.trim() : undefined),
+        nyaaEnabled: nyaaEnabledInput,
+        nyaaUrl: nyaaUrlInput.trim() || undefined,
+        nyaaCategory: nyaaCategoryInput.trim() || undefined,
+      };
+      await Promise.all([
+        send('PUT', '/pipeline/config', patch),
+        putAcquisitionSettings(acqPatch),
+      ]);
       toast.success('Acquisition pipeline settings saved');
       await loadPipeline();
     } catch (e) {
@@ -648,6 +718,33 @@
       toast.error(message(e));
     } finally {
       pipelineSaving = false;
+    }
+  }
+
+  async function testTorBox() {
+    torboxTesting = true;
+    torboxTestResult = null;
+    try {
+      const token = torboxTokenInput && torboxTokenInput !== '********' ? torboxTokenInput.trim() : undefined;
+      const res = await testTorBoxConnection(torboxUrlInput.trim() || undefined, token);
+      torboxTestResult = { ok: res.success, message: res.message };
+      if (res.success) {
+        acquisition.torboxValidated = true;
+        acquisition.torboxStatusMessage = res.message;
+        toast.success(res.message);
+      } else {
+        acquisition.torboxValidated = false;
+        acquisition.torboxStatusMessage = res.message;
+        toast.error(res.message);
+      }
+    } catch (e) {
+      const err = message(e);
+      torboxTestResult = { ok: false, message: err };
+      acquisition.torboxValidated = false;
+      acquisition.torboxStatusMessage = err;
+      toast.error(err);
+    } finally {
+      torboxTesting = false;
     }
   }
 
@@ -1559,6 +1656,102 @@
                   {/if}
                 </div>
               {/if}
+            </div>
+          </section>
+
+          <section class="card">
+            <h3>TorBox Download Backend</h3>
+            <div class="set">
+              <div class="what">
+                <strong>Enable TorBox Backend</strong>
+                <span>Use TorBox cloud torrent engine to acquire releases discovered from Nyaa and feed them into the native pipeline.</span>
+              </div>
+              <div class="how">
+                {@render toggle(torboxEnabledInput, 'TorBox backend', () => {
+                  torboxEnabledInput = !torboxEnabledInput;
+                })}
+              </div>
+            </div>
+            <div class="set stack">
+              <div class="what">
+                <strong>TorBox API Endpoint</strong>
+                <span>Default: https://api.torbox.app/v1/api</span>
+              </div>
+              <div class="how wide">
+                <label class="field grow">
+                  <input type="url" bind:value={torboxUrlInput} placeholder="https://api.torbox.app/v1/api" autocomplete="off" />
+                </label>
+              </div>
+            </div>
+            <div class="set stack">
+              <div class="what">
+                <strong>TorBox API Token</strong>
+                <span>Bearer token from your TorBox dashboard. Never exposed in responses or UI. Type CLEAR to remove.</span>
+              </div>
+              <div class="how wide">
+                <label class="field grow">
+                  <input
+                    type="password"
+                    bind:value={torboxTokenInput}
+                    placeholder={acquisition.hasTorboxToken ? 'Configured (type CLEAR to remove)' : 'TorBox API Token'}
+                    autocomplete="off"
+                  />
+                </label>
+                <button class="btn" onclick={testTorBox} disabled={torboxTesting}>
+                  <Icon name="refresh" size={16} />
+                  {torboxTesting ? 'Validating…' : 'Validate Connection'}
+                </button>
+              </div>
+            </div>
+            {#if torboxTestResult}
+              <div class="set stack">
+                <Notice error={torboxTestResult.ok ? null : torboxTestResult.message}>
+                  {#if torboxTestResult.ok}<span>{torboxTestResult.message}</span>{/if}
+                </Notice>
+              </div>
+            {:else if acquisition.torboxStatusMessage}
+              <div class="path-status-row" style="margin-top: 0.5rem;">
+                <span class="status-badge status-{acquisition.torboxValidated ? 'valid' : 'failed'}">
+                  {acquisition.torboxValidated ? '✓ Connected' : '✗ Error'}: {acquisition.torboxStatusMessage}
+                </span>
+              </div>
+            {/if}
+          </section>
+
+          <section class="card">
+            <h3>Nyaa Release Discovery</h3>
+            <div class="set">
+              <div class="what">
+                <strong>Enable Nyaa Discovery</strong>
+                <span>Discover canonical manga releases from Nyaa directly inside title overview pages.</span>
+              </div>
+              <div class="how">
+                {@render toggle(nyaaEnabledInput, 'Nyaa discovery', () => {
+                  nyaaEnabledInput = !nyaaEnabledInput;
+                })}
+              </div>
+            </div>
+            <div class="set stack">
+              <div class="what">
+                <strong>Nyaa Base URL</strong>
+                <span>Default: https://nyaa.si</span>
+              </div>
+              <div class="how wide">
+                <label class="field grow">
+                  <input type="url" bind:value={nyaaUrlInput} placeholder="https://nyaa.si" autocomplete="off" />
+                </label>
+              </div>
+            </div>
+            <div class="set stack">
+              <div class="what">
+                <strong>Nyaa Category</strong>
+                <span>Literature - English-translated category filter code. Default: <code>3_1</code>.</span>
+              </div>
+              <div class="how wide">
+                <label class="field grow">
+                  <input type="text" bind:value={nyaaCategoryInput} placeholder="3_1" autocomplete="off" />
+                </label>
+              </div>
             </div>
           </section>
 

@@ -3,6 +3,7 @@
 //! This binary is the core. The extension host is a JVM process it starts on
 //! demand; see `host.rs`.
 
+pub(crate) mod acquisition;
 mod api;
 mod auth;
 mod config;

@@ -59,6 +59,12 @@ pub struct Queued {
     pub can_retry_komga: bool,
     pub failure_stage: Option<String>,
     pub published_path: Option<String>,
+    pub source_type: Option<String>,
+    pub backend_type: Option<String>,
+    pub external_job_id: Option<String>,
+    pub raw_title: Option<String>,
+    pub uploader: Option<String>,
+    pub release_size: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -88,6 +94,50 @@ pub(crate) struct Job {
     pub(crate) chapter_number: Option<f64>,
     pub(crate) published_path: Option<String>,
     pub(crate) target_library_id: Option<String>,
+    pub(crate) source_type: String,
+    pub(crate) backend_type: String,
+    pub(crate) external_job_id: Option<String>,
+    #[allow(dead_code)]
+    pub(crate) external_file_id: Option<i64>,
+    pub(crate) torrent_hash: Option<String>,
+    pub(crate) raw_title: Option<String>,
+    pub(crate) uploader: Option<String>,
+    pub(crate) release_size: Option<u64>,
+    pub(crate) retrieved_path: Option<String>,
+}
+
+impl Default for Job {
+    fn default() -> Self {
+        Self {
+            chapter: 0,
+            manga_id: 0,
+            attempts: 0,
+            source: "Unknown source".to_string(),
+            title: String::new(),
+            name: String::new(),
+            number: 0.0,
+            scanlator: None,
+            author: None,
+            artist: None,
+            genre: None,
+            summary: None,
+            lang: None,
+            volume: None,
+            release_type: crate::release::ReleaseType::Volume,
+            chapter_number: None,
+            published_path: None,
+            target_library_id: None,
+            source_type: "reader".to_string(),
+            backend_type: "internal".to_string(),
+            external_job_id: None,
+            external_file_id: None,
+            torrent_hash: None,
+            raw_title: None,
+            uploader: None,
+            release_size: None,
+            retrieved_path: None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -103,6 +153,7 @@ pub struct Downloads {
     progress: Arc<StdMutex<Option<(i64, i64, i64)>>>,
     live_stage: Arc<StdMutex<Option<AcquisitionLiveState>>>,
     pipeline: Option<Arc<crate::pipeline::Pipeline>>,
+    pub(crate) acquisition: Option<Arc<crate::acquisition::service::AcquisitionService>>,
 }
 
 impl Downloads {
@@ -117,11 +168,20 @@ impl Downloads {
             progress: Arc::default(),
             live_stage: Arc::default(),
             pipeline: None,
+            acquisition: None,
         }
     }
 
     pub fn set_pipeline(&mut self, pipeline: Arc<crate::pipeline::Pipeline>) {
         self.pipeline = Some(pipeline);
+    }
+
+    pub fn set_acquisition(&mut self, acquisition: Arc<crate::acquisition::service::AcquisitionService>) {
+        self.acquisition = Some(acquisition);
+    }
+
+    pub fn wake(&self) -> Arc<Notify> {
+        self.wake.clone()
     }
 
     /// The folder chapters are saved in.
@@ -287,6 +347,43 @@ impl Downloads {
 
     /// Takes one chapter out of the queue, or with None all of them. A fetch in progress stops at its next page.
     pub async fn cancel(&self, chapter: Option<i64>) -> Result<()> {
+        let external_jobs: Vec<(String, String)> = self
+            .db
+            .call(move |conn| {
+                let sql = match chapter {
+                    Some(id) => format!("SELECT backend_type, external_job_id FROM downloads WHERE chapter_id = {id} AND external_job_id IS NOT NULL"),
+                    None => "SELECT backend_type, external_job_id FROM downloads WHERE external_job_id IS NOT NULL".to_string(),
+                };
+                let mut stmt = conn.prepare(&sql)?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .filter_map(std::result::Result::ok)
+                    .collect();
+                Ok(rows)
+            })
+            .await?;
+
+        for (backend, job_id) in external_jobs {
+            if backend == "torbox" {
+                let token = if let Some(acq) = &self.acquisition {
+                    acq.get_torbox_token().await.ok().flatten()
+                } else {
+                    self.db.call(|conn| crate::db::state(conn, "acquisition.torbox_token")).await.ok().flatten()
+                };
+                let (acq_cfg, _) = if let Some(acq) = &self.acquisition {
+                    acq.load_internal_config().await.unwrap_or_default()
+                } else {
+                    (crate::acquisition::AcquisitionConfig::default(), false)
+                };
+                let client = crate::acquisition::torbox::TorBoxClient::new(
+                    self.pipeline.as_ref().map(|p| p.http.clone()).unwrap_or_default(),
+                    acq_cfg.torbox_url,
+                    token,
+                );
+                let _ = client.cancel(&job_id).await;
+            }
+        }
+
         self.db
             .call(move |conn| {
                 match chapter {
@@ -519,7 +616,49 @@ impl Downloads {
                 }
             }
 
-            let outcome = self.save(&job).await;
+            let outcome = if job.backend_type == "torbox" {
+                match self.handle_torbox_job(&job).await {
+                    Ok(Some(res)) => Ok(Some(res)),
+                    Ok(None) => continue, // in progress or stalled waiting for retry
+                    Err(e) => {
+                        let ch_id = job.chapter;
+                        let err_msg = e.to_string();
+                        let err_msg_db = err_msg.clone();
+                        let _ = self
+                            .db
+                            .call(move |conn| {
+                                conn.execute(
+                                    "UPDATE downloads SET state = 'failed', error = ?1 WHERE chapter_id = ?2",
+                                    rusqlite::params![&err_msg_db, ch_id],
+                                )?;
+                                Ok(())
+                            })
+                            .await;
+                        if let Some(acq) = &self.acquisition {
+                            let _ = acq
+                                .record_history(
+                                    Some(job.chapter),
+                                    job.manga_id,
+                                    &job.title,
+                                    job.raw_title.as_deref().unwrap_or(&job.name),
+                                    &job.source_type,
+                                    job.uploader.as_deref(),
+                                    job.external_job_id.as_deref(),
+                                    &job.backend_type,
+                                    "failed",
+                                    None,
+                                    job.release_size,
+                                    Some(&err_msg),
+                                )
+                                .await;
+                        }
+                        *self.live_stage.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                        continue;
+                    }
+                }
+            } else {
+                self.save(&job).await
+            };
             *self.progress.lock().unwrap_or_else(|e| e.into_inner()) = None;
 
             let mut final_outcome = outcome.clone();
@@ -542,20 +681,92 @@ impl Downloads {
 
                     match pipeline.process_download_with_progress(&cbz_file, &job, update_stage).await {
                         Ok(crate::pipeline::AcquisitionOutcome::Complete(_)) => {
+                            if let Some(acq) = &self.acquisition {
+                                let _ = acq
+                                    .record_history(
+                                        Some(job.chapter),
+                                        job.manga_id,
+                                        &job.title,
+                                        job.raw_title.as_deref().unwrap_or(&job.name),
+                                        &job.source_type,
+                                        job.uploader.as_deref(),
+                                        job.external_job_id.as_deref(),
+                                        &job.backend_type,
+                                        "completed",
+                                        Some(&cbz_file.display().to_string()),
+                                        job.release_size,
+                                        None,
+                                    )
+                                    .await;
+                            }
                             *self.live_stage.lock().unwrap_or_else(|e| e.into_inner()) = None;
                             continue;
                         }
                         Ok(crate::pipeline::AcquisitionOutcome::PublishedPendingKomga(_)) => {
+                            if let Some(acq) = &self.acquisition {
+                                let _ = acq
+                                    .record_history(
+                                        Some(job.chapter),
+                                        job.manga_id,
+                                        &job.title,
+                                        job.raw_title.as_deref().unwrap_or(&job.name),
+                                        &job.source_type,
+                                        job.uploader.as_deref(),
+                                        job.external_job_id.as_deref(),
+                                        &job.backend_type,
+                                        "verification_pending",
+                                        Some(&cbz_file.display().to_string()),
+                                        job.release_size,
+                                        None,
+                                    )
+                                    .await;
+                            }
                             *self.live_stage.lock().unwrap_or_else(|e| e.into_inner()) = None;
                             continue;
                         }
                         Ok(crate::pipeline::AcquisitionOutcome::PublishedScanFailed { error, .. }) => {
                             tracing::warn!("acquisition published for {} / {}, but Komga scan failed: {error}", job.title, job.name);
+                            if let Some(acq) = &self.acquisition {
+                                let _ = acq
+                                    .record_history(
+                                        Some(job.chapter),
+                                        job.manga_id,
+                                        &job.title,
+                                        job.raw_title.as_deref().unwrap_or(&job.name),
+                                        &job.source_type,
+                                        job.uploader.as_deref(),
+                                        job.external_job_id.as_deref(),
+                                        &job.backend_type,
+                                        "published_scan_failed",
+                                        Some(&cbz_file.display().to_string()),
+                                        job.release_size,
+                                        Some(&error),
+                                    )
+                                    .await;
+                            }
                             *self.live_stage.lock().unwrap_or_else(|e| e.into_inner()) = None;
                             continue;
                         }
                         Err(e) => {
                             tracing::warn!("acquisition pipeline processing failed for {} / {}: {e}", job.title, job.name);
+                            if let Some(acq) = &self.acquisition {
+                                let _ = acq
+                                    .record_history(
+                                        Some(job.chapter),
+                                        job.manga_id,
+                                        &job.title,
+                                        job.raw_title.as_deref().unwrap_or(&job.name),
+                                        &job.source_type,
+                                        job.uploader.as_deref(),
+                                        job.external_job_id.as_deref(),
+                                        &job.backend_type,
+                                        "pipeline_failed",
+                                        None,
+                                        job.release_size,
+                                        Some(&e.to_string()),
+                                    )
+                                    .await;
+                            }
                             final_outcome = Err(e);
                         }
                     }
@@ -572,6 +783,182 @@ impl Downloads {
                 tracing::warn!("could not record a download: {e}");
             }
         }
+    }
+
+    /// Handles external remote torrent acquisition via TorBox.
+    async fn handle_torbox_job(&self, job: &Job) -> Result<Option<(String, i64)>> {
+        // 1. If already retrieved, verify staging CBZ
+        if let Some(ref rel) = job.retrieved_path {
+            let path = self.dir.join(rel);
+            if path.is_file() && crate::pipeline::publisher::verify_cbz_integrity(&path).is_ok() {
+                return Ok(Some((rel.clone(), 1)));
+            }
+        }
+
+        let token = if let Some(acq) = &self.acquisition {
+            acq.get_torbox_token().await.ok().flatten()
+        } else {
+            self.db.call(|conn| crate::db::state(conn, "acquisition.torbox_token")).await.ok().flatten()
+        };
+        let (acq_cfg, _) = if let Some(acq) = &self.acquisition {
+            acq.load_internal_config().await.unwrap_or_default()
+        } else {
+            (crate::acquisition::AcquisitionConfig::default(), false)
+        };
+        let client = crate::acquisition::torbox::TorBoxClient::new(
+            self.pipeline.as_ref().map(|p| p.http.clone()).unwrap_or_default(),
+            acq_cfg.torbox_url,
+            token,
+        );
+
+        let live_stage = self.live_stage.clone();
+        let chapter_id = job.chapter;
+        let update_stage = move |stage: &str, msg: &str| {
+            if let Ok(mut lock) = live_stage.lock() {
+                *lock = Some(AcquisitionLiveState {
+                    chapter_id,
+                    stage: stage.to_string(),
+                    status_message: msg.to_string(),
+                    destination: None,
+                });
+            }
+        };
+
+        // 2. Submit if external_job_id is missing
+        let external_job_id = match &job.external_job_id {
+            Some(id) if !id.trim().is_empty() => id.clone(),
+            _ => {
+                update_stage("torbox_submitting", "Submitting torrent to TorBox remote swarm...");
+                let magnet = if let Some(ref hash) = job.torrent_hash {
+                    crate::acquisition::nyaa::build_magnet(hash, job.raw_title.as_deref().unwrap_or(&job.name))
+                } else {
+                    return Err(AppError::bad_request("TorBox job has no torrent hash or magnet"));
+                };
+
+                let rel = crate::acquisition::AcquisitionRelease {
+                    source: "nyaa".to_string(),
+                    source_item_id: job.chapter.to_string(),
+                    title: job.name.clone(),
+                    raw_title: job.raw_title.clone().unwrap_or_else(|| job.name.clone()),
+                    uploader: job.uploader.clone(),
+                    source_url: String::new(),
+                    torrent_url: None,
+                    magnet_url: Some(magnet),
+                    info_hash: job.torrent_hash.clone(),
+                    category_id: None,
+                    category_name: None,
+                    size_bytes: job.release_size.unwrap_or(0),
+                    size_formatted: String::new(),
+                    seeders: 1,
+                    leechers: 0,
+                    published_at: None,
+                    is_trusted: false,
+                    is_remake: false,
+                    release_unit: match job.release_type {
+                        crate::release::ReleaseType::Volume => crate::acquisition::AcquisitionReleaseUnit::Volume(job.volume.unwrap_or(job.number)),
+                        crate::release::ReleaseType::Chapter => crate::acquisition::AcquisitionReleaseUnit::Chapter(job.chapter_number.unwrap_or(job.number)),
+                    },
+                    release_number: Some(job.number),
+                    release_range: None,
+                    language: job.lang.clone(),
+                };
+
+                let info = client.submit(&rel).await?;
+                let jid = info.external_job_id.clone();
+                let jid_db = jid.clone();
+                let thash = info.torrent_hash.clone();
+                let ch_id = job.chapter;
+                self.db.call(move |conn| {
+                    conn.execute(
+                        "UPDATE downloads SET external_job_id = ?1, torrent_hash = COALESCE(torrent_hash, ?2) WHERE chapter_id = ?3",
+                        rusqlite::params![&jid_db, &thash, ch_id],
+                    )?;
+                    Ok(())
+                }).await?;
+                jid
+            }
+        };
+
+        // 3. Check status
+        update_stage("torbox_checking", "Checking TorBox download status...");
+        let status = client.check_status(&external_job_id).await?;
+        match status {
+            crate::acquisition::BackendJobStatus::Downloading { progress, seeds, .. } => {
+                let pct = (progress * 100.0).clamp(0.0, 99.0);
+                update_stage("torbox_downloading", &format!("Downloading in TorBox: {pct:.0}% ({seeds} seeds)"));
+                let ch_id = job.chapter;
+                let status_msg = format!("Downloading in TorBox ({pct:.0}%)");
+                self.db.call(move |conn| {
+                    conn.execute(
+                        "UPDATE downloads SET state = 'queued', error = ?1, retry_at = strftime('%s','now') + 5 WHERE chapter_id = ?2",
+                        rusqlite::params![&status_msg, ch_id],
+                    )?;
+                    Ok(())
+                }).await?;
+                if let Ok(mut p) = self.progress.lock() {
+                    *p = Some((job.chapter, pct as i64, 100));
+                }
+                return Ok(None);
+            }
+            crate::acquisition::BackendJobStatus::Stalled { reason } => {
+                update_stage("torbox_stalled", &format!("TorBox stalled: {reason}"));
+                let ch_id = job.chapter;
+                let err_msg = reason.clone();
+                self.db.call(move |conn| {
+                    conn.execute(
+                        "UPDATE downloads SET state = 'queued', error = ?1, retry_at = strftime('%s','now') + 15 WHERE chapter_id = ?2",
+                        rusqlite::params![&err_msg, ch_id],
+                    )?;
+                    Ok(())
+                }).await?;
+                return Ok(None);
+            }
+            crate::acquisition::BackendJobStatus::Failed { error } => {
+                return Err(AppError::bad_request(format!("TorBox download failed: {error}")));
+            }
+            crate::acquisition::BackendJobStatus::Cached | crate::acquisition::BackendJobStatus::Completed => {
+                // Done on TorBox remote swarm
+            }
+        }
+
+        // 4. File selection
+        update_stage("torbox_selecting", "Selecting manga archive file...");
+        let files = client.list_files(&external_job_id).await?;
+        let target_unit = match job.release_type {
+            crate::release::ReleaseType::Volume => Some(crate::acquisition::AcquisitionReleaseUnit::Volume(job.volume.unwrap_or(job.number))),
+            crate::release::ReleaseType::Chapter => Some(crate::acquisition::AcquisitionReleaseUnit::Chapter(job.chapter_number.unwrap_or(job.number))),
+        };
+        let selected_file = crate::acquisition::torbox::select_artifact(&files, target_unit.as_ref())?;
+
+        // 5. Staging path
+        let relative = self.place(job);
+        let full_cbz_path = self.dir.join(&relative);
+        let part_path = full_cbz_path.with_extension("cbz.part");
+
+        if let Some(parent) = full_cbz_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+
+        // 6. Stream retrieve to staging .part
+        update_stage("torbox_retrieving", &format!("Retrieving {} from TorBox CDN...", selected_file.name));
+        client.retrieve_file(&external_job_id, selected_file.id, selected_file.size, &part_path).await?;
+
+        // Atomic promotion
+        std::fs::rename(&part_path, &full_cbz_path)?;
+
+        let rel_str = relative.to_string_lossy().replace('\\', "/");
+        let ch_id = job.chapter;
+        let rel_clone = rel_str.clone();
+        self.db.call(move |conn| {
+            conn.execute("UPDATE chapters SET download_path = ?1 WHERE id = ?2", rusqlite::params![&rel_clone, ch_id])?;
+            conn.execute("UPDATE downloads SET retrieved_path = ?1 WHERE chapter_id = ?2", rusqlite::params![&rel_clone, ch_id])?;
+            Ok(())
+        }).await?;
+
+        // Best effort remote delete on TorBox
+        let _ = client.cancel(&external_job_id).await;
+
+        Ok(Some((rel_str, 1)))
     }
 
     /// Fetches a chapter and writes its CBZ. None when it was cancelled or paused part way.
@@ -709,7 +1096,8 @@ fn unread_of(conn: &Connection, titles: &[i64]) -> Result<Vec<i64>> {
 pub(crate) fn read_queue(conn: &Connection) -> Result<QueueView> {
     let mut stmt = conn.prepare(
         "SELECT d.chapter_id, c.name, m.id, m.title, d.state, c.page_count, d.attempts, d.retry_at, d.error,
-                COALESCE(s.name, 'Unknown source'), c.scanlator, c.chapter_number, d.published_path
+                COALESCE(s.name, 'Unknown source'), c.scanlator, c.chapter_number, d.published_path,
+                d.source_type, d.backend_type, d.external_job_id, d.raw_title, d.uploader, d.release_size
          FROM downloads d
          JOIN chapters c ON c.id = d.chapter_id
          JOIN manga m ON m.id = c.manga_id
@@ -762,6 +1150,12 @@ pub(crate) fn read_queue(conn: &Connection) -> Result<QueueView> {
                 can_retry_komga,
                 failure_stage,
                 published_path,
+                source_type: r.get(13)?,
+                backend_type: r.get(14)?,
+                external_job_id: r.get(15)?,
+                raw_title: r.get(16)?,
+                uploader: r.get(17)?,
+                release_size: r.get::<_, Option<i64>>(18)?.map(|s| s as u64),
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -776,7 +1170,9 @@ fn next_job(conn: &Connection) -> Result<Option<Job>> {
     let job_row = conn
         .query_row(
             "SELECT d.chapter_id, d.attempts, COALESCE(s.name, 'Unknown source'), m.title, c.name, c.chapter_number, c.scanlator,
-                    m.author, m.artist, m.genre, m.description, s.lang, m.id, d.published_path, d.target_library_id, d.state
+                    m.author, m.artist, m.genre, m.description, s.lang, m.id, d.published_path, d.target_library_id, d.state,
+                    d.source_type, d.backend_type, d.external_job_id, d.external_file_id, d.torrent_hash, d.raw_title,
+                    d.uploader, d.release_size, d.retrieved_path
              FROM downloads d JOIN chapters c ON c.id = d.chapter_id JOIN manga m ON m.id = c.manga_id
              LEFT JOIN sources s ON s.id = m.source_id
              WHERE (d.state = 'queued' OR d.state = 'verifying') AND (d.retry_at IS NULL OR d.retry_at <= ?1)
@@ -807,6 +1203,15 @@ fn next_job(conn: &Connection) -> Result<Option<Job>> {
                         chapter_number: release_info.chapter_number,
                         published_path: r.get(13)?,
                         target_library_id: r.get(14)?,
+                        source_type: r.get(16)?,
+                        backend_type: r.get(17)?,
+                        external_job_id: r.get(18)?,
+                        external_file_id: r.get(19)?,
+                        torrent_hash: r.get(20)?,
+                        raw_title: r.get(21)?,
+                        uploader: r.get(22)?,
+                        release_size: r.get::<_, Option<i64>>(23)?.map(|s| s as u64),
+                        retrieved_path: r.get(24)?,
                     },
                     state,
                 ))
@@ -1072,6 +1477,7 @@ mod tests {
             chapter_number: Some(1.5),
             published_path: None,
             target_library_id: None,
+            ..Default::default()
         };
         let xml = comic_info(&job, 12);
         assert!(xml.contains("<Series>Tom &amp; Jerry &lt;3</Series>"));
@@ -1108,6 +1514,7 @@ mod tests {
             chapter_number: None,
             published_path: None,
             target_library_id: None,
+            ..Default::default()
         };
         let vol_xml = comic_info(&vol_job, 192);
         assert!(vol_xml.contains("<Volume>1</Volume>"));
@@ -1136,6 +1543,7 @@ mod tests {
             chapter_number: Some(5.0),
             published_path: None,
             target_library_id: None,
+            ..Default::default()
         };
         let ch_vol_xml = comic_info(&ch_vol_job, 24);
         assert!(ch_vol_xml.contains("<Volume>1</Volume>"));
@@ -1162,6 +1570,7 @@ mod tests {
             chapter_number: Some(1.0),
             published_path: None,
             target_library_id: None,
+            ..Default::default()
         };
         let ch_xml = comic_info(&ch_job, 75);
         assert!(ch_xml.contains("<Number>1</Number>"));
@@ -1194,6 +1603,7 @@ mod tests {
             chapter_number: None,
             published_path: None,
             target_library_id: None,
+            ..Default::default()
         };
         let frac_xml = comic_info(&frac_job, 100);
         assert!(frac_xml.contains("<Volume>12.5</Volume>"));

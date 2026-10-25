@@ -1,5 +1,17 @@
 <script lang="ts">
-  import { get, message, send, type Category, type Chapter, type OwnershipStatus, type Title, type TitleOwnership } from '../lib/api';
+  import {
+    get,
+    message,
+    send,
+    getTitleAcquisitionReleases,
+    acquireRelease,
+    type AcquisitionCandidate,
+    type Category,
+    type Chapter,
+    type OwnershipStatus,
+    type Title,
+    type TitleOwnership,
+  } from '../lib/api';
   import { confirm } from '../lib/confirm.svelte';
   import Cover from '../lib/Cover.svelte';
   import Icon from '../lib/Icon.svelte';
@@ -165,6 +177,45 @@
     }
     return missing;
   });
+
+  // ---------- Nyaa Release Discovery & TorBox Acquisition ----------
+  let nyaaReleases = $state<AcquisitionCandidate[]>([]);
+  let loadingNyaa = $state(false);
+  let nyaaError = $state<string | null>(null);
+  let showNyaa = $state(false);
+  let acquiringReleases = $state<Record<string, boolean>>({});
+
+  async function searchNyaa(unitType?: string, unitNumber?: number) {
+    showNyaa = true;
+    loadingNyaa = true;
+    nyaaError = null;
+    try {
+      nyaaReleases = await getTitleAcquisitionReleases(id, unitType, unitNumber);
+      if (nyaaReleases.length === 0) {
+        toast.info('No matching manga literature releases found on Nyaa');
+      }
+    } catch (e) {
+      nyaaError = message(e);
+      toast.error(nyaaError);
+    } finally {
+      loadingNyaa = false;
+    }
+  }
+
+  async function acquireCandidate(cand: AcquisitionCandidate) {
+    const key = cand.release.sourceItemId;
+    acquiringReleases[key] = true;
+    try {
+      await acquireRelease(id, cand.release, cand.release.releaseUnit);
+      toast.success(`Queued "${cand.release.title}" for download via TorBox!`);
+      cand.ownershipStatus = 'acquiring';
+      refreshOwnership();
+    } catch (e) {
+      toast.error(message(e));
+    } finally {
+      acquiringReleases[key] = false;
+    }
+  }
 
   function formatVolumeRanges(nums: number[]): string {
     if (!nums.length) return 'None';
@@ -705,6 +756,98 @@
           </div>
         {/if}
         <Tracking {id} title={title.title} />
+
+        <div class="nyaa-discovery-card">
+          <div class="nyaa-header-row">
+            <div>
+              <h3 class="display nyaa-title">NYAA RELEASES</h3>
+              <span class="nyaa-subtext">Discover manga releases on Nyaa and acquire via TorBox.</span>
+            </div>
+            <button class="btn pill" onclick={() => searchNyaa()} disabled={loadingNyaa}>
+              {#if loadingNyaa}
+                <span class="spin"><Icon name="spinner" size={14} stroke={3} /></span>
+              {:else}
+                <Icon name="search" size={14} />
+              {/if}
+              {showNyaa ? 'Refresh Nyaa' : 'Find Releases on Nyaa'}
+            </button>
+          </div>
+
+          {#if showNyaa}
+            {#if nyaaError}
+              <Notice error={nyaaError} retry={() => searchNyaa()} />
+            {:else if loadingNyaa}
+              <div class="nyaa-loading-box">
+                <span class="spin"><Icon name="spinner" size={20} stroke={3} /></span>
+                Searching Nyaa manga literature...
+              </div>
+            {:else if nyaaReleases.length === 0}
+              <p class="nyaa-muted">No manga literature releases found matching this title on Nyaa.</p>
+            {:else}
+              <ul class="candidate-list">
+                {#each nyaaReleases as cand (cand.release.sourceItemId)}
+                  <li class="candidate-item" class:owned={cand.ownershipStatus === 'owned'} class:acquiring={cand.ownershipStatus === 'acquiring'}>
+                    <div class="candidate-main">
+                      <div class="candidate-badges">
+                        <span class="tag" class:spot={cand.matchType.startsWith('exact')}>
+                          {cand.matchType.replace('_', ' ').toUpperCase()}
+                        </span>
+                        {#if cand.release.isTrusted}
+                          <span class="tag spot">TRUSTED</span>
+                        {/if}
+                        {#if cand.release.isRemake}
+                          <span class="tag error">REMAKE</span>
+                        {/if}
+                        {#if cand.ownershipStatus === 'owned'}
+                          <span class="tag spot">OWNED IN KOMGA</span>
+                        {:else if cand.ownershipStatus === 'acquiring'}
+                          <span class="tag">ACQUIRING</span>
+                        {/if}
+                      </div>
+                      <div class="candidate-title" title={cand.release.rawTitle}>
+                        <strong>{cand.release.rawTitle}</strong>
+                      </div>
+                      <div class="candidate-meta">
+                        {#if cand.release.uploader}
+                          <span>Uploader: <strong>{cand.release.uploader}</strong></span>
+                          <span>·</span>
+                        {/if}
+                        <span>Size: <strong>{cand.release.sizeFormatted}</strong></span>
+                        <span>·</span>
+                        <span class="seeders">Seeders: <strong>{cand.release.seeders}</strong></span>
+                        <span>·</span>
+                        <span>Leechers: {cand.release.leechers}</span>
+                      </div>
+                    </div>
+                    <div class="candidate-action">
+                      {#if cand.ownershipStatus === 'owned'}
+                        <button class="btn pill" disabled title="Already owned in canonical library">
+                          <Icon name="check" size={14} /> Owned
+                        </button>
+                      {:else if cand.ownershipStatus === 'acquiring'}
+                        <button class="btn pill" disabled title="Currently in download or verification queue">
+                          <span class="spin"><Icon name="spinner" size={14} stroke={3} /></span> Acquiring
+                        </button>
+                      {:else}
+                        <button
+                          class="btn spot pill"
+                          disabled={acquiringReleases[cand.release.sourceItemId]}
+                          onclick={() => acquireCandidate(cand)}
+                        >
+                          {#if acquiringReleases[cand.release.sourceItemId]}
+                            <span class="spin"><Icon name="spinner" size={14} stroke={3} /></span> Acquiring…
+                          {:else}
+                            <Icon name="download" size={14} /> Acquire with TorBox
+                          {/if}
+                        </button>
+                      {/if}
+                    </div>
+                  </li>
+                {/each}
+              </ul>
+            {/if}
+          {/if}
+        </div>
       </div>
 
       <div class="chapters">
@@ -866,6 +1009,16 @@
                         <Icon name="download" size={14} />
                       {/if}
                       Download Volume
+                    </button>
+                  {/if}
+                  {#if grp.ownershipStatus !== 'owned'}
+                    <button
+                      class="btn pill"
+                      aria-label="Find {grp.label} on Nyaa"
+                      onclick={() => searchNyaa('volume', grp.volume)}
+                      title="Search Nyaa for {grp.label}"
+                    >
+                      <Icon name="search" size={14} /> Find Nyaa
                     </button>
                   {/if}
                 </div>
@@ -1389,6 +1542,119 @@
     font-weight: 900;
     background: var(--surface);
     border: 1.5px solid var(--ink);
+  }
+
+  .nyaa-discovery-card {
+    border: 2px solid var(--ink);
+    background: var(--paper);
+    padding: 16px;
+    margin: 16px 0;
+    box-shadow: 3px 3px 0 var(--ink);
+  }
+
+  .nyaa-header-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-bottom: 8px;
+  }
+
+  .nyaa-title {
+    margin: 0;
+    font-size: 15px;
+    letter-spacing: 0.08em;
+  }
+
+  .nyaa-subtext {
+    font-size: 12px;
+    opacity: 0.75;
+  }
+
+  .nyaa-loading-box {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 16px;
+    font-size: 14px;
+    opacity: 0.85;
+  }
+
+  .nyaa-muted {
+    font-size: 13px;
+    opacity: 0.7;
+    margin: 12px 0 4px;
+  }
+
+  .candidate-list {
+    list-style: none;
+    padding: 0;
+    margin: 12px 0 0;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .candidate-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 16px;
+    border: 1.5px solid var(--ink);
+    background: var(--surface);
+    padding: 12px;
+    box-shadow: 2px 2px 0 var(--ink);
+  }
+
+  .candidate-item.owned {
+    opacity: 0.75;
+  }
+
+  .candidate-main {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .candidate-badges {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+
+  .candidate-title {
+    font-size: 14px;
+    line-height: 1.35;
+    word-break: break-word;
+  }
+
+  .candidate-meta {
+    display: flex;
+    gap: 8px;
+    font-size: 12px;
+    opacity: 0.8;
+    flex-wrap: wrap;
+  }
+
+  .candidate-meta .seeders strong {
+    color: var(--accent, #008800);
+  }
+
+  .candidate-action {
+    flex-shrink: 0;
+  }
+
+  @media (max-width: 640px) {
+    .candidate-item {
+      flex-direction: column;
+      align-items: flex-start;
+    }
+    .candidate-action {
+      align-self: flex-end;
+    }
   }
 
   @media (max-width: 640px) {

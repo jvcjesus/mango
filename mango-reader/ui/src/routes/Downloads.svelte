@@ -147,6 +147,7 @@
   function describe(entry: Queued): string {
     if (entry.statusMessage) return entry.statusMessage;
     if (entry.state === 'verifying' || entry.stage === 'verifying') return 'Published — waiting for Komga';
+    if (entry.backendType === 'torbox' && entry.state === 'downloading') return 'Downloading via TorBox';
     if (entry.state === 'downloading') return entry.total ? `Downloading, page ${entry.done} of ${entry.total}` : 'Downloading';
     if (entry.state === 'identifying') return 'Identifying release semantics';
     if (entry.state === 'metadata') return 'Querying MangaBaka metadata';
@@ -165,6 +166,12 @@
   function stageLabel(entry: Queued): string {
     const s = entry.stage ?? entry.state;
     switch (s) {
+      case 'torbox_submitting': return 'TorBox Submit';
+      case 'torbox_checking': return 'TorBox Wait';
+      case 'torbox_downloading': return 'TorBox Downloading';
+      case 'torbox_stalled': return 'TorBox Stalled';
+      case 'torbox_selecting': return 'TorBox Select';
+      case 'torbox_retrieving': return 'Retrieving';
       case 'downloading': return 'Downloading';
       case 'identifying': return 'Identifying';
       case 'metadata': return 'Metadata';
@@ -239,6 +246,12 @@
                 <span class="tag" class:spot={entry.stage !== 'queued' && entry.stage !== 'failed'} class:error={entry.stage === 'failed'}>
                   {stageLabel(entry)}
                 </span>
+                {#if entry.sourceType === 'nyaa'}
+                  <span class="tag spot">Nyaa</span>
+                {/if}
+                {#if entry.uploader}
+                  <span class="tag">{entry.uploader}</span>
+                {/if}
                 {#if entry.releaseType === 'volume' || (entry.volume !== undefined && entry.volume !== null)}
                   <span class="tag">Vol. {entry.volume ?? 'Special'}</span>
                 {/if}

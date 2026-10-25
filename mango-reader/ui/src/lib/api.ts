@@ -222,6 +222,12 @@ export type Queued = {
   canRetryKomga?: boolean;
   failureStage?: string | null;
   publishedPath?: string | null;
+  sourceType?: string | null;
+  backendType?: string | null;
+  externalJobId?: string | null;
+  rawTitle?: string | null;
+  uploader?: string | null;
+  releaseSize?: number | null;
 };
 
 export type Queue = { paused: boolean; queue: Queued[] };
@@ -713,3 +719,107 @@ export const getLists = (query?: ListsQuery) => {
 
 export const refreshLists = (tracker?: string | null) =>
   send<ListsRefreshReport>('POST', '/lists/refresh', { tracker: tracker ?? null });
+
+// ---------- Acquisition (Nyaa & TorBox) ----------
+
+export type AcquisitionReleaseUnit =
+  | { type: 'volume'; value: number }
+  | { type: 'chapter'; value: number }
+  | { type: 'collection'; value: { start: number; end: number } }
+  | { type: 'unknown' };
+
+export interface AcquisitionRelease {
+  source: string;
+  sourceItemId: string;
+  title: string;
+  rawTitle: string;
+  uploader?: string | null;
+  sourceUrl: string;
+  torrentUrl?: string | null;
+  magnetUrl?: string | null;
+  infoHash?: string | null;
+  categoryId?: string | null;
+  categoryName?: string | null;
+  sizeBytes: number;
+  sizeFormatted: string;
+  seeders: number;
+  leechers: number;
+  publishedAt?: number | null;
+  isTrusted: boolean;
+  isRemake: boolean;
+  releaseUnit: AcquisitionReleaseUnit;
+  releaseNumber?: number | null;
+  releaseRange?: [number, number] | null;
+  language?: string | null;
+}
+
+export interface AcquisitionCandidate {
+  release: AcquisitionRelease;
+  score: number;
+  matchType: string;
+  ownershipStatus: string;
+}
+
+export interface AcquisitionConfig {
+  nyaaEnabled: boolean;
+  nyaaUrl?: string | null;
+  nyaaCategory?: string | null;
+  torboxEnabled: boolean;
+  torboxUrl?: string | null;
+  hasTorboxToken: boolean;
+  torboxValidated?: boolean | null;
+  torboxStatusMessage?: string | null;
+}
+
+export interface AcquisitionConfigPatch {
+  nyaaEnabled?: boolean;
+  nyaaUrl?: string;
+  nyaaCategory?: string;
+  torboxEnabled?: boolean;
+  torboxUrl?: string;
+  torboxToken?: string;
+}
+
+export interface AcquisitionHistoryRecord {
+  id: number;
+  chapterId?: number | null;
+  mangaId: number;
+  series: string;
+  releaseName: string;
+  sourceType: string;
+  uploader?: string | null;
+  externalJobId?: string | null;
+  backendType: string;
+  outcome: string;
+  canonicalPath?: string | null;
+  releaseSize?: number | null;
+  completedAt: number;
+  error?: string | null;
+}
+
+export const getTitleAcquisitionReleases = (id: number, unitType?: string, unitNumber?: number) => {
+  const params = new URLSearchParams();
+  if (unitType) params.set('unit_type', unitType);
+  if (unitNumber !== undefined) params.set('unit_number', String(unitNumber));
+  const qs = params.toString();
+  return get<AcquisitionCandidate[]>(`/titles/${id}/acquisition-releases${qs ? `?${qs}` : ''}`);
+};
+
+export const acquireRelease = (id: number, release: AcquisitionRelease, targetUnit?: AcquisitionReleaseUnit) =>
+  send<{ success: boolean; chapterId: number }>('POST', `/titles/${id}/acquire`, { release, targetUnit });
+
+export const getAcquisitionSettings = () => get<AcquisitionConfig>('/settings/acquisition');
+
+export const putAcquisitionSettings = (patch: AcquisitionConfigPatch) =>
+  send<AcquisitionConfig>('PUT', '/settings/acquisition', patch);
+
+export const testTorBoxConnection = (url?: string, token?: string) =>
+  send<{ success: boolean; message: string }>('POST', '/settings/acquisition/torbox/test', { url, token });
+
+export const getAcquisitionHistory = (mangaId?: number, limit?: number) => {
+  const params = new URLSearchParams();
+  if (mangaId !== undefined) params.set('manga_id', String(mangaId));
+  if (limit !== undefined) params.set('limit', String(limit));
+  const qs = params.toString();
+  return get<AcquisitionHistoryRecord[]>(`/acquisition/history${qs ? `?${qs}` : ''}`);
+};

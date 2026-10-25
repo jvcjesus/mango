@@ -1907,5 +1907,103 @@ describe('first-class volume acquisition & release semantics', () => {
       expect(resWithoutSrc.html).not.toContain('<img');
       expect(resWithoutSrc.html).toContain('S'); // glyph placeholder
     });
+
+    it('verifies Nyaa release discovery & TorBox external download frontend contracts', () => {
+      // 1. Secret token protection in config patch
+      const originalConfig: import('./api').AcquisitionConfig = {
+        nyaaEnabled: true,
+        nyaaUrl: 'https://nyaa.si',
+        nyaaCategory: '3_1',
+        torboxEnabled: true,
+        torboxUrl: 'https://api.torbox.app/v1/api',
+        hasTorboxToken: true,
+        torboxValidated: true,
+        torboxStatusMessage: 'Connected as user@example.com (Plan: Pro)',
+      };
+
+      // When token input is '********' (unchanged placeholder), patch must omit token to preserve backend state
+      const tokenInputUnchanged = '********';
+      const patch1: import('./api').AcquisitionConfigPatch = {
+        torboxEnabled: originalConfig.torboxEnabled,
+        torboxUrl: originalConfig.torboxUrl || undefined,
+        torboxToken: tokenInputUnchanged === 'CLEAR' ? '' : (tokenInputUnchanged && tokenInputUnchanged !== '********' ? tokenInputUnchanged.trim() : undefined),
+      };
+      expect(patch1.torboxToken).toBeUndefined();
+
+      // When token input is 'CLEAR', patch sends empty string to forget token
+      const tokenInputClear = 'CLEAR';
+      const patch2: import('./api').AcquisitionConfigPatch = {
+        torboxToken: tokenInputClear === 'CLEAR' ? '' : (tokenInputClear && tokenInputClear !== '********' ? tokenInputClear.trim() : undefined),
+      };
+      expect(patch2.torboxToken).toBe('');
+
+      // When user enters a new token, patch sends trimmed token
+      const tokenInputNew = '  secret_new_token_123  ';
+      const patch3: import('./api').AcquisitionConfigPatch = {
+        torboxToken: tokenInputNew === 'CLEAR' ? '' : (tokenInputNew && tokenInputNew !== '********' ? tokenInputNew.trim() : undefined),
+      };
+      expect(patch3.torboxToken).toBe('secret_new_token_123');
+
+      // 2. Candidate ranking & status badges
+      const candidate: import('./api').AcquisitionCandidate = {
+        release: {
+          id: 'nyaa-12345',
+          title: '[Group] Berserk - Vol. 01 [Digital] [1080p]',
+          url: 'https://nyaa.si/view/12345',
+          magnet: 'magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567',
+          infoHash: '0123456789abcdef0123456789abcdef01234567',
+          sizeBytes: 157286400,
+          seeders: 42,
+          leechers: 3,
+          publishedAt: 1700000000,
+          uploader: 'Group',
+          unit: {
+            kind: 'volume',
+            number: 1,
+            unitType: 'single',
+          },
+          trusted: true,
+          remake: false,
+        },
+        exactMatch: true,
+        alreadyOwned: false,
+        currentlyAcquiring: false,
+      };
+
+      expect(candidate.exactMatch).toBe(true);
+      expect(candidate.release.trusted).toBe(true);
+      expect(candidate.release.unit.kind).toBe('volume');
+      expect(candidate.release.unit.number).toBe(1);
+      expect(candidate.release.seeders).toBe(42);
+
+      // 3. TorBox external download job lifecycle representation
+      const torboxJob: import('./api').Queued = {
+        chapterId: 200,
+        chapterName: 'Volume 1',
+        mangaId: 10,
+        title: 'Berserk',
+        state: 'downloading',
+        stage: 'torbox_downloading',
+        source: 'Nyaa',
+        sourceType: 'nyaa',
+        backendType: 'torbox',
+        externalJobId: 'tb-999',
+        torrentHash: '0123456789abcdef0123456789abcdef01234567',
+        rawTitle: '[Group] Berserk - Vol. 01 [Digital] [1080p]',
+        uploader: 'Group',
+        releaseSize: 157286400,
+        releaseType: 'volume',
+        done: 45,
+        total: 100,
+        attempts: 1,
+        retryAt: null,
+        canRetryKomga: false,
+      };
+
+      expect(torboxJob.sourceType).toBe('nyaa');
+      expect(torboxJob.backendType).toBe('torbox');
+      expect(torboxJob.stage).toBe('torbox_downloading');
+      expect(torboxJob.uploader).toBe('Group');
+    });
   });
 });

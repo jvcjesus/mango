@@ -115,6 +115,13 @@ impl Spaces {
         let pipeline = Arc::new(crate::pipeline::Pipeline::new(db.clone()));
         let mut downloads = Downloads::new(db.clone(), images.clone(), &dir, shared.keep_free_mb);
         downloads.set_pipeline(pipeline.clone());
+        let acquisition = Arc::new(crate::acquisition::service::AcquisitionService::new(
+            db.clone(),
+            pipeline.http.clone(),
+            Some(pipeline.clone()),
+            Some(downloads.wake()),
+        ));
+        downloads.set_acquisition(acquisition.clone());
         let updates = Updates::new(db.clone(), titles.clone(), downloads.clone());
         let trackers_inst = Trackers::new(db.clone())?;
         let sync = Arc::new(crate::sync::service::SyncService::new(db.clone(), trackers_inst.clone(), pipeline.clone()));
@@ -132,6 +139,7 @@ impl Spaces {
             importer: Importer::new(db.clone()),
             trackers: trackers_inst,
             sync,
+            acquisition,
             auth: self.auth.clone(),
             releases: shared.releases.clone(),
             host: shared.host.clone(),

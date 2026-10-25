@@ -60,6 +60,7 @@ pub struct AppState {
     pub trackers: Trackers,
     pub pipeline: Arc<crate::pipeline::Pipeline>,
     pub sync: Arc<crate::sync::service::SyncService>,
+    pub acquisition: Arc<crate::acquisition::service::AcquisitionService>,
     /// The local source's folder, shown in Settings so the owner knows where to put files.
     pub local_dir: String,
 }
@@ -207,6 +208,20 @@ pub fn router(state: Spaces) -> Router {
             post(retry_komga_download),
         )
         .route("/pipeline/events", get(get_pipeline_events))
+        .route(
+            "/titles/{id}/acquisition-releases",
+            get(get_title_acquisition_releases),
+        )
+        .route("/titles/{id}/acquire", post(post_title_acquire))
+        .route(
+            "/settings/acquisition",
+            get(get_acquisition_settings).put(put_acquisition_settings),
+        )
+        .route(
+            "/settings/acquisition/torbox/test",
+            post(test_torbox_connection),
+        )
+        .route("/acquisition/history", get(get_acquisition_history))
         .route("/sync/dry-run", post(sync_dry_run))
         .route("/sync/run", post(sync_run))
         .route("/sync/status", get(sync_status))
@@ -1448,6 +1463,87 @@ async fn discover_pipeline_komga_libraries(
 async fn get_pipeline_events(Me(app): Me) -> Result<Json<Vec<crate::pipeline::PipelineEvent>>> {
     app.me.admin()?;
     Ok(Json(app.pipeline.recent_events()))
+}
+
+// ---------- acquisition (Nyaa + TorBox) ----------
+
+#[derive(Deserialize)]
+struct AcquisitionReleasesQuery {
+    unit_type: Option<String>,
+    unit_number: Option<f64>,
+}
+
+async fn get_title_acquisition_releases(
+    Me(app): Me,
+    Path(id): Path<i64>,
+    Query(query): Query<AcquisitionReleasesQuery>,
+) -> Result<Json<Vec<crate::acquisition::AcquisitionCandidate>>> {
+    let target_unit = match (query.unit_type.as_deref(), query.unit_number) {
+        (Some("volume"), Some(num)) => Some(crate::acquisition::AcquisitionReleaseUnit::Volume(num)),
+        (Some("chapter"), Some(num)) => Some(crate::acquisition::AcquisitionReleaseUnit::Chapter(num)),
+        _ => None,
+    };
+    let candidates = app.acquisition.search_candidates(id, target_unit).await?;
+    Ok(Json(candidates))
+}
+
+async fn post_title_acquire(
+    Me(app): Me,
+    Path(id): Path<i64>,
+    Json(payload): Json<crate::acquisition::service::AcquireReleaseRequest>,
+) -> Result<Json<serde_json::Value>> {
+    let chapter_id = app.acquisition.acquire_release(id, payload.release, payload.target_unit).await?;
+    Ok(Json(json!({
+        "success": true,
+        "chapterId": chapter_id
+    })))
+}
+
+async fn get_acquisition_settings(Me(app): Me) -> Result<Json<crate::acquisition::AcquisitionConfig>> {
+    let config = app.acquisition.load_config().await?;
+    Ok(Json(config))
+}
+
+async fn put_acquisition_settings(
+    Me(app): Me,
+    Json(patch): Json<crate::acquisition::service::AcquisitionConfigPatch>,
+) -> Result<Json<crate::acquisition::AcquisitionConfig>> {
+    app.me.admin()?;
+    app.acquisition.save_config(patch).await?;
+    let config = app.acquisition.load_config().await?;
+    Ok(Json(config))
+}
+
+#[derive(Deserialize)]
+struct TestTorBoxPayload {
+    url: Option<String>,
+    token: Option<String>,
+}
+
+async fn test_torbox_connection(
+    Me(app): Me,
+    Json(payload): Json<TestTorBoxPayload>,
+) -> Result<Json<serde_json::Value>> {
+    app.me.admin()?;
+    let msg = app.acquisition.test_torbox(payload.url, payload.token).await?;
+    Ok(Json(json!({
+        "success": true,
+        "message": msg
+    })))
+}
+
+#[derive(Deserialize)]
+struct AcquisitionHistoryQuery {
+    manga_id: Option<i64>,
+    limit: Option<i64>,
+}
+
+async fn get_acquisition_history(
+    Me(app): Me,
+    Query(query): Query<AcquisitionHistoryQuery>,
+) -> Result<Json<Vec<crate::acquisition::AcquisitionHistoryRecord>>> {
+    let history = app.acquisition.list_history(query.manga_id, query.limit).await?;
+    Ok(Json(history))
 }
 
 #[derive(Deserialize, Default)]

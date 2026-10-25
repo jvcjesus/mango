@@ -1219,6 +1219,7 @@ mod tests {
             chapter_number: None,
             published_path: None,
             target_library_id: None,
+            ..Default::default()
         };
 
         pipeline.process_download(&eng_cbz, &eng_job).await.unwrap();
@@ -1247,6 +1248,7 @@ mod tests {
             chapter_number: None,
             published_path: None,
             target_library_id: None,
+            ..Default::default()
         };
 
         pipeline.process_download(&zh_cbz, &zh_job).await.unwrap();
@@ -1363,6 +1365,7 @@ exit 0
             chapter_number: Some(1.0),
             published_path: None,
             target_library_id: None,
+            ..Default::default()
         };
 
         pipeline.process_download(&cbz, &job).await.unwrap();
@@ -1398,6 +1401,7 @@ exit 0
             chapter_number: Some(2.0),
             published_path: None,
             target_library_id: None,
+            ..Default::default()
         };
 
         pipeline.process_download(&cbz2, &job2).await.unwrap();
@@ -1621,6 +1625,7 @@ exit 0
             chapter_number: None,
             published_path: None,
             target_library_id: None,
+            ..Default::default()
         };
 
         let outcome = pipeline.process_download(&cbz, &job).await.unwrap();
@@ -1764,6 +1769,7 @@ exit 0
             chapter_number: None,
             published_path: None,
             target_library_id: None,
+            ..Default::default()
         };
 
         let outcome = pipeline.process_download(&cbz, &job).await.unwrap();
@@ -1834,6 +1840,7 @@ exit 0
             chapter_number: None,
             published_path: None,
             target_library_id: None,
+            ..Default::default()
         };
 
         let outcome = pipeline.process_download(&cbz, &job).await.unwrap();
@@ -1954,6 +1961,7 @@ exit 0
             chapter_number: None,
             published_path: None,
             target_library_id: None,
+            ..Default::default()
         };
 
         let outcome = pipeline.process_download(&cbz, &job).await.unwrap();
