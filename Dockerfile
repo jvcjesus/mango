@@ -1,8 +1,9 @@
 # syntax=docker/dockerfile:1
 # Mango: the reader and its extension host.
 #
-#   docker build -t mango .                        the image
+#   docker build -t mango-fork:full .              the full image (default target)
 #   docker build --target full -t mango:full .     the image with what a web view needs
+#   docker build --target mango -t mango:slim .    the image without web view dependencies
 #   docker buildx build --target dist -o out .     the binary and the host's jars, to run without a container
 #   docker buildx build --target jars -o out .     the host's two jars alone
 #   docker build --target host -t mango-host .     the extension host on its own
@@ -234,14 +235,15 @@ RUN if [ "$TARGETARCH" = "amd64" ]; then \
  && chmod 755 /RustyLibraryShrinker
 
 # ---------- the images ----------
-# `mango`, the last stage, is what a plain build gives. `full` is the same with what
-# a web view needs.
+# `base` contains Mango, its Java extension host runtime, and the bundled optimizer.
+# `mango` is the lightweight image (without web view libraries).
+# `full`, the default/last stage, adds what a web view needs (xvfb, xauth, browser libs).
 
 FROM debian:bookworm-slim AS base
 ARG SUWAYOMI_VERSION
 # Fonts are for the sources that draw text onto their pages.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends fontconfig fonts-dejavu-core libfreetype6 \
+ && apt-get install -y --no-install-recommends fontconfig fonts-dejavu-core libfreetype6 libstdc++6 \
  && rm -rf /var/lib/apt/lists/* \
  && useradd --system --uid 10001 --home-dir /data mango && mkdir /data && chown mango /data
 COPY --from=java /java /opt/java
@@ -249,6 +251,10 @@ COPY --from=host-build /build/out /opt/mango/host
 COPY LICENSE NOTICE /usr/share/doc/mango/
 COPY --from=notices-build /THIRD-PARTY-LICENSES.txt /usr/share/doc/mango/
 COPY --from=core /mango /usr/local/bin/mango
+RUN mkdir -p /opt/mango/bin
+COPY --from=optimizer /RustyLibraryShrinker /opt/mango/bin/RustyLibraryShrinker
+RUN chmod 755 /opt/mango/bin/RustyLibraryShrinker \
+ && ln -sf /opt/mango/bin/RustyLibraryShrinker /usr/local/bin/RustyLibraryShrinker
 USER mango
 # `mango.toml` is looked for here, so it can live in the volume.
 WORKDIR /data
@@ -258,15 +264,22 @@ ENV HOME=/data \
     MANGO_HOST_DIR=/opt/mango/host \
     MANGO_JAVA=/opt/java/bin/java \
     MANGO_RUNTIME_VERSION=${SUWAYOMI_VERSION} \
-    MANGO_DOCKER=1
+    MANGO_DOCKER=1 \
+    PATH="/opt/mango/bin:${PATH}"
 VOLUME /data
 EXPOSE 8787
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --start-interval=2s --retries=3 CMD ["mango", "health"]
 ENTRYPOINT ["mango"]
 
+# The lightweight image without web view dependencies.
+FROM base AS mango
+
 # Some sources open a web view. Its browser is downloaded into the data volume the
 # first time one does; this image has the libraries the browser links and the
 # program that lends it a display. Mango finds that program and uses it by itself.
+# `full` is placed last so that normal builds (`docker build -t mango-fork:full .`
+# without `--target full`) produce the full image containing both web view dependencies
+# and the bundled optimizer.
 FROM base AS full
 USER root
 RUN apt-get update \
@@ -276,11 +289,4 @@ RUN apt-get update \
       libdrm2 libgbm1 libegl1 xvfb xauth \
       libstdc++6 \
  && rm -rf /var/lib/apt/lists/*
-RUN mkdir -p /opt/mango/bin
-COPY --from=optimizer /RustyLibraryShrinker /opt/mango/bin/RustyLibraryShrinker
-RUN chmod 755 /opt/mango/bin/RustyLibraryShrinker \
- && ln -sf /opt/mango/bin/RustyLibraryShrinker /usr/local/bin/RustyLibraryShrinker
-ENV PATH="/opt/mango/bin:${PATH}"
 USER mango
-
-FROM base AS mango
