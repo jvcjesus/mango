@@ -10,6 +10,7 @@ use crate::acquisition::{
 use crate::error::AppError;
 use reqwest::{Client, StatusCode};
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::File;
 use std::io::Write;
@@ -646,6 +647,93 @@ pub fn select_artifact<'a>(
         "Torrent contains {} archive files and no unambiguous volume match could be determined",
         archives.len()
     )))
+}
+
+/// Conservative collection file mapper:
+/// Maps torrent files to volume numbers (e.g. Volume 1 -> BackendFile).
+///
+/// Rules:
+/// 1. Filters out junk and metadata files.
+/// 2. If any archive is an unsupported format (.cbr, .rar, etc.), fails closed with TorBoxError::UnsupportedFormat.
+/// 3. Filters to supported archives (.cbz, .zip).
+/// 4. Classifies volume number using classify_release.
+/// 5. If multiple files map to the same volume:
+///    - If one is .cbz and another is .zip, prefers .cbz.
+///    - If both have identical extensions or duplicate archives exist, fails closed with TorBoxError::AmbiguousFiles.
+/// 6. If an archive file has an unparseable volume number, fails closed with TorBoxError::AmbiguousFiles.
+/// 7. If no archives found, fails with TorBoxError::NoArchiveFound.
+pub fn map_torrent_files_to_volumes(
+    files: &[BackendFile],
+) -> std::result::Result<BTreeMap<i64, BackendFile>, TorBoxError> {
+    if files.is_empty() {
+        return Err(TorBoxError::NoArchiveFound("Torrent contains 0 files".to_string()));
+    }
+
+    // 1. Scan for unsupported formats
+    for f in files {
+        let lower = f.name.to_ascii_lowercase();
+        if !is_junk_file(&lower) && is_unsupported_format(&lower) {
+            return Err(TorBoxError::UnsupportedFormat(format!(
+                "Collection torrent contains unsupported archive format '{}'",
+                f.name
+            )));
+        }
+    }
+
+    // 2. Scan supported archives
+    let archives: Vec<&BackendFile> = files
+        .iter()
+        .filter(|f| {
+            let lower = f.name.to_ascii_lowercase();
+            !is_junk_file(&lower) && (lower.ends_with(".cbz") || lower.ends_with(".zip"))
+        })
+        .collect();
+
+    if archives.is_empty() {
+        return Err(TorBoxError::NoArchiveFound(
+            "Torrent contains no .cbz or .zip volume archives".to_string(),
+        ));
+    }
+
+    let mut map: BTreeMap<i64, BackendFile> = BTreeMap::new();
+
+    for arch in archives {
+        let (unit, num, _) = crate::acquisition::nyaa::classify_release(&arch.name);
+        let vol_opt = match unit {
+            AcquisitionReleaseUnit::Volume(v) => Some(v.round() as i64),
+            _ => num.map(|n| n.round() as i64),
+        };
+
+        let Some(vol) = vol_opt else {
+            return Err(TorBoxError::AmbiguousFiles(format!(
+                "Cannot unambiguously determine volume number for file '{}'",
+                arch.name
+            )));
+        };
+
+        if let Some(existing) = map.get(&vol) {
+            let existing_is_cbz = existing.name.to_ascii_lowercase().ends_with(".cbz");
+            let new_is_cbz = arch.name.to_ascii_lowercase().ends_with(".cbz");
+
+            if existing_is_cbz && !new_is_cbz {
+                // Keep existing .cbz, ignore duplicate .zip
+                continue;
+            } else if !existing_is_cbz && new_is_cbz {
+                // Replace .zip with preferred .cbz
+                map.insert(vol, (*arch).clone());
+            } else {
+                // Duplicate archives with same format
+                return Err(TorBoxError::AmbiguousFiles(format!(
+                    "Duplicate archives found for Volume {vol}: '{}' and '{}'",
+                    existing.name, arch.name
+                )));
+            }
+        } else {
+            map.insert(vol, (*arch).clone());
+        }
+    }
+
+    Ok(map)
 }
 
 fn is_junk_file(lower: &str) -> bool {

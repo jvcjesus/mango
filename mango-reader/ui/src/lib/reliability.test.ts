@@ -2004,6 +2004,103 @@ describe('first-class volume acquisition & release semantics', () => {
       expect(torboxJob.backendType).toBe('torbox');
       expect(torboxJob.stage).toBe('torbox_downloading');
       expect(torboxJob.uploader).toBe('Group');
+
+      // 4. Smart Nyaa ranking and collection inspection representation
+      const smartScore: import('./api').SmartScore = {
+        total: 88.5,
+        identity: 25.0,
+        coverage: 25.0,
+        quality: 15.0,
+        health: 13.5,
+        freshness: 10.0,
+        efficiency: 10.0,
+        penalties: 0.0,
+        summaryTag: 'BEST MATCH',
+        explanation: 'Excellent coverage for missing volumes; High health (42 seeders); Trusted uploader',
+      };
+
+      const collectionCandidate: import('./api').AcquisitionCandidate = {
+        release: {
+          id: 'nyaa-54321',
+          title: '[Stick] Blue Lock v01-39 [Digital]',
+          url: 'https://nyaa.si/view/54321',
+          magnet: 'magnet:?xt=urn:btih:fedcba9876543210fedcba9876543210fedcba98',
+          infoHash: 'fedcba9876543210fedcba9876543210fedcba98',
+          sizeBytes: 4200000000,
+          seeders: 55,
+          leechers: 8,
+          publishedAt: 1710000000,
+          uploader: 'Stick',
+          unit: {
+            kind: 'range',
+            start: 1,
+            end: 39,
+            unitType: 'range',
+          },
+          trusted: true,
+          remake: false,
+          isVariant: false,
+          isMixed: false,
+        },
+        exactMatch: true,
+        alreadyOwned: false,
+        currentlyAcquiring: false,
+        smartScore,
+        unitsIncluded: [1, 2, 3],
+        unitsMissing: [2, 3],
+        unitsOwned: [1],
+        ownershipStatus: 'partial',
+        coverageSummary: '2 of 3 volumes missing',
+      };
+
+      expect(collectionCandidate.smartScore?.summaryTag).toBe('BEST MATCH');
+      expect(collectionCandidate.ownershipStatus).toBe('partial');
+      expect(collectionCandidate.unitsMissing).toEqual([2, 3]);
+
+      // 5. Collection Inspection model and child unit download representation
+      const inspection: import('./api').CollectionInspection = {
+        releaseTitle: '[Stick] Blue Lock v01-03 [Digital]',
+        totalUnits: 3,
+        missingCount: 2,
+        ownedCount: 1,
+        recommendedMode: 'missing_only',
+        units: [
+          { volume: 1, isOwned: true, isAcquiring: false, filename: 'Blue Lock v01.cbz', fileSize: 100000000 },
+          { volume: 2, isOwned: false, isAcquiring: false, filename: 'Blue Lock v02.cbz', fileSize: 105000000 },
+          { volume: 3, isOwned: false, isAcquiring: false, filename: 'Blue Lock v03.cbz', fileSize: 110000000 },
+        ],
+      };
+
+      expect(inspection.recommendedMode).toBe('missing_only');
+      expect(inspection.units[0].isOwned).toBe(true);
+      expect(inspection.units[1].isOwned).toBe(false);
+
+      const collectionChildJob: import('./api').Queued = {
+        chapterId: 202,
+        chapterName: 'Volume 2',
+        mangaId: 1,
+        title: 'Blue Lock',
+        state: 'queued',
+        stage: 'queued',
+        source: 'Nyaa',
+        sourceType: 'nyaa',
+        backendType: 'torbox',
+        externalJobId: 'tb-8888',
+        collectionId: 'col-8888',
+        collectionName: 'Blue Lock v01-03',
+        rawTitle: '[Stick] Blue Lock v01-03 [Digital]',
+        uploader: 'Stick',
+        releaseSize: 105000000,
+        releaseType: 'volume',
+        done: 0,
+        total: 100,
+        attempts: 0,
+        retryAt: null,
+        canRetryKomga: false,
+      };
+
+      expect(collectionChildJob.collectionId).toBe('col-8888');
+      expect(collectionChildJob.collectionName).toBe('Blue Lock v01-03');
     });
   });
 });

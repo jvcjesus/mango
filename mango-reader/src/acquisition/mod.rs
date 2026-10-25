@@ -22,7 +22,87 @@ pub enum AcquisitionReleaseUnit {
     Volume(f64),
     Chapter(f64),
     Collection { start: f64, end: f64 },
+    MultiRange(Vec<(f64, f64)>),
+    MixedCollection {
+        volume_start: f64,
+        volume_end: f64,
+        chapter_start: f64,
+        chapter_end: f64,
+    },
     Unknown,
+}
+
+impl AcquisitionReleaseUnit {
+    pub fn is_collection(&self) -> bool {
+        matches!(
+            self,
+            Self::Collection { .. } | Self::MultiRange(_) | Self::MixedCollection { .. }
+        )
+    }
+
+    pub fn included_volumes(&self) -> Vec<f64> {
+        match self {
+            Self::Volume(v) => vec![*v],
+            Self::Collection { start, end } => {
+                let s = *start as i64;
+                let e = *end as i64;
+                if s <= e {
+                    (s..=e).map(|n| n as f64).collect()
+                } else {
+                    vec![]
+                }
+            }
+            Self::MultiRange(ranges) => {
+                let mut vols = Vec::new();
+                for (s, e) in ranges {
+                    let s_i = *s as i64;
+                    let e_i = *e as i64;
+                    if s_i <= e_i {
+                        for n in s_i..=e_i {
+                            vols.push(n as f64);
+                        }
+                    }
+                }
+                vols.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+                vols.dedup();
+                vols
+            }
+            Self::MixedCollection {
+                volume_start,
+                volume_end,
+                ..
+            } => {
+                let s = *volume_start as i64;
+                let e = *volume_end as i64;
+                if s <= e {
+                    (s..=e).map(|n| n as f64).collect()
+                } else {
+                    vec![]
+                }
+            }
+            Self::Chapter(_) | Self::Unknown => vec![],
+        }
+    }
+
+    pub fn included_chapters(&self) -> Vec<f64> {
+        match self {
+            Self::Chapter(c) => vec![*c],
+            Self::MixedCollection {
+                chapter_start,
+                chapter_end,
+                ..
+            } => {
+                let s = *chapter_start as i64;
+                let e = *chapter_end as i64;
+                if s <= e {
+                    (s..=e).map(|n| n as f64).collect()
+                } else {
+                    vec![]
+                }
+            }
+            _ => vec![],
+        }
+    }
 }
 
 impl std::fmt::Display for AcquisitionReleaseUnit {
@@ -31,9 +111,44 @@ impl std::fmt::Display for AcquisitionReleaseUnit {
             Self::Volume(v) => write!(f, "Volume {v}"),
             Self::Chapter(c) => write!(f, "Chapter {c}"),
             Self::Collection { start, end } => write!(f, "Volumes {start}-{end}"),
+            Self::MultiRange(ranges) => {
+                let s = ranges
+                    .iter()
+                    .map(|(s, e)| format!("{s}-{e}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(f, "Volumes {s}")
+            }
+            Self::MixedCollection {
+                volume_start,
+                volume_end,
+                chapter_start,
+                chapter_end,
+            } => {
+                write!(
+                    f,
+                    "Volumes {volume_start}-{volume_end} + Chapters {chapter_start}-{chapter_end}"
+                )
+            }
             Self::Unknown => write!(f, "Unknown"),
         }
     }
+}
+
+/// Detailed, explainable components of the deterministic Smart ranking score.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SmartScore {
+    pub identity: f64,       // 0..25: Title/alias match confidence and variant penalty
+    pub coverage: f64,       // 0..25: Useful missing units supplied vs duplicate overhead
+    pub quality: f64,        // 0..15: Digital format, trusted uploader, preferred uploader
+    pub health: f64,         // 0..15: Saturating seeders curve
+    pub freshness: f64,      // 0..10: Recency of release
+    pub efficiency: f64,     // 0..10: Download bytes per useful missing unit
+    pub penalties: f64,      // Negative penalties (e.g. dead torrent, remake, mixed collection)
+    pub total: f64,          // Final normalized score 0..100
+    pub explanation: String, // Concise human explanation e.g. "★ BEST MATCH: Covers all 7 missing volumes · Digital · 12 seeders"
+    pub summary_tag: String, // "BEST MATCH", "GOOD ALTERNATIVE", "LOWER MATCH", "COLLECTION", "MIXED COLLECTION"
 }
 
 /// A normalized release candidate from an acquisition source (e.g. Nyaa).
@@ -58,6 +173,9 @@ pub struct AcquisitionRelease {
     pub published_at: Option<i64>,
     pub is_trusted: bool,
     pub is_remake: bool,
+    pub is_variant: bool,
+    pub variant_name: Option<String>,
+    pub is_mixed: bool,
     pub release_unit: AcquisitionReleaseUnit,
     pub release_number: Option<f64>,
     pub release_range: Option<(f64, f64)>,
@@ -70,8 +188,46 @@ pub struct AcquisitionRelease {
 pub struct AcquisitionCandidate {
     pub release: AcquisitionRelease,
     pub score: f64,
-    pub match_type: String, // exact_volume, exact_chapter, collection, related, ambiguous
-    pub ownership_status: String, // owned, acquiring, not_owned, unknown
+    pub smart_score: Option<SmartScore>,
+    pub match_type: String, // exact_volume, exact_chapter, collection, mixed_collection, related, ambiguous
+    pub ownership_status: String, // owned, acquiring, not_owned, partial, unknown
+    pub units_included: Vec<f64>,
+    pub units_owned: Vec<f64>,
+    pub units_missing: Vec<f64>,
+    pub coverage_summary: String,
+    pub useful_efficiency_bytes: Option<u64>,
+    pub is_variant: bool,
+    pub variant_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollectionUnitEntry {
+    pub volume: f64,
+    pub file_id: Option<i64>,
+    pub filename: Option<String>,
+    pub file_size: Option<u64>,
+    pub is_owned: bool,
+    pub is_acquiring: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CollectionInspection {
+    pub release: AcquisitionRelease,
+    pub units: Vec<CollectionUnitEntry>,
+    pub total_units: usize,
+    pub owned_count: usize,
+    pub missing_count: usize,
+    pub recommended_mode: String, // "missing_only" | "entire"
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcquireCollectionRequest {
+    pub release: AcquisitionRelease,
+    pub selected_volumes: Vec<f64>,
+    pub mode: String, // "missing_only" | "entire" | "manual"
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

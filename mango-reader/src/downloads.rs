@@ -65,6 +65,8 @@ pub struct Queued {
     pub raw_title: Option<String>,
     pub uploader: Option<String>,
     pub release_size: Option<u64>,
+    pub collection_id: Option<String>,
+    pub collection_name: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -104,6 +106,10 @@ pub(crate) struct Job {
     pub(crate) uploader: Option<String>,
     pub(crate) release_size: Option<u64>,
     pub(crate) retrieved_path: Option<String>,
+    #[allow(dead_code)]
+    pub(crate) collection_id: Option<String>,
+    #[allow(dead_code)]
+    pub(crate) collection_name: Option<String>,
 }
 
 impl Default for Job {
@@ -136,6 +142,8 @@ impl Default for Job {
             uploader: None,
             release_size: None,
             retrieved_path: None,
+            collection_id: None,
+            collection_name: None,
         }
     }
 }
@@ -380,7 +388,19 @@ impl Downloads {
                     acq_cfg.torbox_url,
                     token,
                 );
-                let _ = client.cancel(&job_id).await;
+                let jid = job_id.clone();
+                let has_siblings = self.db.call(move |conn| {
+                    let count: i64 = conn.query_row(
+                        "SELECT count(*) FROM downloads WHERE external_job_id = ?1 AND chapter_id != COALESCE(?2, -1)",
+                        rusqlite::params![&jid, chapter],
+                        |r| r.get(0),
+                    ).unwrap_or(0);
+                    Ok(count > 0)
+                }).await.unwrap_or(false);
+
+                if !has_siblings {
+                    let _ = client.cancel(&job_id).await;
+                }
             }
         }
 
@@ -854,6 +874,9 @@ impl Downloads {
                     published_at: None,
                     is_trusted: false,
                     is_remake: false,
+                    is_variant: false,
+                    variant_name: None,
+                    is_mixed: false,
                     release_unit: match job.release_type {
                         crate::release::ReleaseType::Volume => crate::acquisition::AcquisitionReleaseUnit::Volume(job.volume.unwrap_or(job.number)),
                         crate::release::ReleaseType::Chapter => crate::acquisition::AcquisitionReleaseUnit::Chapter(job.chapter_number.unwrap_or(job.number)),
@@ -928,7 +951,15 @@ impl Downloads {
             crate::release::ReleaseType::Volume => Some(crate::acquisition::AcquisitionReleaseUnit::Volume(job.volume.unwrap_or(job.number))),
             crate::release::ReleaseType::Chapter => Some(crate::acquisition::AcquisitionReleaseUnit::Chapter(job.chapter_number.unwrap_or(job.number))),
         };
-        let selected_file = crate::acquisition::torbox::select_artifact(&files, target_unit.as_ref())?;
+        let selected_file = if let Some(fid) = job.external_file_id {
+            files.iter().find(|f| f.id == fid).ok_or_else(|| {
+                crate::acquisition::torbox::TorBoxError::NoArchiveFound(format!(
+                    "File id {fid} not found in TorBox torrent"
+                ))
+            })?
+        } else {
+            crate::acquisition::torbox::select_artifact(&files, target_unit.as_ref())?
+        };
 
         // 5. Staging path
         let relative = self.place(job);
@@ -961,8 +992,20 @@ impl Downloads {
             Ok(())
         }).await?;
 
-        // Best effort remote delete on TorBox
-        let _ = client.cancel(&external_job_id).await;
+        // Best effort remote delete on TorBox only if no other sibling downloads remain active
+        let ext_jid = external_job_id.clone();
+        let is_last_active = self.db.call(move |conn| {
+            let count: i64 = conn.query_row(
+                "SELECT count(*) FROM downloads WHERE external_job_id = ?1 AND chapter_id != ?2 AND state NOT IN ('failed', 'completed')",
+                rusqlite::params![&ext_jid, ch_id],
+                |r| r.get(0),
+            ).unwrap_or(0);
+            Ok(count == 0)
+        }).await.unwrap_or(true);
+
+        if is_last_active {
+            let _ = client.cancel(&external_job_id).await;
+        }
 
         Ok(Some((rel_str, 1)))
     }
@@ -1103,7 +1146,8 @@ pub(crate) fn read_queue(conn: &Connection) -> Result<QueueView> {
     let mut stmt = conn.prepare(
         "SELECT d.chapter_id, c.name, m.id, m.title, d.state, c.page_count, d.attempts, d.retry_at, d.error,
                 COALESCE(s.name, 'Unknown source'), c.scanlator, c.chapter_number, d.published_path,
-                d.source_type, d.backend_type, d.external_job_id, d.raw_title, d.uploader, d.release_size
+                d.source_type, d.backend_type, d.external_job_id, d.raw_title, d.uploader, d.release_size,
+                d.collection_id, d.collection_name
          FROM downloads d
          JOIN chapters c ON c.id = d.chapter_id
          JOIN manga m ON m.id = c.manga_id
@@ -1162,6 +1206,8 @@ pub(crate) fn read_queue(conn: &Connection) -> Result<QueueView> {
                 raw_title: r.get(16)?,
                 uploader: r.get(17)?,
                 release_size: r.get::<_, Option<i64>>(18)?.map(|s| s as u64),
+                collection_id: r.get(19)?,
+                collection_name: r.get(20)?,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -1178,7 +1224,7 @@ fn next_job(conn: &Connection) -> Result<Option<Job>> {
             "SELECT d.chapter_id, d.attempts, COALESCE(s.name, 'Unknown source'), m.title, c.name, c.chapter_number, c.scanlator,
                     m.author, m.artist, m.genre, m.description, s.lang, m.id, d.published_path, d.target_library_id, d.state,
                     d.source_type, d.backend_type, d.external_job_id, d.external_file_id, d.torrent_hash, d.raw_title,
-                    d.uploader, d.release_size, d.retrieved_path
+                    d.uploader, d.release_size, d.retrieved_path, d.collection_id, d.collection_name
              FROM downloads d JOIN chapters c ON c.id = d.chapter_id JOIN manga m ON m.id = c.manga_id
              LEFT JOIN sources s ON s.id = m.source_id
              WHERE (d.state = 'queued' OR d.state = 'verifying') AND (d.retry_at IS NULL OR d.retry_at <= ?1)
@@ -1218,6 +1264,8 @@ fn next_job(conn: &Connection) -> Result<Option<Job>> {
                         uploader: r.get(22)?,
                         release_size: r.get::<_, Option<i64>>(23)?.map(|s| s as u64),
                         retrieved_path: r.get(24)?,
+                        collection_id: r.get(25)?,
+                        collection_name: r.get(26)?,
                     },
                     state,
                 ))

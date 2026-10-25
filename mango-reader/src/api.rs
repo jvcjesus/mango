@@ -214,6 +214,14 @@ pub fn router(state: Spaces) -> Router {
         )
         .route("/titles/{id}/acquire", post(post_title_acquire))
         .route(
+            "/titles/{id}/acquisition-inspect-collection",
+            post(post_title_acquisition_inspect_collection),
+        )
+        .route(
+            "/titles/{id}/acquire-collection",
+            post(post_title_acquire_collection),
+        )
+        .route(
             "/settings/acquisition",
             get(get_acquisition_settings).put(put_acquisition_settings),
         )
@@ -1471,6 +1479,11 @@ async fn get_pipeline_events(Me(app): Me) -> Result<Json<Vec<crate::pipeline::Pi
 struct AcquisitionReleasesQuery {
     unit_type: Option<String>,
     unit_number: Option<f64>,
+    sort: Option<String>,
+    filter_type: Option<String>,
+    filter_ownership: Option<String>,
+    filter_uploader: Option<String>,
+    min_seeders: Option<u32>,
 }
 
 async fn get_title_acquisition_releases(
@@ -1483,7 +1496,18 @@ async fn get_title_acquisition_releases(
         (Some("chapter"), Some(num)) => Some(crate::acquisition::AcquisitionReleaseUnit::Chapter(num)),
         _ => None,
     };
-    let candidates = app.acquisition.search_candidates(id, target_unit).await?;
+    let candidates = app
+        .acquisition
+        .search_candidates(
+            id,
+            target_unit,
+            query.sort,
+            query.filter_type,
+            query.filter_ownership,
+            query.filter_uploader,
+            query.min_seeders,
+        )
+        .await?;
     Ok(Json(candidates))
 }
 
@@ -1496,6 +1520,28 @@ async fn post_title_acquire(
     Ok(Json(json!({
         "success": true,
         "chapterId": chapter_id
+    })))
+}
+
+async fn post_title_acquisition_inspect_collection(
+    Me(app): Me,
+    Path(id): Path<i64>,
+    Json(release): Json<crate::acquisition::AcquisitionRelease>,
+) -> Result<Json<crate::acquisition::CollectionInspection>> {
+    let inspection = app.acquisition.inspect_collection(id, release).await?;
+    Ok(Json(inspection))
+}
+
+async fn post_title_acquire_collection(
+    Me(app): Me,
+    Path(id): Path<i64>,
+    Json(payload): Json<crate::acquisition::AcquireCollectionRequest>,
+) -> Result<Json<serde_json::Value>> {
+    let chapter_ids = app.acquisition.acquire_collection(id, payload).await?;
+    Ok(Json(json!({
+        "success": true,
+        "queuedCount": chapter_ids.len(),
+        "chapterIds": chapter_ids,
     })))
 }
 

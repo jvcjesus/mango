@@ -14,6 +14,15 @@
   let clearing = $state(false);
   let reordering = $state(false);
   let busyItems = $state<Record<number, boolean>>({});
+  let expandedCollections = $state<Record<string, boolean>>({});
+
+  type CollectionGroup = {
+    collectionId: string;
+    collectionName: string;
+    title: string;
+    mangaId: number;
+    items: Queued[];
+  };
 
   const queue = $derived(data?.queue ?? []);
   // Only chapters still waiting can be moved; active or verifying items stay where they are.
@@ -26,6 +35,35 @@
         q.stage !== 'verifying'
     )
   );
+
+  const groupedQueue = $derived.by(() => {
+    const collectionsMap = new Map<string, CollectionGroup>();
+    const standalone: Queued[] = [];
+
+    for (const entry of queue) {
+      if (entry.collectionId) {
+        let group = collectionsMap.get(entry.collectionId);
+        if (!group) {
+          group = {
+            collectionId: entry.collectionId,
+            collectionName: entry.collectionName ?? entry.title,
+            title: entry.title,
+            mangaId: entry.mangaId,
+            items: [],
+          };
+          collectionsMap.set(entry.collectionId, group);
+        }
+        group.items.push(entry);
+      } else {
+        standalone.push(entry);
+      }
+    }
+
+    return {
+      collections: Array.from(collectionsMap.values()),
+      standalone,
+    };
+  });
 
   async function load(isBackground = false) {
     try {
@@ -144,6 +182,34 @@
     }
   }
 
+  async function cancelCollectionGroup(col: CollectionGroup) {
+    const ok = await confirm({
+      title: 'Cancel Collection?',
+      message: `Cancel all ${col.items.length} queued child volumes of "${col.collectionName}"? Any already completed or published volumes will remain intact.`,
+      confirmText: 'Cancel collection',
+      danger: true,
+    });
+    if (!ok) return;
+    for (const item of col.items) {
+      busyItems[item.chapterId] = true;
+    }
+    try {
+      for (const item of col.items) {
+        await send('DELETE', `/downloads/${item.chapterId}`);
+      }
+      toast.info(`Canceled collection "${col.collectionName}"`);
+    } catch (e) {
+      const msg = message(e);
+      error = msg;
+      toast.error(msg);
+    } finally {
+      for (const item of col.items) {
+        busyItems[item.chapterId] = false;
+      }
+      await load();
+    }
+  }
+
   function describe(entry: Queued): string {
     if (entry.statusMessage) return entry.statusMessage;
     if (entry.state === 'verifying' || entry.stage === 'verifying') return 'Published — waiting for Komga';
@@ -236,66 +302,156 @@
         Nothing is waiting. Chapters are queued from a title's page, from Updates, or by themselves for titles set to download new chapters.
       </Notice>
     {:else}
-      <ul class="rows">
-        {#each queue as entry (entry.chapterId)}
-          {@const at = movable.indexOf(entry)}
-          <li>
-            <a class="main" href="#/title/{entry.mangaId}">
-              <div class="row-header">
-                <strong>{entry.title}</strong>
-                <span class="tag" class:spot={entry.stage !== 'queued' && entry.stage !== 'failed'} class:error={entry.stage === 'failed'}>
-                  {stageLabel(entry)}
-                </span>
-                {#if entry.sourceType === 'nyaa'}
-                  <span class="tag spot">Nyaa</span>
-                {/if}
-                {#if entry.uploader}
-                  <span class="tag">{entry.uploader}</span>
-                {/if}
-                {#if entry.releaseType === 'volume' || (entry.volume !== undefined && entry.volume !== null)}
-                  <span class="tag">Vol. {entry.volume ?? 'Special'}</span>
+      <div class="downloads-container">
+        <!-- Grouped Collections if any -->
+        {#if groupedQueue.collections.length > 0}
+          <div class="collections-section">
+            {#each groupedQueue.collections as col (col.collectionId)}
+              {@const isExpanded = expandedCollections[col.collectionId] ?? true}
+              <div class="collection-card">
+                <div class="collection-header">
+                  <div class="collection-info">
+                    <div class="collection-tag-row">
+                      <span class="tag spot">COLLECTION</span>
+                      <span class="tag">{col.items.length} units</span>
+                    </div>
+                    <h3 class="display collection-title">{col.title} · {col.collectionName}</h3>
+                  </div>
+                  <div class="collection-tools">
+                    <button
+                      class="btn pill icon-text"
+                      onclick={() => { expandedCollections[col.collectionId] = !isExpanded; }}
+                    >
+                      <Icon name={isExpanded ? 'up' : 'down'} size={14} />
+                      {isExpanded ? 'Hide units' : `Show units (${col.items.length})`}
+                    </button>
+                    <button
+                      class="btn pill icon-text"
+                      onclick={() => cancelCollectionGroup(col)}
+                      title="Cancel all queued units in this collection"
+                    >
+                      <Icon name="close" size={14} /> Cancel collection
+                    </button>
+                  </div>
+                </div>
+
+                {#if isExpanded}
+                  <ul class="rows collection-unit-rows">
+                    {#each col.items as entry (entry.chapterId)}
+                      <li>
+                        <div class="main">
+                          <div class="row-header">
+                            <strong>{entry.chapterName}</strong>
+                            <span class="tag" class:spot={entry.stage !== 'queued' && entry.stage !== 'failed'} class:error={entry.stage === 'failed'}>
+                              {stageLabel(entry)}
+                            </span>
+                            {#if entry.rawTitle}
+                              <span class="tag filename-tag">{entry.rawTitle}</span>
+                            {/if}
+                          </div>
+                          <span>{describe(entry)}</span>
+                          {#if entry.state === 'downloading' && entry.total}
+                            <span class="meter" aria-hidden="true"><span style:width="{Math.round((entry.done / entry.total) * 100)}%"></span></span>
+                          {/if}
+                        </div>
+                        <span class="tools">
+                          {#if entry.canRetryKomga}
+                            <button class="btn pill" disabled={busyItems[entry.chapterId]} onclick={() => act('POST', `/downloads/${entry.chapterId}/retry-komga`)}>
+                              <Icon name="refresh" size={16} />Retry Komga
+                            </button>
+                          {/if}
+                          {#if entry.state === 'failed'}
+                            <button class="btn" disabled={busyItems[entry.chapterId]} onclick={() => act('POST', `/downloads/${entry.chapterId}/retry`)}>
+                              <Icon name="refresh" size={18} />Try again
+                            </button>
+                          {/if}
+                          <button
+                            class="btn icon"
+                            aria-label="Cancel {entry.chapterName}"
+                            disabled={busyItems[entry.chapterId]}
+                            onclick={() => cancelDownload(entry)}
+                            title="Cancel this child unit only"
+                          >
+                            {#if busyItems[entry.chapterId]}
+                              <span class="spin"><Icon name="spinner" size={18} stroke={3} /></span>
+                            {:else}
+                              <Icon name="close" />
+                            {/if}
+                          </button>
+                        </span>
+                      </li>
+                    {/each}
+                  </ul>
                 {/if}
               </div>
-              <span>{entry.chapterName} · {describe(entry)}</span>
-              {#if entry.state === 'downloading' && entry.total}
-                <span class="meter" aria-hidden="true"><span style:width="{Math.round((entry.done / entry.total) * 100)}%"></span></span>
-              {/if}
-            </a>
-            <span class="tools">
-              {#if entry.canRetryKomga}
-                <button class="btn pill" disabled={busyItems[entry.chapterId]} onclick={() => act('POST', `/downloads/${entry.chapterId}/retry-komga`)}>
-                  <Icon name="refresh" size={16} />Retry Komga Scan
-                </button>
-              {/if}
-              {#if entry.state === 'failed'}
-                <button class="btn" disabled={busyItems[entry.chapterId]} onclick={() => act('POST', `/downloads/${entry.chapterId}/retry`)}>
-                  <Icon name="refresh" size={18} />Try again
-                </button>
-              {/if}
-              {#if at >= 0}
-                <button class="btn icon" aria-label="Move {entry.chapterName} up" disabled={at === 0 || reordering} onclick={() => move(entry, -1)}>
-                  <Icon name="up" />
-                </button>
-                <button class="btn icon" aria-label="Move {entry.chapterName} down" disabled={at === movable.length - 1 || reordering} onclick={() => move(entry, 1)}>
-                  <Icon name="down" />
-                </button>
-              {/if}
-              <button
-                class="btn icon"
-                aria-label="Cancel {entry.chapterName} of {entry.title}"
-                disabled={busyItems[entry.chapterId]}
-                onclick={() => cancelDownload(entry)}
-              >
-                {#if busyItems[entry.chapterId]}
-                  <span class="spin"><Icon name="spinner" size={18} stroke={3} /></span>
-                {:else}
-                  <Icon name="close" />
-                {/if}
-              </button>
-            </span>
-          </li>
-        {/each}
-      </ul>
+            {/each}
+          </div>
+        {/if}
+
+        <!-- Standalone items if any -->
+        {#if groupedQueue.standalone.length > 0}
+          <ul class="rows">
+            {#each groupedQueue.standalone as entry (entry.chapterId)}
+              {@const at = movable.indexOf(entry)}
+              <li>
+                <a class="main" href="#/title/{entry.mangaId}">
+                  <div class="row-header">
+                    <strong>{entry.title}</strong>
+                    <span class="tag" class:spot={entry.stage !== 'queued' && entry.stage !== 'failed'} class:error={entry.stage === 'failed'}>
+                      {stageLabel(entry)}
+                    </span>
+                    {#if entry.sourceType === 'nyaa'}
+                      <span class="tag spot">Nyaa</span>
+                    {/if}
+                    {#if entry.uploader}
+                      <span class="tag">{entry.uploader}</span>
+                    {/if}
+                    {#if entry.releaseType === 'volume' || (entry.volume !== undefined && entry.volume !== null)}
+                      <span class="tag">Vol. {entry.volume ?? 'Special'}</span>
+                    {/if}
+                  </div>
+                  <span>{entry.chapterName} · {describe(entry)}</span>
+                  {#if entry.state === 'downloading' && entry.total}
+                    <span class="meter" aria-hidden="true"><span style:width="{Math.round((entry.done / entry.total) * 100)}%"></span></span>
+                  {/if}
+                </a>
+                <span class="tools">
+                  {#if entry.canRetryKomga}
+                    <button class="btn pill" disabled={busyItems[entry.chapterId]} onclick={() => act('POST', `/downloads/${entry.chapterId}/retry-komga`)}>
+                      <Icon name="refresh" size={16} />Retry Komga Scan
+                    </button>
+                  {/if}
+                  {#if entry.state === 'failed'}
+                    <button class="btn" disabled={busyItems[entry.chapterId]} onclick={() => act('POST', `/downloads/${entry.chapterId}/retry`)}>
+                      <Icon name="refresh" size={18} />Try again
+                    </button>
+                  {/if}
+                  {#if at >= 0}
+                    <button class="btn icon" aria-label="Move {entry.chapterName} up" disabled={at === 0 || reordering} onclick={() => move(entry, -1)}>
+                      <Icon name="up" />
+                    </button>
+                    <button class="btn icon" aria-label="Move {entry.chapterName} down" disabled={at === movable.length - 1 || reordering} onclick={() => move(entry, 1)}>
+                      <Icon name="down" />
+                    </button>
+                  {/if}
+                  <button
+                    class="btn icon"
+                    aria-label="Cancel {entry.chapterName} of {entry.title}"
+                    disabled={busyItems[entry.chapterId]}
+                    onclick={() => cancelDownload(entry)}
+                  >
+                    {#if busyItems[entry.chapterId]}
+                      <span class="spin"><Icon name="spinner" size={18} stroke={3} /></span>
+                    {:else}
+                      <Icon name="close" />
+                    {/if}
+                  </button>
+                </span>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+      </div>
     {/if}
 
     {#if events.length > 0}
@@ -398,5 +554,83 @@
 
   .meter span {
     background: var(--spot);
+  }
+
+  .downloads-container {
+    display: flex;
+    flex-direction: column;
+    gap: 20px;
+  }
+
+  .collections-section {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  .collection-card {
+    background: var(--paper);
+    border: 2px solid var(--ink);
+    border-radius: var(--radius);
+    overflow: hidden;
+    box-shadow: 2px 2px 0 var(--ink);
+  }
+
+  .collection-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 16px;
+    background: var(--shade);
+    border-bottom: 2px solid var(--ink);
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+
+  .collection-info {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 0;
+  }
+
+  .collection-tag-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .collection-title {
+    font-size: 15px;
+    margin: 0;
+    word-break: break-word;
+  }
+
+  .collection-tools {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .collection-unit-rows {
+    background: var(--paper);
+  }
+
+  .collection-unit-rows li {
+    padding: 10px 16px;
+    border-bottom: 1px solid var(--ink);
+  }
+
+  .collection-unit-rows li:last-child {
+    border-bottom: none;
+  }
+
+  .filename-tag {
+    font-size: 11px;
+    max-width: 280px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
 </style>

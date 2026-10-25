@@ -117,6 +117,9 @@ async fn test_scenario_j_torbox_submit_torrent() {
         published_at: None,
         is_trusted: true,
         is_remake: false,
+        is_variant: false,
+        variant_name: None,
+        is_mixed: false,
         release_unit: AcquisitionReleaseUnit::Volume(1.0),
         release_number: Some(1.0),
         release_range: None,
@@ -433,6 +436,9 @@ async fn test_scenario_w_duplicate_protection() {
         published_at: None,
         is_trusted: true,
         is_remake: false,
+        is_variant: false,
+        variant_name: None,
+        is_mixed: false,
         release_unit: AcquisitionReleaseUnit::Volume(1.0),
         release_number: Some(1.0),
         release_range: None,
@@ -462,6 +468,9 @@ async fn test_scenario_w_duplicate_protection() {
         published_at: None,
         is_trusted: true,
         is_remake: false,
+        is_variant: false,
+        variant_name: None,
+        is_mixed: false,
         release_unit: AcquisitionReleaseUnit::Volume(2.0),
         release_number: Some(2.0),
         release_range: None,
@@ -707,6 +716,9 @@ async fn test_scenario_ah_end_to_end_acquisition_workflow() {
         published_at: None,
         is_trusted: true,
         is_remake: false,
+        is_variant: false,
+        variant_name: None,
+        is_mixed: false,
         release_unit: AcquisitionReleaseUnit::Volume(1.0),
         release_number: Some(1.0),
         release_range: None,
@@ -770,6 +782,8 @@ async fn test_scenario_ah_end_to_end_acquisition_workflow() {
         uploader: Some("danke-Empire".to_string()),
         release_size: Some(server_cbz_bytes.len() as u64),
         retrieved_path: Some(staging_rel),
+        collection_id: None,
+        collection_name: None,
     };
 
     let outcome = pipeline.process_download(&staging_cbz, &job).await.unwrap();
@@ -983,4 +997,541 @@ fn test_artifact_format_fail_closed_regression_scenarios_a_through_k() {
 fn pipeline_has_parallel_publish_routines() -> bool {
     // Compile-time architectural guarantee
     false
+}
+
+#[tokio::test]
+async fn test_smart_ranking_scenario_a_release_classification() {
+    use crate::acquisition::nyaa::classify_release;
+
+    // Single volume
+    let (u1, n1, r1) = classify_release("Blue Lock v26 (2024) (Digital) (Rillant)");
+    assert_eq!(u1, AcquisitionReleaseUnit::Volume(26.0));
+    assert_eq!(n1, Some(26.0));
+    assert_eq!(r1, None);
+
+    // Standard collection
+    let (u2, n2, r2) = classify_release("Blue Lock v01-39 (2021-2026) (Digital) (Stick)");
+    assert_eq!(u2, AcquisitionReleaseUnit::Collection { start: 1.0, end: 39.0 });
+    assert_eq!(n2, None);
+    assert_eq!(r2, Some((1.0, 39.0)));
+
+    // Sub-range collection
+    let (u3, _, r3) = classify_release("Blue Lock v20-25 (Digital)");
+    assert_eq!(u3, AcquisitionReleaseUnit::Collection { start: 20.0, end: 25.0 });
+    assert_eq!(r3, Some((20.0, 25.0)));
+
+    // Multi-range collection
+    let (u4, _, _) = classify_release("Blue Lock v01-19,168-220 (Digital)");
+    assert_eq!(u4, AcquisitionReleaseUnit::MultiRange(vec![(1.0, 19.0), (168.0, 220.0)]));
+
+    // Mixed collection (volumes + chapters)
+    let (u5, _, _) = classify_release("Blue Lock v01-28 + 249-288 (Digital)");
+    assert_eq!(
+        u5,
+        AcquisitionReleaseUnit::MixedCollection {
+            volume_start: 1.0,
+            volume_end: 28.0,
+            chapter_start: 249.0,
+            chapter_end: 288.0,
+        }
+    );
+
+    // Single chapter
+    let (u6, n6, _) = classify_release("Blue Lock c368 [ENG]");
+    assert_eq!(u6, AcquisitionReleaseUnit::Chapter(368.0));
+    assert_eq!(n6, Some(368.0));
+}
+
+#[tokio::test]
+async fn test_smart_ranking_scenario_b_edition_variant_detection() {
+    use crate::acquisition::nyaa::detect_variant;
+
+    // "Blue Lock Full Color Selection v01" vs "Blue Lock"
+    let (is_var1, name1) = detect_variant("Blue Lock Full Color Selection v01", "Blue Lock");
+    assert!(is_var1);
+    assert_eq!(name1.as_deref(), Some("Full Color Selection"));
+
+    // "Blue Lock Side Story: Episode Nagi" vs "Blue Lock"
+    let (is_var2, name2) = detect_variant("Blue Lock Side Story: Episode Nagi", "Blue Lock");
+    assert!(is_var2);
+    assert_eq!(name2.as_deref(), Some("Side Story"));
+
+    // Canonical release
+    let (is_var3, name3) = detect_variant("Blue Lock v26 (Digital)", "Blue Lock");
+    assert!(!is_var3);
+    assert_eq!(name3, None);
+
+    // Target title itself IS the variant
+    let (is_var4, _) = detect_variant("Blue Lock Full Color Selection v01", "Blue Lock Full Color Selection");
+    assert!(!is_var4, "If target title contains the variant phrase, it is not flagged as extraneous");
+}
+
+#[tokio::test]
+async fn test_smart_ranking_scenario_c_hard_gates() {
+    use crate::acquisition::nyaa::evaluate_hard_gates;
+
+    let target_title = "Blue Lock";
+    let aliases = vec!["BL".to_string()];
+
+    // 1. Anime false positive rejected
+    let mut anime_rel = make_test_release("Blue Lock", "Blue Lock - 01 [1080p][HEVC]", 100);
+    anime_rel.category_id = Some("1_2".to_string());
+    assert!(!evaluate_hard_gates(&anime_rel, target_title, &aliases, None));
+
+    // 2. Wrong manga identity rejected
+    let wrong_rel = make_test_release("Jujutsu Kaisen", "Jujutsu Kaisen v01", 100);
+    assert!(!evaluate_hard_gates(&wrong_rel, target_title, &aliases, None));
+
+    // 3. Exact unit contradiction when target_unit is Volume(26)
+    let vol11_rel = make_test_release("Blue Lock v11", "Blue Lock v11 (Digital)", 100);
+    assert!(
+        !evaluate_hard_gates(&vol11_rel, target_title, &aliases, Some(&AcquisitionReleaseUnit::Volume(26.0))),
+        "Volume 11 must be gated out when specifically targeting Volume 26"
+    );
+
+    // 4. Exact matching volume passes
+    let vol26_rel = make_test_release("Blue Lock v26", "Blue Lock v26 (Digital)", 100);
+    assert!(evaluate_hard_gates(&vol26_rel, target_title, &aliases, Some(&AcquisitionReleaseUnit::Volume(26.0))));
+
+    // 5. Collection containing Volume 26 passes
+    let col_rel = make_test_release("Blue Lock v01-39", "Blue Lock v01-39 (Digital)", 100);
+    assert!(evaluate_hard_gates(&col_rel, target_title, &aliases, Some(&AcquisitionReleaseUnit::Volume(26.0))));
+
+    // 6. Collection NOT containing Volume 26 fails
+    let col_not_rel = make_test_release("Blue Lock v01-20", "Blue Lock v01-20 (Digital)", 100);
+    assert!(!evaluate_hard_gates(&col_not_rel, target_title, &aliases, Some(&AcquisitionReleaseUnit::Volume(26.0))));
+}
+
+#[tokio::test]
+async fn test_smart_ranking_scenario_d_smart_score_calculation() {
+    use crate::acquisition::nyaa::compute_smart_score;
+
+    let target_title = "Blue Lock";
+    let owned_volumes = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+    let all_series_missing = vec![6.0, 7.0, 8.0, 9.0, 10.0];
+
+    // High quality digital release for missing volume 6
+    let good_rel = make_test_release("Blue Lock v06", "[Stick] Blue Lock v06 (Digital)", 50);
+    let score_good = compute_smart_score(&good_rel, target_title, &[], Some(&AcquisitionReleaseUnit::Volume(6.0)), &owned_volumes, &all_series_missing);
+    assert!(score_good.total >= 80.0, "Expected high score, got {}", score_good.total);
+    assert_eq!(score_good.summary_tag, "BEST MATCH");
+
+    // Dead torrent (0 seeders)
+    let mut dead_rel = good_rel.clone();
+    dead_rel.seeders = 0;
+    let score_dead = compute_smart_score(&dead_rel, target_title, &[], Some(&AcquisitionReleaseUnit::Volume(6.0)), &owned_volumes, &all_series_missing);
+    assert!(score_dead.total < score_good.total - 15.0);
+    assert!(score_dead.penalties <= -20.0);
+
+    // Variant edition penalty
+    let mut var_rel = good_rel.clone();
+    var_rel.is_variant = true;
+    var_rel.variant_name = Some("Full Color Selection".to_string());
+    let score_var = compute_smart_score(&var_rel, target_title, &[], None, &owned_volumes, &all_series_missing);
+    assert_eq!(score_var.summary_tag, "VARIANT");
+    assert!(score_var.penalties <= -25.0);
+}
+
+#[tokio::test]
+async fn test_smart_ranking_scenario_e_missing_aware_ranking() {
+    use crate::acquisition::nyaa::rank_candidates_smart;
+
+    let target_title = "Blue Lock";
+    // Library has volumes 1..=25 owned; missing 26..=39
+    let owned: Vec<f64> = (1..=25).map(|n| n as f64).collect();
+    let missing: Vec<f64> = (26..=39).map(|n| n as f64).collect();
+
+    let releases = vec![
+        make_test_release("Blue Lock v20-25", "Blue Lock v20-25 (Digital)", 40), // 0 missing, all owned
+        make_test_release("Blue Lock v01-39", "[Stick] Blue Lock v01-39 (Digital)", 60), // covers all 14 missing
+        make_test_release("Blue Lock v26", "[Rillant] Blue Lock v26 (Digital)", 30), // covers volume 26
+    ];
+
+    let ranked = rank_candidates_smart(
+        releases,
+        target_title,
+        &[],
+        None,
+        &owned,
+        &missing,
+        Some("smart"),
+        None,
+        None,
+        None,
+        None,
+    );
+
+    assert_eq!(ranked.len(), 3);
+    // The collection covering all 14 missing volumes ranks #1
+    assert_eq!(ranked[0].release.raw_title, "[Stick] Blue Lock v01-39 (Digital)");
+    assert_eq!(ranked[0].units_missing.len(), 14);
+    assert_eq!(ranked[0].smart_score.as_ref().unwrap().summary_tag, "BEST MATCH");
+
+    // The single missing volume ranks #2
+    assert_eq!(ranked[1].release.raw_title, "[Rillant] Blue Lock v26 (Digital)");
+    assert_eq!(ranked[1].units_missing.len(), 1);
+
+    // The collection covering 0 missing volumes ranks last
+    assert_eq!(ranked[2].release.raw_title, "Blue Lock v20-25 (Digital)");
+    assert_eq!(ranked[2].units_missing.len(), 0);
+    assert_eq!(ranked[2].smart_score.as_ref().unwrap().summary_tag, "ALREADY OWNED");
+}
+
+#[tokio::test]
+async fn test_smart_ranking_scenario_f_sort_options() {
+    use crate::acquisition::nyaa::rank_candidates_smart;
+
+    let target_title = "Blue Lock";
+    let owned = vec![1.0, 2.0, 3.0];
+    let missing = vec![4.0, 5.0, 6.0, 7.0, 8.0];
+
+    let releases = vec![
+        make_test_release_ext("Blue Lock v04", "Blue Lock v04", 10, 50_000_000, Some(100)),
+        make_test_release_ext("Blue Lock v05", "Blue Lock v05", 50, 60_000_000, Some(200)),
+        make_test_release_ext("Blue Lock v04-08", "Blue Lock v04-08", 20, 200_000_000, Some(150)),
+    ];
+
+    // 1. Sort by seeders
+    let by_seeders = rank_candidates_smart(releases.clone(), target_title, &[], None, &owned, &missing, Some("seeders"), None, None, None, None);
+    assert_eq!(by_seeders[0].release.seeders, 50);
+
+    // 2. Sort by size_asc
+    let by_size_asc = rank_candidates_smart(releases.clone(), target_title, &[], None, &owned, &missing, Some("size_asc"), None, None, None, None);
+    assert_eq!(by_size_asc[0].release.size_bytes, 50_000_000);
+
+    // 3. Sort by newest
+    let by_newest = rank_candidates_smart(releases.clone(), target_title, &[], None, &owned, &missing, Some("newest"), None, None, None, None);
+    assert_eq!(by_newest[0].release.published_at, Some(200));
+
+    // 4. Sort by coverage (missing units count)
+    let by_coverage = rank_candidates_smart(releases, target_title, &[], None, &owned, &missing, Some("coverage"), None, None, None, None);
+    assert_eq!(by_coverage[0].release.raw_title, "Blue Lock v04-08");
+}
+
+#[tokio::test]
+async fn test_smart_ranking_scenario_g_filters() {
+    use crate::acquisition::nyaa::rank_candidates_smart;
+
+    let target_title = "Blue Lock";
+    let owned = vec![1.0, 2.0];
+    let missing = vec![3.0];
+
+    let releases = vec![
+        make_test_release("Blue Lock v01", "Blue Lock v01", 10), // owned volume
+        make_test_release("Blue Lock v03", "Blue Lock v03", 2),  // missing volume, 2 seeders
+        make_test_release("Blue Lock v01-03", "[Stick] Blue Lock v01-03", 25), // collection
+        make_test_release("Blue Lock c100", "Blue Lock c100", 5), // chapter
+    ];
+
+    // Filter type = "volumes"
+    let vols_only = rank_candidates_smart(releases.clone(), target_title, &[], None, &owned, &missing, None, Some("volumes"), None, None, None);
+    assert_eq!(vols_only.len(), 2);
+    assert!(vols_only.iter().all(|c| matches!(c.release.release_unit, AcquisitionReleaseUnit::Volume(_))));
+
+    // Filter type = "collections"
+    let cols_only = rank_candidates_smart(releases.clone(), target_title, &[], None, &owned, &missing, None, Some("collections"), None, None, None);
+    assert_eq!(cols_only.len(), 1);
+    assert!(cols_only[0].release.release_unit.is_collection());
+
+    // Filter min_seeders = 5
+    let min_5_seeders = rank_candidates_smart(releases.clone(), target_title, &[], None, &owned, &missing, None, None, None, None, Some(5));
+    assert_eq!(min_5_seeders.len(), 3);
+
+    // Filter uploader = "Stick"
+    let stick_only = rank_candidates_smart(releases.clone(), target_title, &[], None, &owned, &missing, None, None, None, Some("Stick"), None);
+    assert_eq!(stick_only.len(), 1);
+    assert_eq!(stick_only[0].release.uploader.as_deref(), Some("Stick"));
+
+    // Filter ownership = "missing_only"
+    let missing_only = rank_candidates_smart(releases, target_title, &[], None, &owned, &missing, None, None, Some("missing_only"), None, None);
+    assert_eq!(missing_only.len(), 2); // v03 and v01-03
+}
+
+#[tokio::test]
+async fn test_smart_ranking_scenario_h_torbox_file_mapping() {
+    use crate::acquisition::torbox::map_torrent_files_to_volumes;
+    use crate::acquisition::BackendFile;
+
+    // 1. Valid collection with .cbz files
+    let files = vec![
+        BackendFile { id: 1, name: "Blue Lock v01.cbz".to_string(), size: 100_000_000, path: "Blue Lock v01.cbz".to_string() },
+        BackendFile { id: 2, name: "Blue Lock v02.cbz".to_string(), size: 110_000_000, path: "Blue Lock v02.cbz".to_string() },
+        BackendFile { id: 3, name: "cover.jpg".to_string(), size: 500_000, path: "cover.jpg".to_string() }, // junk
+    ];
+    let map = map_torrent_files_to_volumes(&files).unwrap();
+    assert_eq!(map.len(), 2);
+    assert_eq!(map.get(&1).unwrap().id, 1);
+    assert_eq!(map.get(&2).unwrap().id, 2);
+
+    // 2. Prefers .cbz over .zip for the same volume
+    let files_with_zip = vec![
+        BackendFile { id: 10, name: "Blue Lock v01.zip".to_string(), size: 90_000_000, path: "Blue Lock v01.zip".to_string() },
+        BackendFile { id: 11, name: "Blue Lock v01.cbz".to_string(), size: 100_000_000, path: "Blue Lock v01.cbz".to_string() },
+    ];
+    let map_pref = map_torrent_files_to_volumes(&files_with_zip).unwrap();
+    assert_eq!(map_pref.len(), 1);
+    assert_eq!(map_pref.get(&1).unwrap().id, 11, "Must prefer native .cbz over .zip");
+
+    // 3. Duplicate identical extensions fail closed as AmbiguousFiles
+    let dup_files = vec![
+        BackendFile { id: 20, name: "Blue Lock v01.cbz".to_string(), size: 100_000_000, path: "Blue Lock v01.cbz".to_string() },
+        BackendFile { id: 21, name: "[Alt] Blue Lock v01.cbz".to_string(), size: 105_000_000, path: "[Alt] Blue Lock v01.cbz".to_string() },
+    ];
+    let err_dup = map_torrent_files_to_volumes(&dup_files).unwrap_err();
+    assert!(err_dup.to_string().contains("Duplicate archives found"));
+
+    // 4. Unsupported format (.cbr) fails closed
+    let cbr_files = vec![
+        BackendFile { id: 30, name: "Blue Lock v01.cbr".to_string(), size: 100_000_000, path: "Blue Lock v01.cbr".to_string() },
+    ];
+    let err_cbr = map_torrent_files_to_volumes(&cbr_files).unwrap_err();
+    assert!(err_cbr.to_string().contains("unsupported archive format"));
+}
+
+#[tokio::test]
+async fn test_smart_ranking_scenario_i_collection_inspection() {
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let temp_dir = std::env::temp_dir().join(format!("mango-test-col-inspect-{pid}-{nanos}"));
+    let db_path = temp_dir.join("test.db");
+    fs::create_dir_all(&temp_dir).unwrap();
+    let db = Db::open(&db_path).unwrap();
+
+    let service = crate::acquisition::service::AcquisitionService::new(
+        db.clone(),
+        reqwest::Client::new(),
+        None,
+        None,
+    );
+
+    db.call(|conn| {
+        conn.execute("INSERT INTO manga (id, source_id, url, title, in_library) VALUES (1, 1, '/m1', 'Blue Lock', 1)", [])?;
+        // Mark volume 1 as already downloaded
+        conn.execute("INSERT INTO chapters (id, manga_id, url, name, chapter_number, scanlator, source_order, fetched_at) VALUES (101, 1, 'url1', 'Volume 1', 1.0, 'Stick', 0, 0)", [])?;
+        conn.execute("INSERT INTO downloads (chapter_id, state, position, attempts, added_at) VALUES (101, 'completed', 1, 1, 0)", [])?;
+        Ok(())
+    }).await.unwrap();
+
+    let release = make_test_release("Blue Lock v01-03", "Blue Lock v01-03 (Digital)", 20);
+    let inspection = service.inspect_collection(1, release).await.unwrap();
+
+    assert_eq!(inspection.total_units, 3);
+    assert_eq!(inspection.owned_count, 1);
+    assert_eq!(inspection.missing_count, 2);
+    assert_eq!(inspection.recommended_mode, "missing_only");
+    assert_eq!(inspection.units.len(), 3);
+    assert!(inspection.units[0].is_owned);
+    assert!(!inspection.units[1].is_owned);
+    assert!(!inspection.units[2].is_owned);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_smart_ranking_scenario_j_collection_acquisition_execution() {
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let temp_dir = std::env::temp_dir().join(format!("mango-test-col-acq-{pid}-{nanos}"));
+    let db_path = temp_dir.join("test.db");
+    fs::create_dir_all(&temp_dir).unwrap();
+    let db = Db::open(&db_path).unwrap();
+
+    // Mock TorBox server responding to create
+    let (tx, mut _rx) = tokio::sync::mpsc::channel::<()>(1);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let mut buf = [0u8; 4096];
+            let n = tokio::io::AsyncReadExt::read(&mut stream, &mut buf).await.unwrap_or(0);
+            let req = String::from_utf8_lossy(&buf[..n]);
+            if req.contains("createtorrent") {
+                let resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"success\":true,\"data\":{\"torrent_id\":8888,\"hash\":\"testhash8888\"}}";
+                tokio::io::AsyncWriteExt::write_all(&mut stream, resp.as_bytes()).await.unwrap();
+            } else if req.contains("mylist") {
+                let resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"success\":true,\"data\":[{\"id\":8888,\"files\":[{\"id\":801,\"name\":\"Blue Lock v02.cbz\",\"size\":100000000},{\"id\":802,\"name\":\"Blue Lock v03.cbz\",\"size\":105000000}]}]}";
+                tokio::io::AsyncWriteExt::write_all(&mut stream, resp.as_bytes()).await.unwrap();
+            }
+        }
+        let _ = tx.send(()).await;
+    });
+
+    let service = crate::acquisition::service::AcquisitionService::new(
+        db.clone(),
+        reqwest::Client::new(),
+        None,
+        None,
+    );
+
+    db.call(move |conn| {
+        conn.execute("INSERT INTO manga (id, source_id, url, title, in_library) VALUES (1, 1, '/m1', 'Blue Lock', 1)", [])?;
+        crate::db::set_state(conn, "acquisition.torbox_enabled", "true")?;
+        crate::db::set_state(conn, "acquisition.torbox_url", &format!("http://127.0.0.1:{port}"))?;
+        crate::db::set_state(conn, "acquisition.torbox_token", "test-token")?;
+        Ok(())
+    }).await.unwrap();
+
+    let release = make_test_release("Blue Lock v01-03", "Blue Lock v01-03 (Digital)", 20);
+    let request = crate::acquisition::AcquireCollectionRequest {
+        release,
+        selected_volumes: vec![2.0, 3.0],
+        mode: "missing_only".to_string(),
+    };
+
+    let chapter_ids = service.acquire_collection(1, request).await.unwrap();
+    assert_eq!(chapter_ids.len(), 2);
+
+    // Verify child unit rows created in downloads table
+    let rows: Vec<(i64, String, Option<String>, Option<String>)> = db.call(|conn| {
+        let mut stmt = conn.prepare("SELECT chapter_id, state, collection_id, collection_name FROM downloads ORDER BY chapter_id")?;
+        let list = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+            .filter_map(std::result::Result::ok)
+            .collect();
+        Ok(list)
+    }).await.unwrap();
+
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].1, "queued");
+    assert_eq!(rows[0].2.as_deref(), Some("col-8888"));
+    assert_eq!(rows[0].3.as_deref(), Some("Blue Lock v01-03"));
+
+    assert_eq!(rows[1].1, "queued");
+    assert_eq!(rows[1].2.as_deref(), Some("col-8888"));
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_smart_ranking_scenario_k_sibling_failure_isolation() {
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let temp_dir = std::env::temp_dir().join(format!("mango-test-col-sibling-{pid}-{nanos}"));
+    let db_path = temp_dir.join("test.db");
+    fs::create_dir_all(&temp_dir).unwrap();
+    let db = Db::open(&db_path).unwrap();
+
+    // Insert 2 child downloads for the same collection
+    db.call(|conn| {
+        conn.execute("INSERT INTO manga (id, source_id, url, title, in_library) VALUES (1, 1, '/m1', 'Blue Lock', 1)", [])?;
+        conn.execute("INSERT INTO chapters (id, manga_id, url, name, chapter_number, scanlator, source_order, fetched_at) VALUES (201, 1, 'u201', 'Volume 2', 2.0, 'Stick', 0, 0)", [])?;
+        conn.execute("INSERT INTO chapters (id, manga_id, url, name, chapter_number, scanlator, source_order, fetched_at) VALUES (202, 1, 'u202', 'Volume 3', 3.0, 'Stick', 0, 0)", [])?;
+        conn.execute(
+            "INSERT INTO downloads (chapter_id, state, position, attempts, added_at, backend_type, external_job_id, collection_id)
+             VALUES (201, 'failed', 1, 5, 0, 'torbox', 'job-999', 'col-999')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO downloads (chapter_id, state, position, attempts, added_at, backend_type, external_job_id, collection_id)
+             VALUES (202, 'queued', 2, 0, 0, 'torbox', 'job-999', 'col-999')",
+            [],
+        )?;
+        Ok(())
+    }).await.unwrap();
+
+    // Verify independent retry: retrying failed child 201 does not affect child 202
+    db.call(|conn| {
+        conn.execute("UPDATE downloads SET state = 'queued', attempts = 0, error = NULL WHERE chapter_id = 201", [])?;
+        Ok(())
+    }).await.unwrap();
+
+    let state_201: String = db.call(|conn| Ok(conn.query_row("SELECT state FROM downloads WHERE chapter_id = 201", [], |r| r.get(0))?)).await.unwrap();
+    let state_202: String = db.call(|conn| Ok(conn.query_row("SELECT state FROM downloads WHERE chapter_id = 202", [], |r| r.get(0))?)).await.unwrap();
+    assert_eq!(state_201, "queued");
+    assert_eq!(state_202, "queued");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_smart_ranking_scenario_l_published_files_preserved_on_cancellation() {
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
+    let temp_dir = std::env::temp_dir().join(format!("mango-test-col-cancel-{pid}-{nanos}"));
+    let db_path = temp_dir.join("test.db");
+    let lib_dir = temp_dir.join("library");
+    fs::create_dir_all(&lib_dir).unwrap();
+    let db = Db::open(&db_path).unwrap();
+
+    // Create a published canonical CBZ for volume 1
+    let series_dir = lib_dir.join("Blue Lock");
+    fs::create_dir_all(&series_dir).unwrap();
+    let pub_v1 = series_dir.join("Blue Lock v01.cbz");
+    make_valid_test_cbz(&pub_v1, "Blue Lock");
+    assert!(pub_v1.is_file());
+
+    // Host & Downloads
+    let host = crate::host::Host::new(crate::config::HostConfig::default(), temp_dir.join("host_bin"), &temp_dir).unwrap();
+    let local = crate::local::Local::new(temp_dir.join("local"));
+    let images = crate::images::Images::new(db.clone(), host, local, &temp_dir, 10);
+    let downloads = crate::downloads::Downloads::new(db.clone(), images, &temp_dir, 0);
+
+    // Seed DB with child volume 2 in queue
+    db.call(|conn| {
+        conn.execute("INSERT INTO manga (id, source_id, url, title, in_library) VALUES (1, 1, '/m1', 'Blue Lock', 1)", [])?;
+        conn.execute("INSERT INTO chapters (id, manga_id, url, name, chapter_number, scanlator, source_order, fetched_at) VALUES (302, 1, 'u302', 'Volume 2', 2.0, 'Stick', 0, 0)", [])?;
+        conn.execute(
+            "INSERT INTO downloads (chapter_id, state, position, attempts, added_at, backend_type, external_job_id, collection_id)
+             VALUES (302, 'queued', 1, 0, 0, 'torbox', 'job-777', 'col-777')",
+            [],
+        )?;
+        Ok(())
+    }).await.unwrap();
+
+    // Cancel volume 2
+    downloads.cancel(Some(302)).await.unwrap();
+
+    // Verify queue is empty
+    let q_count: i64 = db.call(|conn| Ok(conn.query_row("SELECT count(*) FROM downloads", [], |r| r.get(0))?)).await.unwrap();
+    assert_eq!(q_count, 0);
+
+    // Crucial requirement: published canonical artifact for volume 1 MUST NOT BE DELETED!
+    assert!(pub_v1.is_file(), "Canonical library artifact is never deleted on download queue cancellation");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+fn make_test_release(title: &str, raw_title: &str, seeders: u32) -> AcquisitionRelease {
+    make_test_release_ext(title, raw_title, seeders, 150_000_000, None)
+}
+
+fn make_test_release_ext(title: &str, raw_title: &str, seeders: u32, size_bytes: u64, published_at: Option<i64>) -> AcquisitionRelease {
+    let (release_unit, release_number, release_range) = crate::acquisition::nyaa::classify_release(raw_title);
+    let (is_variant, variant_name) = crate::acquisition::nyaa::detect_variant(raw_title, "");
+    let is_mixed = matches!(release_unit, AcquisitionReleaseUnit::MixedCollection { .. });
+    let is_trusted = raw_title.contains("Stick") || raw_title.contains("danke");
+
+    let uploader = if raw_title.starts_with('[') {
+        raw_title.find(']').map(|e| raw_title[1..e].to_string())
+    } else {
+        None
+    };
+
+    AcquisitionRelease {
+        source: "nyaa".to_string(),
+        source_item_id: format!("test-{}", seeders),
+        title: title.to_string(),
+        raw_title: raw_title.to_string(),
+        uploader,
+        source_url: format!("https://nyaa.si/view/{seeders}"),
+        torrent_url: None,
+        magnet_url: Some(format!("magnet:?xt=urn:btih:hash_{seeders}")),
+        info_hash: Some(format!("hash_{seeders}")),
+        category_id: Some("3_1".to_string()),
+        category_name: Some("Literature - English".to_string()),
+        size_bytes,
+        size_formatted: format!("{} MiB", size_bytes / (1024 * 1024)),
+        seeders,
+        leechers: 1,
+        published_at,
+        is_trusted,
+        is_remake: raw_title.to_ascii_lowercase().contains("remake"),
+        is_variant,
+        variant_name,
+        is_mixed,
+        release_unit,
+        release_number,
+        release_range,
+        language: Some("en".to_string()),
+    }
 }

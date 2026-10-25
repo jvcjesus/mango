@@ -3,11 +3,11 @@
 //! Orchestrates Nyaa release discovery, TorBox external downloads, candidate ranking,
 //! duplicate protection against canonical storage and download queues, and durable acquisition history.
 
-use crate::acquisition::nyaa::{rank_candidates, NyaaClient, DEFAULT_NYAA_URL};
+use crate::acquisition::nyaa::{rank_candidates_smart, NyaaClient, DEFAULT_NYAA_URL};
 use crate::acquisition::torbox::{TorBoxClient, DEFAULT_TORBOX_URL};
 use crate::acquisition::{
-    AcquisitionCandidate, AcquisitionConfig, AcquisitionHistoryRecord, AcquisitionRelease,
-    AcquisitionReleaseUnit,
+    AcquireCollectionRequest, AcquisitionCandidate, AcquisitionConfig, AcquisitionHistoryRecord,
+    AcquisitionRelease, AcquisitionReleaseUnit, CollectionInspection, CollectionUnitEntry,
 };
 use crate::db::Db;
 use crate::error::{AppError, Result};
@@ -186,20 +186,9 @@ impl AcquisitionService {
         }
     }
 
-    /// Searches Nyaa for candidates for a given title, matching aliases and ranking candidates.
-    pub async fn search_candidates(
-        &self,
-        manga_id: i64,
-        target_unit: Option<AcquisitionReleaseUnit>,
-    ) -> Result<Vec<AcquisitionCandidate>> {
-        let (config, _) = self.load_internal_config().await?;
-        if !config.nyaa_enabled {
-            return Err(AppError::bad_request("Nyaa release discovery is disabled in Settings"));
-        }
-
-        // Fetch title and known aliases from database
-        let (title, aliases) = self
-            .db
+    /// Fetches title and known aliases for a given manga from DB.
+    pub async fn get_title_and_aliases(&self, manga_id: i64) -> Result<(String, Vec<String>)> {
+        self.db
             .call(move |conn| {
                 let title: String = conn.query_row(
                     "SELECT title FROM manga WHERE id = ?1",
@@ -228,40 +217,307 @@ impl AcquisitionService {
 
                 Ok((title, aliases))
             })
-            .await?;
+            .await
+    }
+
+    /// Searches Nyaa for candidates for a given title, matching aliases and ranking candidates.
+    pub async fn search_candidates(
+        &self,
+        manga_id: i64,
+        target_unit: Option<AcquisitionReleaseUnit>,
+        sort_by: Option<String>,
+        filter_type: Option<String>,
+        filter_ownership: Option<String>,
+        filter_uploader: Option<String>,
+        min_seeders: Option<u32>,
+    ) -> Result<Vec<AcquisitionCandidate>> {
+        let (config, _) = self.load_internal_config().await?;
+        if !config.nyaa_enabled {
+            return Err(AppError::bad_request("Nyaa release discovery is disabled in Settings"));
+        }
+
+        let (title, aliases) = self.get_title_and_aliases(manga_id).await?;
 
         let nyaa = NyaaClient::new(self.http.clone(), config.nyaa_url);
-        let releases = nyaa
-            .search(&title, config.nyaa_category.as_deref())
-            .await
-            .unwrap_or_default();
+        let mut releases = Vec::new();
+        let mut seen_keys = std::collections::HashSet::new();
 
-        let mut candidates = rank_candidates(releases, &title, &aliases, target_unit.as_ref());
-
-        // Check ownership status for each candidate against DB and canonical library
-        let (owned_units, acquiring_units) = self.get_title_acquisition_state(manga_id, &title).await?;
-
-        for cand in &mut candidates {
-            match &cand.release.release_unit {
-                AcquisitionReleaseUnit::Volume(v) => {
-                    if owned_units.contains(&format!("v{v}")) {
-                        cand.ownership_status = "owned".to_string();
-                    } else if acquiring_units.contains(&format!("v{v}")) {
-                        cand.ownership_status = "acquiring".to_string();
+        if let Some(AcquisitionReleaseUnit::Volume(v)) = &target_unit {
+            let v_int = v.round() as i64;
+            let queries = [
+                format!("{title} v{v_int}"),
+                format!("{title} vol {v_int}"),
+                format!("{title} volume {v_int}"),
+                title.clone(),
+            ];
+            for q in queries {
+                if let Ok(res) = nyaa.search(&q, config.nyaa_category.as_deref()).await {
+                    for r in res {
+                        let key = r.info_hash.clone().unwrap_or_else(|| r.source_item_id.clone());
+                        if seen_keys.insert(key) {
+                            releases.push(r);
+                        }
                     }
                 }
-                AcquisitionReleaseUnit::Chapter(c) => {
-                    if owned_units.contains(&format!("c{c}")) {
-                        cand.ownership_status = "owned".to_string();
-                    } else if acquiring_units.contains(&format!("c{c}")) {
-                        cand.ownership_status = "acquiring".to_string();
-                    }
+            }
+        } else {
+            releases = nyaa
+                .search(&title, config.nyaa_category.as_deref())
+                .await
+                .unwrap_or_default();
+        }
+
+        // Fetch ownership state and volumes for library-aware smart ranking
+        let (owned_set, _) = self.get_title_acquisition_state(manga_id, &title).await?;
+
+        let mut owned_volumes = Vec::new();
+        let mut all_series_missing_volumes = Vec::new();
+
+        if let Some(pipeline) = &self.pipeline {
+            let title_owned = pipeline.ownership.get_title_ownership(manga_id, &title).await;
+            for v in &title_owned.volumes {
+                if v.status == crate::pipeline::ownership::OwnershipStatus::Owned {
+                    owned_volumes.push(v.volume);
+                } else {
+                    all_series_missing_volumes.push(v.volume);
                 }
-                _ => {}
             }
         }
 
+        if owned_volumes.is_empty() {
+            for s in &owned_set {
+                if s.starts_with('v') {
+                    if let Ok(val) = s[1..].parse::<f64>() {
+                        owned_volumes.push(val);
+                    }
+                }
+            }
+        }
+
+        let candidates = rank_candidates_smart(
+            releases,
+            &title,
+            &aliases,
+            target_unit.as_ref(),
+            &owned_volumes,
+            &all_series_missing_volumes,
+            sort_by.as_deref(),
+            filter_type.as_deref(),
+            filter_ownership.as_deref(),
+            filter_uploader.as_deref(),
+            min_seeders,
+        );
+
         Ok(candidates)
+    }
+
+    /// Inspects a collection release, breaking it down into unit entries with owned/missing status.
+    pub async fn inspect_collection(
+        &self,
+        manga_id: i64,
+        release: AcquisitionRelease,
+    ) -> Result<CollectionInspection> {
+        let (title, _) = self.get_title_and_aliases(manga_id).await?;
+        let (owned_set, acquiring_set) = self.get_title_acquisition_state(manga_id, &title).await?;
+
+        let vols = release.release_unit.included_volumes();
+
+        // Optional TorBox file mapping if torrent files are already available
+        let mut file_map = std::collections::BTreeMap::new();
+        if let Some(ref hash) = release.info_hash {
+            if let Ok(Some(token)) = self.get_torbox_token().await {
+                let (config, _) = self.load_internal_config().await.unwrap_or_default();
+                let client = TorBoxClient::new(self.http.clone(), config.torbox_url, Some(token));
+                if let Ok(files) = client.list_files(hash).await {
+                    if let Ok(mapped) = crate::acquisition::torbox::map_torrent_files_to_volumes(&files) {
+                        file_map = mapped;
+                    }
+                }
+            }
+        }
+
+        let mut units = Vec::new();
+        for &v in &vols {
+            let v_idx = v.round() as i64;
+            let is_owned = owned_set.contains(&format!("v{v}")) || owned_set.contains(&format!("v{v_idx}"));
+            let is_acquiring = acquiring_set.contains(&format!("v{v}")) || acquiring_set.contains(&format!("v{v_idx}"));
+
+            let (file_id, filename, file_size) = if let Some(bf) = file_map.get(&v_idx) {
+                (Some(bf.id), Some(bf.name.clone()), Some(bf.size))
+            } else {
+                (None, Some(format!("Volume {:02}", v_idx)), None)
+            };
+
+            units.push(CollectionUnitEntry {
+                volume: v,
+                file_id,
+                filename,
+                file_size,
+                is_owned,
+                is_acquiring,
+            });
+        }
+
+        let total_units = units.len();
+        let owned_count = units.iter().filter(|u| u.is_owned).count();
+        let missing_count = total_units.saturating_sub(owned_count);
+        let recommended_mode = if owned_count > 0 && missing_count > 0 {
+            "missing_only".to_string()
+        } else {
+            "entire".to_string()
+        };
+
+        Ok(CollectionInspection {
+            release,
+            units,
+            total_units,
+            owned_count,
+            missing_count,
+            recommended_mode,
+        })
+    }
+
+    /// Enqueues selected volumes of a collection release as independent child jobs in downloads queue.
+    pub async fn acquire_collection(
+        &self,
+        manga_id: i64,
+        req: AcquireCollectionRequest,
+    ) -> Result<Vec<i64>> {
+        let (config, has_token) = self.load_internal_config().await?;
+        if !config.torbox_enabled {
+            return Err(AppError::bad_request("TorBox download backend is disabled in Settings"));
+        }
+        if !has_token {
+            return Err(AppError::bad_request("TorBox API token is not configured. Add it in Settings."));
+        }
+        let actual_token = self.get_torbox_token().await?.unwrap_or_default();
+
+        let title: String = self
+            .db
+            .call(move |conn| Ok(conn.query_row("SELECT title FROM manga WHERE id = ?1", [manga_id], |r| r.get(0))?))
+            .await?;
+
+        // Filter out volumes already owned or acquiring
+        let (owned_set, acquiring_set) = self.get_title_acquisition_state(manga_id, &title).await?;
+
+        let mut volumes_to_acquire = Vec::new();
+        for &v in &req.selected_volumes {
+            let v_idx = v.round() as i64;
+            let is_owned = owned_set.contains(&format!("v{v}")) || owned_set.contains(&format!("v{v_idx}"));
+            let is_acquiring = acquiring_set.contains(&format!("v{v}")) || acquiring_set.contains(&format!("v{v_idx}"));
+
+            if req.mode == "missing_only" && is_owned {
+                continue;
+            }
+            if is_acquiring {
+                continue;
+            }
+            volumes_to_acquire.push(v);
+        }
+
+        if volumes_to_acquire.is_empty() {
+            return Err(AppError::bad_request("All selected volumes are already owned or currently acquiring"));
+        }
+
+        // Submit collection torrent to TorBox
+        let client = TorBoxClient::new(self.http.clone(), config.torbox_url, Some(actual_token));
+        let job_info = client.submit(&req.release).await?;
+        let external_job_id = job_info.external_job_id.clone();
+        let torrent_hash = job_info.torrent_hash.clone().or_else(|| req.release.info_hash.clone());
+        let collection_id = format!("col-{}", external_job_id);
+        let collection_name = req.release.title.clone();
+
+        // Attempt file mapping if files are listed
+        let mut file_map = std::collections::BTreeMap::new();
+        if let Ok(files) = client.list_files(&external_job_id).await {
+            if let Ok(mapped) = crate::acquisition::torbox::map_torrent_files_to_volumes(&files) {
+                file_map = mapped;
+            }
+        }
+
+        let uploader = req.release.uploader.clone();
+        let total_size = req.release.size_bytes;
+        let per_vol_size = if !volumes_to_acquire.is_empty() {
+            total_size / volumes_to_acquire.len() as u64
+        } else {
+            0
+        };
+
+        let mut chapter_ids = Vec::new();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+
+        for v in volumes_to_acquire {
+            let v_idx = v.round() as i64;
+            let (ext_file_id, raw_name, f_size) = if let Some(bf) = file_map.get(&v_idx) {
+                (Some(bf.id), bf.name.clone(), bf.size)
+            } else {
+                (None, format!("{} v{:02}", req.release.title, v_idx), per_vol_size)
+            };
+
+            let ch_url = format!("nyaa:{}:{v_idx}", req.release.source_item_id);
+            let ch_name = format!("Volume {v_idx}");
+            let up_clone = uploader.clone();
+            let ext_jid = external_job_id.clone();
+            let col_id = collection_id.clone();
+            let col_name = collection_name.clone();
+            let thash = torrent_hash.clone();
+
+            let ch_id: i64 = self.db.call(move |conn| {
+                let existing_id: Option<i64> = conn
+                    .query_row(
+                        "SELECT id FROM chapters WHERE manga_id = ?1 AND url = ?2",
+                        rusqlite::params![manga_id, &ch_url],
+                        |r| r.get(0),
+                    )
+                    .ok();
+
+                let id = if let Some(id) = existing_id {
+                    id
+                } else {
+                    conn.execute(
+                        "INSERT INTO chapters (manga_id, url, name, chapter_number, scanlator, source_order, fetched_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
+                        rusqlite::params![manga_id, &ch_url, &ch_name, v, &up_clone, now],
+                    )?;
+                    conn.last_insert_rowid()
+                };
+
+                conn.execute(
+                    "INSERT INTO downloads (
+                        chapter_id, state, position, attempts, added_at, source_type, backend_type,
+                        external_job_id, external_file_id, raw_title, uploader, release_size, torrent_hash,
+                        collection_id, collection_name
+                    ) VALUES (
+                        ?1, 'queued', (SELECT COALESCE(MAX(position), 0) + 1 FROM downloads), 0, ?2,
+                        'nyaa', 'torbox', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+                    ) ON CONFLICT(chapter_id) DO UPDATE SET
+                        state = 'queued', attempts = 0, retry_at = NULL, error = NULL,
+                        source_type = 'nyaa', backend_type = 'torbox',
+                        external_job_id = excluded.external_job_id,
+                        external_file_id = excluded.external_file_id,
+                        raw_title = excluded.raw_title, uploader = excluded.uploader,
+                        release_size = excluded.release_size, torrent_hash = excluded.torrent_hash,
+                        collection_id = excluded.collection_id, collection_name = excluded.collection_name",
+                    rusqlite::params![
+                        id, now, &ext_jid, ext_file_id, &raw_name, &up_clone, f_size as i64, &thash,
+                        &col_id, &col_name
+                    ],
+                )?;
+
+                Ok(id)
+            }).await?;
+
+            chapter_ids.push(ch_id);
+        }
+
+        if let Some(wake) = &self.wake_downloads {
+            wake.notify_one();
+        }
+
+        Ok(chapter_ids)
     }
 
     /// Helper to get sets of owned and acquiring unit identifiers (e.g. "v1", "c12").
@@ -289,6 +545,30 @@ impl AcquisitionService {
             }
         }
 
+        // Query downloaded chapters from DB (useful when pipeline is offline or in tests)
+        let downloaded_chapters: Vec<(String, f64)> = self
+            .db
+            .call(move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT name, chapter_number FROM chapters WHERE manga_id = ?1 AND download_path IS NOT NULL",
+                )?;
+                let rows = stmt
+                    .query_map([manga_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .filter_map(std::result::Result::ok)
+                    .collect();
+                Ok(rows)
+            })
+            .await?;
+
+        for (name, num) in downloaded_chapters {
+            let rel = crate::release::parse_release(&name, num);
+            if rel.release_type == crate::release::ReleaseType::Volume {
+                owned_set.insert(format!("v{}", rel.volume.unwrap_or(num)));
+            } else {
+                owned_set.insert(format!("c{}", rel.chapter_number.unwrap_or(num)));
+            }
+        }
+
         // Also check downloads queue
         let queued_items: Vec<(String, f64, String)> = self
             .db
@@ -305,13 +585,17 @@ impl AcquisitionService {
             .await?;
 
         for (name, num, state) in queued_items {
-            if state != "failed" {
-                let rel = crate::release::parse_release(&name, num);
-                if rel.release_type == crate::release::ReleaseType::Volume {
-                    acquiring_set.insert(format!("v{}", rel.volume.unwrap_or(num)));
-                } else {
-                    acquiring_set.insert(format!("c{}", rel.chapter_number.unwrap_or(num)));
-                }
+            let rel = crate::release::parse_release(&name, num);
+            let key = if rel.release_type == crate::release::ReleaseType::Volume {
+                format!("v{}", rel.volume.unwrap_or(num))
+            } else {
+                format!("c{}", rel.chapter_number.unwrap_or(num))
+            };
+
+            if state == "completed" {
+                owned_set.insert(key);
+            } else if state != "failed" {
+                acquiring_set.insert(key);
             }
         }
 
@@ -425,6 +709,13 @@ impl AcquisitionService {
             AcquisitionReleaseUnit::Volume(v) => (format!("Volume {v}"), *v),
             AcquisitionReleaseUnit::Chapter(c) => (format!("Chapter {c}"), *c),
             AcquisitionReleaseUnit::Collection { start, end } => (format!("Volumes {start}-{end}"), *start),
+            AcquisitionReleaseUnit::MultiRange(ranges) => {
+                let s = ranges.iter().map(|(s, e)| format!("{s}-{e}")).collect::<Vec<_>>().join(", ");
+                (format!("Volumes {s}"), ranges.first().map(|(s, _)| *s).unwrap_or(1.0))
+            }
+            AcquisitionReleaseUnit::MixedCollection { volume_start, volume_end, .. } => {
+                (format!("Volumes {volume_start}-{volume_end}"), *volume_start)
+            }
             AcquisitionReleaseUnit::Unknown => (release.title.clone(), -1.0),
         };
 
@@ -507,7 +798,7 @@ impl AcquisitionService {
             }
 
             let (file_unit, _, _) = crate::acquisition::nyaa::classify_release(name);
-            match (unit, file_unit) {
+            match (unit, &file_unit) {
                 (AcquisitionReleaseUnit::Volume(target_v), AcquisitionReleaseUnit::Volume(v)) => {
                     if (target_v - v).abs() < 0.001 {
                         return true;
@@ -515,6 +806,11 @@ impl AcquisitionService {
                 }
                 (AcquisitionReleaseUnit::Chapter(target_c), AcquisitionReleaseUnit::Chapter(c)) => {
                     if (target_c - c).abs() < 0.001 {
+                        return true;
+                    }
+                }
+                (AcquisitionReleaseUnit::Volume(target_v), rel_u) if rel_u.is_collection() => {
+                    if rel_u.included_volumes().iter().any(|v| (v - target_v).abs() < 0.001) {
                         return true;
                     }
                 }

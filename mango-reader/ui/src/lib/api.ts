@@ -228,6 +228,8 @@ export type Queued = {
   rawTitle?: string | null;
   uploader?: string | null;
   releaseSize?: number | null;
+  collectionId?: string | null;
+  collectionName?: string | null;
 };
 
 export type Queue = { paused: boolean; queue: Queued[] };
@@ -747,17 +749,65 @@ export interface AcquisitionRelease {
   publishedAt?: number | null;
   isTrusted: boolean;
   isRemake: boolean;
+  isVariant?: boolean;
+  variantName?: string | null;
+  isMixed?: boolean;
   releaseUnit: AcquisitionReleaseUnit;
   releaseNumber?: number | null;
   releaseRange?: [number, number] | null;
   language?: string | null;
 }
 
+export interface SmartScore {
+  identity: number;
+  coverage: number;
+  quality: number;
+  health: number;
+  freshness: number;
+  efficiency: number;
+  penalties: number;
+  total: number;
+  explanation: string;
+  summaryTag: string;
+}
+
 export interface AcquisitionCandidate {
   release: AcquisitionRelease;
   score: number;
+  smartScore?: SmartScore | null;
   matchType: string;
   ownershipStatus: string;
+  unitsIncluded: number[];
+  unitsOwned: number[];
+  unitsMissing: number[];
+  coverageSummary: string;
+  usefulEfficiencyBytes?: number | null;
+  isVariant?: boolean;
+  variantName?: string | null;
+}
+
+export interface CollectionUnitEntry {
+  volume: number;
+  fileId?: number | null;
+  filename?: string | null;
+  fileSize?: number | null;
+  isOwned: boolean;
+  isAcquiring: boolean;
+}
+
+export interface CollectionInspection {
+  release: AcquisitionRelease;
+  units: CollectionUnitEntry[];
+  totalUnits: number;
+  ownedCount: number;
+  missingCount: number;
+  recommendedMode: 'missing_only' | 'entire';
+}
+
+export interface AcquireCollectionRequest {
+  release: AcquisitionRelease;
+  selectedVolumes: number[];
+  mode: 'missing_only' | 'entire' | 'manual';
 }
 
 export interface AcquisitionConfig {
@@ -797,13 +847,47 @@ export interface AcquisitionHistoryRecord {
   error?: string | null;
 }
 
-export const getTitleAcquisitionReleases = (id: number, unitType?: string, unitNumber?: number) => {
+export const getTitleAcquisitionReleases = (
+  id: number,
+  optionsOrUnitType?:
+    | string
+    | {
+        unitType?: string;
+        unitNumber?: number;
+        sort?: string;
+        filterType?: string;
+        filterOwnership?: string;
+        filterUploader?: string;
+        minSeeders?: number;
+      },
+  unitNumber?: number
+) => {
   const params = new URLSearchParams();
-  if (unitType) params.set('unit_type', unitType);
-  if (unitNumber !== undefined) params.set('unit_number', String(unitNumber));
+  if (typeof optionsOrUnitType === 'string') {
+    if (optionsOrUnitType) params.set('unit_type', optionsOrUnitType);
+    if (unitNumber !== undefined) params.set('unit_number', String(unitNumber));
+  } else if (optionsOrUnitType) {
+    if (optionsOrUnitType.unitType) params.set('unit_type', optionsOrUnitType.unitType);
+    if (optionsOrUnitType.unitNumber !== undefined) params.set('unit_number', String(optionsOrUnitType.unitNumber));
+    if (optionsOrUnitType.sort) params.set('sort', optionsOrUnitType.sort);
+    if (optionsOrUnitType.filterType) params.set('filter_type', optionsOrUnitType.filterType);
+    if (optionsOrUnitType.filterOwnership) params.set('filter_ownership', optionsOrUnitType.filterOwnership);
+    if (optionsOrUnitType.filterUploader) params.set('filter_uploader', optionsOrUnitType.filterUploader);
+    if (optionsOrUnitType.minSeeders !== undefined) params.set('min_seeders', String(optionsOrUnitType.minSeeders));
+  }
   const qs = params.toString();
   return get<AcquisitionCandidate[]>(`/titles/${id}/acquisition-releases${qs ? `?${qs}` : ''}`);
 };
+
+export const inspectCollection = (id: number, release: AcquisitionRelease) =>
+  send<CollectionInspection>('POST', `/titles/${id}/acquisition-inspect-collection`, release);
+
+export const acquireCollection = (id: number, request: AcquireCollectionRequest) =>
+  send<{ success: boolean; queuedCount: number; chapterIds: number[] }>(
+    'POST',
+    `/titles/${id}/acquire-collection`,
+    request
+  );
 
 export const acquireRelease = (id: number, release: AcquisitionRelease, targetUnit?: AcquisitionReleaseUnit) =>
   send<{ success: boolean; chapterId: number }>('POST', `/titles/${id}/acquire`, { release, targetUnit });

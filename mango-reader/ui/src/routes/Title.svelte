@@ -5,7 +5,11 @@
     send,
     getTitleAcquisitionReleases,
     acquireRelease,
+    acquireCollection,
+    inspectCollection,
     type AcquisitionCandidate,
+    type AcquisitionRelease,
+    type CollectionInspection,
     type Category,
     type Chapter,
     type OwnershipStatus,
@@ -185,12 +189,49 @@
   let showNyaa = $state(false);
   let acquiringReleases = $state<Record<string, boolean>>({});
 
+  // Filter & sort state
+  let filterType = $state('all');
+  let filterOwnership = $state('all');
+  let filterUploader = $state('all');
+  let filterSeeders = $state(0);
+  let sortBy = $state('smart');
+  let targetedUnit = $state<{ type: string; number: number } | null>(null);
+  let expandedScoreBreakdown = $state<Record<string, boolean>>({});
+
+  // Collection Inspector state
+  let inspectingCollection = $state<CollectionInspection | null>(null);
+  let inspectingLoading = $state(false);
+  let collectionMode = $state<'missing_only' | 'entire' | 'manual'>('missing_only');
+  let manualSelectedVolumes = $state<Record<number, boolean>>({});
+  let acquiringCollectionLoading = $state(false);
+
+  const discoveredUploaders = $derived.by(() => {
+    const set = new Set<string>();
+    for (const cand of nyaaReleases) {
+      if (cand.release.uploader) {
+        set.add(cand.release.uploader);
+      }
+    }
+    return Array.from(set).sort();
+  });
+
   async function searchNyaa(unitType?: string, unitNumber?: number) {
     showNyaa = true;
     loadingNyaa = true;
     nyaaError = null;
+    if (unitType && unitNumber !== undefined) {
+      targetedUnit = { type: unitType, number: unitNumber };
+    }
     try {
-      nyaaReleases = await getTitleAcquisitionReleases(id, unitType, unitNumber);
+      nyaaReleases = await getTitleAcquisitionReleases(id, {
+        unitType: targetedUnit?.type,
+        unitNumber: targetedUnit?.number,
+        sort: sortBy,
+        filterType: filterType !== 'all' ? filterType : undefined,
+        filterOwnership: filterOwnership !== 'all' ? filterOwnership : undefined,
+        filterUploader: filterUploader !== 'all' ? filterUploader : undefined,
+        minSeeders: filterSeeders > 0 ? filterSeeders : undefined,
+      });
       if (nyaaReleases.length === 0) {
         toast.info('No matching manga literature releases found on Nyaa');
       }
@@ -199,6 +240,79 @@
       toast.error(nyaaError);
     } finally {
       loadingNyaa = false;
+    }
+  }
+
+  function clearTargetedUnit() {
+    targetedUnit = null;
+    searchNyaa();
+  }
+
+  async function openCollectionInspector(release: AcquisitionRelease) {
+    inspectingLoading = true;
+    inspectingCollection = null;
+    manualSelectedVolumes = {};
+    collectionMode = 'missing_only';
+    try {
+      const inspection = await inspectCollection(id, release);
+      inspectingCollection = inspection;
+      collectionMode = inspection.recommendedMode;
+      for (const u of inspection.units) {
+        manualSelectedVolumes[u.volume] = !u.isOwned;
+      }
+    } catch (e) {
+      toast.error(message(e));
+    } finally {
+      inspectingLoading = false;
+    }
+  }
+
+  function closeCollectionInspector() {
+    inspectingCollection = null;
+  }
+
+  async function executeAcquireCollection() {
+    if (!inspectingCollection) return;
+    acquiringCollectionLoading = true;
+    try {
+      let selectedVolumes: number[] = [];
+      if (collectionMode === 'missing_only') {
+        selectedVolumes = inspectingCollection.units.filter((u) => !u.isOwned).map((u) => u.volume);
+      } else if (collectionMode === 'entire') {
+        selectedVolumes = inspectingCollection.units.map((u) => u.volume);
+      } else {
+        selectedVolumes = inspectingCollection.units.filter((u) => manualSelectedVolumes[u.volume]).map((u) => u.volume);
+      }
+
+      if (selectedVolumes.length === 0) {
+        toast.error('No volumes selected for acquisition');
+        return;
+      }
+
+      const res = await acquireCollection(id, {
+        release: inspectingCollection.release,
+        selectedVolumes,
+        mode: collectionMode,
+      });
+
+      toast.success(`Queued ${res.queuedCount} volumes for acquisition via TorBox!`);
+      closeCollectionInspector();
+      refreshOwnership();
+    } catch (e) {
+      toast.error(message(e));
+    } finally {
+      acquiringCollectionLoading = false;
+    }
+  }
+
+  function toggleManualVolume(vol: number) {
+    manualSelectedVolumes[vol] = !manualSelectedVolumes[vol];
+  }
+
+  function selectAllManual(select: boolean) {
+    if (!inspectingCollection) return;
+    for (const u of inspectingCollection.units) {
+      manualSelectedVolumes[u.volume] = select;
     }
   }
 
@@ -774,6 +888,77 @@
           </div>
 
           {#if showNyaa}
+            <div class="nyaa-controls">
+              <div class="nyaa-filter-bar">
+                <div class="filter-group">
+                  <span class="filter-label">Type:</span>
+                  <div class="pill-group">
+                    <button class="filter-pill" class:active={filterType === 'all'} onclick={() => { filterType = 'all'; searchNyaa(); }}>All</button>
+                    <button class="filter-pill" class:active={filterType === 'volumes'} onclick={() => { filterType = 'volumes'; searchNyaa(); }}>Volumes</button>
+                    <button class="filter-pill" class:active={filterType === 'collections'} onclick={() => { filterType = 'collections'; searchNyaa(); }}>Collections</button>
+                    <button class="filter-pill" class:active={filterType === 'chapters'} onclick={() => { filterType = 'chapters'; searchNyaa(); }}>Chapters</button>
+                  </div>
+                </div>
+
+                <div class="filter-group">
+                  <span class="filter-label">Coverage:</span>
+                  <div class="pill-group">
+                    <button class="filter-pill" class:active={filterOwnership === 'all'} onclick={() => { filterOwnership = 'all'; searchNyaa(); }}>All</button>
+                    <button class="filter-pill" class:active={filterOwnership === 'missing_only'} onclick={() => { filterOwnership = 'missing_only'; searchNyaa(); }}>Missing</button>
+                    <button class="filter-pill" class:active={filterOwnership === 'owned'} onclick={() => { filterOwnership = 'owned'; searchNyaa(); }}>Owned</button>
+                  </div>
+                </div>
+
+                {#if discoveredUploaders.length > 0}
+                  <div class="filter-group">
+                    <span class="filter-label">Uploader:</span>
+                    <select class="input select-compact" bind:value={filterUploader} onchange={() => searchNyaa()}>
+                      <option value="all">All Uploaders</option>
+                      {#each discoveredUploaders as up}
+                        <option value={up}>{up}</option>
+                      {/each}
+                    </select>
+                  </div>
+                {/if}
+
+                <div class="filter-group">
+                  <span class="filter-label">Seeders:</span>
+                  <select class="input select-compact" bind:value={filterSeeders} onchange={() => searchNyaa()}>
+                    <option value={0}>Any</option>
+                    <option value={1}>1+ seeders</option>
+                    <option value={3}>3+ seeders</option>
+                    <option value={5}>5+ seeders</option>
+                    <option value={10}>10+ seeders</option>
+                  </select>
+                </div>
+
+                <div class="filter-group sort-group">
+                  <span class="filter-label">Sort:</span>
+                  <select class="input select-compact" bind:value={sortBy} onchange={() => searchNyaa()}>
+                    <option value="smart">Smart Score</option>
+                    <option value="coverage">Missing Coverage</option>
+                    <option value="quality">Quality</option>
+                    <option value="newest">Newest First</option>
+                    <option value="oldest">Oldest First</option>
+                    <option value="seeders">Most Seeders</option>
+                    <option value="size_asc">Smallest Size</option>
+                    <option value="size_desc">Largest Size</option>
+                    <option value="volume_asc">Volume Asc</option>
+                    <option value="volume_desc">Volume Desc</option>
+                  </select>
+                </div>
+              </div>
+
+              {#if targetedUnit}
+                <div class="targeted-search-banner">
+                  <span>Targeted Search: <strong>Volume {targetedUnit.number}</strong></span>
+                  <button class="btn pill icon-text clear-btn" onclick={clearTargetedUnit}>
+                    <Icon name="close" size={12} /> Clear Filter
+                  </button>
+                </div>
+              {/if}
+            </div>
+
             {#if nyaaError}
               <Notice error={nyaaError} retry={() => searchNyaa()} />
             {:else if loadingNyaa}
@@ -786,12 +971,29 @@
             {:else}
               <ul class="candidate-list">
                 {#each nyaaReleases as cand (cand.release.sourceItemId)}
+                  {@const isCollection = cand.release.releaseUnit.type === 'collection' || cand.matchType === 'collection' || cand.matchType === 'mixed_collection'}
                   <li class="candidate-item" class:owned={cand.ownershipStatus === 'owned'} class:acquiring={cand.ownershipStatus === 'acquiring'}>
                     <div class="candidate-main">
                       <div class="candidate-badges">
+                        {#if cand.smartScore}
+                          <span
+                            class="tag smart-badge"
+                            class:spot={cand.smartScore.summaryTag === 'BEST MATCH'}
+                            class:warn={cand.smartScore.summaryTag === 'GOOD ALTERNATIVE'}
+                            class:error={cand.smartScore.summaryTag === 'VARIANT' || cand.smartScore.summaryTag === 'MIXED COLLECTION'}
+                          >
+                            ★ {cand.smartScore.total.toFixed(0)} · {cand.smartScore.summaryTag}
+                          </span>
+                        {/if}
                         <span class="tag" class:spot={cand.matchType.startsWith('exact')}>
                           {cand.matchType.replace('_', ' ').toUpperCase()}
                         </span>
+                        {#if cand.coverageSummary}
+                          <span class="tag coverage-pill">{cand.coverageSummary}</span>
+                        {/if}
+                        {#if cand.isVariant}
+                          <span class="tag error">VARIANT: {cand.variantName}</span>
+                        {/if}
                         {#if cand.release.isTrusted}
                           <span class="tag spot">TRUSTED</span>
                         {/if}
@@ -807,12 +1009,45 @@
                       <div class="candidate-title" title={cand.release.rawTitle}>
                         <strong>{cand.release.rawTitle}</strong>
                       </div>
+
+                      {#if cand.smartScore?.explanation}
+                        <div class="candidate-explanation">
+                          <span>{cand.smartScore.explanation}</span>
+                          <button
+                            class="btn-text-score"
+                            onclick={() => {
+                              expandedScoreBreakdown[cand.release.sourceItemId] = !expandedScoreBreakdown[cand.release.sourceItemId];
+                            }}
+                          >
+                            {expandedScoreBreakdown[cand.release.sourceItemId] ? 'Hide breakdown ▴' : 'Score breakdown ▾'}
+                          </button>
+                        </div>
+                      {/if}
+
+                      {#if expandedScoreBreakdown[cand.release.sourceItemId] && cand.smartScore}
+                        <div class="score-breakdown-panel">
+                          <div class="score-col">Identity: <strong>{cand.smartScore.identity.toFixed(1)}/25</strong></div>
+                          <div class="score-col">Coverage: <strong>{cand.smartScore.coverage.toFixed(1)}/25</strong></div>
+                          <div class="score-col">Quality: <strong>{cand.smartScore.quality.toFixed(1)}/15</strong></div>
+                          <div class="score-col">Health: <strong>{cand.smartScore.health.toFixed(1)}/15</strong></div>
+                          <div class="score-col">Freshness: <strong>{cand.smartScore.freshness.toFixed(1)}/10</strong></div>
+                          <div class="score-col">Efficiency: <strong>{cand.smartScore.efficiency.toFixed(1)}/10</strong></div>
+                          {#if cand.smartScore.penalties < 0}
+                            <div class="score-col penalty">Penalties: <strong>{cand.smartScore.penalties.toFixed(1)}</strong></div>
+                          {/if}
+                        </div>
+                      {/if}
+
                       <div class="candidate-meta">
                         {#if cand.release.uploader}
                           <span>Uploader: <strong>{cand.release.uploader}</strong></span>
                           <span>·</span>
                         {/if}
                         <span>Size: <strong>{cand.release.sizeFormatted}</strong></span>
+                        {#if cand.usefulEfficiencyBytes}
+                          <span>·</span>
+                          <span>~{Math.round(cand.usefulEfficiencyBytes / (1024 * 1024))} MB/vol</span>
+                        {/if}
                         <span>·</span>
                         <span class="seeders">Seeders: <strong>{cand.release.seeders}</strong></span>
                         <span>·</span>
@@ -820,7 +1055,15 @@
                       </div>
                     </div>
                     <div class="candidate-action">
-                      {#if cand.ownershipStatus === 'owned'}
+                      {#if isCollection}
+                        <button
+                          class="btn spot pill"
+                          onclick={() => openCollectionInspector(cand.release)}
+                          disabled={inspectingLoading}
+                        >
+                          <Icon name="folder" size={14} /> View Collection ({cand.unitsIncluded.length} vols)
+                        </button>
+                      {:else if cand.ownershipStatus === 'owned'}
                         <button class="btn pill" disabled title="Already owned in canonical library">
                           <Icon name="check" size={14} /> Owned
                         </button>
@@ -1117,6 +1360,137 @@
     </div>
   {/if}
 </div>
+
+{#if inspectingCollection}
+  <div class="modal-backdrop" onclick={closeCollectionInspector} role="presentation">
+    <div
+      class="modal-card collection-modal"
+      onclick={(e) => e.stopPropagation()}
+      onkeydown={(e) => { if (e.key === 'Escape') closeCollectionInspector(); }}
+      role="dialog"
+      aria-modal="true"
+      tabindex="-1"
+    >
+      <div class="modal-header">
+        <div>
+          <span class="tag spot">COLLECTION INSPECTOR</span>
+          <h2 class="display modal-title">{inspectingCollection.release.title}</h2>
+          <span class="modal-subtext">
+            {inspectingCollection.totalUnits} total volumes · 
+            <strong class="text-spot">{inspectingCollection.missingCount} missing</strong> · 
+            {inspectingCollection.ownedCount} owned in Komga
+          </span>
+        </div>
+        <button class="btn icon" onclick={closeCollectionInspector} aria-label="Close">
+          <Icon name="close" size={18} />
+        </button>
+      </div>
+
+      <div class="modal-body">
+        <div class="mode-selector-card">
+          <span class="selector-title">Acquisition Mode:</span>
+          <div class="mode-options">
+            <label class="mode-label" class:selected={collectionMode === 'missing_only'}>
+              <input type="radio" name="col_mode" value="missing_only" bind:group={collectionMode} />
+              <div>
+                <strong>Missing Only ({inspectingCollection.missingCount} volumes)</strong>
+                <span class="mode-desc">Only retrieves unowned volumes and skips {inspectingCollection.ownedCount} duplicates.</span>
+              </div>
+            </label>
+
+            <label class="mode-label" class:selected={collectionMode === 'entire'}>
+              <input type="radio" name="col_mode" value="entire" bind:group={collectionMode} />
+              <div>
+                <strong>Entire Collection ({inspectingCollection.totalUnits} volumes)</strong>
+                <span class="mode-desc">Retrieves all volumes in collection.</span>
+              </div>
+            </label>
+
+            <label class="mode-label" class:selected={collectionMode === 'manual'}>
+              <input type="radio" name="col_mode" value="manual" bind:group={collectionMode} />
+              <div>
+                <strong>Select Manually</strong>
+                <span class="mode-desc">Pick individual volumes below.</span>
+              </div>
+            </label>
+          </div>
+        </div>
+
+        <div class="collection-units-section">
+          <div class="units-header-row">
+            <h4>Included Volumes ({inspectingCollection.units.length})</h4>
+            {#if collectionMode === 'manual'}
+              <div class="quick-select">
+                <button class="btn-text" onclick={() => selectAllManual(true)}>Select All</button>
+                <span>·</span>
+                <button class="btn-text" onclick={() => selectAllManual(false)}>Deselect All</button>
+              </div>
+            {/if}
+          </div>
+
+          <div class="units-scroll-list">
+            {#each inspectingCollection.units as u (u.volume)}
+              <label class="unit-row" class:unit-owned={u.isOwned} class:unit-acquiring={u.isAcquiring}>
+                {#if collectionMode === 'manual'}
+                  <input
+                    type="checkbox"
+                    checked={manualSelectedVolumes[u.volume]}
+                    onchange={() => toggleManualVolume(u.volume)}
+                  />
+                {:else if collectionMode === 'missing_only'}
+                  <input type="checkbox" checked={!u.isOwned} disabled />
+                {:else}
+                  <input type="checkbox" checked={true} disabled />
+                {/if}
+
+                <div class="unit-row-info">
+                  <strong>Volume {u.volume}</strong>
+                  {#if u.filename}
+                    <span class="unit-filename">{u.filename}</span>
+                  {/if}
+                </div>
+
+                <div class="unit-row-status">
+                  {#if u.isOwned}
+                    <span class="tag spot"><Icon name="check" size={12} /> Owned</span>
+                  {:else if u.isAcquiring}
+                    <span class="tag"><span class="spin"><Icon name="spinner" size={12} stroke={3} /></span> Acquiring</span>
+                  {:else}
+                    <span class="tag warn">Missing</span>
+                  {/if}
+                </div>
+              </label>
+            {/each}
+          </div>
+        </div>
+      </div>
+
+      <div class="modal-footer">
+        <button class="btn" onclick={closeCollectionInspector} disabled={acquiringCollectionLoading}>
+          Cancel
+        </button>
+        <button
+          class="btn spot"
+          onclick={executeAcquireCollection}
+          disabled={acquiringCollectionLoading}
+        >
+          {#if acquiringCollectionLoading}
+            <span class="spin"><Icon name="spinner" size={16} stroke={3} /></span> Enqueuing Volumes…
+          {:else}
+            <Icon name="download" size={16} />
+            Acquire {
+              collectionMode === 'missing_only'
+                ? inspectingCollection.missingCount
+                : collectionMode === 'entire'
+                ? inspectingCollection.totalUnits
+                : Object.values(manualSelectedVolumes).filter(Boolean).length
+            } Volumes via TorBox
+          {/if}
+        </button>
+      </div>
+    </div>
+  </div>
+{/if}
 
 <style>
   .page {
@@ -1645,6 +2019,316 @@
 
   .candidate-action {
     flex-shrink: 0;
+  }
+
+  .nyaa-controls {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin-bottom: 14px;
+    padding: 10px 12px;
+    background: var(--shade);
+    border: 2px solid var(--ink);
+    border-radius: var(--radius);
+  }
+
+  .nyaa-filter-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .filter-group {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .filter-label {
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    opacity: 0.7;
+    letter-spacing: 0.5px;
+  }
+
+  .pill-group {
+    display: flex;
+    background: var(--paper);
+    border: 1px solid var(--ink);
+    border-radius: 999px;
+    padding: 2px;
+    gap: 2px;
+  }
+
+  .filter-pill {
+    background: none;
+    border: none;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 999px;
+    cursor: pointer;
+    color: inherit;
+    transition: all 0.15s ease;
+  }
+
+  .filter-pill.active {
+    background: var(--ink);
+    color: var(--paper);
+  }
+
+  .select-compact {
+    padding: 3px 8px;
+    font-size: 12px;
+    height: auto;
+    border: 1px solid var(--ink);
+    border-radius: var(--radius);
+    background: var(--paper);
+  }
+
+  .targeted-search-banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 10px;
+    background: var(--paper);
+    border-left: 3px solid var(--accent);
+    font-size: 12px;
+  }
+
+  .smart-badge {
+    font-weight: 700;
+    letter-spacing: 0.5px;
+  }
+
+  .coverage-pill {
+    font-size: 11px;
+  }
+
+  .candidate-explanation {
+    font-size: 12px;
+    color: var(--ink);
+    opacity: 0.9;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .btn-text-score {
+    background: none;
+    border: none;
+    font-size: 11px;
+    color: var(--accent);
+    cursor: pointer;
+    text-decoration: underline;
+    padding: 0;
+  }
+
+  .score-breakdown-panel {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+    gap: 6px;
+    padding: 8px 10px;
+    background: var(--shade);
+    border: 1px dashed var(--ink);
+    border-radius: var(--radius);
+    font-size: 11px;
+  }
+
+  .score-col.penalty {
+    color: var(--error, #cc0000);
+  }
+
+  /* Modal Backdrop & Card */
+  .modal-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    background: rgba(0, 0, 0, 0.6);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 16px;
+  }
+
+  .modal-card.collection-modal {
+    background: var(--paper);
+    border: 3px solid var(--ink);
+    border-radius: var(--radius);
+    box-shadow: 4px 4px 0 var(--ink);
+    width: 100%;
+    max-width: 640px;
+    max-height: 85vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  .modal-header {
+    display: flex;
+    align-items: flex-start;
+    justify-content: space-between;
+    padding: 16px 20px;
+    border-bottom: 2px solid var(--ink);
+    background: var(--shade);
+  }
+
+  .modal-title {
+    font-size: 18px;
+    margin: 4px 0 2px;
+    word-break: break-word;
+  }
+
+  .modal-subtext {
+    font-size: 13px;
+    opacity: 0.85;
+  }
+
+  .text-spot {
+    color: var(--accent);
+  }
+
+  .modal-body {
+    padding: 16px 20px;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  .mode-selector-card {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .selector-title {
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+    opacity: 0.7;
+  }
+
+  .mode-options {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .mode-label {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 10px 12px;
+    border: 2px solid var(--ink);
+    border-radius: var(--radius);
+    background: var(--paper);
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+
+  .mode-label.selected {
+    background: var(--shade);
+    border-color: var(--accent);
+    box-shadow: 2px 2px 0 var(--ink);
+  }
+
+  .mode-desc {
+    display: block;
+    font-size: 12px;
+    opacity: 0.75;
+    margin-top: 2px;
+  }
+
+  .collection-units-section {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .units-header-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .units-header-row h4 {
+    margin: 0;
+    font-size: 13px;
+    text-transform: uppercase;
+    opacity: 0.8;
+  }
+
+  .quick-select {
+    display: flex;
+    gap: 6px;
+    font-size: 11px;
+  }
+
+  .btn-text {
+    background: none;
+    border: none;
+    padding: 0;
+    font-size: 11px;
+    color: var(--accent);
+    cursor: pointer;
+    text-decoration: underline;
+  }
+
+  .units-scroll-list {
+    max-height: 240px;
+    overflow-y: auto;
+    border: 2px solid var(--ink);
+    border-radius: var(--radius);
+    display: flex;
+    flex-direction: column;
+  }
+
+  .unit-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--ink);
+    cursor: pointer;
+    font-size: 13px;
+  }
+
+  .unit-row:last-child {
+    border-bottom: none;
+  }
+
+  .unit-row.unit-owned {
+    opacity: 0.7;
+    background: var(--shade);
+  }
+
+  .unit-row-info {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+
+  .unit-filename {
+    font-size: 11px;
+    opacity: 0.7;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .modal-footer {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 12px;
+    padding: 12px 20px;
+    border-top: 2px solid var(--ink);
+    background: var(--shade);
   }
 
   @media (max-width: 640px) {
