@@ -125,7 +125,11 @@ impl Spaces {
         let updates = Updates::new(db.clone(), titles.clone(), downloads.clone());
         let trackers_inst = Trackers::new(db.clone())?;
         let sync = Arc::new(crate::sync::service::SyncService::new(db.clone(), trackers_inst.clone(), pipeline.clone()));
+        let acq_startup = acquisition.clone();
         let tasks = vec![
+            tokio::spawn(async move {
+                let _ = acq_startup.reconcile_executions_on_startup().await;
+            }),
             tokio::spawn(images.clone().sweep_forever()),
             tokio::spawn(downloads.clone().run()),
             tokio::spawn(updates.clone().schedule()),

@@ -241,7 +241,7 @@ pub fn generate_plan(
 
     if missing_vols.is_empty() {
         return AcquisitionPlan {
-            id: format!("plan_{manga_id}_{}", now()),
+            id: format!("plan_{manga_id}_{}_{}", now(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().subsec_nanos()),
             manga_id,
             series_title: series_title.to_string(),
             profile_id: profile.id.clone(),
@@ -490,7 +490,7 @@ pub fn generate_plan(
     };
 
     AcquisitionPlan {
-        id: format!("plan_{manga_id}_{}", now()),
+        id: format!("plan_{manga_id}_{}_{}", now(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().subsec_nanos()),
         manga_id,
         series_title: series_title.to_string(),
         profile_id: profile.id.clone(),

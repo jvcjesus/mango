@@ -6,6 +6,14 @@
 use super::{AcquisitionCandidate, AcquisitionReleaseUnit};
 use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UnitMappingProvenance {
+    ExplicitVolumeMetadata,
+    ParsedVolumeFromTitle,
+    ChapterToVolumeInference,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CandidateHealth {
@@ -48,6 +56,7 @@ pub struct NormalizedAcquisitionCandidate {
     pub missing_units: Vec<f64>,
     pub confidence: String, // "high", "review_recommended"
     pub score: f64,
+    pub mapping_provenance: UnitMappingProvenance,
     pub provider_metadata: serde_json::Value,
 }
 
@@ -121,6 +130,7 @@ impl NormalizedAcquisitionCandidate {
             missing_units: cand.units_missing.clone(),
             confidence,
             score: cand.score,
+            mapping_provenance: UnitMappingProvenance::ParsedVolumeFromTitle,
             provider_metadata: serde_json::json!({
                 "sourceUrl": r.source_url,
                 "torrentHash": r.info_hash,
@@ -137,7 +147,14 @@ impl NormalizedAcquisitionCandidate {
         release_title: &str,
         size_bytes: Option<u64>,
         language: &str,
+        provenance: UnitMappingProvenance,
     ) -> Self {
+        let confidence = if provenance == UnitMappingProvenance::ChapterToVolumeInference {
+            "review_recommended".to_string()
+        } else {
+            "high".to_string()
+        };
+
         Self {
             series_identity: series.to_string(),
             provider: "mangadot".to_string(),
@@ -168,11 +185,13 @@ impl NormalizedAcquisitionCandidate {
             },
             owned_units: vec![],
             missing_units: vec![volume_number],
-            confidence: "high".to_string(),
-            score: 80.0,
+            confidence,
+            score: if provenance == UnitMappingProvenance::ChapterToVolumeInference { 50.0 } else { 80.0 },
+            mapping_provenance: provenance,
             provider_metadata: serde_json::json!({
                 "sourceType": "reader",
                 "directVolume": true,
+                "inferred": provenance == UnitMappingProvenance::ChapterToVolumeInference,
             }),
         }
     }

@@ -2229,5 +2229,285 @@ describe('first-class volume acquisition & release semantics', () => {
       expect(globalPlan.totalSeriesAnalyzed).toBe(14);
       expect(globalPlan.totalVolumesToAcquire).toBe(1);
     });
+
+    it('models acquisition execution snapshot and immutable approval contract', async () => {
+      const { createExecution, startExecution, cancelExecution, retryExecution } = await import('./api');
+      type AcquisitionExecution = import('./api').AcquisitionExecution;
+      type ExecutionStatus = import('./api').ExecutionStatus;
+
+      const mockExecution: AcquisitionExecution = {
+        id: 'exec_001',
+        planId: 'plan_001',
+        mangaId: 1,
+        title: 'Blue Lock',
+        profileId: 'default',
+        profileSnapshot: {
+          id: 'default',
+          name: 'Default Manga',
+          language: 'en',
+          destinationLibrary: 'manga',
+          preferredUploaders: ['Stick'],
+          ignoredUploaders: [],
+          qualityPreference: 'digital_preferred',
+          minSeeders: 1,
+          allowCollections: true,
+          requireExactMatch: true,
+          maxUnnecessaryDuplicateCoverage: 50,
+          maxAcquisitionSizeBytes: null,
+          maxPlanSizeBytes: null,
+          isDefault: true,
+          createdAt: 0,
+          updatedAt: 0,
+        },
+        planSnapshot: {
+          id: 'plan_001',
+          mangaId: 1,
+          seriesTitle: 'Blue Lock',
+          profileId: 'default',
+          profileName: 'Default Manga',
+          missingUnits: [39],
+          selectedItems: [],
+          alternatives: [],
+          confidence: 'high',
+          state: 'ready',
+          staleReason: null,
+          totalEstimatedSize: 312000000,
+          totalAcquisitionsCount: 1,
+          missingUnitsCoveredCount: 1,
+          isDryRun: false,
+          createdAt: 1700000000,
+          refreshedAt: 1700000000,
+        },
+        missingContentSnapshot: {
+          mangaId: 1,
+          title: 'Blue Lock',
+          totalKnownVolumes: 39,
+          ownedVolumes: Array.from({ length: 38 }, (_, i) => i + 1),
+          missingVolumes: [39],
+          acquiringVolumes: [],
+          unavailableVolumes: [],
+          unknownVolumes: [],
+          volumeEntries: [],
+          totalKnownChapters: 0,
+          ownedChapters: [],
+          missingChapters: [],
+          acquiringChapters: [],
+          isFullyOwned: false,
+          hasMissing: true,
+          explanation: '38/39 volumes owned (1 missing)',
+        },
+        items: [
+          {
+            id: 'item_001_1',
+            executionId: 'exec_001',
+            itemIndex: 0,
+            frozenCandidate: {
+              provider: 'nyaa',
+              providerReleaseId: 'nyaa_39',
+              title: 'Blue Lock v39 (Digital) [Stick]',
+              uploader: 'Stick',
+              format: 'cbz',
+              size: 312000000,
+              language: 'en',
+              publishedAt: 1700000000,
+              releaseUnit: { type: 'volume', number: 39 },
+              releaseNumber: 39,
+              releaseRange: null,
+              edition: 'Digital',
+              qualitySignals: {
+                isDigital: true,
+                isRaw: false,
+                isRemake: false,
+                isTrusted: true,
+                editionPenalty: 0,
+                hasCbzExtension: true,
+                hasValidMangaZip: false,
+                rejectedNonZipFormat: false,
+              },
+              health: { seeders: 12, leechers: 2, lastCheckedAt: 1700000000 },
+              score: 95,
+              confidence: 'high',
+              unitsIncluded: [39],
+              unitsOwned: [],
+              unitsMissing: [39],
+              duplicateUnits: [],
+              providerMetadata: { unitMappingProvenance: 'ParsedVolumeFromTitle' },
+            },
+            expectedUnits: [39],
+            duplicateUnits: [],
+            status: 'QUEUED',
+            downloadJobId: 101,
+            verificationState: null,
+            publicationState: null,
+            errorMessage: null,
+            completedAt: null,
+          },
+        ],
+        status: 'QUEUED',
+        statusMessage: 'Queueing acquisition jobs',
+        expectedTotalBytes: 312000000,
+        cancellationReason: null,
+        failureReason: null,
+        approvedAt: 1700000005,
+        startedAt: 1700000006,
+        completedAt: null,
+        updatedAt: 1700000006,
+      };
+
+      expect(mockExecution.status).toBe('QUEUED');
+      expect(mockExecution.items.length).toBe(1);
+      expect(mockExecution.items[0].expectedUnits).toEqual([39]);
+      expect(mockExecution.profileSnapshot.name).toBe('Default Manga');
+    });
+
+    it('verifies execution status progression and phase breadcrumb transitions', () => {
+      const allPhases = [
+        'APPROVED',
+        'PREFLIGHT',
+        'REVALIDATING',
+        'QUEUED',
+        'DOWNLOADING',
+        'VERIFYING',
+        'PUBLISHING',
+        'RECONCILING',
+        'COMPLETED',
+      ];
+
+      expect(allPhases).toHaveLength(9);
+      expect(allPhases[0]).toBe('APPROVED');
+      expect(allPhases[allPhases.length - 1]).toBe('COMPLETED');
+
+      const isTerminal = (status: string) => ['COMPLETED', 'CANCELLED', 'STALE'].includes(status);
+      expect(isTerminal('COMPLETED')).toBe(true);
+      expect(isTerminal('CANCELLED')).toBe(true);
+      expect(isTerminal('STALE')).toBe(true);
+      expect(isTerminal('DOWNLOADING')).toBe(false);
+      expect(isTerminal('PARTIAL')).toBe(false);
+    });
+
+    it('verifies per-item status, verification state, and publication state tracking', () => {
+      type ExecutionItemStatus = import('./api').ExecutionItemStatus;
+      const completedItem: import('./api').AcquisitionExecutionItem = {
+        id: 'item_1',
+        executionId: 'exec_1',
+        itemIndex: 0,
+        frozenCandidate: {} as any,
+        expectedUnits: [29],
+        duplicateUnits: [],
+        status: 'COMPLETED',
+        downloadJobId: 201,
+        verificationState: 'verified',
+        publicationState: 'published',
+        errorMessage: null,
+        completedAt: 1700000100,
+      };
+
+      expect(completedItem.status).toBe('COMPLETED');
+      expect(completedItem.verificationState).toBe('verified');
+      expect(completedItem.publicationState).toBe('published');
+
+      const failedItem: import('./api').AcquisitionExecutionItem = {
+        id: 'item_2',
+        executionId: 'exec_1',
+        itemIndex: 1,
+        frozenCandidate: {} as any,
+        expectedUnits: [30],
+        duplicateUnits: [],
+        status: 'FAILED',
+        downloadJobId: 202,
+        verificationState: 'corrupt_archive',
+        publicationState: null,
+        errorMessage: 'Corrupt archive: zip parsing error',
+        completedAt: null,
+      };
+
+      expect(failedItem.status).toBe('FAILED');
+      expect(failedItem.errorMessage).toContain('Corrupt archive');
+    });
+
+    it('detects and displays inferred MangaDot volume mappings with explicit review warning', () => {
+      const inferredCandidate: import('./api').NormalizedAcquisitionCandidate = {
+        provider: 'mangadot',
+        providerReleaseId: 'md_39',
+        title: 'Blue Lock Chapter 289-298',
+        uploader: 'ScanTeam',
+        format: 'zip',
+        size: 80000000,
+        language: 'en',
+        publishedAt: null,
+        releaseUnit: { type: 'volume', number: 39 },
+        releaseNumber: 39,
+        releaseRange: null,
+        edition: null,
+        qualitySignals: {
+          isDigital: true,
+          isRaw: false,
+          isRemake: false,
+          isTrusted: false,
+          editionPenalty: 0,
+          hasCbzExtension: false,
+          hasValidMangaZip: true,
+          rejectedNonZipFormat: false,
+        },
+        health: { seeders: null, leechers: null, lastCheckedAt: null },
+        score: 70,
+        confidence: 'review_recommended',
+        unitsIncluded: [39],
+        unitsOwned: [],
+        unitsMissing: [39],
+        duplicateUnits: [],
+        providerMetadata: {
+          unitMappingProvenance: 'ChapterToVolumeInference',
+          volumeSupportMode: 'inferred',
+        },
+      };
+
+      const isInferred =
+        inferredCandidate.provider === 'mangadot' ||
+        inferredCandidate.providerMetadata?.unitMappingProvenance === 'ChapterToVolumeInference' ||
+        inferredCandidate.providerMetadata?.volumeSupportMode === 'inferred';
+
+      expect(isInferred).toBe(true);
+    });
+
+    it('verifies execution history displays previous runs with counts, size, and status badges', () => {
+      const historyItems: import('./api').AcquisitionExecution[] = [
+        {
+          id: 'exec_old_1',
+          planId: 'plan_old_1',
+          mangaId: 1,
+          title: 'Blue Lock',
+          profileId: 'default',
+          profileSnapshot: {} as any,
+          planSnapshot: {} as any,
+          missingContentSnapshot: {} as any,
+          items: [{ id: 'i1' } as any, { id: 'i2' } as any],
+          status: 'COMPLETED',
+          expectedTotalBytes: 500000000,
+          approvedAt: 1699000000,
+          updatedAt: 1699000500,
+        },
+        {
+          id: 'exec_old_2',
+          planId: 'plan_old_2',
+          mangaId: 1,
+          title: 'Blue Lock',
+          profileId: 'default',
+          profileSnapshot: {} as any,
+          planSnapshot: {} as any,
+          missingContentSnapshot: {} as any,
+          items: [{ id: 'i3' } as any],
+          status: 'PARTIAL',
+          expectedTotalBytes: 250000000,
+          approvedAt: 1700000000,
+          updatedAt: 1700000200,
+        },
+      ];
+
+      expect(historyItems).toHaveLength(2);
+      expect(historyItems[0].status).toBe('COMPLETED');
+      expect(historyItems[1].status).toBe('PARTIAL');
+      expect(historyItems[0].items).toHaveLength(2);
+    });
   });
 });

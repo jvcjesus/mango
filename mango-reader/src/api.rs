@@ -256,6 +256,14 @@ pub fn router(state: Spaces) -> Router {
             "/titles/{id}/plan",
             get(get_title_plan).post(post_title_plan),
         )
+        .route(
+            "/titles/{id}/executions",
+            get(get_title_executions).post(post_create_execution),
+        )
+        .route("/acquisition/executions/{id}", get(get_acquisition_execution))
+        .route("/acquisition/executions/{id}/start", post(post_start_execution))
+        .route("/acquisition/executions/{id}/cancel", post(post_cancel_execution))
+        .route("/acquisition/executions/{id}/retry", post(post_retry_execution))
         .route("/acquisition/missing", get(get_global_missing))
         .route("/acquisition/plan-all", post(post_plan_all))
         .route("/acquisition/sources/health", get(get_acquisition_sources_health))
@@ -1752,6 +1760,59 @@ async fn get_acquisition_sources_health(
 ) -> Result<Json<Vec<crate::acquisition::intelligence::SourceHealthReport>>> {
     let reports = app.acquisition.get_source_health_reports().await?;
     Ok(Json(reports))
+}
+
+async fn post_create_execution(
+    Me(app): Me,
+    Path(id): Path<i64>,
+    Json(payload): Json<crate::acquisition::execution::ApprovePlanRequest>,
+) -> Result<Json<crate::acquisition::execution::AcquisitionExecution>> {
+    let execution = app.acquisition.approve_and_create_execution(id, payload).await?;
+    let started = app.acquisition.start_execution(execution.id).await?;
+    Ok(Json(started))
+}
+
+async fn get_title_executions(
+    Me(app): Me,
+    Path(id): Path<i64>,
+) -> Result<Json<Vec<crate::acquisition::execution::AcquisitionExecution>>> {
+    let list = app.acquisition.get_title_executions(id).await?;
+    Ok(Json(list))
+}
+
+async fn get_acquisition_execution(
+    Me(app): Me,
+    Path(id): Path<String>,
+) -> Result<Json<crate::acquisition::execution::AcquisitionExecution>> {
+    let exec = app.acquisition.get_execution(&id).await?;
+    match exec {
+        Some(e) => Ok(Json(e)),
+        None => Err(AppError::not_found("Execution not found")),
+    }
+}
+
+async fn post_start_execution(
+    Me(app): Me,
+    Path(id): Path<String>,
+) -> Result<Json<crate::acquisition::execution::AcquisitionExecution>> {
+    let exec = app.acquisition.start_execution(id).await?;
+    Ok(Json(exec))
+}
+
+async fn post_cancel_execution(
+    Me(app): Me,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>> {
+    app.acquisition.cancel_execution(&id, "Cancelled by user via API").await?;
+    Ok(Json(serde_json::json!({ "success": true })))
+}
+
+async fn post_retry_execution(
+    Me(app): Me,
+    Path(id): Path<String>,
+) -> Result<Json<crate::acquisition::execution::AcquisitionExecution>> {
+    let exec = app.acquisition.retry_execution(&id).await?;
+    Ok(Json(exec))
 }
 
 #[derive(Deserialize, Default)]

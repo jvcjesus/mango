@@ -1323,7 +1323,7 @@ fn record(conn: &Connection, chapter: i64, attempts: i64, outcome: Result<Option
 
 /// Bytes the disk that holds `dir` has free for Mango. None where that is not known.
 #[cfg(unix)]
-fn free_space(dir: &Path) -> Option<u64> {
+pub(crate) fn free_space(dir: &Path) -> Option<u64> {
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
     // SAFETY: statvfs fills the struct it is given, which is plain numbers, and reads a
@@ -1335,7 +1335,7 @@ fn free_space(dir: &Path) -> Option<u64> {
 }
 
 #[cfg(not(unix))]
-fn free_space(_: &Path) -> Option<u64> {
+pub(crate) fn free_space(_: &Path) -> Option<u64> {
     None
 }
 

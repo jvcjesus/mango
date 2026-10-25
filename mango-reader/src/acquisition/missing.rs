@@ -259,6 +259,25 @@ pub fn resolve_missing_content_for_title(
         }
         authoritative_total_vols = own.summary.authoritative_total_volumes;
         authoritative_total_chaps = own.summary.authoritative_total_chapters;
+    } else {
+        // Fallback when Komga ownership is not available / offline: check local chapters with download_path
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT name, download_path, chapter_number FROM chapters WHERE manga_id = ?1 AND download_path IS NOT NULL"
+        ) {
+            if let Ok(rows) = stmt.query_map([manga_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, f64>(2)?))
+            }) {
+                for row in rows.flatten() {
+                    let vol_opt = crate::release::parse_volume(&row.0)
+                        .or_else(|| row.1.as_deref().and_then(crate::release::parse_volume));
+                    if let Some(v) = vol_opt {
+                        owned_vols.push((v, None));
+                    } else if row.2 >= 0.0 {
+                        owned_chaps.push(row.2);
+                    }
+                }
+            }
+        }
     }
 
     // Query catalog entries if totals were not in ownership summary

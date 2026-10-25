@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onDestroy } from 'svelte';
   import {
     get,
     message,
@@ -13,10 +14,20 @@
     getTitleMissingContent,
     planTitleMissingContent,
     getTitlePlan,
+    createExecution,
+    getTitleExecutions,
+    getAcquisitionExecution,
+    startExecution,
+    cancelExecution,
+    retryExecution,
     type AcquisitionProfile,
     type MissingContentSummary,
     type AcquisitionPlan,
     type AcquisitionPlanItem,
+    type AcquisitionExecution,
+    type AcquisitionExecutionItem,
+    type ExecutionStatus,
+    type ExecutionItemStatus,
     type AcquisitionCandidate,
     type AcquisitionRelease,
     type CollectionInspection,
@@ -194,6 +205,126 @@
   let selectedPlanItemIds = $state<Record<string, boolean>>({});
   let acquiringPlanLoading = $state(false);
 
+  // Execution state
+  let titleExecutions = $state<AcquisitionExecution[]>([]);
+  let activeExecution = $state<AcquisitionExecution | null>(null);
+  let executionModalOpen = $state(false);
+  let executionActionLoading = $state(false);
+  let executionPollTimer: any = null;
+  let showExecutionHistory = $state(false);
+
+  onDestroy(() => {
+    if (executionPollTimer) {
+      clearInterval(executionPollTimer);
+      executionPollTimer = null;
+    }
+  });
+
+  async function loadTitleExecutions() {
+    try {
+      titleExecutions = await getTitleExecutions(id);
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  async function refreshActiveExecution() {
+    if (!activeExecution) return;
+    try {
+      const updated = await getAcquisitionExecution(activeExecution.id);
+      activeExecution = updated;
+      loadTitleExecutions();
+      if (['COMPLETED', 'CANCELLED', 'STALE'].includes(updated.status)) {
+        if (executionPollTimer) {
+          clearInterval(executionPollTimer);
+          executionPollTimer = null;
+        }
+      }
+    } catch (e) {
+      // ignore
+    }
+  }
+
+  async function handleApproveAndStartExecution() {
+    if (!currentPlan) return;
+    if (currentPlan.confidence !== 'high') {
+      const ok = await confirm({
+        title: 'Approve Plan With Warnings',
+        message: 'This plan is flagged as review recommended. Are you sure you want to approve and execute it?',
+        confirmText: 'Approve & Execute',
+        danger: false,
+      });
+      if (!ok) return;
+    }
+
+    executionActionLoading = true;
+    try {
+      let executablePlanId = currentPlan.id;
+      if (currentPlan.isDryRun) {
+        const persisted = await planTitleMissingContent(id, false);
+        currentPlan = persisted;
+        executablePlanId = persisted.id;
+      }
+
+      const execution = await createExecution(id, {
+        planId: executablePlanId,
+        approved: true,
+      });
+
+      const started = await startExecution(execution.id);
+      activeExecution = started;
+      planModalOpen = false;
+      executionModalOpen = true;
+      toast.success('Acquisition execution approved and started');
+      loadTitleExecutions();
+
+      if (executionPollTimer) clearInterval(executionPollTimer);
+      executionPollTimer = setInterval(refreshActiveExecution, 2000);
+    } catch (e) {
+      toast.error(message(e));
+    } finally {
+      executionActionLoading = false;
+    }
+  }
+
+  async function handleCancelExecution(executionId: string) {
+    const ok = await confirm({
+      title: 'Cancel Execution',
+      message: 'Are you sure you want to cancel this acquisition execution? In-flight downloads will be safely stopped, and any published units will be preserved.',
+      confirmText: 'Cancel Execution',
+      danger: true,
+    });
+    if (!ok) return;
+
+    executionActionLoading = true;
+    try {
+      const cancelled = await cancelExecution(executionId, 'User requested cancellation');
+      activeExecution = cancelled;
+      toast.success('Execution cancelled');
+      loadTitleExecutions();
+    } catch (e) {
+      toast.error(message(e));
+    } finally {
+      executionActionLoading = false;
+    }
+  }
+
+  async function handleRetryExecution(executionId: string) {
+    executionActionLoading = true;
+    try {
+      const retried = await retryExecution(executionId);
+      activeExecution = retried;
+      toast.success('Retrying failed execution items');
+      loadTitleExecutions();
+      if (executionPollTimer) clearInterval(executionPollTimer);
+      executionPollTimer = setInterval(refreshActiveExecution, 2000);
+    } catch (e) {
+      toast.error(message(e));
+    } finally {
+      executionActionLoading = false;
+    }
+  }
+
   async function loadMissingAndProfile() {
     loadingMissing = true;
     try {
@@ -205,6 +336,7 @@
       missingContent = miss;
       currentProfile = prof;
       availableProfiles = allProfs;
+      loadTitleExecutions();
     } finally {
       loadingMissing = false;
     }
@@ -1069,6 +1201,33 @@
                 {/each}
               </select>
             </div>
+
+            <!-- Execution History Section -->
+            {#if titleExecutions.length > 0}
+              <div class="executions-history-section">
+                <button class="btn pill icon-text sm" onclick={() => (showExecutionHistory = !showExecutionHistory)}>
+                  <Icon name={showExecutionHistory ? 'chevron-up' : 'chevron-down'} size={14} />
+                  Acquisition Executions ({titleExecutions.length})
+                </button>
+
+                {#if showExecutionHistory}
+                  <div class="executions-history-list">
+                    {#each titleExecutions as exec (exec.id)}
+                      <!-- svelte-ignore a11y_click_events_have_key_events -->
+                      <!-- svelte-ignore a11y_no_static_element_interactions -->
+                      <div class="execution-history-row" onclick={() => { activeExecution = exec; executionModalOpen = true; }}>
+                        <span class="tag {exec.status === 'COMPLETED' ? 'spot' : ['PARTIAL', 'FAILED', 'CANCELLED'].includes(exec.status) ? 'warn' : ''}">
+                          {exec.status}
+                        </span>
+                        <span class="muted">{new Date(exec.approvedAt * 1000).toLocaleString()}</span>
+                        <span>{exec.items.length} units ({Math.round(exec.expectedTotalBytes / (1024 * 1024))} MiB)</span>
+                        <span class="view-details-arrow">View Details →</span>
+                      </div>
+                    {/each}
+                  </div>
+                {/if}
+              </div>
+            {/if}
           </div>
         {/if}
 
@@ -1777,6 +1936,14 @@
                     <span class="tag spot">{item.candidate.provider.toUpperCase()}</span>
                   </div>
 
+                  {#if item.candidate.provider === 'mangadot' || item.candidate.providerMetadata?.unitMappingProvenance === 'ChapterToVolumeInference' || item.candidate.providerMetadata?.volumeSupportMode === 'inferred'}
+                    <div class="inferred-badge-row">
+                      <span class="tag warn" title="Derived from chapter releases, not native volume package">
+                        Inferred volume mapping: requires manual review
+                      </span>
+                    </div>
+                  {/if}
+
                   <div class="candidate-meta-row">
                     {#if item.candidate.uploader}
                       <span>Uploader: <strong>{item.candidate.uploader}</strong></span>
@@ -1855,11 +2022,123 @@
           <button class="btn" onclick={handleSavePlan}>
             <Icon name="bookmark" size={14} /> Save Plan
           </button>
-          <button class="btn spot" onclick={handleAcquirePlanSelected} disabled={acquiringPlanLoading}>
-            <Icon name="download" size={14} />
-            {acquiringPlanLoading ? 'Submitting…' : 'Acquire Selected'}
+          <button
+            class="btn spot approve-btn"
+            onclick={handleApproveAndStartExecution}
+            disabled={executionActionLoading}
+          >
+            <Icon name="check" size={14} />
+            {executionActionLoading
+              ? 'Approving…'
+              : `Approve & Acquire (${currentPlan.selectedItems.length} items${currentPlan.totalEstimatedSize > 0 ? `, ~${(currentPlan.totalEstimatedSize / (1024 * 1024 * 1024)).toFixed(1)} GB` : ''})`}
           </button>
         {/if}
+      </div>
+    </div>
+  </div>
+{/if}
+
+{#if executionModalOpen && activeExecution}
+  <!-- svelte-ignore a11y_click_events_have_key_events -->
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <div class="modal-backdrop" onclick={() => (executionModalOpen = false)}>
+    <div class="modal-content execution-modal" onclick={(e) => e.stopPropagation()}>
+      <div class="modal-header">
+        <div>
+          <h3>Acquisition Execution</h3>
+          <span class="muted">{activeExecution.title} (ID: <code>{activeExecution.id}</code>)</span>
+        </div>
+        <button class="btn icon close-btn" onclick={() => (executionModalOpen = false)} aria-label="Close">
+          <Icon name="close" size={18} />
+        </button>
+      </div>
+
+      <div class="modal-body">
+        <!-- Execution Status Banner -->
+        <div class="execution-status-banner">
+          <div class="execution-status-row">
+            <span class="tag {activeExecution.status === 'COMPLETED' ? 'spot' : ['PARTIAL', 'FAILED', 'CANCELLED', 'STALE'].includes(activeExecution.status) ? 'warn' : 'spot'}" style="font-weight: 700; font-size: 0.9rem;">
+              {activeExecution.status}
+            </span>
+            {#if activeExecution.statusMessage}
+              <span class="muted">{activeExecution.statusMessage}</span>
+            {/if}
+          </div>
+
+          <!-- Phase progression breadcrumb -->
+          <div class="execution-pipeline-steps">
+            {#each ['APPROVED', 'PREFLIGHT', 'REVALIDATING', 'QUEUED', 'DOWNLOADING', 'VERIFYING', 'PUBLISHING', 'RECONCILING', 'COMPLETED'] as phase, idx}
+              <span class="step-badge {activeExecution.status === phase ? 'current' : ''}">
+                {phase}
+              </span>
+              {#if idx < 8}
+                <span class="step-arrow">→</span>
+              {/if}
+            {/each}
+          </div>
+
+          {#if activeExecution.failureReason}
+            <div class="execution-notice error">
+              <strong>Failure:</strong> {activeExecution.failureReason}
+            </div>
+          {/if}
+          {#if activeExecution.cancellationReason}
+            <div class="execution-notice warn">
+              <strong>Cancelled:</strong> {activeExecution.cancellationReason}
+            </div>
+          {/if}
+        </div>
+
+        <!-- Items Breakdown -->
+        <h4 style="margin-top: 1rem; margin-bottom: 0.5rem;">Acquisition Items ({activeExecution.items.length})</h4>
+        <div class="execution-items-list">
+          {#each activeExecution.items as item (item.id)}
+            <div class="execution-item-card {item.status.toLowerCase()}">
+              <div class="execution-item-header">
+                <span class="tag {item.status === 'COMPLETED' ? 'spot' : item.status === 'FAILED' ? 'warn' : ''}">
+                  {item.status}
+                </span>
+                <strong class="item-candidate-title">{item.frozenCandidate.title}</strong>
+                <span class="tag">{item.frozenCandidate.provider.toUpperCase()}</span>
+              </div>
+              <div class="item-meta-row">
+                <span>Targets: <strong>Volumes {item.expectedUnits.join(', ')}</strong></span>
+                {#if item.frozenCandidate.size}
+                  <span>Size: <strong>{Math.round(item.frozenCandidate.size / (1024 * 1024))} MiB</strong></span>
+                {/if}
+                {#if item.downloadJobId}
+                  <span>Job ID: <strong>#{item.downloadJobId}</strong></span>
+                {/if}
+                {#if item.verificationState}
+                  <span>Verification: <strong>{item.verificationState}</strong></span>
+                {/if}
+                {#if item.publicationState}
+                  <span>Publication: <strong>{item.publicationState}</strong></span>
+                {/if}
+              </div>
+              {#if item.errorMessage}
+                <div class="item-error-box">
+                  <Icon name="alert-triangle" size={14} />
+                  <span>{item.errorMessage}</span>
+                </div>
+              {/if}
+            </div>
+          {/each}
+        </div>
+      </div>
+
+      <div class="modal-footer">
+        {#if ['APPROVED', 'PREFLIGHT', 'REVALIDATING', 'QUEUED', 'DOWNLOADING', 'VERIFYING', 'PUBLISHING', 'RECONCILING'].includes(activeExecution.status)}
+          <button class="btn danger" onclick={() => handleCancelExecution(activeExecution.id)} disabled={executionActionLoading}>
+            Cancel Execution
+          </button>
+        {/if}
+        {#if ['PARTIAL', 'FAILED'].includes(activeExecution.status)}
+          <button class="btn spot" onclick={() => handleRetryExecution(activeExecution.id)} disabled={executionActionLoading}>
+            Retry Failed Items
+          </button>
+        {/if}
+        <button class="btn" onclick={() => (executionModalOpen = false)}>Close</button>
       </div>
     </div>
   </div>
@@ -2858,5 +3137,155 @@
     border: 1px solid rgba(255, 122, 0, 0.25);
     border-radius: 6px;
     font-size: 0.82rem;
+  }
+
+  /* Execution Modal & Progress */
+  .execution-modal {
+    max-width: 720px;
+  }
+
+  .execution-status-banner {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    padding-bottom: 0.75rem;
+    border-bottom: 1px solid var(--border-color, rgba(255, 255, 255, 0.1));
+  }
+
+  .execution-status-row {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+  }
+
+  .execution-pipeline-steps {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.35rem;
+    font-size: 0.75rem;
+  }
+
+  .step-badge {
+    padding: 2px 6px;
+    border-radius: 4px;
+    background: rgba(255, 255, 255, 0.05);
+    color: var(--muted, #888);
+  }
+
+  .step-badge.current {
+    background: var(--spot, #ff7a00);
+    color: #fff;
+    font-weight: 700;
+  }
+
+  .step-arrow {
+    color: var(--muted, #555);
+  }
+
+  .execution-notice {
+    padding: 0.5rem 0.75rem;
+    border-radius: 6px;
+    font-size: 0.82rem;
+  }
+
+  .execution-notice.error {
+    background: rgba(239, 68, 68, 0.1);
+    border: 1px solid rgba(239, 68, 68, 0.3);
+    color: #ef4444;
+  }
+
+  .execution-notice.warn {
+    background: rgba(245, 158, 11, 0.1);
+    border: 1px solid rgba(245, 158, 11, 0.3);
+    color: #f59e0b;
+  }
+
+  .execution-items-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+  }
+
+  .execution-item-card {
+    background: var(--card-bg, rgba(255, 255, 255, 0.03));
+    border: 1px solid var(--border-color, rgba(255, 255, 255, 0.1));
+    border-radius: 8px;
+    padding: 0.75rem 1rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+  }
+
+  .execution-item-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .item-candidate-title {
+    flex: 1;
+    font-size: 0.9rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .item-meta-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.85rem;
+    font-size: 0.8rem;
+    color: var(--muted, #888);
+  }
+
+  .item-error-box {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    color: #ef4444;
+    font-size: 0.8rem;
+    margin-top: 0.25rem;
+  }
+
+  .inferred-badge-row {
+    margin-top: -0.2rem;
+    margin-bottom: 0.2rem;
+  }
+
+  /* Execution History Section */
+  .executions-history-section {
+    margin-top: 0.75rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+
+  .executions-history-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+  }
+
+  .execution-history-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0.45rem 0.75rem;
+    background: var(--card-bg, rgba(255, 255, 255, 0.03));
+    border: 1px solid var(--border-color, rgba(255, 255, 255, 0.08));
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 0.82rem;
+  }
+
+  .execution-history-row:hover {
+    background: rgba(255, 255, 255, 0.06);
+  }
+
+  .view-details-arrow {
+    color: var(--spot, #ff7a00);
+    font-weight: 600;
+    font-size: 0.8rem;
   }
 </style>

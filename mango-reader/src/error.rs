@@ -76,3 +76,9 @@ impl From<std::io::Error> for AppError {
         Self::internal(e.to_string())
     }
 }
+
+impl From<serde_json::Error> for AppError {
+    fn from(e: serde_json::Error) -> Self {
+        Self::internal(format!("json: {e}"))
+    }
+}

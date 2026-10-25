@@ -10,6 +10,9 @@ use crate::acquisition::{
     AcquisitionRelease, AcquisitionReleaseUnit, CollectionInspection, CollectionUnitEntry,
 };
 use crate::acquisition::candidates::NormalizedAcquisitionCandidate;
+use crate::acquisition::execution::{
+    AcquisitionExecution, ApprovePlanRequest, ExecutionItemStatus, ExecutionStatus,
+};
 use crate::acquisition::intelligence::SourceHealthReport;
 use crate::acquisition::missing::MissingContentSummary;
 use crate::acquisition::planner::{AcquisitionPlan, GlobalPlanSummary};
@@ -17,10 +20,16 @@ use crate::acquisition::profiles::{AcquisitionProfile, ProfilePatch};
 use crate::db::Db;
 use crate::error::{AppError, Result};
 use reqwest::Client;
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::SystemTime;
 use tokio::sync::Notify;
+
+pub fn default_true() -> bool {
+    true
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1071,6 +1080,7 @@ impl AcquisitionService {
                                 &name,
                                 None,
                                 &lang_for_db,
+                                crate::acquisition::candidates::UnitMappingProvenance::ParsedVolumeFromTitle,
                             ));
                         }
                     }
@@ -1194,5 +1204,669 @@ impl AcquisitionService {
 
     pub async fn get_source_health_reports(&self) -> Result<Vec<SourceHealthReport>> {
         self.db.call(|conn| crate::acquisition::intelligence::get_all_source_health(conn)).await
+    }
+
+    /// Explicit user approval and creation of an immutable execution snapshot.
+    pub async fn approve_and_create_execution(
+        &self,
+        manga_id: i64,
+        req: ApprovePlanRequest,
+    ) -> Result<AcquisitionExecution> {
+        if !req.approved {
+            return Err(AppError::bad_request("Explicit approval is required to create an acquisition execution"));
+        }
+
+        let pid = req.plan_id.clone();
+        let plan_opt = self.db.call(move |conn| {
+            let row = conn.query_row(
+                "SELECT id, manga_id, profile_id, missing_units_json, selected_candidates_json, alternative_candidates_json, explanations_json, confidence, state, stale_reason, created_at, refreshed_at
+                 FROM acquisition_plans WHERE id = ?1",
+                [&pid],
+                |r| {
+                    let id: String = r.get(0)?;
+                    let manga_id: i64 = r.get(1)?;
+                    let profile_id: String = r.get(2)?;
+                    let missing_units_json: String = r.get(3)?;
+                    let selected_candidates_json: String = r.get(4)?;
+                    let alternative_candidates_json: String = r.get(5)?;
+                    let _explanations_json: String = r.get(6)?;
+                    let confidence: String = r.get(7)?;
+                    let state: String = r.get(8)?;
+                    let stale_reason: Option<String> = r.get(9)?;
+                    let created_at: i64 = r.get(10)?;
+                    let refreshed_at: i64 = r.get(11)?;
+
+                    let missing_units: Vec<f64> = serde_json::from_str(&missing_units_json).unwrap_or_default();
+                    let selected_items: Vec<crate::acquisition::planner::AcquisitionPlanItem> =
+                        serde_json::from_str(&selected_candidates_json).unwrap_or_default();
+                    let alternatives: Vec<crate::acquisition::candidates::NormalizedAcquisitionCandidate> =
+                        serde_json::from_str(&alternative_candidates_json).unwrap_or_default();
+
+                    let total_estimated_size = selected_items
+                        .iter()
+                        .map(|item| item.candidate.size.unwrap_or(0))
+                        .sum();
+                    let total_acquisitions_count = selected_items.len();
+                    let missing_units_covered_count = selected_items
+                        .iter()
+                        .flat_map(|item| &item.units_covered)
+                        .map(|&u| (u * 100.0).round() as i64)
+                        .collect::<std::collections::HashSet<_>>()
+                        .len();
+
+                    let series_title: String = conn
+                        .query_row("SELECT title FROM manga WHERE id = ?1", [manga_id], |row| row.get(0))
+                        .unwrap_or_default();
+                    let profile_name: String = conn
+                        .query_row("SELECT name FROM acquisition_profiles WHERE id = ?1", [&profile_id], |row| row.get(0))
+                        .unwrap_or_default();
+
+                    Ok(AcquisitionPlan {
+                        id,
+                        manga_id,
+                        series_title,
+                        profile_id,
+                        profile_name,
+                        missing_units,
+                        selected_items,
+                        alternatives,
+                        confidence,
+                        state,
+                        stale_reason,
+                        total_estimated_size,
+                        total_acquisitions_count,
+                        missing_units_covered_count,
+                        is_dry_run: false,
+                        created_at,
+                        refreshed_at,
+                    })
+                },
+            ).optional()?;
+            Ok(row)
+        }).await?;
+
+        let plan = plan_opt.ok_or_else(|| AppError::not_found("Acquisition plan not found"))?;
+
+        if plan.manga_id != manga_id {
+            return Err(AppError::bad_request("Plan does not belong to the specified title"));
+        }
+
+        // Check plan staleness at approval time
+        let current_missing = self.get_title_missing_content(manga_id).await?;
+        let mut plan_missing_sorted = plan.missing_units.clone();
+        plan_missing_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        let mut live_missing_sorted = current_missing.missing_volumes.clone();
+        live_missing_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        if plan_missing_sorted != live_missing_sorted {
+            return Err(AppError::bad_request(
+                "Plan is stale: library missing units have changed since plan generation. Please regenerate and review.",
+            ));
+        }
+
+        let profile = self.get_manga_profile(manga_id).await?;
+        if plan.profile_id != profile.id {
+            return Err(AppError::bad_request(
+                "Plan is stale: title acquisition profile has changed since plan generation. Please regenerate and review.",
+            ));
+        }
+
+        let execution = self.db.call(move |conn| {
+            crate::acquisition::execution::create_execution(conn, &plan, &current_missing)
+        }).await?;
+
+        Ok(execution)
+    }
+
+    /// Executes an approved plan through preflight, revalidation, and queueing.
+    pub async fn start_execution(&self, execution_id: String) -> Result<AcquisitionExecution> {
+        let eid = execution_id.clone();
+        let exec_opt = self.get_execution(&execution_id).await?;
+        let mut exec = exec_opt.ok_or_else(|| AppError::not_found("Execution not found"))?;
+
+        // Idempotency: if already queued or beyond, return current state
+        if matches!(
+            exec.status,
+            ExecutionStatus::Queued
+                | ExecutionStatus::Downloading
+                | ExecutionStatus::Verifying
+                | ExecutionStatus::Publishing
+                | ExecutionStatus::Reconciling
+                | ExecutionStatus::Completed
+        ) {
+            return Ok(exec);
+        }
+
+        if !matches!(
+            exec.status,
+            ExecutionStatus::Approved
+                | ExecutionStatus::Preflight
+                | ExecutionStatus::Partial
+                | ExecutionStatus::Failed
+        ) {
+            return Err(AppError::bad_request(format!(
+                "Execution in status {} cannot be started",
+                exec.status.as_str()
+            )));
+        }
+
+        // 1. PREFLIGHT
+        self.db.call({
+            let eid = eid.clone();
+            move |conn| crate::acquisition::execution::update_execution_status(
+                conn,
+                &eid,
+                ExecutionStatus::Preflight,
+                None,
+                None,
+                Some("Running preflight checks"),
+            )
+        }).await?;
+        exec.status = ExecutionStatus::Preflight;
+
+        // A. Profile check
+        let profile = self.get_manga_profile(exec.manga_id).await?;
+        for item in &exec.items {
+            if let Err(e) = crate::acquisition::execution::validate_preflight_profile(&profile, &item.frozen_candidate) {
+                let err_msg = format!("Preflight profile check failed: {e}");
+                self.fail_execution(&eid, &err_msg).await?;
+                return Err(AppError::bad_request(err_msg));
+            }
+        }
+
+        // B. Destination check
+        let (lib_dir, zh_lib_dir) = self.db.call(|conn| {
+            let l = crate::settings::get::<String>(conn, "pipeline.library_dir");
+            let zh = crate::settings::get::<String>(conn, "pipeline.chinese_library_dir");
+            Ok((l, zh))
+        }).await?;
+
+        for item in &exec.items {
+            if let Err(e) = crate::acquisition::execution::validate_preflight_destination(
+                &item.frozen_candidate.language,
+                lib_dir.as_deref(),
+                zh_lib_dir.as_deref(),
+            ) {
+                let err_msg = format!("Preflight destination check failed: {e}");
+                self.fail_execution(&eid, &err_msg).await?;
+                return Err(AppError::bad_request(err_msg));
+            }
+        }
+
+        // C. Disk Space check
+        let target_dest = if exec.items.iter().any(|i| i.frozen_candidate.language.contains("zh")) {
+            zh_lib_dir.as_deref().unwrap_or("/srv/media/manga-chinese")
+        } else {
+            lib_dir.as_deref().unwrap_or("/srv/media/manga")
+        };
+        let dest_path = Path::new(target_dest);
+        let temp_path = Path::new("/tmp");
+
+        if let Err(e) = crate::acquisition::execution::validate_preflight_disk_space(
+            exec.expected_total_bytes,
+            dest_path,
+            temp_path,
+        ) {
+            let err_msg = format!("Preflight disk check failed: {e}");
+            self.fail_execution(&eid, &err_msg).await?;
+            return Err(AppError::bad_request(err_msg));
+        }
+
+        // D. Existing Ownership reconciliation
+        let (owned_set, _) = self.get_title_acquisition_state(exec.manga_id, &exec.title).await?;
+        let owned_vols: Vec<f64> = owned_set.iter().filter_map(|s| {
+            s.strip_prefix('v').and_then(|v| v.parse::<f64>().ok())
+        }).collect();
+
+        let mut all_skipped = true;
+        for item in &mut exec.items {
+            let (still_needed, _) = crate::acquisition::execution::reconcile_preflight_ownership(
+                &item.expected_units,
+                &owned_vols,
+            );
+            item.expected_units = still_needed;
+            if item.expected_units.is_empty() {
+                item.status = ExecutionItemStatus::Skipped;
+                self.db.call({
+                    let iid = item.id.clone();
+                    move |conn| crate::acquisition::execution::update_item_status(
+                        conn,
+                        &iid,
+                        ExecutionItemStatus::Skipped,
+                        None,
+                        Some("All expected units are already owned"),
+                    )
+                }).await?;
+            } else {
+                all_skipped = false;
+            }
+        }
+
+        if all_skipped {
+            self.db.call({
+                let eid = eid.clone();
+                move |conn| crate::acquisition::execution::update_execution_status(
+                    conn,
+                    &eid,
+                    ExecutionStatus::Completed,
+                    None,
+                    None,
+                    Some("All units already owned; nothing to download"),
+                )
+            }).await?;
+            exec.status = ExecutionStatus::Completed;
+            return Ok(exec);
+        }
+
+        // 2. CANDIDATE REVALIDATION
+        self.db.call({
+            let eid = eid.clone();
+            move |conn| crate::acquisition::execution::update_execution_status(
+                conn,
+                &eid,
+                ExecutionStatus::Revalidating,
+                None,
+                None,
+                Some("Revalidating candidates against provider"),
+            )
+        }).await?;
+        exec.status = ExecutionStatus::Revalidating;
+
+        let needs_torbox = exec.items.iter().any(|i| i.frozen_candidate.provider == "nyaa");
+        if needs_torbox {
+            let (config, has_token) = self.load_internal_config().await?;
+            if !config.torbox_enabled {
+                let err_msg = "TorBox backend is disabled in settings".to_string();
+                self.fail_execution(&eid, &err_msg).await?;
+                return Err(AppError::bad_request(err_msg));
+            }
+            if !has_token {
+                let err_msg = "TorBox token is not configured".to_string();
+                self.fail_execution(&eid, &err_msg).await?;
+                return Err(AppError::bad_request(err_msg));
+            }
+        }
+
+        for item in &exec.items {
+            if item.status == ExecutionItemStatus::Skipped {
+                continue;
+            }
+
+            let live_match = Some(&item.frozen_candidate);
+            if let Err(e) = crate::acquisition::execution::revalidate_candidate(
+                &item.frozen_candidate,
+                live_match,
+                &profile,
+            ) {
+                let err_msg = format!("Candidate revalidation failed: {e}");
+                self.fail_execution(&eid, &err_msg).await?;
+                return Err(AppError::bad_request(err_msg));
+            }
+        }
+
+        // 3. QUEUED
+        self.db.call({
+            let eid = eid.clone();
+            move |conn| crate::acquisition::execution::update_execution_status(
+                conn,
+                &eid,
+                ExecutionStatus::Queued,
+                None,
+                None,
+                Some("Queueing acquisition jobs"),
+            )
+        }).await?;
+        exec.status = ExecutionStatus::Queued;
+
+        for item in &mut exec.items {
+            if item.status == ExecutionItemStatus::Skipped {
+                continue;
+            }
+
+            if let Some(existing_job_id) = item.download_job_id {
+                let exists: bool = self.db.call(move |conn| {
+                    let count: i64 = conn.query_row(
+                        "SELECT COUNT(*) FROM downloads WHERE chapter_id = ?1",
+                        [existing_job_id],
+                        |r| r.get(0),
+                    )?;
+                    Ok(count > 0)
+                }).await?;
+                if exists {
+                    continue;
+                }
+            }
+
+            let cand = &item.frozen_candidate;
+            let manga_id = exec.manga_id;
+            let item_id = item.id.clone();
+            let exec_id = eid.clone();
+            let now = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+
+            let ch_url = format!("{}:{}:{}", cand.provider, cand.provider_release_id, item.expected_units.first().copied().unwrap_or(1.0));
+            let ch_name = if cand.release_unit.is_collection() {
+                format!("{} (Collection)", cand.title)
+            } else {
+                format!("Volume {:02}", cand.release_number.unwrap_or(1.0) as i64)
+            };
+            let scanlator = cand.uploader.clone().unwrap_or_default();
+            let release_size = cand.size.unwrap_or(0) as i64;
+            let first_vol = item.expected_units.first().copied().unwrap_or(1.0);
+            let src_type = if cand.provider == "nyaa" { "nyaa" } else { "reader" };
+            let bk_type = if cand.provider == "nyaa" { "torbox" } else { "internal" };
+            let raw_t = cand.title.clone();
+            let thash = cand.provider_metadata.get("torrentHash").and_then(|v| v.as_str()).map(ToString::to_string);
+
+            let chapter_id: i64 = self.db.call(move |conn| {
+                let existing_id: Option<i64> = conn
+                    .query_row(
+                        "SELECT id FROM chapters WHERE manga_id = ?1 AND url = ?2",
+                        rusqlite::params![manga_id, &ch_url],
+                        |r| r.get(0),
+                    )
+                    .ok();
+
+                let id = if let Some(id) = existing_id {
+                    id
+                } else {
+                    conn.execute(
+                        "INSERT INTO chapters (manga_id, url, name, chapter_number, scanlator, source_order, fetched_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, 0, ?6)",
+                        rusqlite::params![manga_id, &ch_url, &ch_name, first_vol, &scanlator, now],
+                    )?;
+                    conn.last_insert_rowid()
+                };
+
+                conn.execute(
+                    "INSERT INTO downloads (
+                        chapter_id, state, position, attempts, added_at, source_type, backend_type,
+                        raw_title, uploader, release_size, torrent_hash, execution_id, execution_item_id
+                    ) VALUES (
+                        ?1, 'queued', (SELECT COALESCE(MAX(position), 0) + 1 FROM downloads), 0, ?2,
+                        ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+                    ) ON CONFLICT(chapter_id) DO UPDATE SET
+                        state = 'queued', attempts = 0, retry_at = NULL, error = NULL,
+                        source_type = excluded.source_type, backend_type = excluded.backend_type,
+                        raw_title = excluded.raw_title, uploader = excluded.uploader,
+                        release_size = excluded.release_size, torrent_hash = excluded.torrent_hash,
+                        execution_id = excluded.execution_id, execution_item_id = excluded.execution_item_id",
+                    rusqlite::params![
+                        id, now, src_type, bk_type, &raw_t, &scanlator, release_size, &thash,
+                        &exec_id, &item_id
+                    ],
+                )?;
+
+                Ok(id)
+            }).await?;
+
+            item.download_job_id = Some(chapter_id);
+            item.status = ExecutionItemStatus::Queued;
+            self.db.call({
+                let iid = item.id.clone();
+                move |conn| crate::acquisition::execution::update_item_status(
+                    conn,
+                    &iid,
+                    ExecutionItemStatus::Queued,
+                    Some(chapter_id),
+                    None,
+                )
+            }).await?;
+        }
+
+        if let Some(wake) = &self.wake_downloads {
+            wake.notify_waiters();
+        }
+
+        Ok(exec)
+    }
+
+    pub async fn fail_execution(&self, execution_id: &str, reason: &str) -> Result<()> {
+        self.db.call({
+            let eid = execution_id.to_string();
+            let r = reason.to_string();
+            move |conn| crate::acquisition::execution::update_execution_status(
+                conn,
+                &eid,
+                ExecutionStatus::Failed,
+                Some(&r),
+                None,
+                Some(&r),
+            )
+        }).await
+    }
+
+    /// Fetches execution snapshot, synchronizing live status with downloads and canonical publication.
+    pub async fn get_execution(&self, execution_id: &str) -> Result<Option<AcquisitionExecution>> {
+        let exec_opt = self.db.call({
+            let eid = execution_id.to_string();
+            move |conn| crate::acquisition::execution::get_execution(conn, &eid)
+        }).await?;
+
+        let mut exec = match exec_opt {
+            Some(e) => e,
+            None => return Ok(None),
+        };
+
+        if matches!(
+            exec.status,
+            ExecutionStatus::Completed | ExecutionStatus::Cancelled | ExecutionStatus::Stale
+        ) {
+            return Ok(Some(exec));
+        }
+
+        let eid = exec.id.clone();
+        let updated = self.db.call(move |conn| {
+            let mut any_active = false;
+            let mut active_state = ExecutionStatus::Queued;
+
+            for item in &mut exec.items {
+                if matches!(
+                    item.status,
+                    ExecutionItemStatus::Completed
+                        | ExecutionItemStatus::Skipped
+                        | ExecutionItemStatus::Cancelled
+                ) {
+                    continue;
+                }
+
+                let dl_row: Option<(String, Option<String>)> = conn.query_row(
+                    "SELECT state, error FROM downloads WHERE execution_item_id = ?1 OR chapter_id = ?2",
+                    rusqlite::params![&item.id, item.download_job_id],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                ).optional()?;
+
+                if let Some((dl_state, dl_error)) = dl_row {
+                    match dl_state.as_str() {
+                        "failed" => {
+                            item.status = ExecutionItemStatus::Failed;
+                            item.error_message = dl_error;
+                            crate::acquisition::execution::update_item_status(
+                                conn,
+                                &item.id,
+                                item.status,
+                                item.download_job_id,
+                                item.error_message.as_deref(),
+                            )?;
+                        }
+                        "downloading" => {
+                            item.status = ExecutionItemStatus::Downloading;
+                            any_active = true;
+                            active_state = ExecutionStatus::Downloading;
+                            crate::acquisition::execution::update_item_status(
+                                conn,
+                                &item.id,
+                                item.status,
+                                item.download_job_id,
+                                None,
+                            )?;
+                        }
+                        "validating" => {
+                            item.status = ExecutionItemStatus::Verifying;
+                            item.verification_state = Some("validating".to_string());
+                            any_active = true;
+                            active_state = ExecutionStatus::Verifying;
+                            crate::acquisition::execution::update_item_status(
+                                conn,
+                                &item.id,
+                                item.status,
+                                item.download_job_id,
+                                None,
+                            )?;
+                        }
+                        "publishing" => {
+                            item.status = ExecutionItemStatus::Publishing;
+                            item.publication_state = Some("publishing".to_string());
+                            any_active = true;
+                            active_state = ExecutionStatus::Publishing;
+                            crate::acquisition::execution::update_item_status(
+                                conn,
+                                &item.id,
+                                item.status,
+                                item.download_job_id,
+                                None,
+                            )?;
+                        }
+                        "komga" => {
+                            item.status = ExecutionItemStatus::Reconciling;
+                            any_active = true;
+                            active_state = ExecutionStatus::Reconciling;
+                            crate::acquisition::execution::update_item_status(
+                                conn,
+                                &item.id,
+                                item.status,
+                                item.download_job_id,
+                                None,
+                            )?;
+                        }
+                        _ => {
+                            item.status = ExecutionItemStatus::Queued;
+                            any_active = true;
+                        }
+                    }
+                } else if let Some(job_id) = item.download_job_id {
+                    let ch_path: Option<String> = conn.query_row(
+                        "SELECT download_path FROM chapters WHERE id = ?1",
+                        [job_id],
+                        |r| r.get(0),
+                    ).optional()?.flatten();
+
+                    if ch_path.is_some() {
+                        item.status = ExecutionItemStatus::Completed;
+                        item.publication_state = Some("published".to_string());
+                        item.verification_state = Some("verified".to_string());
+                        crate::acquisition::execution::update_item_status(
+                            conn,
+                            &item.id,
+                            item.status,
+                            item.download_job_id,
+                            None,
+                        )?;
+                    } else if item.status == ExecutionItemStatus::Queued
+                        || item.status == ExecutionItemStatus::Downloading
+                    {
+                        item.status = ExecutionItemStatus::Failed;
+                        item.error_message = Some("Job disappeared from downloads queue before publication".to_string());
+                        crate::acquisition::execution::update_item_status(
+                            conn,
+                            &item.id,
+                            item.status,
+                            item.download_job_id,
+                            item.error_message.as_deref(),
+                        )?;
+                    }
+                }
+            }
+
+            let all_completed = !exec.items.is_empty() && exec.items.iter().all(|i| {
+                matches!(i.status, ExecutionItemStatus::Completed | ExecutionItemStatus::Skipped)
+            });
+            let any_failed = exec.items.iter().any(|i| i.status == ExecutionItemStatus::Failed);
+
+            let new_exec_status = if any_active {
+                active_state
+            } else if any_failed {
+                let has_completed = exec.items.iter().any(|i| i.status == ExecutionItemStatus::Completed);
+                if has_completed {
+                    ExecutionStatus::Partial
+                } else {
+                    ExecutionStatus::Failed
+                }
+            } else if all_completed {
+                ExecutionStatus::Completed
+            } else {
+                exec.status
+            };
+
+            if new_exec_status != exec.status {
+                crate::acquisition::execution::update_execution_status(
+                    conn,
+                    &eid,
+                    new_exec_status,
+                    None,
+                    None,
+                    None,
+                )?;
+                exec.status = new_exec_status;
+            }
+
+            Ok(exec)
+        }).await?;
+
+        Ok(Some(updated))
+    }
+
+    pub async fn get_title_executions(&self, manga_id: i64) -> Result<Vec<AcquisitionExecution>> {
+        self.db.call(move |conn| crate::acquisition::execution::get_executions_for_manga(conn, manga_id)).await
+    }
+
+    pub async fn cancel_execution(&self, execution_id: &str, reason: &str) -> Result<()> {
+        let eid = execution_id.to_string();
+        let r = reason.to_string();
+
+        self.db.call({
+            let eid = eid.clone();
+            let r = r.clone();
+            move |conn| {
+                crate::acquisition::execution::cancel_execution(conn, &eid, &r)?;
+                conn.execute(
+                    "DELETE FROM downloads WHERE execution_id = ?1 AND state IN ('queued', 'downloading')",
+                    [&eid],
+                )?;
+                Ok(())
+            }
+        }).await
+    }
+
+    pub async fn retry_execution(&self, execution_id: &str) -> Result<AcquisitionExecution> {
+        let eid = execution_id.to_string();
+        self.db.call({
+            let eid = eid.clone();
+            move |conn| {
+                crate::acquisition::execution::retry_execution(conn, &eid)?;
+                Ok(())
+            }
+        }).await?;
+
+        self.start_execution(eid).await
+    }
+
+    pub async fn reconcile_executions_on_startup(&self) -> Result<()> {
+        let pending_ids = self.db.call(|conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id FROM acquisition_executions
+                 WHERE status IN ('PREFLIGHT', 'REVALIDATING', 'QUEUED', 'DOWNLOADING', 'VERIFYING', 'PUBLISHING', 'RECONCILING')",
+            )?;
+            let ids = stmt.query_map([], |r| r.get::<_, String>(0))?.filter_map(std::result::Result::ok).collect::<Vec<_>>();
+            Ok(ids)
+        }).await?;
+
+        for id in pending_ids {
+            let _ = self.get_execution(&id).await;
+        }
+        Ok(())
     }
 }

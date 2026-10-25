@@ -1079,3 +1079,79 @@ export const getTitlePlan = (id: number) => get<AcquisitionPlan | null>(`/titles
 export const getGlobalMissingContent = () => get<MissingContentSummary[]>('/acquisition/missing');
 export const planAllMissingContent = () => send<GlobalPlanSummary>('POST', '/acquisition/plan-all', {});
 export const getSourceHealthReports = () => get<SourceHealthReport[]>('/acquisition/sources/health');
+
+export type ExecutionStatus =
+  | 'APPROVED'
+  | 'PREFLIGHT'
+  | 'REVALIDATING'
+  | 'QUEUED'
+  | 'DOWNLOADING'
+  | 'VERIFYING'
+  | 'PUBLISHING'
+  | 'RECONCILING'
+  | 'COMPLETED'
+  | 'PARTIAL'
+  | 'FAILED'
+  | 'CANCELLED'
+  | 'STALE';
+
+export type ExecutionItemStatus =
+  | 'PENDING'
+  | 'QUEUED'
+  | 'DOWNLOADING'
+  | 'VERIFYING'
+  | 'PUBLISHING'
+  | 'RECONCILING'
+  | 'COMPLETED'
+  | 'FAILED'
+  | 'SKIPPED'
+  | 'CANCELLED';
+
+export interface AcquisitionExecutionItem {
+  id: string;
+  executionId: string;
+  itemIndex: number;
+  frozenCandidate: NormalizedAcquisitionCandidate;
+  expectedUnits: number[];
+  duplicateUnits: number[];
+  status: ExecutionItemStatus;
+  downloadJobId?: number | null;
+  verificationState?: string | null;
+  publicationState?: string | null;
+  errorMessage?: string | null;
+  completedAt?: number | null;
+}
+
+export interface AcquisitionExecution {
+  id: string;
+  planId: string;
+  mangaId: number;
+  title: string;
+  profileId: string;
+  profileSnapshot: AcquisitionProfile;
+  planSnapshot: AcquisitionPlan;
+  missingContentSnapshot: MissingContentSummary;
+  items: AcquisitionExecutionItem[];
+  status: ExecutionStatus;
+  statusMessage?: string | null;
+  expectedTotalBytes: number;
+  cancellationReason?: string | null;
+  failureReason?: string | null;
+  approvedAt: number;
+  startedAt?: number | null;
+  completedAt?: number | null;
+  updatedAt: number;
+}
+
+export interface ApprovePlanRequest {
+  planId: string;
+  approved: boolean;
+}
+
+export const createExecution = (id: number, req: ApprovePlanRequest) => send<AcquisitionExecution>('POST', `/titles/${id}/executions`, req);
+export const getTitleExecutions = (id: number) => get<AcquisitionExecution[]>(`/titles/${id}/executions`);
+export const getAcquisitionExecution = (id: string) => get<AcquisitionExecution>(`/acquisition/executions/${encodeURIComponent(id)}`);
+export const startExecution = (id: string) => send<AcquisitionExecution>('POST', `/acquisition/executions/${encodeURIComponent(id)}/start`, {});
+export const cancelExecution = (id: string, reason?: string) => send<AcquisitionExecution>('POST', `/acquisition/executions/${encodeURIComponent(id)}/cancel`, { reason });
+export const retryExecution = (id: string) => send<AcquisitionExecution>('POST', `/acquisition/executions/${encodeURIComponent(id)}/retry`, {});
+
