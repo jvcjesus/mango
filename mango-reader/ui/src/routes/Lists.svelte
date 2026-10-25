@@ -37,13 +37,7 @@
   async function loadData() {
     error = null;
     try {
-      const res = await getLists({
-        status: statusFilter === 'all' ? undefined : statusFilter,
-        ownership: ownershipFilter === 'all' ? undefined : ownershipFilter,
-        tracker: trackerFilter === 'all' ? undefined : trackerFilter,
-        q: searchQuery.trim() || undefined,
-        sort: sortOption,
-      });
+      const res = await getLists({});
       data = res;
       keep('tracked_lists', res);
     } catch (e) {
@@ -54,13 +48,154 @@
   }
 
   $effect(() => {
-    // Re-query when filters change
-    void statusFilter;
-    void ownershipFilter;
-    void trackerFilter;
-    void sortOption;
-    void searchQuery;
+    // Fetch initial list once on mount
     loadData();
+  });
+
+  // All tracked items from response
+  const allItems = $derived(data?.items ?? []);
+
+  // Items filtered by secondary filters: ownership, tracker, and search (ignoring status)
+  // This is the faceted base used to calculate the contextual counts on the status tabs!
+  const statusFacetedItems = $derived.by(() => {
+    return allItems.filter((item) => {
+      // Ownership filter
+      if (ownershipFilter !== 'all') {
+        const owNorm = ownershipFilter.replace('_', ' ').toLowerCase();
+        if (item.ownershipStatus.toLowerCase() !== owNorm) {
+          return false;
+        }
+      }
+      // Tracker filter
+      if (trackerFilter === 'anilist' && !item.anilist) {
+        return false;
+      }
+      if (trackerFilter === 'mangabaka' && !item.mangabaka) {
+        return false;
+      }
+      if (trackerFilter === 'both' && (!item.anilist || !item.mangabaka)) {
+        return false;
+      }
+      // Search query (matches display title or any alias)
+      if (searchQuery.trim()) {
+        const q = searchQuery.trim().toLowerCase();
+        const matchTitle = item.title.toLowerCase().includes(q);
+        const matchAlias = item.aliases?.some((a) => a.toLowerCase().includes(q)) ?? false;
+        if (!matchTitle && !matchAlias) {
+          return false;
+        }
+      }
+      return true;
+    });
+  });
+
+  // Faceted counts for status tabs based on statusFacetedItems
+  const facetedStatusCounts = $derived.by(() => {
+    const counts = {
+      all: statusFacetedItems.length,
+      reading: 0,
+      planning: 0,
+      completed: 0,
+      paused: 0,
+      dropped: 0,
+    };
+    for (const item of statusFacetedItems) {
+      switch (item.normalizedStatus.toLowerCase()) {
+        case 'reading':
+          counts.reading++;
+          break;
+        case 'planning':
+          counts.planning++;
+          break;
+        case 'completed':
+          counts.completed++;
+          break;
+        case 'paused':
+          counts.paused++;
+          break;
+        case 'dropped':
+          counts.dropped++;
+          break;
+      }
+    }
+    return counts;
+  });
+
+  // Items filtered by status, tracker, and search (used to calculate faceted ownership counts)
+  const ownershipFacetedItems = $derived.by(() => {
+    return allItems.filter((item) => {
+      if (statusFilter !== 'all' && item.normalizedStatus.toLowerCase() !== statusFilter) {
+        return false;
+      }
+      if (trackerFilter === 'anilist' && !item.anilist) return false;
+      if (trackerFilter === 'mangabaka' && !item.mangabaka) return false;
+      if (trackerFilter === 'both' && (!item.anilist || !item.mangabaka)) return false;
+      if (searchQuery.trim()) {
+        const q = searchQuery.trim().toLowerCase();
+        const matchTitle = item.title.toLowerCase().includes(q);
+        const matchAlias = item.aliases?.some((a) => a.toLowerCase().includes(q)) ?? false;
+        if (!matchTitle && !matchAlias) return false;
+      }
+      return true;
+    });
+  });
+
+  const facetedOwnershipCounts = $derived.by(() => {
+    const counts = {
+      all: ownershipFacetedItems.length,
+      owned: 0,
+      partially_owned: 0,
+      not_owned: 0,
+    };
+    for (const item of ownershipFacetedItems) {
+      switch (item.ownershipStatus.toLowerCase()) {
+        case 'owned':
+          counts.owned++;
+          break;
+        case 'partially owned':
+          counts.partially_owned++;
+          break;
+        case 'not owned':
+          counts.not_owned++;
+          break;
+      }
+    }
+    return counts;
+  });
+
+  // Final displayed items: statusFacetedItems filtered by statusFilter, then sorted
+  const displayItems = $derived.by(() => {
+    let items = statusFacetedItems;
+    if (statusFilter !== 'all') {
+      items = items.filter((item) => item.normalizedStatus.toLowerCase() === statusFilter);
+    }
+    const sorted = [...items];
+    switch (sortOption) {
+      case 'title':
+        sorted.sort((a, b) => a.title.localeCompare(b.title));
+        break;
+      case 'progress':
+        sorted.sort((a, b) => {
+          const ap =
+            a.anilist?.progressVolume ??
+            a.anilist?.progressChapter ??
+            a.mangabaka?.progressVolume ??
+            a.mangabaka?.progressChapter ??
+            0;
+          const bp =
+            b.anilist?.progressVolume ??
+            b.anilist?.progressChapter ??
+            b.mangabaka?.progressVolume ??
+            b.mangabaka?.progressChapter ??
+            0;
+          return bp - ap;
+        });
+        break;
+      default: // 'updated'
+        sorted.sort((a, b) => b.updatedAt - a.updatedAt);
+        break;
+    }
+    return sorted;
   });
 
   async function handleRefresh() {
@@ -124,6 +259,12 @@
       default:
         return 'ownership-unknown';
     }
+  }
+
+  function getDistinctAliases(item: UnifiedTrackedItem | null): string[] {
+    if (!item || !item.aliases) return [];
+    const titleLower = item.title.toLowerCase();
+    return item.aliases.filter((a) => a.toLowerCase() !== titleLower);
   }
 </script>
 
@@ -203,7 +344,7 @@
           role="tab"
           aria-selected={statusFilter === 'all'}
         >
-          All {data?.summary ? `(${data.summary.total})` : ''}
+          All {data ? `(${facetedStatusCounts.all})` : ''}
         </button>
         <button
           class="pill"
@@ -212,7 +353,7 @@
           role="tab"
           aria-selected={statusFilter === 'reading'}
         >
-          Reading {data?.summary ? `(${data.summary.reading})` : ''}
+          Reading {data ? `(${facetedStatusCounts.reading})` : ''}
         </button>
         <button
           class="pill"
@@ -221,7 +362,7 @@
           role="tab"
           aria-selected={statusFilter === 'planning'}
         >
-          Planning {data?.summary ? `(${data.summary.planning})` : ''}
+          Planning {data ? `(${facetedStatusCounts.planning})` : ''}
         </button>
         <button
           class="pill"
@@ -230,7 +371,7 @@
           role="tab"
           aria-selected={statusFilter === 'completed'}
         >
-          Completed {data?.summary ? `(${data.summary.completed})` : ''}
+          Completed {data ? `(${facetedStatusCounts.completed})` : ''}
         </button>
         <button
           class="pill"
@@ -239,7 +380,7 @@
           role="tab"
           aria-selected={statusFilter === 'paused'}
         >
-          Paused {data?.summary ? `(${data.summary.paused})` : ''}
+          Paused {data ? `(${facetedStatusCounts.paused})` : ''}
         </button>
         <button
           class="pill"
@@ -248,7 +389,7 @@
           role="tab"
           aria-selected={statusFilter === 'dropped'}
         >
-          Dropped {data?.summary ? `(${data.summary.dropped})` : ''}
+          Dropped {data ? `(${facetedStatusCounts.dropped})` : ''}
         </button>
       </div>
 
@@ -257,10 +398,10 @@
         <div class="filter-dropdown">
           <span class="filter-label">Ownership:</span>
           <select bind:value={ownershipFilter} aria-label="Filter by local ownership">
-            <option value="all">All ownership</option>
-            <option value="owned">Owned ({data?.summary?.owned ?? 0})</option>
-            <option value="partially_owned">Partially Owned ({data?.summary?.partiallyOwned ?? 0})</option>
-            <option value="not_owned">Not Owned ({data?.summary?.notOwned ?? 0})</option>
+            <option value="all">All ownership ({facetedOwnershipCounts.all})</option>
+            <option value="owned">Owned ({facetedOwnershipCounts.owned})</option>
+            <option value="partially_owned">Partially Owned ({facetedOwnershipCounts.partially_owned})</option>
+            <option value="not_owned">Not Owned ({facetedOwnershipCounts.not_owned})</option>
           </select>
         </div>
 
@@ -290,23 +431,25 @@
       <div class="empty-icon"><Icon name="bookmark" size={48} /></div>
       <h2 class="display">No tracked titles found</h2>
       <p class="empty-msg">
-        {#if searchQuery || statusFilter !== 'all' || ownershipFilter !== 'all' || trackerFilter !== 'all'}
-          No titles matched the selected filters.
-        {:else}
-          Your tracked catalog is empty. Click "Refresh Lists" to import your manga lists from AniList and MangaBaka.
-        {/if}
+        Your tracked catalog is empty. Click "Refresh Lists" to import your manga lists from AniList and MangaBaka.
       </p>
-      {#if !data || data.items.length === 0}
-        <button class="btn primary" onclick={handleRefresh} disabled={refreshing}>
-          <Icon name={refreshing ? 'spinner' : 'refresh'} size={18} />
-          <span>Refresh Lists</span>
-        </button>
-      {/if}
+      <button class="btn primary" onclick={handleRefresh} disabled={refreshing}>
+        <Icon name={refreshing ? 'spinner' : 'refresh'} size={18} />
+        <span>Refresh Lists</span>
+      </button>
+    </div>
+  {:else if displayItems.length === 0}
+    <div class="empty-state">
+      <div class="empty-icon"><Icon name="bookmark" size={48} /></div>
+      <h2 class="display">No matching titles</h2>
+      <p class="empty-msg">
+        No titles matched the selected filters.
+      </p>
     </div>
   {:else}
     <!-- Grid of Tracked Cards -->
     <div class="grid" role="list">
-      {#each data.items as item (item.id)}
+      {#each displayItems as item (item.id)}
         <button
           type="button"
           class="card-wrap"
@@ -401,6 +544,18 @@
                 <span class="summary-value monospace">{selectedItem.komgaSeriesId}</span>
               </div>
             {/if}
+            {#if getDistinctAliases(selectedItem).length > 0}
+              {@const distinctAliases = getDistinctAliases(selectedItem)}
+              <div class="summary-row">
+                <span class="summary-label">Aliases</span>
+                <span class="summary-value dim">
+                  {distinctAliases.slice(0, 4).join(' · ')}
+                  {#if distinctAliases.length > 4}
+                    (+{distinctAliases.length - 4} more)
+                  {/if}
+                </span>
+              </div>
+            {/if}
             <div class="summary-row">
               <span class="summary-label">Acquisition</span>
               <span class="summary-value">
@@ -424,6 +579,9 @@
             </div>
             {#if selectedItem.anilist}
               <div class="tracker-details">
+                {#if selectedItem.anilist.title && selectedItem.anilist.title.toLowerCase() !== selectedItem.title.toLowerCase()}
+                  <div><strong>Provider Title:</strong> {selectedItem.anilist.title}</div>
+                {/if}
                 <div><strong>Native Status:</strong> {selectedItem.anilist.status}</div>
                 <div><strong>Progress:</strong> Vol {selectedItem.anilist.progressVolume ?? 0} / Ch {selectedItem.anilist.progressChapter ?? 0}</div>
                 <div><strong>Total Known:</strong> {selectedItem.anilist.totalVolumes ? `${selectedItem.anilist.totalVolumes} volumes` : 'Unknown volumes'}</div>
@@ -445,6 +603,9 @@
             </div>
             {#if selectedItem.mangabaka}
               <div class="tracker-details">
+                {#if selectedItem.mangabaka.title && selectedItem.mangabaka.title.toLowerCase() !== selectedItem.title.toLowerCase()}
+                  <div><strong>Provider Title:</strong> {selectedItem.mangabaka.title}</div>
+                {/if}
                 <div><strong>Native State:</strong> {selectedItem.mangabaka.status}</div>
                 <div><strong>Progress:</strong> Vol {selectedItem.mangabaka.progressVolume ?? 0} / Ch {selectedItem.mangabaka.progressChapter ?? 0}</div>
                 <div><strong>Total Known:</strong> {selectedItem.mangabaka.totalVolumes ? `${selectedItem.mangabaka.totalVolumes} volumes` : 'Unknown volumes'}</div>

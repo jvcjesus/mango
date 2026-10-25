@@ -2517,8 +2517,10 @@ async fn test_mangabaka_cross_reference_remote_error_does_not_fall_through_to_ti
 use super::eligibility::evaluate_completion_predicate;
 use super::lists::{
     ListsQuery, TrackerListEntry, TrackerListRefreshStatus, build_unified_catalog,
-    get_tracker_list_entries, normalize_status, update_refresh_status, upsert_tracker_list_entries,
+    get_tracker_list_entries, normalize_status, resolve_cover_url, resolve_display_title,
+    update_refresh_status, upsert_tracker_list_entries,
 };
+use crate::pipeline::mangabaka::{is_latin_script, is_safe_cover_url};
 
 #[test]
 fn test_backend_anilist_planning_imports_without_komga_ownership() {
@@ -2542,6 +2544,7 @@ fn test_backend_anilist_planning_imports_without_komga_ownership() {
         format: Some("MANGA".to_string()),
         updated_at: 1700000000,
         raw_data: None,
+        ..Default::default()
     };
 
     upsert_tracker_list_entries(&conn, &[entry]).unwrap();
@@ -2582,6 +2585,7 @@ fn test_backend_mangabaka_want_to_read_imports_without_komga_ownership() {
         format: Some("manga".to_string()),
         updated_at: 1700000000,
         raw_data: None,
+        ..Default::default()
     };
 
     upsert_tracker_list_entries(&conn, &[entry]).unwrap();
@@ -2621,6 +2625,7 @@ fn test_backend_same_title_merges_when_identity_known() {
         format: Some("MANGA".to_string()),
         updated_at: 1700000000,
         raw_data: None,
+        ..Default::default()
     };
 
     let mb = TrackerListEntry {
@@ -2637,6 +2642,7 @@ fn test_backend_same_title_merges_when_identity_known() {
         format: Some("manga".to_string()),
         updated_at: 1700000100,
         raw_data: None,
+        ..Default::default()
     };
 
     upsert_tracker_list_entries(&conn, &[al, mb]).unwrap();
@@ -2675,6 +2681,7 @@ fn test_backend_ambiguous_identities_remain_separate() {
         format: None,
         updated_at: 1700000000,
         raw_data: None,
+        ..Default::default()
     };
 
     // Multiple MangaBaka entries matching the same title
@@ -2692,6 +2699,7 @@ fn test_backend_ambiguous_identities_remain_separate() {
         format: None,
         updated_at: 1700000100,
         raw_data: None,
+        ..Default::default()
     };
 
     let mb2 = TrackerListEntry {
@@ -2708,6 +2716,7 @@ fn test_backend_ambiguous_identities_remain_separate() {
         format: None,
         updated_at: 1700000200,
         raw_data: None,
+        ..Default::default()
     };
 
     upsert_tracker_list_entries(&conn, &[al, mb1, mb2]).unwrap();
@@ -2741,6 +2750,7 @@ fn test_backend_import_never_queues_acquisition_and_auto_acquire_false() {
         format: None,
         updated_at: 1700000000,
         raw_data: None,
+        ..Default::default()
     };
 
     upsert_tracker_list_entries(&conn, &[entry]).unwrap();
@@ -3003,6 +3013,7 @@ fn test_backend_refresh_failure_preserves_cached_entries() {
         format: None,
         updated_at: 1700000000,
         raw_data: None,
+        ..Default::default()
     };
 
     upsert_tracker_list_entries(&conn, &[entry]).unwrap();
@@ -3055,6 +3066,7 @@ fn test_backend_rate_limit_and_unauthorized_preserve_cached_entries() {
         format: None,
         updated_at: 1700000000,
         raw_data: None,
+        ..Default::default()
     };
 
     upsert_tracker_list_entries(&conn, &[entry]).unwrap();
@@ -3095,4 +3107,352 @@ fn test_backend_status_normalization_mapping() {
     assert_eq!(normalize_status("mangabaka", "completed"), "Completed");
     assert_eq!(normalize_status("mangabaka", "paused"), "Paused");
     assert_eq!(normalize_status("mangabaka", "dropped"), "Dropped");
+}
+
+#[test]
+fn test_latin_script_classifier() {
+    // Pure Latin and standard alphanumeric titles
+    assert!(is_latin_script("Berserk"));
+    assert!(is_latin_script("SPY×FAMILY"));
+    assert!(is_latin_script("Re:Zero"));
+    assert!(is_latin_script("Chainsaw Man"));
+    assert!(is_latin_script("Attack on Titan (Shingeki no Kyojin)"));
+    assert!(is_latin_script("Kagurabachi"));
+    assert!(is_latin_script("Akane-banashi"));
+    assert!(is_latin_script("Sakamoto Days"));
+    assert!(is_latin_script("Blue Lock"));
+    assert!(is_latin_script("Pandora Hearts"));
+
+    // Non-Latin titles (Korean Hangul, Japanese Kana/Kanji, Chinese Hanzi)
+    assert!(!is_latin_script("베르세르크"));
+    assert!(!is_latin_script("사카모토 데이즈"));
+    assert!(!is_latin_script("카구라바치"));
+    assert!(!is_latin_script("아카네 이야기"));
+    assert!(!is_latin_script("ベルセルク"));
+    assert!(!is_latin_script("烙印勇士"));
+    assert!(!is_latin_script("進撃の巨人"));
+
+    // Empty or punctuation-only strings
+    assert!(!is_latin_script(""));
+    assert!(!is_latin_script("   "));
+    assert!(!is_latin_script("---..."));
+}
+
+#[test]
+fn test_display_title_selection_precedence() {
+    // 1. English title preferred over romaji, native, etc.
+    let title1 = resolve_display_title(
+        Some("Berserk"),
+        Some("Kenpuu Denki Berserk"),
+        Some("Kenpuu Denki Berserk"),
+        Some("베르세르크"),
+        None,
+        None,
+        None,
+        None,
+        "Fallback",
+    );
+    assert_eq!(title1, "Berserk");
+
+    // 2. MangaBaka English title preferred over MangaBaka native Korean
+    let title2 = resolve_display_title(
+        None,
+        None,
+        None,
+        None,
+        Some("Sakamoto Days"),
+        Some("Sakamoto Days"),
+        Some("사카모토 데이즈"),
+        Some("사카모토 데이즈"),
+        "Fallback",
+    );
+    assert_eq!(title2, "Sakamoto Days");
+
+    // 3. Kagurabachi with MB romaji/English vs native Korean
+    let title3 = resolve_display_title(
+        None,
+        None,
+        None,
+        None,
+        Some("Kagurabachi"),
+        None,
+        Some("카구라바치"),
+        Some("카구라바치"),
+        "Fallback",
+    );
+    assert_eq!(title3, "Kagurabachi");
+
+    // 4. Akane-banashi with romaji vs native Korean
+    let title4 = resolve_display_title(
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some("Akane-banashi"),
+        Some("아카네 이야기"),
+        Some("아카네 이야기"),
+        "Fallback",
+    );
+    assert_eq!(title4, "Akane-banashi");
+
+    // 5. Latin userPreferred preferred over non-Latin
+    let title5 = resolve_display_title(
+        None,
+        Some("Solo Leveling"),
+        None,
+        Some("나 혼자만 레벨업"),
+        None,
+        None,
+        None,
+        None,
+        "Fallback",
+    );
+    assert_eq!(title5, "Solo Leveling");
+
+    // 6. CJK-only fallback gracefully returns native/canonical without panicking
+    let title6 = resolve_display_title(
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some("烙印勇士"),
+        Some("烙印勇士"),
+        "Fallback",
+    );
+    assert_eq!(title6, "烙印勇士");
+
+    // 7. Complete empty metadata falls back to provided fallback
+    let title7 = resolve_display_title(
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        "Default Title",
+    );
+    assert_eq!(title7, "Default Title");
+}
+
+#[test]
+fn test_cover_precedence_and_url_safety() {
+    // 1. AniList extraLarge has highest priority
+    let c1 = resolve_cover_url(
+        Some("https://s4.anilist.co/file/anilistcdn/media/manga/cover/extraLarge/bx30001.jpg"),
+        Some("https://s4.anilist.co/file/anilistcdn/media/manga/cover/large/bx30001.jpg"),
+        Some("https://s4.anilist.co/file/anilistcdn/media/manga/cover/large/bx30001.jpg"),
+        Some("https://s4.anilist.co/file/anilistcdn/media/manga/cover/medium/bx30001.jpg"),
+        Some("https://images.mangabaka.dev/covers/350.webp"),
+    );
+    assert_eq!(
+        c1,
+        Some("https://s4.anilist.co/file/anilistcdn/media/manga/cover/extraLarge/bx30001.jpg".to_string())
+    );
+
+    // 2. Fallback to large when extraLarge missing
+    let c2 = resolve_cover_url(
+        None,
+        Some("https://s4.anilist.co/file/anilistcdn/media/manga/cover/large/bx30001.jpg"),
+        None,
+        Some("https://s4.anilist.co/file/anilistcdn/media/manga/cover/medium/bx30001.jpg"),
+        Some("https://images.mangabaka.dev/covers/350.webp"),
+    );
+    assert_eq!(
+        c2,
+        Some("https://s4.anilist.co/file/anilistcdn/media/manga/cover/large/bx30001.jpg".to_string())
+    );
+
+    // 3. Fallback to MangaBaka when AniList covers are missing
+    let c3 = resolve_cover_url(
+        None,
+        None,
+        None,
+        None,
+        Some("https://images.mangabaka.dev/covers/350.webp"),
+    );
+    assert_eq!(
+        c3,
+        Some("https://images.mangabaka.dev/covers/350.webp".to_string())
+    );
+
+    // 4. URL safety validation
+    assert!(is_safe_cover_url("https://s4.anilist.co/cover.jpg"));
+    assert!(is_safe_cover_url("http://images.mangabaka.dev/img.png"));
+    assert!(!is_safe_cover_url("javascript:alert(1)"));
+    assert!(!is_safe_cover_url("data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="));
+    assert!(!is_safe_cover_url("file:///etc/passwd"));
+    assert!(!is_safe_cover_url("blob:http://localhost/uuid"));
+    assert!(!is_safe_cover_url(""));
+
+    // 5. Unsafe URL is ignored by resolve_cover_url and falls through
+    let c4 = resolve_cover_url(
+        Some("javascript:alert(1)"),
+        None,
+        None,
+        None,
+        Some("https://images.mangabaka.dev/covers/350.webp"),
+    );
+    assert_eq!(
+        c4,
+        Some("https://images.mangabaka.dev/covers/350.webp".to_string())
+    );
+}
+
+#[test]
+fn test_backend_cached_cover_and_metadata_preservation_on_update() {
+    let dir = std::env::temp_dir().join("mango-test-backend-metadata-preserve");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = Db::open(&dir.join("test.db")).expect("test db");
+    let conn = db.second().expect("conn");
+
+    // 1. Initial upsert with rich title & cover metadata
+    let entry1 = TrackerListEntry {
+        tracker: "anilist".to_string(),
+        tracker_id: "30001".to_string(),
+        title: "Berserk".to_string(),
+        english_title: Some("Berserk".to_string()),
+        romaji_title: Some("Kenpuu Denki Berserk".to_string()),
+        native_title: Some("베르세르크".to_string()),
+        aliases: Some("[\"Kenpuu Denki Berserk\",\"베르세르크\"]".to_string()),
+        cover_url: Some("https://s4.anilist.co/cover-large.jpg".to_string()),
+        extra_large_cover_url: Some("https://s4.anilist.co/cover-xl.jpg".to_string()),
+        large_cover_url: Some("https://s4.anilist.co/cover-large.jpg".to_string()),
+        medium_cover_url: Some("https://s4.anilist.co/cover-med.jpg".to_string()),
+        status: "CURRENT".to_string(),
+        normalized_status: "Reading".to_string(),
+        progress_chapter: Some(364.0),
+        progress_volume: Some(41.0),
+        total_chapters: None,
+        total_volumes: None,
+        format: Some("MANGA".to_string()),
+        updated_at: 1700000000,
+        raw_data: None,
+    };
+    upsert_tracker_list_entries(&conn, &[entry1]).unwrap();
+
+    let cached = get_tracker_list_entries(&conn, Some("anilist")).unwrap();
+    assert_eq!(cached.len(), 1);
+    assert_eq!(cached[0].english_title.as_deref(), Some("Berserk"));
+    assert_eq!(
+        cached[0].extra_large_cover_url.as_deref(),
+        Some("https://s4.anilist.co/cover-xl.jpg")
+    );
+
+    // 2. Second upsert from a partial payload where optional metadata is None
+    // COALESCE must protect existing english_title and extra_large_cover_url from being overwritten with NULL!
+    let entry2 = TrackerListEntry {
+        tracker: "anilist".to_string(),
+        tracker_id: "30001".to_string(),
+        title: "Berserk".to_string(),
+        english_title: None, // Missing in partial update
+        romaji_title: None,
+        native_title: None,
+        aliases: None,
+        cover_url: None,
+        extra_large_cover_url: None,
+        large_cover_url: None,
+        medium_cover_url: None,
+        status: "CURRENT".to_string(),
+        normalized_status: "Reading".to_string(),
+        progress_chapter: Some(365.0), // progress moved forward
+        progress_volume: Some(41.0),
+        total_chapters: None,
+        total_volumes: None,
+        format: Some("MANGA".to_string()),
+        updated_at: 1700001000,
+        raw_data: None,
+    };
+    upsert_tracker_list_entries(&conn, &[entry2]).unwrap();
+
+    let after_update = get_tracker_list_entries(&conn, Some("anilist")).unwrap();
+    assert_eq!(after_update.len(), 1);
+    assert_eq!(after_update[0].progress_chapter, Some(365.0));
+    assert_eq!(
+        after_update[0].english_title.as_deref(),
+        Some("Berserk"),
+        "English title must be preserved"
+    );
+    assert_eq!(
+        after_update[0].extra_large_cover_url.as_deref(),
+        Some("https://s4.anilist.co/cover-xl.jpg"),
+        "Cover URL must be preserved across updates"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_unified_catalog_alias_search_and_ambiguity_protection() {
+    let dir = std::env::temp_dir().join("mango-test-backend-catalog-search");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = Db::open(&dir.join("test.db")).expect("test db");
+    let conn = db.second().expect("conn");
+
+    // Insert MangaBaka item whose native title is Korean, with English alias
+    let mb_entry = TrackerListEntry {
+        tracker: "mangabaka".to_string(),
+        tracker_id: "mb-sakamoto".to_string(),
+        title: "사카모토 데이즈".to_string(),
+        english_title: Some("Sakamoto Days".to_string()),
+        romaji_title: Some("Sakamoto Days".to_string()),
+        native_title: Some("사카모토 데이즈".to_string()),
+        aliases: Some("[\"Sakamoto Days\",\"사카모토 데이즈\"]".to_string()),
+        status: "reading".to_string(),
+        normalized_status: "Reading".to_string(),
+        progress_chapter: Some(150.0),
+        ..Default::default()
+    };
+
+    // Insert AniList item for Berserk with Korean alias
+    let al_entry = TrackerListEntry {
+        tracker: "anilist".to_string(),
+        tracker_id: "al-berserk".to_string(),
+        title: "Berserk".to_string(),
+        english_title: Some("Berserk".to_string()),
+        romaji_title: Some("Kenpuu Denki Berserk".to_string()),
+        native_title: Some("베르세르크".to_string()),
+        aliases: Some("[\"Kenpuu Denki Berserk\",\"베르세르크\"]".to_string()),
+        status: "CURRENT".to_string(),
+        normalized_status: "Reading".to_string(),
+        progress_chapter: Some(364.0),
+        ..Default::default()
+    };
+
+    upsert_tracker_list_entries(&conn, &[mb_entry, al_entry]).unwrap();
+
+    // Query 1: Search by Korean alias for Berserk ("베르세르크")
+    let q_korean = ListsQuery {
+        q: Some("베르세르크".to_string()),
+        ..Default::default()
+    };
+    let res1 = build_unified_catalog(&conn, &[], &q_korean).unwrap();
+    assert_eq!(res1.items.len(), 1);
+    assert_eq!(res1.items[0].title, "Berserk");
+    assert!(res1.items[0].aliases.contains(&"베르세르크".to_string()));
+
+    // Query 2: Search by English name for Sakamoto Days ("sakamoto")
+    let q_sakamoto = ListsQuery {
+        q: Some("sakamoto".to_string()),
+        ..Default::default()
+    };
+    let res2 = build_unified_catalog(&conn, &[], &q_sakamoto).unwrap();
+    assert_eq!(res2.items.len(), 1);
+    assert_eq!(res2.items[0].title, "Sakamoto Days");
+
+    // Query 3: Search with no match
+    let q_none = ListsQuery {
+        q: Some("NonexistentTitle".to_string()),
+        ..Default::default()
+    };
+    let res3 = build_unified_catalog(&conn, &[], &q_none).unwrap();
+    assert_eq!(res3.items.len(), 0);
+
+    let _ = std::fs::remove_dir_all(&dir);
 }

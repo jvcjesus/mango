@@ -59,6 +59,10 @@ pub struct MangaBakaLibraryEntry {
 pub struct MangaBakaLibraryItem {
     pub series_id: i64,
     pub title: String,
+    pub english_title: Option<String>,
+    pub romaji_title: Option<String>,
+    pub native_title: Option<String>,
+    pub aliases: Vec<String>,
     pub cover_url: Option<String>,
     pub state: String, // "reading", "plan_to_read", "considering", "completed", "paused", "dropped", "rereading"
     pub progress_chapter: Option<f64>,
@@ -70,51 +74,150 @@ pub struct MangaBakaLibraryItem {
     pub updated_at: i64,
 }
 
-fn extract_mb_series_title(series_node: &serde_json::Value) -> String {
-    if let Some(t) = series_node.get("title").and_then(|v| v.as_str()) {
-        if !t.trim().is_empty() {
-            return t.trim().to_string();
+pub fn is_safe_cover_url(url: &str) -> bool {
+    let trimmed = url.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if let Ok(parsed) = reqwest::Url::parse(trimmed) {
+        matches!(parsed.scheme(), "http" | "https")
+    } else {
+        false
+    }
+}
+
+pub fn is_latin_script(s: &str) -> bool {
+    let mut latin_count = 0;
+    let mut non_latin_script_count = 0;
+
+    for c in s.chars() {
+        if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || ('\u{00C0}'..='\u{024F}').contains(&c) {
+            latin_count += 1;
+        } else if is_non_latin_script_char(c) {
+            non_latin_script_count += 1;
         }
     }
-    if let Some(titles) = series_node.get("titles").and_then(|v| v.as_array()) {
-        for item in titles {
-            let traits = item.get("traits").and_then(|v| v.as_array());
-            let is_official = traits.map_or(false, |tr| {
-                tr.iter().any(|t| t.as_str() == Some("official"))
-            });
-            let lang = item.get("language").and_then(|v| v.as_str());
-            if is_official || lang == Some("en") || lang == Some("english") {
-                if let Some(t) = item.get("title").and_then(|v| v.as_str()) {
-                    if !t.trim().is_empty() {
-                        return t.trim().to_string();
-                    }
-                }
-            }
-        }
-        for item in titles {
-            if let Some(t) = item.get("title").and_then(|v| v.as_str()) {
-                if !t.trim().is_empty() {
-                    return t.trim().to_string();
-                }
-            }
-        }
-    }
-    format!(
-        "MangaBaka Series {}",
-        series_node.get("id").and_then(|v| v.as_i64()).unwrap_or(0)
+
+    latin_count > 0 && latin_count >= non_latin_script_count
+}
+
+fn is_non_latin_script_char(c: char) -> bool {
+    matches!(
+        c,
+        '\u{4E00}'..='\u{9FFF}' | '\u{3400}'..='\u{4DBF}' |
+        '\u{AC00}'..='\u{D7AF}' | '\u{1100}'..='\u{11FF}' | '\u{3130}'..='\u{318F}' |
+        '\u{3040}'..='\u{309F}' | '\u{30A0}'..='\u{30FF}' |
+        '\u{0400}'..='\u{04FF}' |
+        '\u{0600}'..='\u{06FF}' |
+        '\u{0590}'..='\u{05FF}' |
+        '\u{0E00}'..='\u{0E7F}' |
+        '\u{0900}'..='\u{097F}'
     )
 }
 
-fn extract_mb_series_cover(series_node: &serde_json::Value) -> Option<String> {
+pub fn extract_mb_series_title_info(
+    series_node: &serde_json::Value,
+) -> (String, Option<String>, Option<String>, Option<String>, Vec<String>) {
+    let mut english_title: Option<String> = None;
+    let mut romaji_title: Option<String> = None;
+    let mut native_title: Option<String> = None;
+    let mut aliases: Vec<String> = Vec::new();
+
+    let top_title = series_node
+        .get("title")
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    if let Some(ref t) = top_title {
+        aliases.push(t.clone());
+    }
+
+    if let Some(titles) = series_node.get("titles").and_then(|v| v.as_array()) {
+        for item in titles {
+            let lang = item.get("language").and_then(|v| v.as_str()).unwrap_or("");
+            let traits = item.get("traits").and_then(|v| v.as_array());
+            let is_official = traits.map_or(false, |tr| tr.iter().any(|t| t.as_str() == Some("official")));
+            let is_native = traits.map_or(false, |tr| tr.iter().any(|t| t.as_str() == Some("native")));
+            let is_primary = item.get("is_primary").and_then(|v| v.as_bool()).unwrap_or(false);
+            let t = item.get("title").and_then(|v| v.as_str()).map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+
+            let Some(title_str) = t else { continue; };
+
+            if !aliases.contains(&title_str) {
+                aliases.push(title_str.clone());
+            }
+
+            if lang == "en" || lang == "english" {
+                if english_title.is_none() || is_official || is_primary {
+                    english_title = Some(title_str.clone());
+                }
+            } else if lang == "ja-Latn" || lang == "ko-Latn" || lang.ends_with("-Latn") {
+                if romaji_title.is_none() || is_primary {
+                    romaji_title = Some(title_str.clone());
+                }
+            } else if is_native {
+                if native_title.is_none() || is_primary {
+                    native_title = Some(title_str.clone());
+                }
+            }
+        }
+    }
+
+    let series_id = series_node.get("id").and_then(|v| v.as_i64()).unwrap_or(0);
+    let display_title = english_title
+        .as_deref()
+        .or_else(|| romaji_title.as_deref().filter(|s| is_latin_script(s)))
+        .or_else(|| top_title.as_deref().filter(|s| is_latin_script(s)))
+        .or_else(|| aliases.iter().find(|s| is_latin_script(s)).map(|s| s.as_str()))
+        .or_else(|| top_title.as_deref())
+        .or_else(|| aliases.first().map(|s| s.as_str()))
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("MangaBaka Series {series_id}"));
+
+    (display_title, english_title, romaji_title, native_title, aliases)
+}
+
+#[allow(dead_code)]
+pub fn extract_mb_series_title(series_node: &serde_json::Value) -> String {
+    let (display, _, _, _, _) = extract_mb_series_title_info(series_node);
+    display
+}
+
+fn extract_url_from_image_size(node: &serde_json::Value) -> Option<String> {
+    if let Some(s) = node.as_str() {
+        let t = s.trim();
+        if !t.is_empty() {
+            return Some(t.to_string());
+        }
+    }
+    if let Some(obj) = node.as_object() {
+        for dpr in ["x2", "x1", "x3", "url"] {
+            if let Some(s) = obj.get(dpr).and_then(|v| v.as_str()) {
+                let t = s.trim();
+                if !t.is_empty() {
+                    return Some(t.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn extract_mb_series_cover(series_node: &serde_json::Value) -> Option<String> {
     if let Some(cover) = series_node.get("cover") {
         if let Some(s) = cover.as_str() {
-            return Some(s.to_string());
+            let t = s.trim();
+            if !t.is_empty() && is_safe_cover_url(t) {
+                return Some(t.to_string());
+            }
         }
         if let Some(obj) = cover.as_object() {
-            for key in ["x250", "x350", "x500", "raw"] {
-                if let Some(u) = obj.get(key).and_then(|v| v.as_str()) {
-                    if !u.trim().is_empty() {
-                        return Some(u.trim().to_string());
+            for key in ["x350", "x250", "raw", "x150", "x500"] {
+                if let Some(val) = obj.get(key) {
+                    if let Some(url) = extract_url_from_image_size(val) {
+                        if is_safe_cover_url(&url) {
+                            return Some(url);
+                        }
                     }
                 }
             }
@@ -654,7 +757,7 @@ impl MangaBakaClient {
         let limit = 50;
 
         loop {
-            let endpoint = format!("/v2/my/library?page={page}&limit={limit}");
+            let endpoint = format!("/v2/my/library?page={page}&limit={limit}&schema=full");
             let resp = match self
                 .authenticated_request(reqwest::Method::GET, &endpoint)?
                 .send()
@@ -743,9 +846,9 @@ impl MangaBakaClient {
                     continue;
                 }
 
-                let title = series_node
-                    .map(extract_mb_series_title)
-                    .unwrap_or_else(|| format!("MangaBaka Series {series_id}"));
+                let (title, english_title, romaji_title, native_title, aliases) = series_node
+                    .map(extract_mb_series_title_info)
+                    .unwrap_or_else(|| (format!("MangaBaka Series {series_id}"), None, None, None, Vec::new()));
 
                 let cover_url = series_node.and_then(extract_mb_series_cover);
 
@@ -767,6 +870,10 @@ impl MangaBakaClient {
                 items.push(MangaBakaLibraryItem {
                     series_id,
                     title,
+                    english_title,
+                    romaji_title,
+                    native_title,
+                    aliases,
                     cover_url,
                     state,
                     progress_chapter,

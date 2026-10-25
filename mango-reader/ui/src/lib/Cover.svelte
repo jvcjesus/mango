@@ -22,6 +22,6 @@
 <span class="cover" class:tilt style:background-color={print[0]} style:color={print[1]}>
   <span class="glyph display" aria-hidden="true">{glyph}</span>
   {#if src && failedSrc !== src}
-    <img {src} alt="" loading="lazy" decoding="async" onerror={() => (failedSrc = src)} />
+    <img {src} alt={`${title} cover`} loading="lazy" decoding="async" referrerpolicy="no-referrer" onerror={() => (failedSrc = src)} />
   {/if}
 </span>

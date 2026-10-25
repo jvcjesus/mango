@@ -22,11 +22,12 @@ const STATUSES: [(i32, &str); 6] = [
 const SEARCH: &str = "query ($q: String) { Page(perPage: 20) { media(search: $q, type: MANGA, format_not_in: [NOVEL]) {
     id title { userPreferred english romaji native } format chapters volumes description startDate { year } siteUrl } } }";
 // Scores are asked for out of 100 whatever scale the account shows them in.
+use crate::pipeline::mangabaka::{is_latin_script, is_safe_cover_url};
 const FIND: &str = "query ($user: Int, $media: Int) { Page { mediaList(userId: $user, mediaId: $media, type: MANGA) {
     id status progress progressVolumes score(format: POINT_100) media { chapters volumes } } } }";
 const SAVE: &str = "mutation ($media: Int, $status: MediaListStatus, $progress: Int, $progressVolumes: Int, $score: Int) {
     SaveMediaListEntry(mediaId: $media, status: $status, progress: $progress, progressVolumes: $progressVolumes, scoreRaw: $score) { id } }";
-const USER_LIST: &str = "query ($userId: Int, $page: Int) { Page(page: $page, perPage: 50) { pageInfo { total hasNextPage } mediaList(userId: $userId, type: MANGA, sort: UPDATED_TIME_DESC) { id mediaId status progress progressVolumes score(format: POINT_100) updatedAt media { id title { userPreferred english romaji native } coverImage { extraLarge large medium } format status chapters volumes siteUrl } } } }";
+const USER_LIST: &str = "query ($userId: Int, $page: Int) { Page(page: $page, perPage: 50) { pageInfo { total hasNextPage } mediaList(userId: $userId, type: MANGA, sort: UPDATED_TIME_DESC) { id mediaId status progress progressVolumes score(format: POINT_100) updatedAt media { id title { userPreferred english romaji native } synonyms coverImage { extraLarge large medium } format status chapters volumes siteUrl } } } }";
 
 fn request(
     http: &Client,
@@ -183,7 +184,15 @@ pub(crate) struct AniListMangaListEntry {
     pub id: i64,
     pub media_id: i64,
     pub title: String,
+    pub english_title: Option<String>,
+    pub romaji_title: Option<String>,
+    pub native_title: Option<String>,
+    pub user_preferred_title: Option<String>,
+    pub aliases: Vec<String>,
     pub cover_url: Option<String>,
+    pub extra_large_cover_url: Option<String>,
+    pub large_cover_url: Option<String>,
+    pub medium_cover_url: Option<String>,
     pub status: String, // "CURRENT", "PLANNING", "COMPLETED", "PAUSED", "DROPPED", "REPEATING"
     pub progress_chapter: f64,
     pub progress_volume: f64,
@@ -238,22 +247,81 @@ pub(crate) async fn fetch_user_manga_list(
                 .unwrap_or_else(|| crate::db::now());
 
             let media = &item["media"];
-            let mut title = text(&media["title"]["userPreferred"]);
-            if title.is_empty() {
-                title = text(&media["title"]["english"]);
+            let title_node = &media["title"];
+            let english_title = title_node["english"]
+                .as_str()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let romaji_title = title_node["romaji"]
+                .as_str()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let user_preferred_title = title_node["userPreferred"]
+                .as_str()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let native_title = title_node["native"]
+                .as_str()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+
+            let mut aliases: Vec<String> = Vec::new();
+            if let Some(ref e) = english_title {
+                aliases.push(e.clone());
             }
-            if title.is_empty() {
-                title = text(&media["title"]["romaji"]);
+            if let Some(ref r) = romaji_title {
+                if !aliases.contains(r) {
+                    aliases.push(r.clone());
+                }
             }
-            if title.is_empty() {
-                title = format!("AniList Media {}", media_id);
+            if let Some(ref u) = user_preferred_title {
+                if !aliases.contains(u) {
+                    aliases.push(u.clone());
+                }
+            }
+            if let Some(ref n) = native_title {
+                if !aliases.contains(n) {
+                    aliases.push(n.clone());
+                }
+            }
+            if let Some(syn_arr) = media["synonyms"].as_array() {
+                for s_val in syn_arr {
+                    if let Some(s) = s_val.as_str() {
+                        let tr = s.trim().to_string();
+                        if !tr.is_empty() && !aliases.contains(&tr) {
+                            aliases.push(tr);
+                        }
+                    }
+                }
             }
 
-            let cover_url = media["coverImage"]["extraLarge"]
+            let title = english_title
+                .as_deref()
+                .or_else(|| user_preferred_title.as_deref().filter(|s| is_latin_script(s)))
+                .or_else(|| romaji_title.as_deref().filter(|s| is_latin_script(s)))
+                .or_else(|| user_preferred_title.as_deref())
+                .or_else(|| romaji_title.as_deref())
+                .or_else(|| native_title.as_deref())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("AniList Media {}", media_id));
+
+            let extra_large_cover_url = media["coverImage"]["extraLarge"]
                 .as_str()
-                .or_else(|| media["coverImage"]["large"].as_str())
-                .or_else(|| media["coverImage"]["medium"].as_str())
+                .filter(|s| is_safe_cover_url(s))
                 .map(|s| s.to_string());
+            let large_cover_url = media["coverImage"]["large"]
+                .as_str()
+                .filter(|s| is_safe_cover_url(s))
+                .map(|s| s.to_string());
+            let medium_cover_url = media["coverImage"]["medium"]
+                .as_str()
+                .filter(|s| is_safe_cover_url(s))
+                .map(|s| s.to_string());
+
+            let cover_url = extra_large_cover_url
+                .clone()
+                .or_else(|| large_cover_url.clone())
+                .or_else(|| medium_cover_url.clone());
 
             let format = label(&media["format"]);
             let format_str = if format.is_empty() {
@@ -269,7 +337,15 @@ pub(crate) async fn fetch_user_manga_list(
                 id,
                 media_id,
                 title,
+                english_title,
+                romaji_title,
+                native_title,
+                user_preferred_title,
+                aliases,
                 cover_url,
+                extra_large_cover_url,
+                large_cover_url,
+                medium_cover_url,
                 status,
                 progress_chapter: progress,
                 progress_volume: progress_volumes,

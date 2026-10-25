@@ -630,6 +630,8 @@ export const setTrackedStatus = (id: number, enabled: boolean) =>
 
 export interface TrackerItemDetail {
   trackerId: string;
+  title?: string | null;
+  coverUrl?: string | null;
   status: string;
   normalizedStatus: string;
   progressChapter?: number | null;
@@ -643,6 +645,7 @@ export interface UnifiedTrackedItem {
   id: string;
   title: string;
   coverUrl?: string | null;
+  aliases?: string[];
   normalizedStatus: string;
   format?: string | null;
   anilist?: TrackerItemDetail | null;

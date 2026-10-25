@@ -10,9 +10,9 @@ use rust_embed::RustEmbed;
 #[folder = "ui/dist"]
 struct Assets;
 
-/// The page may load its own scripts, styles and fonts, and images from Mango only.
+/// The page may load its own scripts, styles and fonts, images from Mango, and external HTTPS covers.
 /// Inline styles are allowed because the UI sets colours and sizes through them.
-const POLICY: &str = "default-src 'self'; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; \
+const POLICY: &str = "default-src 'self'; img-src 'self' data: blob: https:; style-src 'self' 'unsafe-inline'; \
                       object-src 'none'; base-uri 'self'; frame-ancestors 'self'";
 
 /// Serves a built file, or the app's page for any path that is not a file.

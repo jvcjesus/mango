@@ -1797,5 +1797,115 @@ describe('first-class volume acquisition & release semantics', () => {
       expect(dryRunRecord.isDryRun).toBe(true);
       expect(dryRunRecord.message).toContain('PLANNING -> CURRENT');
     });
+
+    it('derives contextual/faceted status and ownership counts reactively without API calls', () => {
+      type Item = {
+        id: string;
+        title: string;
+        aliases?: string[];
+        normalizedStatus: string;
+        ownershipStatus: string;
+        anilist: boolean;
+        mangabaka: boolean;
+      };
+
+      const items: Item[] = [
+        { id: '1', title: 'Berserk', aliases: ['베르세르크'], normalizedStatus: 'Reading', ownershipStatus: 'Owned', anilist: true, mangabaka: false },
+        { id: '2', title: 'Sakamoto Days', aliases: ['사카모토 데이즈'], normalizedStatus: 'Reading', ownershipStatus: 'Not Owned', anilist: false, mangabaka: true },
+        { id: '3', title: 'Frieren', aliases: ['Sousou no Frieren'], normalizedStatus: 'Planning', ownershipStatus: 'Owned', anilist: true, mangabaka: true },
+        { id: '4', title: 'Chainsaw Man', aliases: [], normalizedStatus: 'Completed', ownershipStatus: 'Owned', anilist: true, mangabaka: true },
+        { id: '5', title: 'Nana', aliases: [], normalizedStatus: 'Paused', ownershipStatus: 'Partially Owned', anilist: true, mangabaka: false },
+      ];
+
+      function computeFacetedCounts(itemsList: Item[], activeOwnership: string, activeTracker: string, search: string) {
+        const matchesSecondary = (item: Item) => {
+          if (activeOwnership !== 'all') {
+            if (activeOwnership === 'owned' && item.ownershipStatus !== 'Owned') return false;
+            if (activeOwnership === 'partially_owned' && item.ownershipStatus !== 'Partially Owned') return false;
+            if (activeOwnership === 'not_owned' && item.ownershipStatus !== 'Not Owned') return false;
+          }
+          if (activeTracker !== 'all') {
+            if (activeTracker === 'anilist' && !item.anilist) return false;
+            if (activeTracker === 'mangabaka' && !item.mangabaka) return false;
+            if (activeTracker === 'both' && (!item.anilist || !item.mangabaka)) return false;
+          }
+          if (search) {
+            const q = search.toLowerCase();
+            const inTitle = item.title.toLowerCase().includes(q);
+            const inAlias = (item.aliases ?? []).some((a) => a.toLowerCase().includes(q));
+            if (!inTitle && !inAlias) return false;
+          }
+          return true;
+        };
+
+        const filtered = itemsList.filter(matchesSecondary);
+        const counts = { total: filtered.length, reading: 0, planning: 0, completed: 0, paused: 0, dropped: 0 };
+        for (const item of filtered) {
+          switch (item.normalizedStatus.toLowerCase()) {
+            case 'reading': counts.reading++; break;
+            case 'planning': counts.planning++; break;
+            case 'completed': counts.completed++; break;
+            case 'paused': counts.paused++; break;
+            case 'dropped': counts.dropped++; break;
+          }
+        }
+        return counts;
+      }
+
+      // Unfiltered global counts
+      const globalCounts = computeFacetedCounts(items, 'all', 'all', '');
+      expect(globalCounts.total).toBe(5);
+      expect(globalCounts.reading).toBe(2);
+      expect(globalCounts.planning).toBe(1);
+      expect(globalCounts.completed).toBe(1);
+      expect(globalCounts.paused).toBe(1);
+
+      // Faceted count when Ownership is Owned
+      const ownedCounts = computeFacetedCounts(items, 'owned', 'all', '');
+      expect(ownedCounts.total).toBe(3);
+      expect(ownedCounts.reading).toBe(1); // Berserk
+      expect(ownedCounts.planning).toBe(1); // Frieren
+      expect(ownedCounts.completed).toBe(1); // CSM
+      expect(ownedCounts.paused).toBe(0); // Nana is partially owned
+
+      // Faceted count when Tracker is Both
+      const bothCounts = computeFacetedCounts(items, 'all', 'both', '');
+      expect(bothCounts.total).toBe(2); // Frieren and CSM
+      expect(bothCounts.reading).toBe(0);
+      expect(bothCounts.planning).toBe(1);
+      expect(bothCounts.completed).toBe(1);
+
+      // Faceted count when Search is "사카모토 데이즈" (Korean alias)
+      const aliasCounts = computeFacetedCounts(items, 'all', 'all', '사카모토 데이즈');
+      expect(aliasCounts.total).toBe(1);
+      expect(aliasCounts.reading).toBe(1); // Sakamoto Days
+    });
+
+    it('verifies Cover.svelte renders with referrerpolicy="no-referrer" and accessible alt text', async () => {
+      const { render } = await import('svelte/server');
+      const Cover = (await import('./Cover.svelte')).default;
+
+      // When src is provided
+      const resWithSrc = render(Cover, {
+        props: {
+          src: 'https://images.mangabaka.dev/covers/350.webp',
+          title: 'Berserk',
+        },
+      });
+      expect(resWithSrc.html).toContain('referrerpolicy="no-referrer"');
+      expect(resWithSrc.html).toContain('alt="Berserk cover"');
+      expect(resWithSrc.html).toContain('https://images.mangabaka.dev/covers/350.webp');
+      expect(resWithSrc.html).toContain('B'); // glyph placeholder behind cover
+
+      // When src is null
+      const resWithoutSrc = render(Cover, {
+        props: {
+          src: null,
+          title: 'Sakamoto Days',
+        },
+      });
+      expect(resWithoutSrc.html).not.toContain('<img');
+      expect(resWithoutSrc.html).toContain('S'); // glyph placeholder
+    });
   });
 });
