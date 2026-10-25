@@ -18,28 +18,29 @@ use crate::db::Db;
 use crate::error::{AppError, Result};
 use komga::KomgaClient;
 use mangabaka::MangaBakaClient;
-use std::fs;
 #[allow(unused_imports)]
 pub use optimizer::{
-    check_executable_invocable, count_cbz_pages, is_executable, optimize_cbz, resolve_optimizer_binary,
-    validate_optimizer, BUNDLED_OPTIMIZER_PATH, DEFAULT_IMAGE_QUALITY, DEFAULT_MIN_SAVINGS_PERCENT,
-    DEFAULT_TARGET_HEIGHT, LEGACY_DEFAULT_OPTIMIZER_BIN, MAX_IMAGE_QUALITY, MAX_MIN_SAVINGS_PERCENT,
-    MAX_TARGET_HEIGHT, MIN_IMAGE_QUALITY, MIN_SAVINGS_PERCENT, MIN_TARGET_HEIGHT, OptimizationResult,
-    OptimizerValidationCode, OptimizerValidationResult,
+    BUNDLED_OPTIMIZER_PATH, DEFAULT_IMAGE_QUALITY, DEFAULT_MIN_SAVINGS_PERCENT,
+    DEFAULT_TARGET_HEIGHT, LEGACY_DEFAULT_OPTIMIZER_BIN, MAX_IMAGE_QUALITY,
+    MAX_MIN_SAVINGS_PERCENT, MAX_TARGET_HEIGHT, MIN_IMAGE_QUALITY, MIN_SAVINGS_PERCENT,
+    MIN_TARGET_HEIGHT, OptimizationResult, OptimizerValidationCode, OptimizerValidationResult,
+    check_executable_invocable, count_cbz_pages, is_executable, optimize_cbz,
+    resolve_optimizer_binary, validate_optimizer,
 };
 #[allow(unused_imports)]
-pub use publisher::{canonical_release_name, publish_cbz, PublishOutcome};
-#[allow(unused_imports)]
-pub use validation::{
-    probe_writable_directory, validate_destination_dir, PathValidationCode, PathValidationResult,
-};
+pub use publisher::{PublishOutcome, canonical_release_name, publish_cbz};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
+use std::fs;
 use std::{
     collections::VecDeque,
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
     time::{Duration, SystemTime},
+};
+#[allow(unused_imports)]
+pub use validation::{
+    PathValidationCode, PathValidationResult, probe_writable_directory, validate_destination_dir,
 };
 
 const MAX_RECENT_EVENTS: usize = 50;
@@ -197,6 +198,31 @@ pub struct PipelineEvent {
     pub optimizer_status: String,
     pub komga_status: String,
     pub error: Option<String>,
+    pub mangabaka_id: Option<i64>,
+    pub anilist_id: Option<i64>,
+    pub requested_unit: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepairOutcome {
+    pub status: String,
+    pub canonical_path: String,
+    pub series: String,
+    pub volume: f64,
+    pub mangabaka_id: i64,
+    pub fields_populated: Vec<String>,
+    pub page_count: i64,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepairCbzRequest {
+    pub path: Option<String>,
+    pub series: Option<String>,
+    pub volume: Option<f64>,
+    pub anilist_id: Option<i64>,
+    pub mangabaka_id: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -232,7 +258,10 @@ impl Pipeline {
     }
 
     pub fn verification_policy(&self) -> VerificationPolicy {
-        self.verification_policy.read().map(|p| *p).unwrap_or_default()
+        self.verification_policy
+            .read()
+            .map(|p| *p)
+            .unwrap_or_default()
     }
 
     /// Loads the active pipeline configuration from settings and state, enriched with live validation statuses.
@@ -240,7 +269,8 @@ impl Pipeline {
         let (raw_cfg, mangabaka_token, komga_api_key) = self.load_internal_config().await?;
 
         // Authoritative server-side runtime validation of library destinations and optimizer
-        let library_status = validate_destination_dir(raw_cfg.library_dir.as_deref(), raw_cfg.enabled);
+        let library_status =
+            validate_destination_dir(raw_cfg.library_dir.as_deref(), raw_cfg.enabled);
         let chinese_library_status =
             validate_destination_dir(raw_cfg.chinese_library_dir.as_deref(), false);
         let optimizer_status = validate_optimizer(raw_cfg.optimizer_bin.as_deref()).await;
@@ -299,22 +329,35 @@ impl Pipeline {
     }
 
     /// Internal helper to load configuration with secrets included for execution.
-    pub(crate) async fn load_internal_config(&self) -> Result<(PipelineConfig, Option<String>, Option<String>)> {
+    pub(crate) async fn load_internal_config(
+        &self,
+    ) -> Result<(PipelineConfig, Option<String>, Option<String>)> {
         self.db
             .call(|conn| {
-                let enabled = crate::settings::get::<bool>(conn, "pipeline.enabled").unwrap_or(false);
+                let enabled =
+                    crate::settings::get::<bool>(conn, "pipeline.enabled").unwrap_or(false);
                 let library_dir = crate::settings::get::<String>(conn, "pipeline.library_dir");
-                let chinese_library_dir = crate::settings::get::<String>(conn, "pipeline.chinese_library_dir");
-                let mangabaka_enabled = crate::settings::get::<bool>(conn, "pipeline.mangabaka_enabled").unwrap_or(true);
+                let chinese_library_dir =
+                    crate::settings::get::<String>(conn, "pipeline.chinese_library_dir");
+                let mangabaka_enabled =
+                    crate::settings::get::<bool>(conn, "pipeline.mangabaka_enabled")
+                        .unwrap_or(true);
                 let mangabaka_url = crate::settings::get::<String>(conn, "pipeline.mangabaka_url")
                     .or_else(|| Some(mangabaka::DEFAULT_MANGABAKA_API.to_string()));
-                let komga_enabled = crate::settings::get::<bool>(conn, "pipeline.komga_enabled").unwrap_or(false);
+                let komga_enabled =
+                    crate::settings::get::<bool>(conn, "pipeline.komga_enabled").unwrap_or(false);
                 let komga_url = crate::settings::get::<String>(conn, "pipeline.komga_url")
                     .or_else(|| Some(komga::DEFAULT_KOMGA_URL.to_string()));
-                let komga_library_id = crate::settings::get::<String>(conn, "pipeline.komga_library_id");
-                let komga_chinese_library_id = crate::settings::get::<String>(conn, "pipeline.komga_chinese_library_id");
-                let komga_scan_enabled = crate::settings::get::<bool>(conn, "pipeline.komga_scan_enabled").unwrap_or(true);
-                let optimize_enabled = crate::settings::get::<bool>(conn, "pipeline.optimize_enabled").unwrap_or(false);
+                let komga_library_id =
+                    crate::settings::get::<String>(conn, "pipeline.komga_library_id");
+                let komga_chinese_library_id =
+                    crate::settings::get::<String>(conn, "pipeline.komga_chinese_library_id");
+                let komga_scan_enabled =
+                    crate::settings::get::<bool>(conn, "pipeline.komga_scan_enabled")
+                        .unwrap_or(true);
+                let optimize_enabled =
+                    crate::settings::get::<bool>(conn, "pipeline.optimize_enabled")
+                        .unwrap_or(false);
 
                 // Migration semantics: untouched legacy default path is migrated to None (using bundled path)
                 let raw_bin = crate::settings::get::<String>(conn, "pipeline.optimizer_bin");
@@ -328,8 +371,9 @@ impl Pipeline {
                     .unwrap_or(optimizer::DEFAULT_TARGET_HEIGHT);
                 let image_quality = crate::settings::get::<u32>(conn, "pipeline.image_quality")
                     .unwrap_or(optimizer::DEFAULT_IMAGE_QUALITY);
-                let min_savings_percent = crate::settings::get::<u32>(conn, "pipeline.min_savings_percent")
-                    .unwrap_or(optimizer::DEFAULT_MIN_SAVINGS_PERCENT);
+                let min_savings_percent =
+                    crate::settings::get::<u32>(conn, "pipeline.min_savings_percent")
+                        .unwrap_or(optimizer::DEFAULT_MIN_SAVINGS_PERCENT);
 
                 let mangabaka_token = crate::db::state(conn, "pipeline.mangabaka_token")?;
                 let komga_api_key = crate::db::state(conn, "pipeline.komga_api_key")?;
@@ -390,14 +434,18 @@ impl Pipeline {
         };
 
         // Range validation for optimizer quality settings
-        if patch.target_height < optimizer::MIN_TARGET_HEIGHT || patch.target_height > optimizer::MAX_TARGET_HEIGHT {
+        if patch.target_height < optimizer::MIN_TARGET_HEIGHT
+            || patch.target_height > optimizer::MAX_TARGET_HEIGHT
+        {
             return Err(AppError::bad_request(format!(
                 "Target page height must be between {} and {} px",
                 optimizer::MIN_TARGET_HEIGHT,
                 optimizer::MAX_TARGET_HEIGHT
             )));
         }
-        if patch.image_quality < optimizer::MIN_IMAGE_QUALITY || patch.image_quality > optimizer::MAX_IMAGE_QUALITY {
+        if patch.image_quality < optimizer::MIN_IMAGE_QUALITY
+            || patch.image_quality > optimizer::MAX_IMAGE_QUALITY
+        {
             return Err(AppError::bad_request(format!(
                 "Image quality must be between {} and {}",
                 optimizer::MIN_IMAGE_QUALITY,
@@ -422,8 +470,13 @@ impl Pipeline {
                 )));
             }
 
-            if patch.chinese_library_dir.as_deref().is_some_and(|s| !s.trim().is_empty()) {
-                let zh_status = validate_destination_dir(patch.chinese_library_dir.as_deref(), false);
+            if patch
+                .chinese_library_dir
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+            {
+                let zh_status =
+                    validate_destination_dir(patch.chinese_library_dir.as_deref(), false);
                 if !zh_status.is_valid() {
                     return Err(AppError::bad_request(format!(
                         "Cannot enable acquisition pipeline: Chinese manga library error: {}",
@@ -448,20 +501,62 @@ impl Pipeline {
                 let mut map = serde_json::Map::new();
 
                 map.insert("pipeline.enabled".into(), serde_json::json!(patch.enabled));
-                map.insert("pipeline.library_dir".into(), serde_json::json!(patch.library_dir));
-                map.insert("pipeline.chinese_library_dir".into(), serde_json::json!(patch.chinese_library_dir));
-                map.insert("pipeline.mangabaka_enabled".into(), serde_json::json!(patch.mangabaka_enabled));
-                map.insert("pipeline.mangabaka_url".into(), serde_json::json!(patch.mangabaka_url));
-                map.insert("pipeline.komga_enabled".into(), serde_json::json!(patch.komga_enabled));
-                map.insert("pipeline.komga_url".into(), serde_json::json!(patch.komga_url));
-                map.insert("pipeline.komga_library_id".into(), serde_json::json!(patch.komga_library_id));
-                map.insert("pipeline.komga_chinese_library_id".into(), serde_json::json!(patch.komga_chinese_library_id));
-                map.insert("pipeline.komga_scan_enabled".into(), serde_json::json!(patch.komga_scan_enabled));
-                map.insert("pipeline.optimize_enabled".into(), serde_json::json!(patch.optimize_enabled));
-                map.insert("pipeline.optimizer_bin".into(), serde_json::json!(patch.optimizer_bin));
-                map.insert("pipeline.target_height".into(), serde_json::json!(patch.target_height));
-                map.insert("pipeline.image_quality".into(), serde_json::json!(patch.image_quality));
-                map.insert("pipeline.min_savings_percent".into(), serde_json::json!(patch.min_savings_percent));
+                map.insert(
+                    "pipeline.library_dir".into(),
+                    serde_json::json!(patch.library_dir),
+                );
+                map.insert(
+                    "pipeline.chinese_library_dir".into(),
+                    serde_json::json!(patch.chinese_library_dir),
+                );
+                map.insert(
+                    "pipeline.mangabaka_enabled".into(),
+                    serde_json::json!(patch.mangabaka_enabled),
+                );
+                map.insert(
+                    "pipeline.mangabaka_url".into(),
+                    serde_json::json!(patch.mangabaka_url),
+                );
+                map.insert(
+                    "pipeline.komga_enabled".into(),
+                    serde_json::json!(patch.komga_enabled),
+                );
+                map.insert(
+                    "pipeline.komga_url".into(),
+                    serde_json::json!(patch.komga_url),
+                );
+                map.insert(
+                    "pipeline.komga_library_id".into(),
+                    serde_json::json!(patch.komga_library_id),
+                );
+                map.insert(
+                    "pipeline.komga_chinese_library_id".into(),
+                    serde_json::json!(patch.komga_chinese_library_id),
+                );
+                map.insert(
+                    "pipeline.komga_scan_enabled".into(),
+                    serde_json::json!(patch.komga_scan_enabled),
+                );
+                map.insert(
+                    "pipeline.optimize_enabled".into(),
+                    serde_json::json!(patch.optimize_enabled),
+                );
+                map.insert(
+                    "pipeline.optimizer_bin".into(),
+                    serde_json::json!(patch.optimizer_bin),
+                );
+                map.insert(
+                    "pipeline.target_height".into(),
+                    serde_json::json!(patch.target_height),
+                );
+                map.insert(
+                    "pipeline.image_quality".into(),
+                    serde_json::json!(patch.image_quality),
+                );
+                map.insert(
+                    "pipeline.min_savings_percent".into(),
+                    serde_json::json!(patch.min_savings_percent),
+                );
 
                 crate::settings::put(conn, &map)?;
 
@@ -492,13 +587,23 @@ impl Pipeline {
     }
 
     /// Tests connection to MangaBaka API.
-    pub async fn test_mangabaka(&self, url: Option<String>, token: Option<String>) -> Result<String> {
+    pub async fn test_mangabaka(
+        &self,
+        url: Option<String>,
+        token: Option<String>,
+    ) -> Result<String> {
         let actual_token = match token {
             Some(t) if t.trim() == "********" || t.trim().is_empty() => {
-                self.db.call(|conn| crate::db::state(conn, "pipeline.mangabaka_token")).await?
+                self.db
+                    .call(|conn| crate::db::state(conn, "pipeline.mangabaka_token"))
+                    .await?
             }
             Some(t) => Some(t),
-            None => self.db.call(|conn| crate::db::state(conn, "pipeline.mangabaka_token")).await?,
+            None => {
+                self.db
+                    .call(|conn| crate::db::state(conn, "pipeline.mangabaka_token"))
+                    .await?
+            }
         };
 
         let client = MangaBakaClient::new(self.http.clone(), url, actual_token);
@@ -509,10 +614,16 @@ impl Pipeline {
     pub async fn test_komga(&self, url: Option<String>, api_key: Option<String>) -> Result<String> {
         let actual_key = match api_key {
             Some(k) if k.trim() == "********" || k.trim().is_empty() => {
-                self.db.call(|conn| crate::db::state(conn, "pipeline.komga_api_key")).await?
+                self.db
+                    .call(|conn| crate::db::state(conn, "pipeline.komga_api_key"))
+                    .await?
             }
             Some(k) => Some(k),
-            None => self.db.call(|conn| crate::db::state(conn, "pipeline.komga_api_key")).await?,
+            None => {
+                self.db
+                    .call(|conn| crate::db::state(conn, "pipeline.komga_api_key"))
+                    .await?
+            }
         };
 
         let client = KomgaClient::new(self.http.clone(), url, actual_key);
@@ -593,7 +704,9 @@ impl Pipeline {
                     );
                 }
                 Err(e) => {
-                    tracing::warn!("KOMGA: error checking release indexing during verification: {e}");
+                    tracing::warn!(
+                        "KOMGA: error checking release indexing during verification: {e}"
+                    );
                 }
             }
 
@@ -621,7 +734,8 @@ impl Pipeline {
         source_cbz: &Path,
         job: &crate::downloads::Job,
     ) -> Result<AcquisitionOutcome> {
-        self.process_download_with_progress(source_cbz, job, |_, _, _| {}).await
+        self.process_download_with_progress(source_cbz, job, |_, _, _| {})
+            .await
     }
 
     /// Executes the pipeline reporting lifecycle stages to the provided callback.
@@ -655,9 +769,36 @@ impl Pipeline {
             .unwrap_or_default()
             .as_secs();
 
+        let requested_unit = if is_volume {
+            if release_num.fract() == 0.0 {
+                format!("Volume {}", release_num as i64)
+            } else {
+                format!("Volume {release_num}")
+            }
+        } else if release_num.fract() == 0.0 {
+            format!("Chapter {}", release_num as i64)
+        } else {
+            format!("Chapter {release_num}")
+        };
+
+        let (anilist_id, mangabaka_id) = self.resolve_tracker_ids(job.manga_id, &job.title).await;
+        let mut resolved_mangabaka_id = mangabaka_id;
+        let mut resolved_release_id: Option<String> = None;
+        let mut resolved_enrichment: Option<mangabaka::MangaBakaEnrichment> = None;
+
         // 1. Determine destination permanent library root
-        let is_chinese = job.lang.as_deref().map(|l| l.to_lowercase()).map(|l| l == "zh" || l.contains("chinese") || l.contains("mandarin")).unwrap_or(false);
-        let dest_root = if is_chinese && config.chinese_library_dir.as_deref().is_some_and(|p| !p.trim().is_empty()) {
+        let is_chinese = job
+            .lang
+            .as_deref()
+            .map(|l| l.to_lowercase())
+            .map(|l| l == "zh" || l.contains("chinese") || l.contains("mandarin"))
+            .unwrap_or(false);
+        let dest_root = if is_chinese
+            && config
+                .chinese_library_dir
+                .as_deref()
+                .is_some_and(|p| !p.trim().is_empty())
+        {
             PathBuf::from(config.chinese_library_dir.as_ref().unwrap())
         } else if let Some(dir) = &config.library_dir {
             PathBuf::from(dir)
@@ -678,6 +819,9 @@ impl Pipeline {
                 optimizer_status: "skipped".to_string(),
                 komga_status: "skipped".to_string(),
                 error: Some(err.to_string()),
+                mangabaka_id: resolved_mangabaka_id,
+                anilist_id,
+                requested_unit: Some(requested_unit.clone()),
             });
             return Err(AppError::bad_request(err));
         };
@@ -685,7 +829,10 @@ impl Pipeline {
         // Safety verification: Authoritatively verify destination is valid and writable before proceeding
         let dest_val = validate_destination_dir(Some(&dest_root.to_string_lossy()), true);
         if !dest_val.is_valid() {
-            let err = format!("Configured library path cannot safely be used: {}", dest_val.message);
+            let err = format!(
+                "Configured library path cannot safely be used: {}",
+                dest_val.message
+            );
             tracing::warn!("PIPELINE: {err}");
             self.record_event(PipelineEvent {
                 id: format!("{}-{}", job.chapter, now),
@@ -701,25 +848,138 @@ impl Pipeline {
                 optimizer_status: "skipped".to_string(),
                 komga_status: "skipped".to_string(),
                 error: Some(err.clone()),
+                mangabaka_id: resolved_mangabaka_id,
+                anilist_id,
+                requested_unit: Some(requested_unit.clone()),
             });
             return Err(AppError::bad_request(err));
         }
 
-        // 2. MangaBaka Enrichment (for volumes)
+        // 2. MangaBaka Volume Metadata Resolution (for volumes)
         let mut mangabaka_status = "skipped".to_string();
         if config.mangabaka_enabled && is_volume {
             on_stage("metadata", "Querying MangaBaka catalog...", None);
-            let mb_client = MangaBakaClient::new(self.http.clone(), config.mangabaka_url.clone(), mb_token);
-            match mb_client.fetch_volume_enrichment(&job.title, release_num).await {
+            let mb_client =
+                MangaBakaClient::new(self.http.clone(), config.mangabaka_url.clone(), mb_token);
+            match mb_client
+                .resolve_volume_metadata(&job.title, anilist_id, mangabaka_id, release_num)
+                .await
+            {
                 Ok(mangabaka::MangaBakaOutcome::Success(enrichment)) => {
-                    match MangaBakaClient::enrich_cbz_archive(source_cbz, &enrichment) {
-                        Ok(true) => mangabaka_status = format!("enriched: vol {}", enrichment.volume),
-                        Ok(false) => mangabaka_status = "enrichment skipped (no ComicInfo)".to_string(),
-                        Err(e) => mangabaka_status = format!("enrichment failed: {e}"),
-                    }
+                    resolved_mangabaka_id = Some(enrichment.series_id);
+                    resolved_release_id = enrichment
+                        .work_id
+                        .clone()
+                        .or_else(|| Some(enrichment.collection_id.clone()));
+                    mangabaka_status = format!(
+                        "resolved: vol {} (series {})",
+                        enrichment.volume, enrichment.series_id
+                    );
+                    resolved_enrichment = Some(enrichment);
                 }
-                Ok(outcome) => mangabaka_status = outcome.description(),
-                Err(e) => mangabaka_status = format!("enrichment query error: {e}"),
+                Ok(mangabaka::MangaBakaOutcome::AmbiguousSeries(n)) => {
+                    let err = format!(
+                        "Found {n} candidate MangaBaka series; match ambiguous for '{}'",
+                        job.title
+                    );
+                    tracing::warn!("PIPELINE: {err}");
+                    self.record_event(PipelineEvent {
+                        id: format!("{}-{}", job.chapter, now),
+                        timestamp: now,
+                        chapter_id: job.chapter,
+                        series: job.title.clone(),
+                        release_name,
+                        is_volume,
+                        number: release_num,
+                        outcome: "error".to_string(),
+                        destination: None,
+                        mangabaka_status: "ambiguous series".to_string(),
+                        optimizer_status: "skipped".to_string(),
+                        komga_status: "skipped".to_string(),
+                        error: Some(err.clone()),
+                        mangabaka_id: None,
+                        anilist_id,
+                        requested_unit: Some(requested_unit.clone()),
+                    });
+                    return Err(AppError::bad_request(err));
+                }
+                Ok(mangabaka::MangaBakaOutcome::AmbiguousCollection(n)) => {
+                    let err = format!(
+                        "Found {n} candidate MangaBaka collections; match ambiguous for '{}'",
+                        job.title
+                    );
+                    tracing::warn!("PIPELINE: {err}");
+                    self.record_event(PipelineEvent {
+                        id: format!("{}-{}", job.chapter, now),
+                        timestamp: now,
+                        chapter_id: job.chapter,
+                        series: job.title.clone(),
+                        release_name,
+                        is_volume,
+                        number: release_num,
+                        outcome: "error".to_string(),
+                        destination: None,
+                        mangabaka_status: "ambiguous collection".to_string(),
+                        optimizer_status: "skipped".to_string(),
+                        komga_status: "skipped".to_string(),
+                        error: Some(err.clone()),
+                        mangabaka_id: resolved_mangabaka_id,
+                        anilist_id,
+                        requested_unit: Some(requested_unit.clone()),
+                    });
+                    return Err(AppError::bad_request(err));
+                }
+                Ok(mangabaka::MangaBakaOutcome::NetworkError(msg))
+                | Ok(mangabaka::MangaBakaOutcome::AuthError(msg)) => {
+                    let err = format!("MangaBaka network/auth error: {msg}");
+                    tracing::warn!("PIPELINE: {err}");
+                    self.record_event(PipelineEvent {
+                        id: format!("{}-{}", job.chapter, now),
+                        timestamp: now,
+                        chapter_id: job.chapter,
+                        series: job.title.clone(),
+                        release_name,
+                        is_volume,
+                        number: release_num,
+                        outcome: "error".to_string(),
+                        destination: None,
+                        mangabaka_status: format!("network error: {msg}"),
+                        optimizer_status: "skipped".to_string(),
+                        komga_status: "skipped".to_string(),
+                        error: Some(err.clone()),
+                        mangabaka_id: resolved_mangabaka_id,
+                        anilist_id,
+                        requested_unit: Some(requested_unit.clone()),
+                    });
+                    return Err(AppError::new(502, "mangabaka_network_error", err));
+                }
+                Ok(outcome) => {
+                    mangabaka_status = outcome.description();
+                    tracing::info!("PIPELINE: MangaBaka outcome: {mangabaka_status}");
+                }
+                Err(e) => {
+                    let err = format!("MangaBaka query error: {e}");
+                    tracing::warn!("PIPELINE: {err}");
+                    self.record_event(PipelineEvent {
+                        id: format!("{}-{}", job.chapter, now),
+                        timestamp: now,
+                        chapter_id: job.chapter,
+                        series: job.title.clone(),
+                        release_name,
+                        is_volume,
+                        number: release_num,
+                        outcome: "error".to_string(),
+                        destination: None,
+                        mangabaka_status: "network error".to_string(),
+                        optimizer_status: "skipped".to_string(),
+                        komga_status: "skipped".to_string(),
+                        error: Some(err.clone()),
+                        mangabaka_id: resolved_mangabaka_id,
+                        anilist_id,
+                        requested_unit: Some(requested_unit.clone()),
+                    });
+                    return Err(AppError::new(502, "mangabaka_network_error", err));
+                }
             }
         }
 
@@ -731,12 +991,19 @@ impl Pipeline {
             optimizer_status = "skipped: Chinese edition (already optimized)".to_string();
             tracing::info!("OPTIMIZER: skipped: Chinese edition (already optimized)");
         } else {
-            on_stage("optimizing", "Optimizing image resolution and compression...", None);
-            let (resolved_bin, bin_source) = optimizer::resolve_optimizer_binary(config.optimizer_bin.as_deref());
+            on_stage(
+                "optimizing",
+                "Optimizing image resolution and compression...",
+                None,
+            );
+            let (resolved_bin, bin_source) =
+                optimizer::resolve_optimizer_binary(config.optimizer_bin.as_deref());
             match resolved_bin {
                 None => {
                     optimizer_status = "failed: optimizer unavailable".to_string();
-                    tracing::warn!("OPTIMIZER: failed: optimizer binary unavailable or not found — original retained");
+                    tracing::warn!(
+                        "OPTIMIZER: failed: optimizer binary unavailable or not found — original retained"
+                    );
                 }
                 Some(ref bin) => {
                     let orig_size = fs::metadata(source_cbz).map(|m| m.len()).unwrap_or(0);
@@ -755,7 +1022,9 @@ impl Pipeline {
                         config.target_height,
                         config.image_quality,
                         config.min_savings_percent,
-                    ).await {
+                    )
+                    .await
+                    {
                         Ok(res) => {
                             optimizer_status = res.reason.clone();
                             if res.applied {
@@ -767,10 +1036,7 @@ impl Pipeline {
                                     config.min_savings_percent
                                 );
                             } else {
-                                tracing::info!(
-                                    "OPTIMIZER: {} — original retained",
-                                    res.reason
-                                );
+                                tracing::info!("OPTIMIZER: {} — original retained", res.reason);
                             }
                         }
                         Err(e) => {
@@ -782,8 +1048,64 @@ impl Pipeline {
             }
         }
 
-        // 4. Safe, Atomic Publication into Komga Library
-        on_stage("publishing", "Publishing to canonical Komga library...", None);
+        // 4. Authoritative ComicInfo.xml Generation & Safe CBZ Rewrite (before canonical publication)
+        on_stage("metadata", "Writing ComicInfo.xml metadata...", None);
+        let comic_params = mangabaka::ComicInfoParams {
+            series: &job.title,
+            volume: job
+                .volume
+                .or_else(|| if is_volume { Some(release_num) } else { None }),
+            number: if is_volume { None } else { Some(release_num) },
+            is_volume,
+            title: Some(&job.name),
+            scanlator: job.scanlator.as_deref().or(job.uploader.as_deref()),
+            notes: None,
+        };
+        match mangabaka::write_comic_info_to_cbz(
+            source_cbz,
+            &comic_params,
+            resolved_enrichment.as_ref(),
+        ) {
+            Ok(pages) => {
+                if let Some(ref e) = resolved_enrichment {
+                    mangabaka_status =
+                        format!("enriched: vol {} (MangaBaka ID {})", e.volume, e.series_id);
+                }
+                tracing::info!(
+                    "PIPELINE: ComicInfo.xml written successfully ({pages} pages verified)"
+                );
+            }
+            Err(e) => {
+                let err = format!("Failed to write ComicInfo.xml metadata: {e}");
+                tracing::warn!("PIPELINE: {err}");
+                self.record_event(PipelineEvent {
+                    id: format!("{}-{}", job.chapter, now),
+                    timestamp: now,
+                    chapter_id: job.chapter,
+                    series: job.title.clone(),
+                    release_name,
+                    is_volume,
+                    number: release_num,
+                    outcome: "error".to_string(),
+                    destination: None,
+                    mangabaka_status: "failed".to_string(),
+                    optimizer_status,
+                    komga_status: "skipped".to_string(),
+                    error: Some(err.clone()),
+                    mangabaka_id: resolved_mangabaka_id,
+                    anilist_id,
+                    requested_unit: Some(requested_unit.clone()),
+                });
+                return Err(AppError::bad_request(err));
+            }
+        }
+
+        // 5. Safe, Atomic Publication into Komga Library
+        on_stage(
+            "publishing",
+            "Publishing to canonical Komga library...",
+            None,
+        );
         let pub_res = publish_cbz(source_cbz, &dest_root, &job.title, is_volume, release_num);
         let outcome_str = match &pub_res {
             Ok(PublishOutcome::Published(_)) => "published",
@@ -809,6 +1131,9 @@ impl Pipeline {
                 optimizer_status,
                 komga_status: "skipped".to_string(),
                 error: Some(e.message.clone()),
+                mangabaka_id: resolved_mangabaka_id,
+                anilist_id,
+                requested_unit: Some(requested_unit.clone()),
             });
             return Err(e);
         }
@@ -818,15 +1143,23 @@ impl Pipeline {
         };
         let canonical_dest_str = canonical_dest.to_string_lossy().to_string();
 
-        // 5. Durably persist publication success BEFORE Komga scan or verification
+        // 6. Durably persist publication success BEFORE Komga scan or verification
         let chapter_id = job.chapter;
         let p_str = canonical_dest_str.clone();
         let target_library_id = if is_chinese {
-            config.komga_chinese_library_id.as_deref().or(config.komga_library_id.as_deref())
+            config
+                .komga_chinese_library_id
+                .as_deref()
+                .or(config.komga_library_id.as_deref())
         } else {
             config.komga_library_id.as_deref()
         };
         let t_lib = target_library_id.map(|s| s.to_string());
+        let mb_id_val = resolved_mangabaka_id;
+        let mb_rel_val = resolved_release_id.clone();
+        let a_id_val = anilist_id;
+        let req_unit_val = requested_unit.clone();
+        let mb_stat_val = mangabaka_status.clone();
 
         let _ = self.db.call(move |conn| {
             conn.execute(
@@ -836,6 +1169,16 @@ impl Pipeline {
             conn.execute(
                 "UPDATE downloads SET published_path = ?2, published_at = ?3, target_library_id = ?4, state = 'verifying', error = 'Published — waiting for Komga' WHERE chapter_id = ?1",
                 rusqlite::params![chapter_id, p_str, now as i64, t_lib],
+            )?;
+            conn.execute(
+                "UPDATE acquisition_history
+                 SET mangabaka_id = COALESCE(?1, mangabaka_id),
+                     mangabaka_release_id = COALESCE(?2, mangabaka_release_id),
+                     anilist_id = COALESCE(?3, anilist_id),
+                     requested_unit = COALESCE(?4, requested_unit),
+                     metadata_status = COALESCE(?5, metadata_status)
+                 WHERE chapter_id = ?6",
+                rusqlite::params![mb_id_val, mb_rel_val.as_deref(), a_id_val, &req_unit_val, &mb_stat_val, chapter_id],
             )?;
             Ok(())
         }).await;
@@ -855,23 +1198,36 @@ impl Pipeline {
                 optimizer_status,
                 komga_status: "skipped: komga disabled".to_string(),
                 error: None,
+                mangabaka_id: resolved_mangabaka_id,
+                anilist_id,
+                requested_unit: Some(requested_unit.clone()),
             });
 
-            let _ = self.db.call(move |conn| {
-                conn.execute("DELETE FROM downloads WHERE chapter_id = ?1", [chapter_id])?;
-                Ok(())
-            }).await;
+            let _ = self
+                .db
+                .call(move |conn| {
+                    conn.execute("DELETE FROM downloads WHERE chapter_id = ?1", [chapter_id])?;
+                    Ok(())
+                })
+                .await;
 
             on_stage("complete", "Acquisition complete", Some(canonical_dest_str));
             return Ok(AcquisitionOutcome::Complete(canonical_dest));
         }
 
-        // 6. Trigger only the configured destination Komga library scan
-        on_stage("komga", "Triggering targeted Komga library scan...", Some(canonical_dest_str.clone()));
+        // 7. Trigger only the configured destination Komga library scan
+        on_stage(
+            "komga",
+            "Triggering targeted Komga library scan...",
+            Some(canonical_dest_str.clone()),
+        );
         let komga_client = KomgaClient::new(self.http.clone(), config.komga_url.clone(), komga_key);
 
         if let Err(e) = komga_client.trigger_scan(target_library_id).await {
-            let err_msg = format!("Published to {}, but Komga scan trigger failed: {}", canonical_dest_str, e.message);
+            let err_msg = format!(
+                "Published to {}, but Komga scan trigger failed: {}",
+                canonical_dest_str, e.message
+            );
             tracing::warn!("PIPELINE: {err_msg}");
 
             self.record_event(PipelineEvent {
@@ -888,6 +1244,9 @@ impl Pipeline {
                 optimizer_status,
                 komga_status: format!("scan trigger failed: {}", e.message),
                 error: Some(err_msg.clone()),
+                mangabaka_id: resolved_mangabaka_id,
+                anilist_id,
+                requested_unit: Some(requested_unit.clone()),
             });
 
             let err_clone = err_msg.clone();
@@ -905,22 +1264,32 @@ impl Pipeline {
             });
         }
 
-        // 7. Bounded Asynchronous Ownership Verification
-        on_stage("verifying", "Ownership verification pending in Komga...", Some(canonical_dest_str.clone()));
+        // 8. Bounded Asynchronous Ownership Verification
+        on_stage(
+            "verifying",
+            "Ownership verification pending in Komga...",
+            Some(canonical_dest_str.clone()),
+        );
         let policy = self.verification_policy();
 
-        let verified = self.poll_verify_release(
-            &komga_client,
-            &job.title,
-            target_library_id,
-            is_volume,
-            release_num,
-            policy,
-        ).await.unwrap_or(false);
+        let verified = self
+            .poll_verify_release(
+                &komga_client,
+                &job.title,
+                target_library_id,
+                is_volume,
+                release_num,
+                policy,
+            )
+            .await
+            .unwrap_or(false);
 
         if verified {
             self.ownership.invalidate(job.manga_id);
-            let _ = self.ownership.get_title_ownership(job.manga_id, &job.title).await;
+            let _ = self
+                .ownership
+                .get_title_ownership(job.manga_id, &job.title)
+                .await;
 
             self.record_event(PipelineEvent {
                 id: format!("{}-{}", job.chapter, now),
@@ -936,14 +1305,24 @@ impl Pipeline {
                 optimizer_status,
                 komga_status: "verified in Komga".to_string(),
                 error: None,
+                mangabaka_id: resolved_mangabaka_id,
+                anilist_id,
+                requested_unit: Some(requested_unit.clone()),
             });
 
-            let _ = self.db.call(move |conn| {
-                conn.execute("DELETE FROM downloads WHERE chapter_id = ?1", [chapter_id])?;
-                Ok(())
-            }).await;
+            let _ = self
+                .db
+                .call(move |conn| {
+                    conn.execute("DELETE FROM downloads WHERE chapter_id = ?1", [chapter_id])?;
+                    Ok(())
+                })
+                .await;
 
-            on_stage("complete", "Acquisition complete — verified in Komga", Some(canonical_dest_str));
+            on_stage(
+                "complete",
+                "Acquisition complete — verified in Komga",
+                Some(canonical_dest_str),
+            );
             Ok(AcquisitionOutcome::Complete(canonical_dest))
         } else {
             // Indexing not visible yet within bounded timeout:
@@ -962,6 +1341,9 @@ impl Pipeline {
                 optimizer_status,
                 komga_status: "pending verification (timeout)".to_string(),
                 error: Some("Published — waiting for Komga".to_string()),
+                mangabaka_id: resolved_mangabaka_id,
+                anilist_id,
+                requested_unit: Some(requested_unit.clone()),
             });
 
             let _ = self.db.call(move |conn| {
@@ -972,9 +1354,256 @@ impl Pipeline {
                 Ok(())
             }).await;
 
-            on_stage("verifying", "Published — waiting for Komga", Some(canonical_dest_str));
+            on_stage(
+                "verifying",
+                "Published — waiting for Komga",
+                Some(canonical_dest_str),
+            );
             Ok(AcquisitionOutcome::PublishedPendingKomga(canonical_dest))
         }
+    }
+
+    /// Resolves known tracker IDs (AniList, MangaBaka) from local databases for a series.
+    pub async fn resolve_tracker_ids(
+        &self,
+        manga_id: i64,
+        series_title: &str,
+    ) -> (Option<i64>, Option<i64>) {
+        let norm_title = mangabaka::normalize_title(series_title);
+        let title_clone = series_title.to_string();
+
+        self.db
+            .call(move |conn| {
+                let mut anilist_id: Option<i64> = None;
+                let mut mangabaka_id: Option<i64> = None;
+
+                // 1. If manga_id is provided, check tracks table for AniList
+                if manga_id > 0 {
+                    if let Ok(id) = conn.query_row(
+                        "SELECT media_id FROM tracks WHERE manga_id = ?1 AND tracker = 2 AND media_id > 0",
+                        [manga_id],
+                        |r| r.get(0),
+                    ) {
+                        anilist_id = Some(id);
+                    }
+                }
+
+                // 2. Check tracker_mappings table for MangaBaka and AniList
+                let mut stmt = conn.prepare(
+                    "SELECT tracker, tracker_id, tracker_title, komga_series_id
+                     FROM tracker_mappings
+                     WHERE confidence = 'resolved'"
+                )?;
+                let mappings: Vec<(String, String, Option<String>, String)> = stmt
+                    .query_map([], |r| {
+                        let tracker: String = r.get(0)?;
+                        let t_id: String = r.get(1)?;
+                        let t_title: Option<String> = r.get(2)?;
+                        let k_id: String = r.get(3)?;
+                        Ok((tracker, t_id, t_title, k_id))
+                    })?
+                    .filter_map(|r| r.ok())
+                    .collect();
+
+                for (tracker, t_id, t_title, k_id) in mappings {
+                    let title_matches = t_title.as_deref().map(mangabaka::normalize_title) == Some(norm_title.clone())
+                        || k_id == norm_title
+                        || (manga_id > 0 && k_id == manga_id.to_string());
+
+                    if title_matches {
+                        if tracker == "mangabaka" && mangabaka_id.is_none() {
+                            if let Ok(parsed) = t_id.parse::<i64>() {
+                                mangabaka_id = Some(parsed);
+                            }
+                        } else if tracker == "anilist" && anilist_id.is_none() {
+                            if let Ok(parsed) = t_id.parse::<i64>() {
+                                anilist_id = Some(parsed);
+                            }
+                        }
+                    }
+                }
+
+                // 3. Fallback: if anilist_id still none and manga_id == 0, check manga table
+                if anilist_id.is_none() {
+                    if let Ok(id) = conn.query_row(
+                        "SELECT t.media_id
+                         FROM manga m
+                         JOIN tracks t ON m.id = t.manga_id
+                         WHERE t.tracker = 2 AND t.media_id > 0 AND (m.title = ?1 OR LOWER(m.title) = ?2)",
+                        rusqlite::params![&title_clone, &norm_title],
+                        |r| r.get(0),
+                    ) {
+                        anilist_id = Some(id);
+                    }
+                }
+
+                Ok((anilist_id, mangabaka_id))
+            })
+            .await
+            .unwrap_or((None, None))
+    }
+
+    /// Reprocesses and repairs ComicInfo.xml metadata for an existing canonical CBZ archive.
+    ///
+    /// Pipeline:
+    /// canonical/test v39
+    /// → stage temporary copy
+    /// → resolve MangaBaka metadata
+    /// → write ComicInfo
+    /// → validate
+    /// → atomic replacement
+    /// → targeted Komga rescan
+    pub async fn repair_canonical_cbz(
+        &self,
+        canonical_path: &Path,
+        series_override: Option<&str>,
+        volume_override: Option<f64>,
+        anilist_id_override: Option<i64>,
+        mangabaka_id_override: Option<i64>,
+    ) -> Result<RepairOutcome> {
+        if !canonical_path.is_file() {
+            return Err(AppError::not_found(format!(
+                "Canonical CBZ file not found: {}",
+                canonical_path.display()
+            )));
+        }
+        publisher::verify_cbz_integrity(canonical_path)?;
+
+        let file_stem = canonical_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+
+        let parsed_vol = crate::release::parse_volume(file_stem);
+        let volume = volume_override.or(parsed_vol).ok_or_else(|| {
+            AppError::bad_request(format!(
+                "Could not determine volume number for {}",
+                canonical_path.display()
+            ))
+        })?;
+
+        let series = if let Some(s) = series_override {
+            s.to_string()
+        } else {
+            canonical_path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .filter(|n| !n.trim().is_empty())
+                .unwrap_or(file_stem)
+                .to_string()
+        };
+
+        let (db_anilist_id, db_mangabaka_id) = self.resolve_tracker_ids(0, &series).await;
+        let anilist_id = anilist_id_override.or(db_anilist_id);
+        let mangabaka_id = mangabaka_id_override.or(db_mangabaka_id);
+
+        let (cfg, mb_token, komga_key) = self.load_internal_config().await?;
+        let mb_client =
+            mangabaka::MangaBakaClient::new(self.http.clone(), cfg.mangabaka_url.clone(), mb_token);
+        let outcome = mb_client
+            .resolve_volume_metadata(&series, anilist_id, mangabaka_id, volume)
+            .await?;
+
+        let enrichment = match outcome {
+            mangabaka::MangaBakaOutcome::Success(e) => e,
+            other => {
+                return Err(AppError::bad_request(format!(
+                    "Cannot repair CBZ: MangaBaka resolution failed: {}",
+                    other.description()
+                )));
+            }
+        };
+
+        let parent = canonical_path.parent().unwrap_or_else(|| Path::new("."));
+        let pid = std::process::id();
+        let temp_path = parent.join(format!(
+            ".{}.repair-{pid}-{}.tmp",
+            canonical_path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .subsec_nanos()
+        ));
+
+        struct CleanupGuard<'a>(&'a Path);
+        impl<'a> Drop for CleanupGuard<'a> {
+            fn drop(&mut self) {
+                let _ = fs::remove_file(self.0);
+            }
+        }
+        let guard = CleanupGuard(&temp_path);
+
+        fs::copy(canonical_path, &temp_path).map_err(|e| {
+            AppError::internal(format!("Failed to stage temporary copy for repair: {e}"))
+        })?;
+
+        let params = mangabaka::ComicInfoParams {
+            series: &series,
+            volume: Some(volume),
+            number: None,
+            is_volume: true,
+            title: enrichment.work_title.as_deref(),
+            scanlator: None,
+            notes: None,
+        };
+        let page_count =
+            mangabaka::write_comic_info_to_cbz(&temp_path, &params, Some(&enrichment))?;
+
+        publisher::verify_cbz_integrity(&temp_path)?;
+
+        fs::rename(&temp_path, canonical_path).map_err(|e| {
+            AppError::internal(format!("Failed to atomically replace canonical CBZ: {e}"))
+        })?;
+        std::mem::forget(guard);
+
+        self.ownership.clear_cache();
+        if cfg.komga_enabled && cfg.komga_scan_enabled {
+            let komga_client =
+                komga::KomgaClient::new(self.http.clone(), cfg.komga_url.clone(), komga_key);
+            let _ = komga_client
+                .trigger_scan(cfg.komga_library_id.as_deref())
+                .await;
+        }
+
+        let fields_populated = vec![
+            "Series".to_string(),
+            "Title".to_string(),
+            "Volume".to_string(),
+            "Summary".to_string(),
+            "Writer".to_string(),
+            "Penciller".to_string(),
+            "Publisher".to_string(),
+            "Genre".to_string(),
+            "Tags".to_string(),
+            "Web".to_string(),
+            "LanguageISO".to_string(),
+            "Year".to_string(),
+            "Month".to_string(),
+            "Day".to_string(),
+            "PageCount".to_string(),
+            "Manga".to_string(),
+        ];
+
+        tracing::info!(
+            "PIPELINE: successfully repaired ComicInfo metadata for {} (series {}, volume {})",
+            canonical_path.display(),
+            series,
+            volume
+        );
+
+        Ok(RepairOutcome {
+            status: "repaired".to_string(),
+            canonical_path: canonical_path.to_string_lossy().to_string(),
+            series,
+            volume,
+            mangabaka_id: enrichment.series_id,
+            fields_populated,
+            page_count: page_count as i64,
+        })
     }
 }
 
@@ -982,7 +1611,7 @@ impl Pipeline {
 mod tests {
     use super::*;
     use std::fs::{self, File};
-    use std::io::Write;
+    use std::io::{Read, Write};
 
     use rusqlite::OptionalExtension;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -991,17 +1620,21 @@ mod tests {
     fn make_test_cbz(path: &Path, content: &str) {
         let file = File::create(path).unwrap();
         let mut zip = zip::ZipWriter::new(file);
-        let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
         zip.start_file("ComicInfo.xml", options).unwrap();
-        zip.write_all(format!("<ComicInfo><Series>{content}</Series></ComicInfo>").as_bytes()).unwrap();
+        zip.write_all(format!("<ComicInfo><Series>{content}</Series></ComicInfo>").as_bytes())
+            .unwrap();
         zip.start_file("001.webp", options).unwrap();
-        zip.write_all(b"fake image bytes").unwrap();
+        zip.write_all(format!("fake image bytes: {content}").as_bytes())
+            .unwrap();
         zip.finish().unwrap();
     }
 
     fn test_db() -> Db {
         let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!("mango-pipetest-db-{}-{n}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("mango-pipetest-db-{}-{n}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         Db::open(&dir.join("test.db")).unwrap()
@@ -1073,8 +1706,14 @@ mod tests {
 
         let loaded = pipeline.load_config().await.unwrap();
         assert!(!loaded.enabled);
-        assert_eq!(loaded.library_dir.as_deref(), Some("/unmounted/future/library"));
-        assert_eq!(loaded.library_status.unwrap().code, PathValidationCode::Missing);
+        assert_eq!(
+            loaded.library_dir.as_deref(),
+            Some("/unmounted/future/library")
+        );
+        assert_eq!(
+            loaded.library_status.unwrap().code,
+            PathValidationCode::Missing
+        );
     }
 
     struct TempDir(std::path::PathBuf);
@@ -1135,7 +1774,10 @@ mod tests {
         pipeline.save_config(config).await.unwrap();
 
         let loaded = pipeline.load_config().await.unwrap();
-        assert_eq!(loaded.optimizer_bin.as_deref(), Some("/custom/tools/my_shrinker"));
+        assert_eq!(
+            loaded.optimizer_bin.as_deref(),
+            Some("/custom/tools/my_shrinker")
+        );
     }
 
     #[tokio::test]
@@ -1157,10 +1799,16 @@ mod tests {
 
         let loaded = pipeline.load_config().await.unwrap();
         assert!(loaded.enabled);
-        assert_eq!(loaded.library_dir.as_deref(), Some(temp_lib.path().to_str().unwrap()));
+        assert_eq!(
+            loaded.library_dir.as_deref(),
+            Some(temp_lib.path().to_str().unwrap())
+        );
         assert!(loaded.komga_enabled);
         assert_eq!(loaded.komga_library_id.as_deref(), Some("lib-en-123"));
-        assert_eq!(loaded.komga_chinese_library_id.as_deref(), Some("lib-zh-456"));
+        assert_eq!(
+            loaded.komga_chinese_library_id.as_deref(),
+            Some("lib-zh-456")
+        );
         assert!(loaded.komga_scan_enabled);
         assert!(loaded.has_komga_api_key);
         // Secret must not be exposed in user-facing config
@@ -1179,7 +1827,8 @@ mod tests {
         let pipeline = Pipeline::new(db);
 
         let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let test_root = std::env::temp_dir().join(format!("mango-pipetest-routes-{}-{n}", std::process::id()));
+        let test_root =
+            std::env::temp_dir().join(format!("mango-pipetest-routes-{}-{n}", std::process::id()));
         let _ = fs::remove_dir_all(&test_root);
         let eng_library = test_root.join("manga");
         let zh_library = test_root.join("manga-chinese");
@@ -1223,8 +1872,13 @@ mod tests {
         };
 
         pipeline.process_download(&eng_cbz, &eng_job).await.unwrap();
-        let expected_eng_path = eng_library.join("English Series").join("English Series v01.cbz");
-        assert!(expected_eng_path.exists(), "English volume published to default library");
+        let expected_eng_path = eng_library
+            .join("English Series")
+            .join("English Series v01.cbz");
+        assert!(
+            expected_eng_path.exists(),
+            "English volume published to default library"
+        );
 
         // 2. Process Chinese Volume -> routes to chinese_library_dir
         let zh_cbz = staging_dir.join("zh_vol2.cbz");
@@ -1252,8 +1906,13 @@ mod tests {
         };
 
         pipeline.process_download(&zh_cbz, &zh_job).await.unwrap();
-        let expected_zh_path = zh_library.join("Chinese Series").join("Chinese Series v02.cbz");
-        assert!(expected_zh_path.exists(), "Chinese volume published to chinese_library_dir");
+        let expected_zh_path = zh_library
+            .join("Chinese Series")
+            .join("Chinese Series v02.cbz");
+        assert!(
+            expected_zh_path.exists(),
+            "Chinese volume published to chinese_library_dir"
+        );
 
         // 3. Duplicate protection: re-running identical file succeeds as a safe no-op
         pipeline.process_download(&eng_cbz, &eng_job).await.unwrap();
@@ -1261,7 +1920,10 @@ mod tests {
         // 4. Refuse silent overwrite: different file for same volume produces conflict
         let diff_cbz = staging_dir.join("diff_vol1.cbz");
         make_test_cbz(&diff_cbz, "Completely Different Release Content");
-        let err = pipeline.process_download(&diff_cbz, &eng_job).await.unwrap_err();
+        let err = pipeline
+            .process_download(&diff_cbz, &eng_job)
+            .await
+            .unwrap_err();
         assert_eq!(err.code, "destination_conflict");
 
         // Verify events recorded in audit log
@@ -1279,7 +1941,8 @@ mod tests {
         let pipeline = Pipeline::new(db);
 
         let n = TEST_COUNTER.fetch_add(1, Ordering::SeqCst);
-        let test_root = std::env::temp_dir().join(format!("mango-pipetest-opt-e2e-{}-{n}", std::process::id()));
+        let test_root =
+            std::env::temp_dir().join(format!("mango-pipetest-opt-e2e-{}-{n}", std::process::id()));
         let _ = fs::remove_dir_all(&test_root);
         let library_dir = test_root.join("manga");
         let staging_dir = test_root.join("staging");
@@ -1441,31 +2104,46 @@ exit 0
         let mut cfg = PipelineConfig::default();
         cfg.target_height = 400;
         let err = pipeline.save_config(cfg).await.unwrap_err();
-        assert!(err.message.contains("Target page height must be between 500 and 10000 px"));
+        assert!(
+            err.message
+                .contains("Target page height must be between 500 and 10000 px")
+        );
 
         // Height too high (> 10000)
         let mut cfg = PipelineConfig::default();
         cfg.target_height = 15000;
         let err = pipeline.save_config(cfg).await.unwrap_err();
-        assert!(err.message.contains("Target page height must be between 500 and 10000 px"));
+        assert!(
+            err.message
+                .contains("Target page height must be between 500 and 10000 px")
+        );
 
         // Quality too low (< 1)
         let mut cfg = PipelineConfig::default();
         cfg.image_quality = 0;
         let err = pipeline.save_config(cfg).await.unwrap_err();
-        assert!(err.message.contains("Image quality must be between 1 and 100"));
+        assert!(
+            err.message
+                .contains("Image quality must be between 1 and 100")
+        );
 
         // Quality too high (> 100)
         let mut cfg = PipelineConfig::default();
         cfg.image_quality = 101;
         let err = pipeline.save_config(cfg).await.unwrap_err();
-        assert!(err.message.contains("Image quality must be between 1 and 100"));
+        assert!(
+            err.message
+                .contains("Image quality must be between 1 and 100")
+        );
 
         // Min savings too high (> 99)
         let mut cfg = PipelineConfig::default();
         cfg.min_savings_percent = 100;
         let err = pipeline.save_config(cfg).await.unwrap_err();
-        assert!(err.message.contains("Minimum size savings percentage must be between 0 and 99%"));
+        assert!(
+            err.message
+                .contains("Minimum size savings percentage must be between 0 and 99%")
+        );
     }
 
     #[tokio::test]
@@ -1530,7 +2208,11 @@ exit 0
 
     #[tokio::test]
     async fn test_scenario_a_publish_scan_immediate_ownership_visibility() {
-        use axum::{http::StatusCode, routing::{get, post}, Json, Router};
+        use axum::{
+            Json, Router,
+            http::StatusCode,
+            routing::{get, post},
+        };
         use serde_json::json;
 
         let db = test_db();
@@ -1634,26 +2316,42 @@ exit 0
             other => panic!("Expected Complete, got {:?}", other),
         };
 
-        assert!(canonical.is_file(), "Canonical published artifact exists on disk");
+        assert!(
+            canonical.is_file(),
+            "Canonical published artifact exists on disk"
+        );
         assert_eq!(
             canonical,
-            library_dir.join("Solo Leveling").join("Solo Leveling v01.cbz")
+            library_dir
+                .join("Solo Leveling")
+                .join("Solo Leveling v01.cbz")
         );
 
         let (ch_path, dl_count): (Option<String>, i64) = db
             .call(|conn| {
                 let p: Option<String> = conn
-                    .query_row("SELECT download_path FROM chapters WHERE id = 301", [], |r| r.get(0))
+                    .query_row(
+                        "SELECT download_path FROM chapters WHERE id = 301",
+                        [],
+                        |r| r.get(0),
+                    )
                     .optional()?
                     .flatten();
-                let c: i64 = conn.query_row("SELECT COUNT(*) FROM downloads WHERE chapter_id = 301", [], |r| r.get(0))?;
+                let c: i64 = conn.query_row(
+                    "SELECT COUNT(*) FROM downloads WHERE chapter_id = 301",
+                    [],
+                    |r| r.get(0),
+                )?;
                 Ok((p, c))
             })
             .await
             .unwrap();
 
         assert_eq!(ch_path.as_deref(), Some(canonical.to_str().unwrap()));
-        assert_eq!(dl_count, 0, "Download queue entry deleted upon Komga verification");
+        assert_eq!(
+            dl_count, 0,
+            "Download queue entry deleted upon Komga verification"
+        );
 
         let events = pipeline.recent_events();
         assert!(!events.is_empty());
@@ -1663,7 +2361,11 @@ exit 0
 
     #[tokio::test]
     async fn test_scenario_b_publish_scan_delayed_ownership_visibility() {
-        use axum::{http::StatusCode, routing::{get, post}, Json, Router};
+        use axum::{
+            Json, Router,
+            http::StatusCode,
+            routing::{get, post},
+        };
         use serde_json::json;
 
         let db = test_db();
@@ -1774,15 +2476,30 @@ exit 0
 
         let outcome = pipeline.process_download(&cbz, &job).await.unwrap();
         assert!(matches!(outcome, AcquisitionOutcome::Complete(_)));
-        assert!(poll_count.load(Ordering::SeqCst) >= 2, "Poll loop ran multiple iterations before Komga observed book");
+        assert!(
+            poll_count.load(Ordering::SeqCst) >= 2,
+            "Poll loop ran multiple iterations before Komga observed book"
+        );
 
-        let dl_count: i64 = db.call(|conn| Ok(conn.query_row("SELECT COUNT(*) FROM downloads WHERE chapter_id = 302", [], |r| r.get(0))?)).await.unwrap();
-        assert_eq!(dl_count, 0, "Download queue cleared after delayed visibility");
+        let dl_count: i64 = db
+            .call(|conn| {
+                Ok(conn.query_row(
+                    "SELECT COUNT(*) FROM downloads WHERE chapter_id = 302",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            dl_count, 0,
+            "Download queue cleared after delayed visibility"
+        );
     }
 
     #[tokio::test]
     async fn test_scenario_c_publish_scan_failure_preserves_artifact_and_retryable() {
-        use axum::{http::StatusCode, routing::post, Router};
+        use axum::{Router, http::StatusCode, routing::post};
 
         let db = test_db();
         let pipeline = Pipeline::new(db.clone());
@@ -1793,11 +2510,10 @@ exit 0
         fs::create_dir_all(&library_dir).unwrap();
         fs::create_dir_all(&staging_dir).unwrap();
 
-        let app = Router::new()
-            .route(
-                "/api/v1/libraries/lib-en/scan",
-                post(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "Komga internal crash") }),
-            );
+        let app = Router::new().route(
+            "/api/v1/libraries/lib-en/scan",
+            post(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "Komga internal crash") }),
+        );
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -1882,7 +2598,11 @@ exit 0
 
     #[tokio::test]
     async fn test_scenario_d_publish_scan_timeout_preserves_artifact_and_pending() {
-        use axum::{http::StatusCode, routing::{get, post}, Json, Router};
+        use axum::{
+            Json, Router,
+            http::StatusCode,
+            routing::{get, post},
+        };
         use serde_json::json;
 
         let db = test_db();
@@ -1997,13 +2717,16 @@ exit 0
             .await
             .unwrap();
 
-        assert_eq!(status_message.as_deref(), Some("Published — waiting for Komga"));
+        assert_eq!(
+            status_message.as_deref(),
+            Some("Published — waiting for Komga")
+        );
         assert!(can_retry_komga);
     }
 
     #[tokio::test]
     async fn test_scenario_g_duplicate_acquisition_blocked_while_komga_pending() {
-        use crate::pipeline::publisher::{publish_cbz, PublishOutcome};
+        use crate::pipeline::publisher::{PublishOutcome, publish_cbz};
 
         let db = test_db();
         let test_root = TempDir::new("scenario-g");
@@ -2034,8 +2757,14 @@ exit 0
         }).await.unwrap();
 
         // 1. Database-level duplicate protection
-        let added = db.call(|conn| crate::downloads::add(conn, &[305])).await.unwrap();
-        assert_eq!(added, 0, "Second acquisition blocked while ownership verification is pending");
+        let added = db
+            .call(|conn| crate::downloads::add(conn, &[305]))
+            .await
+            .unwrap();
+        assert_eq!(
+            added, 0,
+            "Second acquisition blocked while ownership verification is pending"
+        );
 
         // 2. Filesystem-level duplicate protection
         let dup_same = publish_cbz(&cbz1, &library_dir, "Duplicate Guard", true, 1.0).unwrap();
@@ -2043,7 +2772,164 @@ exit 0
 
         let cbz2 = staging_dir.join("dup_vol1_different.cbz");
         make_test_cbz(&cbz2, "Different Unrelated Scanlator Content");
-        let dup_conflict = publish_cbz(&cbz2, &library_dir, "Duplicate Guard", true, 1.0).unwrap_err();
+        let dup_conflict =
+            publish_cbz(&cbz2, &library_dir, "Duplicate Guard", true, 1.0).unwrap_err();
         assert_eq!(dup_conflict.code, "destination_conflict");
+    }
+
+    #[tokio::test]
+    async fn test_pipeline_repair_canonical_cbz() {
+        use axum::{Json, Router, routing::get};
+        use serde_json::json;
+
+        let app = Router::new()
+            .route(
+                "/series/83/collections",
+                get(|| async move {
+                    Json(json!({
+                        "status": 200,
+                        "data": [
+                            {
+                                "id": "col_blue_lock",
+                                "name": "Standard Edition",
+                                "language": "English",
+                                "format": "Digital",
+                                "work_count": 39
+                            }
+                        ]
+                    }))
+                }),
+            )
+            .route(
+                "/series/83",
+                get(|| async move {
+                    Json(json!({
+                        "status": 200,
+                        "data": {
+                            "id": 83,
+                            "title": "Blue Lock",
+                            "synopsis": "Egoist striker search.",
+                            "authors": [
+                                {"name": "Muneyuki Kaneshiro", "role": "Story"},
+                                {"name": "Yusuke Nomura", "role": "Art"}
+                            ],
+                            "genres": ["Shounen", "Sports"],
+                            "tags": ["Soccer", "Battle Royale"],
+                            "publisher": "Kodansha"
+                        }
+                    }))
+                }),
+            )
+            .route(
+                "/collections/col_blue_lock/works",
+                get(|| async move {
+                    Json(json!({
+                        "status": 200,
+                        "data": [
+                            {
+                                "id": "w_39",
+                                "name": "Volume 39",
+                                "volume": 39.0,
+                                "sequence_numeric": 39.0,
+                                "release_date": "2026-01-20",
+                                "pages": 192,
+                                "synopsis": "Neo Egoist League climax."
+                            }
+                        ]
+                    }))
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let db = test_db();
+        let test_root = TempDir::new("repair-test");
+        let series_dir = test_root.path().join("Blue Lock");
+        fs::create_dir_all(&series_dir).unwrap();
+        let cbz_path = series_dir.join("Blue Lock v39.cbz");
+
+        // Create a CBZ with images and NO ComicInfo (like the real acceptance fixture was)
+        {
+            let file = File::create(&cbz_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let opt = zip::write::SimpleFileOptions::default();
+            zip.start_file("001.webp", opt).unwrap();
+            zip.write_all(b"image 1 webp").unwrap();
+            zip.start_file("002.webp", opt).unwrap();
+            zip.write_all(b"image 2 webp").unwrap();
+            zip.finish().unwrap();
+        }
+
+        db.call(move |conn| {
+            crate::settings::set(
+                conn,
+                "pipeline.mangabaka_url",
+                &serde_json::json!(format!("http://127.0.0.1:{port}")),
+            )?;
+            crate::db::set_state(conn, "pipeline.mangabaka_token", "mock-token")?;
+            crate::settings::set(
+                conn,
+                "pipeline.komga_scan_enabled",
+                &serde_json::json!(false),
+            )?;
+            crate::settings::set(conn, "pipeline.komga_enabled", &serde_json::json!(false))?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let pipeline = Pipeline::new(db.clone());
+        let outcome = pipeline
+            .repair_canonical_cbz(
+                &cbz_path,
+                Some("Blue Lock"),
+                Some(39.0),
+                Some(106130),
+                Some(83),
+            )
+            .await
+            .expect("Repair must succeed");
+
+        assert_eq!(outcome.status, "repaired");
+        assert_eq!(outcome.series, "Blue Lock");
+        assert_eq!(outcome.volume, 39.0);
+        assert_eq!(outcome.mangabaka_id, 83);
+        assert_eq!(outcome.page_count, 2);
+
+        // Verify the CBZ now has valid integrity and has ComicInfo.xml
+        publisher::verify_cbz_integrity(&cbz_path).expect("Repaired CBZ has valid integrity");
+
+        let file = File::open(&cbz_path).unwrap();
+        let mut archive = zip::ZipArchive::new(file).unwrap();
+        let mut xml_file = archive
+            .by_name("ComicInfo.xml")
+            .expect("ComicInfo.xml must exist");
+        let mut xml_content = String::new();
+        xml_file.read_to_string(&mut xml_content).unwrap();
+
+        assert!(xml_content.contains("<Series>Blue Lock</Series>"));
+        assert!(xml_content.contains("<Volume>39</Volume>"));
+        assert!(
+            !xml_content.contains("<Number>"),
+            "Number tag must be omitted for volume"
+        );
+        assert!(xml_content.contains("<LanguageISO>en</LanguageISO>"));
+        assert!(xml_content.contains("<Writer>Muneyuki Kaneshiro</Writer>"));
+        assert!(xml_content.contains("<Penciller>Yusuke Nomura</Penciller>"));
+        assert!(xml_content.contains("<Publisher>Kodansha</Publisher>"));
+        assert!(xml_content.contains("<Manga>YesAndRightToLeft</Manga>"));
+        assert!(xml_content.contains("<PageCount>2</PageCount>"));
+
+        // Verify no temporary files remain
+        let dir_entries: Vec<_> = fs::read_dir(&series_dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(dir_entries.len(), 1);
+        assert_eq!(dir_entries[0].to_str().unwrap(), "Blue Lock v39.cbz");
     }
 }

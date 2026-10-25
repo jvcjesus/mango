@@ -15,9 +15,9 @@ pub mod planner;
 pub mod profiles;
 pub mod providers;
 pub mod service;
-pub mod torbox;
 #[cfg(test)]
 pub mod tests;
+pub mod torbox;
 
 use crate::error::Result;
 use serde::{Deserialize, Serialize};
@@ -28,7 +28,10 @@ use std::path::Path;
 pub enum AcquisitionReleaseUnit {
     Volume(f64),
     Chapter(f64),
-    Collection { start: f64, end: f64 },
+    Collection {
+        start: f64,
+        end: f64,
+    },
     MultiRange(Vec<(f64, f64)>),
     MixedCollection {
         volume_start: f64,
@@ -290,6 +293,11 @@ pub struct AcquisitionHistoryRecord {
     pub release_size: Option<u64>,
     pub completed_at: i64,
     pub error: Option<String>,
+    pub mangabaka_id: Option<i64>,
+    pub mangabaka_release_id: Option<String>,
+    pub anilist_id: Option<i64>,
+    pub requested_unit: Option<String>,
+    pub metadata_status: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -360,9 +368,7 @@ pub trait DownloadBackend: Send + Sync {
         file_id: i64,
         destination_part: &Path,
     ) -> impl std::future::Future<Output = Result<u64>> + Send;
-    fn cancel(
-        &self,
-        external_job_id: &str,
-    ) -> impl std::future::Future<Output = Result<()>> + Send;
+    fn cancel(&self, external_job_id: &str)
+    -> impl std::future::Future<Output = Result<()>> + Send;
     fn test_connection(&self) -> impl std::future::Future<Output = Result<String>> + Send;
 }

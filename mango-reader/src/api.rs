@@ -207,6 +207,7 @@ pub fn router(state: Spaces) -> Router {
             "/pipeline/retry-komga/{chapter}",
             post(retry_komga_download),
         )
+        .route("/pipeline/repair-cbz", post(repair_pipeline_cbz))
         .route("/pipeline/events", get(get_pipeline_events))
         .route(
             "/titles/{id}/acquisition-releases",
@@ -260,13 +261,28 @@ pub fn router(state: Spaces) -> Router {
             "/titles/{id}/executions",
             get(get_title_executions).post(post_create_execution),
         )
-        .route("/acquisition/executions/{id}", get(get_acquisition_execution))
-        .route("/acquisition/executions/{id}/start", post(post_start_execution))
-        .route("/acquisition/executions/{id}/cancel", post(post_cancel_execution))
-        .route("/acquisition/executions/{id}/retry", post(post_retry_execution))
+        .route(
+            "/acquisition/executions/{id}",
+            get(get_acquisition_execution),
+        )
+        .route(
+            "/acquisition/executions/{id}/start",
+            post(post_start_execution),
+        )
+        .route(
+            "/acquisition/executions/{id}/cancel",
+            post(post_cancel_execution),
+        )
+        .route(
+            "/acquisition/executions/{id}/retry",
+            post(post_retry_execution),
+        )
         .route("/acquisition/missing", get(get_global_missing))
         .route("/acquisition/plan-all", post(post_plan_all))
-        .route("/acquisition/sources/health", get(get_acquisition_sources_health))
+        .route(
+            "/acquisition/sources/health",
+            get(get_acquisition_sources_health),
+        )
         .route("/sync/dry-run", post(sync_dry_run))
         .route("/sync/run", post(sync_run))
         .route("/sync/status", get(sync_status))
@@ -1510,6 +1526,40 @@ async fn get_pipeline_events(Me(app): Me) -> Result<Json<Vec<crate::pipeline::Pi
     Ok(Json(app.pipeline.recent_events()))
 }
 
+async fn repair_pipeline_cbz(
+    Me(app): Me,
+    Json(payload): Json<crate::pipeline::RepairCbzRequest>,
+) -> Result<Json<crate::pipeline::RepairOutcome>> {
+    app.me.admin()?;
+    let path = if let Some(ref p) = payload.path {
+        std::path::PathBuf::from(p)
+    } else if let (Some(ref series), Some(volume)) = (&payload.series, payload.volume) {
+        let (cfg, _, _) = app.pipeline.load_internal_config().await?;
+        let lib_dir = cfg.library_dir.as_deref().unwrap_or("/srv/media/manga");
+        let rel_name = crate::pipeline::canonical_release_name(series, true, volume);
+        std::path::PathBuf::from(lib_dir)
+            .join(series)
+            .join(format!("{rel_name}.cbz"))
+    } else {
+        return Err(AppError::bad_request(
+            "Must provide either 'path' or both 'series' and 'volume'",
+        ));
+    };
+
+    let outcome = app
+        .pipeline
+        .repair_canonical_cbz(
+            &path,
+            payload.series.as_deref(),
+            payload.volume,
+            payload.anilist_id,
+            payload.mangabaka_id,
+        )
+        .await?;
+
+    Ok(Json(outcome))
+}
+
 // ---------- acquisition (Nyaa + TorBox) ----------
 
 #[derive(Deserialize)]
@@ -1529,8 +1579,12 @@ async fn get_title_acquisition_releases(
     Query(query): Query<AcquisitionReleasesQuery>,
 ) -> Result<Json<Vec<crate::acquisition::AcquisitionCandidate>>> {
     let target_unit = match (query.unit_type.as_deref(), query.unit_number) {
-        (Some("volume"), Some(num)) => Some(crate::acquisition::AcquisitionReleaseUnit::Volume(num)),
-        (Some("chapter"), Some(num)) => Some(crate::acquisition::AcquisitionReleaseUnit::Chapter(num)),
+        (Some("volume"), Some(num)) => {
+            Some(crate::acquisition::AcquisitionReleaseUnit::Volume(num))
+        }
+        (Some("chapter"), Some(num)) => {
+            Some(crate::acquisition::AcquisitionReleaseUnit::Chapter(num))
+        }
         _ => None,
     };
     let candidates = app
@@ -1553,7 +1607,10 @@ async fn post_title_acquire(
     Path(id): Path<i64>,
     Json(payload): Json<crate::acquisition::service::AcquireReleaseRequest>,
 ) -> Result<Json<serde_json::Value>> {
-    let chapter_id = app.acquisition.acquire_release(id, payload.release, payload.target_unit).await?;
+    let chapter_id = app
+        .acquisition
+        .acquire_release(id, payload.release, payload.target_unit)
+        .await?;
     Ok(Json(json!({
         "success": true,
         "chapterId": chapter_id
@@ -1582,7 +1639,9 @@ async fn post_title_acquire_collection(
     })))
 }
 
-async fn get_acquisition_settings(Me(app): Me) -> Result<Json<crate::acquisition::AcquisitionConfig>> {
+async fn get_acquisition_settings(
+    Me(app): Me,
+) -> Result<Json<crate::acquisition::AcquisitionConfig>> {
     let config = app.acquisition.load_config().await?;
     Ok(Json(config))
 }
@@ -1608,7 +1667,10 @@ async fn test_torbox_connection(
     Json(payload): Json<TestTorBoxPayload>,
 ) -> Result<Json<serde_json::Value>> {
     app.me.admin()?;
-    let msg = app.acquisition.test_torbox(payload.url, payload.token).await?;
+    let msg = app
+        .acquisition
+        .test_torbox(payload.url, payload.token)
+        .await?;
     Ok(Json(json!({
         "success": true,
         "message": msg
@@ -1625,7 +1687,10 @@ async fn get_acquisition_history(
     Me(app): Me,
     Query(query): Query<AcquisitionHistoryQuery>,
 ) -> Result<Json<Vec<crate::acquisition::AcquisitionHistoryRecord>>> {
-    let history = app.acquisition.list_history(query.manga_id, query.limit).await?;
+    let history = app
+        .acquisition
+        .list_history(query.manga_id, query.limit)
+        .await?;
     Ok(Json(history))
 }
 
@@ -1661,10 +1726,7 @@ async fn put_update_acquisition_profile(
     Ok(Json(updated))
 }
 
-async fn delete_acquisition_profile(
-    Me(app): Me,
-    Path(id): Path<String>,
-) -> Result<Json<bool>> {
+async fn delete_acquisition_profile(Me(app): Me, Path(id): Path<String>) -> Result<Json<bool>> {
     app.acquisition.delete_profile(id).await?;
     Ok(Json(true))
 }
@@ -1703,7 +1765,9 @@ async fn put_title_acquisition_profile(
     Path(id): Path<i64>,
     Json(payload): Json<TitleProfilePayload>,
 ) -> Result<Json<crate::acquisition::profiles::AcquisitionProfile>> {
-    app.acquisition.set_manga_profile(id, payload.profile_id).await?;
+    app.acquisition
+        .set_manga_profile(id, payload.profile_id)
+        .await?;
     let prof = app.acquisition.get_manga_profile(id).await?;
     Ok(Json(prof))
 }
@@ -1729,7 +1793,10 @@ async fn post_title_plan(
     Json(payload): Json<Option<TitlePlanPayload>>,
 ) -> Result<Json<crate::acquisition::planner::AcquisitionPlan>> {
     let dry_run = payload.and_then(|p| p.dry_run).unwrap_or(false);
-    let plan = app.acquisition.plan_title_missing_content(id, dry_run).await?;
+    let plan = app
+        .acquisition
+        .plan_title_missing_content(id, dry_run)
+        .await?;
     Ok(Json(plan))
 }
 
@@ -1767,7 +1834,10 @@ async fn post_create_execution(
     Path(id): Path<i64>,
     Json(payload): Json<crate::acquisition::execution::ApprovePlanRequest>,
 ) -> Result<Json<crate::acquisition::execution::AcquisitionExecution>> {
-    let execution = app.acquisition.approve_and_create_execution(id, payload).await?;
+    let execution = app
+        .acquisition
+        .approve_and_create_execution(id, payload)
+        .await?;
     let started = app.acquisition.start_execution(execution.id).await?;
     Ok(Json(started))
 }
@@ -1803,7 +1873,9 @@ async fn post_cancel_execution(
     Me(app): Me,
     Path(id): Path<String>,
 ) -> Result<Json<serde_json::Value>> {
-    app.acquisition.cancel_execution(&id, "Cancelled by user via API").await?;
+    app.acquisition
+        .cancel_execution(&id, "Cancelled by user via API")
+        .await?;
     Ok(Json(serde_json::json!({ "success": true })))
 }
 

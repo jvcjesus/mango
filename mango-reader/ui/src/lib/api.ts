@@ -430,6 +430,27 @@ export interface PipelineEvent {
   optimizer_status: string;
   komga_status: string;
   error: string | null;
+  mangabaka_id?: number | null;
+  anilist_id?: number | null;
+  requested_unit?: string | null;
+}
+
+export interface RepairCbzRequest {
+  path?: string | null;
+  series?: string | null;
+  volume?: number | null;
+  anilistId?: number | null;
+  mangabakaId?: number | null;
+}
+
+export interface RepairOutcome {
+  status: string;
+  canonicalPath: string;
+  series: string;
+  volume: number;
+  mangabakaId: number;
+  fieldsPopulated: string[];
+  pageCount: number;
 }
 
 export type OwnershipStatus = 'owned' | 'available' | 'acquiring' | 'failed' | 'unknown';
