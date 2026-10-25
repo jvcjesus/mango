@@ -33,8 +33,33 @@ pub async fn sync_series_to_anilist(
     let is_volume =
         progress.highest_completed_volume.is_some() && progress.highest_completed_chapter.is_none();
     let dimension = if is_volume { "volume" } else { "chapter" };
+    let (komga_prog, dim_unit) = if is_volume {
+        (progress.highest_completed_volume.unwrap_or(0.0), "Vol")
+    } else {
+        (progress.highest_completed_chapter.unwrap_or(0.0), "Ch")
+    };
 
-    // 1. Mapping check
+    // 1. Untouched check: untouched series produce SkippedUntouched without tracker mutations
+    if komga_prog == 0.0 && progress.completed_books == 0 {
+        return SyncRecord {
+            id: record_id,
+            timestamp: now(),
+            komga_series_id: series_id.clone(),
+            komga_series_title: series_title.clone(),
+            tracker: SyncTarget::AniList,
+            tracker_media_id: mapping.map(|m| m.tracker_id.clone()),
+            old_progress: None,
+            new_progress: None,
+            dimension: Some(dimension.to_string()),
+            status_change: None,
+            category: SyncResultCategory::SkippedUntouched,
+            message: "Series has not been read in Komga; skipping tracker synchronization"
+                .to_string(),
+            is_dry_run: dry_run,
+        };
+    }
+
+    // 2. Mapping check
     let Some(map) = mapping else {
         return SyncRecord {
             id: record_id,
@@ -73,32 +98,6 @@ pub async fn sync_series_to_anilist(
             };
         }
     };
-
-    // 2. Untouched check
-    let (komga_prog, dim_unit) = if is_volume {
-        (progress.highest_completed_volume.unwrap_or(0.0), "Vol")
-    } else {
-        (progress.highest_completed_chapter.unwrap_or(0.0), "Ch")
-    };
-
-    if komga_prog == 0.0 && progress.completed_books == 0 {
-        return SyncRecord {
-            id: record_id,
-            timestamp: now(),
-            komga_series_id: series_id.clone(),
-            komga_series_title: series_title.clone(),
-            tracker: SyncTarget::AniList,
-            tracker_media_id: Some(media_id.to_string()),
-            old_progress: None,
-            new_progress: None,
-            dimension: Some(dimension.to_string()),
-            status_change: None,
-            category: SyncResultCategory::SkippedUntouched,
-            message: "Series has not been read in Komga; skipping tracker synchronization"
-                .to_string(),
-            is_dry_run: dry_run,
-        };
-    }
 
     // 3. Load AniList account
     let account = match trackers.account(Kind::AniList).await {

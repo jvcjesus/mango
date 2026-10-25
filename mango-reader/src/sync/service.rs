@@ -114,6 +114,7 @@ impl SyncService {
         let sync_anilist = target_tracker.is_none() || target_tracker == Some(SyncTarget::AniList);
         let sync_mangabaka =
             target_tracker.is_none() || target_tracker == Some(SyncTarget::MangaBaka);
+        let mut mangabaka_rate_limited = false;
 
         for series_prog in &progress_list {
             let eligibility = super::eligibility::evaluate_eligibility(series_prog);
@@ -129,45 +130,60 @@ impl SyncService {
                 let s_title = series_prog.series_title.clone();
                 let http_client = self.http.clone();
 
-                let mapping = self
-                    .db
-                    .call(move |conn| {
-                        if let Ok(Some(m)) =
-                            resolve_mapping(conn, &s_id, &s_title, SyncTarget::AniList)
-                        {
-                            return Ok(Some(m));
-                        }
-                        Ok(None)
-                    })
-                    .await
-                    .ok()
-                    .flatten();
+                // Untouched titles only check local DB mapping to avoid expensive external API lookups
+                let mapping = if !eligibility.is_eligible() {
+                    self.db
+                        .call(move |conn| {
+                            if let Ok(Some(m)) =
+                                resolve_mapping(conn, &s_id, &s_title, SyncTarget::AniList)
+                            {
+                                return Ok(Some(m));
+                            }
+                            Ok(None)
+                        })
+                        .await
+                        .ok()
+                        .flatten()
+                } else {
+                    let local = self
+                        .db
+                        .call(move |conn| {
+                            if let Ok(Some(m)) =
+                                resolve_mapping(conn, &s_id, &s_title, SyncTarget::AniList)
+                            {
+                                return Ok(Some(m));
+                            }
+                            Ok(None)
+                        })
+                        .await
+                        .ok()
+                        .flatten();
 
-                // If not locally resolved, try online resolution
-                let mapping = match mapping {
-                    Some(m) => Some(m),
-                    None => {
-                        let s_id_clone = series_prog.series_id.clone();
-                        let s_title_clone = series_prog.series_title.clone();
-                        let http_c = http_client.clone();
-                        self.db
-                            .call(move |conn| {
-                                Ok(tokio::task::block_in_place(|| {
-                                    tokio::runtime::Handle::current().block_on(async {
-                                        super::identity::resolve_anilist_identity(
-                                            conn,
-                                            &http_c,
-                                            &s_id_clone,
-                                            &s_title_clone,
-                                        )
-                                        .await
-                                        .unwrap_or(None)
-                                    })
-                                }))
-                            })
-                            .await
-                            .ok()
-                            .flatten()
+                    match local {
+                        Some(m) => Some(m),
+                        None => {
+                            let s_id_clone = series_prog.series_id.clone();
+                            let s_title_clone = series_prog.series_title.clone();
+                            let http_c = http_client.clone();
+                            self.db
+                                .call(move |conn| {
+                                    Ok(tokio::task::block_in_place(|| {
+                                        tokio::runtime::Handle::current().block_on(async {
+                                            super::identity::resolve_anilist_identity(
+                                                conn,
+                                                &http_c,
+                                                &s_id_clone,
+                                                &s_title_clone,
+                                            )
+                                            .await
+                                            .unwrap_or(None)
+                                        })
+                                    }))
+                                })
+                                .await
+                                .ok()
+                                .flatten()
+                        }
                     }
                 };
 
@@ -187,62 +203,243 @@ impl SyncService {
                 let s_title = series_prog.series_title.clone();
                 let mb_clone = mb_client.clone();
 
-                let mapping = self
-                    .db
-                    .call(move |conn| {
-                        if let Ok(Some(m)) =
-                            resolve_mapping(conn, &s_id, &s_title, SyncTarget::MangaBaka)
-                        {
-                            return Ok(Some(m));
+                // Request discipline: untouched series avoid external API requests
+                if !eligibility.is_eligible() {
+                    let mapping = self
+                        .db
+                        .call(move |conn| {
+                            if let Ok(Some(m)) =
+                                resolve_mapping(conn, &s_id, &s_title, SyncTarget::MangaBaka)
+                            {
+                                return Ok(Some(m));
+                            }
+                            Ok(None)
+                        })
+                        .await
+                        .ok()
+                        .flatten();
+
+                    let record = sync_series_to_mangabaka(
+                        &mb_client,
+                        has_mb_token,
+                        series_prog,
+                        mapping.as_ref(),
+                        dry_run,
+                    )
+                    .await;
+                    self.record_and_tally(&mut summary, record).await;
+                } else if mangabaka_rate_limited {
+                    // Halt further MangaBaka requests for this sync run after 429
+                    let record = SyncRecord {
+                        id: format!(
+                            "sync-{}-{}-{}",
+                            SyncTarget::MangaBaka,
+                            series_prog.series_id,
+                            crate::db::now()
+                        ),
+                        timestamp: crate::db::now(),
+                        komga_series_id: series_prog.series_id.clone(),
+                        komga_series_title: series_prog.series_title.clone(),
+                        tracker: SyncTarget::MangaBaka,
+                        tracker_media_id: None,
+                        old_progress: None,
+                        new_progress: None,
+                        dimension: Some(if series_prog.highest_completed_volume.is_some() {
+                            "volume".into()
+                        } else {
+                            "chapter".into()
+                        }),
+                        status_change: None,
+                        category: SyncResultCategory::RateLimited,
+                        message: "MangaBaka rate limited (HTTP 429); retry later".to_string(),
+                        is_dry_run: dry_run,
+                    };
+                    self.record_and_tally(&mut summary, record).await;
+                } else {
+                    let local = self
+                        .db
+                        .call(move |conn| {
+                            if let Ok(Some(m)) =
+                                resolve_mapping(conn, &s_id, &s_title, SyncTarget::MangaBaka)
+                            {
+                                return Ok(Some(m));
+                            }
+                            Ok(None)
+                        })
+                        .await
+                        .ok()
+                        .flatten();
+
+                    let (mapping, api_failure_record) = match local {
+                        Some(m) => (Some(m), None),
+                        None if has_mb_token => {
+                            let s_id_clone = series_prog.series_id.clone();
+                            let s_title_clone = series_prog.series_title.clone();
+                            let mb_c = mb_clone.clone();
+                            let res = self
+                                .db
+                                .call(move |conn| {
+                                    Ok(tokio::task::block_in_place(|| {
+                                        tokio::runtime::Handle::current().block_on(async {
+                                            super::identity::resolve_mangabaka_identity(
+                                                conn,
+                                                &mb_c,
+                                                &s_id_clone,
+                                                &s_title_clone,
+                                            )
+                                            .await
+                                        })
+                                    }))
+                                })
+                                .await
+                                .unwrap_or_else(|e| {
+                                    Ok(super::identity::IdentityResolutionResult::NetworkError(
+                                        e.to_string(),
+                                    ))
+                                })
+                                .unwrap_or_else(|e| {
+                                    super::identity::IdentityResolutionResult::NetworkError(
+                                        e.to_string(),
+                                    )
+                                });
+
+                            let now_ts = crate::db::now();
+                            let dim_str = if series_prog.highest_completed_volume.is_some() {
+                                "volume"
+                            } else {
+                                "chapter"
+                            };
+
+                            match res {
+                                super::identity::IdentityResolutionResult::Resolved(m) => {
+                                    (Some(m), None)
+                                }
+                                super::identity::IdentityResolutionResult::RateLimited => {
+                                    mangabaka_rate_limited = true;
+                                    (
+                                        None,
+                                        Some(SyncRecord {
+                                            id: format!(
+                                                "sync-{}-{}-{}",
+                                                SyncTarget::MangaBaka,
+                                                series_prog.series_id,
+                                                now_ts
+                                            ),
+                                            timestamp: now_ts,
+                                            komga_series_id: series_prog.series_id.clone(),
+                                            komga_series_title: series_prog.series_title.clone(),
+                                            tracker: SyncTarget::MangaBaka,
+                                            tracker_media_id: None,
+                                            old_progress: None,
+                                            new_progress: None,
+                                            dimension: Some(dim_str.to_string()),
+                                            status_change: None,
+                                            category: SyncResultCategory::RateLimited,
+                                            message:
+                                                "MangaBaka rate limited (HTTP 429); retry later"
+                                                    .to_string(),
+                                            is_dry_run: dry_run,
+                                        }),
+                                    )
+                                }
+                                super::identity::IdentityResolutionResult::ApiError(msg) => (
+                                    None,
+                                    Some(SyncRecord {
+                                        id: format!(
+                                            "sync-{}-{}-{}",
+                                            SyncTarget::MangaBaka,
+                                            series_prog.series_id,
+                                            now_ts
+                                        ),
+                                        timestamp: now_ts,
+                                        komga_series_id: series_prog.series_id.clone(),
+                                        komga_series_title: series_prog.series_title.clone(),
+                                        tracker: SyncTarget::MangaBaka,
+                                        tracker_media_id: None,
+                                        old_progress: None,
+                                        new_progress: None,
+                                        dimension: Some(dim_str.to_string()),
+                                        status_change: None,
+                                        category: SyncResultCategory::RemoteError,
+                                        message: format!(
+                                            "MANGABAKA API ERROR: Search request rejected (HTTP 400): {msg}"
+                                        ),
+                                        is_dry_run: dry_run,
+                                    }),
+                                ),
+                                super::identity::IdentityResolutionResult::AuthError(msg) => (
+                                    None,
+                                    Some(SyncRecord {
+                                        id: format!(
+                                            "sync-{}-{}-{}",
+                                            SyncTarget::MangaBaka,
+                                            series_prog.series_id,
+                                            now_ts
+                                        ),
+                                        timestamp: now_ts,
+                                        komga_series_id: series_prog.series_id.clone(),
+                                        komga_series_title: series_prog.series_title.clone(),
+                                        tracker: SyncTarget::MangaBaka,
+                                        tracker_media_id: None,
+                                        old_progress: None,
+                                        new_progress: None,
+                                        dimension: Some(dim_str.to_string()),
+                                        status_change: None,
+                                        category: SyncResultCategory::AuthError,
+                                        message: format!("MangaBaka auth error: {msg}"),
+                                        is_dry_run: dry_run,
+                                    }),
+                                ),
+                                super::identity::IdentityResolutionResult::NetworkError(msg) => (
+                                    None,
+                                    Some(SyncRecord {
+                                        id: format!(
+                                            "sync-{}-{}-{}",
+                                            SyncTarget::MangaBaka,
+                                            series_prog.series_id,
+                                            now_ts
+                                        ),
+                                        timestamp: now_ts,
+                                        komga_series_id: series_prog.series_id.clone(),
+                                        komga_series_title: series_prog.series_title.clone(),
+                                        tracker: SyncTarget::MangaBaka,
+                                        tracker_media_id: None,
+                                        old_progress: None,
+                                        new_progress: None,
+                                        dimension: Some(dim_str.to_string()),
+                                        status_change: None,
+                                        category: SyncResultCategory::NetworkError,
+                                        message: format!("MangaBaka network error: {msg}"),
+                                        is_dry_run: dry_run,
+                                    }),
+                                ),
+                                super::identity::IdentityResolutionResult::Ambiguous(_) => {
+                                    (None, None)
+                                }
+                                super::identity::IdentityResolutionResult::NotFound => (None, None),
+                            }
                         }
-                        Ok(None)
-                    })
-                    .await
-                    .ok()
-                    .flatten();
+                        None => (None, None),
+                    };
 
-                // If not locally resolved and we have token, try online resolution
-                let mapping = match mapping {
-                    Some(m) => Some(m),
-                    None if has_mb_token => {
-                        let s_id_clone = series_prog.series_id.clone();
-                        let s_title_clone = series_prog.series_title.clone();
-                        let mb_c = mb_clone.clone();
-                        self.db
-                            .call(move |conn| {
-                                Ok(tokio::task::block_in_place(|| {
-                                    tokio::runtime::Handle::current().block_on(async {
-                                        super::identity::resolve_mangabaka_identity(
-                                            conn,
-                                            &mb_c,
-                                            &s_id_clone,
-                                            &s_title_clone,
-                                        )
-                                        .await
-                                        .unwrap_or(None)
-                                    })
-                                }))
-                            })
-                            .await
-                            .ok()
-                            .flatten()
+                    if let Some(record) = api_failure_record {
+                        self.record_and_tally(&mut summary, record).await;
+                    } else {
+                        if mapping.is_some() {
+                            summary.mangabaka_mapped += 1;
+                        }
+
+                        let record = sync_series_to_mangabaka(
+                            &mb_client,
+                            has_mb_token,
+                            series_prog,
+                            mapping.as_ref(),
+                            dry_run,
+                        )
+                        .await;
+                        self.record_and_tally(&mut summary, record).await;
                     }
-                    None => None,
-                };
-
-                if mapping.is_some() {
-                    summary.mangabaka_mapped += 1;
                 }
-
-                let record = sync_series_to_mangabaka(
-                    &mb_client,
-                    has_mb_token,
-                    series_prog,
-                    mapping.as_ref(),
-                    dry_run,
-                )
-                .await;
-                self.record_and_tally(&mut summary, record).await;
             }
         }
 

@@ -44,7 +44,26 @@ pub async fn sync_series_to_mangabaka(
         (progress.highest_completed_chapter.unwrap_or(0.0), "Ch")
     };
 
-    // 1. Auth check
+    // 1. Untouched check: untouched series in Komga produce SkippedUntouched without tracker mutations
+    if komga_prog == 0.0 && progress.completed_books == 0 {
+        return SyncRecord {
+            id: record_id,
+            timestamp: now(),
+            komga_series_id: series_id.clone(),
+            komga_series_title: series_title.clone(),
+            tracker: SyncTarget::MangaBaka,
+            tracker_media_id: mapping.map(|m| m.tracker_id.clone()),
+            old_progress: None,
+            new_progress: None,
+            dimension: Some(dimension.to_string()),
+            status_change: None,
+            category: SyncResultCategory::SkippedUntouched,
+            message: "Series has not been read in Komga; skipping MangaBaka sync".to_string(),
+            is_dry_run: dry_run,
+        };
+    }
+
+    // 2. Auth check
     if !has_token {
         return SyncRecord {
             id: record_id,
@@ -63,7 +82,7 @@ pub async fn sync_series_to_mangabaka(
         };
     }
 
-    // 2. Mapping check
+    // 3. Mapping check
     let Some(map) = mapping else {
         return SyncRecord {
             id: record_id,
@@ -109,25 +128,6 @@ pub async fn sync_series_to_mangabaka(
             };
         }
     };
-
-    // 3. Untouched check
-    if komga_prog == 0.0 && progress.completed_books == 0 {
-        return SyncRecord {
-            id: record_id,
-            timestamp: now(),
-            komga_series_id: series_id.clone(),
-            komga_series_title: series_title.clone(),
-            tracker: SyncTarget::MangaBaka,
-            tracker_media_id: Some(mangabaka_id.to_string()),
-            old_progress: None,
-            new_progress: None,
-            dimension: Some(dimension.to_string()),
-            status_change: None,
-            category: SyncResultCategory::SkippedUntouched,
-            message: "Series has not been read in Komga; skipping MangaBaka sync".to_string(),
-            is_dry_run: dry_run,
-        };
-    }
 
     // 4. Query current user library entry on MangaBaka
     let library_entry = match client.get_my_library_entry(mangabaka_id).await {
