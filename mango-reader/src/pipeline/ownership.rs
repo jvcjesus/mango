@@ -45,6 +45,8 @@ pub struct OwnershipSummary {
     pub total_source_volumes: Option<usize>,
     pub owned_chapters_count: usize,
     pub total_source_chapters: Option<usize>,
+    #[serde(default)]
+    pub unknown_books_count: usize,
     pub source_release_type: String, // "volume", "chapter", "mixed", "empty"
     #[serde(default)]
     pub authoritative_total_volumes: Option<u32>,
@@ -190,6 +192,7 @@ impl OwnershipService {
                             total_source_volumes: None,
                             owned_chapters_count: 0,
                             total_source_chapters: None,
+                            unknown_books_count: 0,
                             source_release_type: "empty".to_string(),
                             authoritative_total_volumes: None,
                             authoritative_total_chapters: None,
@@ -247,6 +250,7 @@ impl OwnershipService {
                     total_source_chapters: (source_release_type == "chapter"
                         || source_release_type == "mixed")
                         .then_some(source_chapters_count),
+                    unknown_books_count: 0,
                     source_release_type,
                     authoritative_total_volumes: None,
                     authoritative_total_chapters: None,
@@ -281,6 +285,7 @@ impl OwnershipService {
                         total_source_chapters: (source_release_type == "chapter"
                             || source_release_type == "mixed")
                             .then_some(source_chapters_count),
+                        unknown_books_count: 0,
                         source_release_type,
                         authoritative_total_volumes: None,
                         authoritative_total_chapters: None,
@@ -319,6 +324,7 @@ impl OwnershipService {
                     total_source_chapters: (source_release_type == "chapter"
                         || source_release_type == "mixed")
                         .then_some(source_chapters_count),
+                    unknown_books_count: 0,
                     source_release_type,
                     authoritative_total_volumes: None,
                     authoritative_total_chapters: None,
@@ -329,7 +335,9 @@ impl OwnershipService {
         }
 
         if exact_matches.len() > 1 {
-            tracing::warn!("OWNERSHIP: found multiple exact series matches for {title:?}; refusing ambiguous match");
+            tracing::warn!(
+                "OWNERSHIP: found multiple exact series matches for {title:?}; refusing ambiguous match"
+            );
             return TitleOwnership {
                 komga_connected: true,
                 error: Some("Ambiguous match: multiple series found in Komga".to_string()),
@@ -348,6 +356,7 @@ impl OwnershipService {
                     total_source_chapters: (source_release_type == "chapter"
                         || source_release_type == "mixed")
                         .then_some(source_chapters_count),
+                    unknown_books_count: 0,
                     source_release_type,
                     authoritative_total_volumes: None,
                     authoritative_total_chapters: None,
@@ -383,6 +392,7 @@ impl OwnershipService {
                         total_source_chapters: (source_release_type == "chapter"
                             || source_release_type == "mixed")
                             .then_some(source_chapters_count),
+                        unknown_books_count: 0,
                         source_release_type,
                         authoritative_total_volumes: None,
                         authoritative_total_chapters: None,
@@ -400,38 +410,58 @@ impl OwnershipService {
             .find(|l| l.id == matched_series.library_id)
             .map(|l| l.name.clone());
 
-        // Extract owned volumes and chapters from Komga books
+        // Extract owned volumes and chapters from Komga books using conservative classification
+        let series_context = crate::release::determine_series_context(books.iter().map(|b| {
+            (
+                b.name.as_str(),
+                b.metadata.as_ref().and_then(|m| m.title.as_deref()),
+            )
+        }));
+
         let mut owned_volumes = HashMap::new();
         let mut owned_chapters = HashMap::new();
+        let mut unknown_books = Vec::new();
 
         for b in &books {
-            let vol_from_name = crate::release::parse_volume(&b.name);
-            let rel_info = crate::release::parse_release(&b.name, b.number);
+            let meta_title = b.metadata.as_ref().and_then(|m| m.title.as_deref());
+            let meta_num = b.metadata.as_ref().and_then(|m| m.number.as_deref());
 
-            if rel_info.release_type == crate::release::ReleaseType::Volume
-                || vol_from_name.is_some()
-            {
-                let vol_num = vol_from_name
-                    .or(rel_info.volume)
-                    .or_else(|| {
-                        b.metadata.as_ref().and_then(|m| {
-                            m.number_sort
-                                .or_else(|| m.number.as_deref().and_then(|n| n.parse::<f64>().ok()))
+            let (unit, num_opt) = crate::release::classify_komga_book(
+                &b.name,
+                meta_title,
+                meta_num,
+                b.number,
+                series_context,
+            );
+
+            match unit {
+                crate::release::ReleaseUnit::Volume => {
+                    let vol_num = num_opt
+                        .or_else(|| {
+                            b.metadata.as_ref().and_then(|m| {
+                                m.number_sort.or_else(|| {
+                                    m.number.as_deref().and_then(|n| n.parse::<f64>().ok())
+                                })
+                            })
                         })
-                    })
-                    .unwrap_or(b.number);
-                owned_volumes.insert(vol_num.to_bits(), (b.id.clone(), b.name.clone()));
-            } else {
-                let ch_num = rel_info
-                    .chapter_number
-                    .or_else(|| {
-                        b.metadata.as_ref().and_then(|m| {
-                            m.number_sort
-                                .or_else(|| m.number.as_deref().and_then(|n| n.parse::<f64>().ok()))
+                        .unwrap_or(b.number);
+                    owned_volumes.insert(vol_num.to_bits(), (b.id.clone(), b.name.clone()));
+                }
+                crate::release::ReleaseUnit::Chapter => {
+                    let ch_num = num_opt
+                        .or_else(|| {
+                            b.metadata.as_ref().and_then(|m| {
+                                m.number_sort.or_else(|| {
+                                    m.number.as_deref().and_then(|n| n.parse::<f64>().ok())
+                                })
+                            })
                         })
-                    })
-                    .unwrap_or(b.number);
-                owned_chapters.insert(ch_num.to_bits(), (b.id.clone(), b.name.clone()));
+                        .unwrap_or(b.number);
+                    owned_chapters.insert(ch_num.to_bits(), (b.id.clone(), b.name.clone()));
+                }
+                crate::release::ReleaseUnit::Unknown => {
+                    unknown_books.push((b.id.clone(), b.name.clone()));
+                }
             }
         }
 
@@ -511,6 +541,7 @@ impl OwnershipService {
 
         let owned_volumes_count = owned_volumes.len();
         let owned_chapters_count = owned_chapters.len();
+        let unknown_books_count = unknown_books.len();
 
         let total_source_volumes =
             if source_release_type == "volume" || source_release_type == "mixed" {
@@ -519,12 +550,16 @@ impl OwnershipService {
                 None
             };
 
-        let total_source_chapters =
-            if source_release_type == "chapter" || source_release_type == "mixed" {
-                Some(source_chapters_count)
-            } else {
-                None
-            };
+        let total_source_chapters = if (source_release_type == "chapter"
+            || source_release_type == "mixed")
+            && owned_chapters_count > 0
+        {
+            Some(source_chapters_count)
+        } else if source_release_type == "chapter" {
+            Some(source_chapters_count)
+        } else {
+            None
+        };
 
         let explanation = if owned_volumes_count > 0 && source_release_type == "chapter" {
             Some("Source provides chapters".to_string())
@@ -548,6 +583,7 @@ impl OwnershipService {
                 total_source_volumes,
                 owned_chapters_count,
                 total_source_chapters,
+                unknown_books_count,
                 source_release_type,
                 authoritative_total_volumes: None,
                 authoritative_total_chapters: None,
@@ -576,7 +612,7 @@ mod tests {
 
     #[tokio::test]
     async fn ownership_service_flow_with_mock_komga() {
-        use axum::{routing::get, Json, Router};
+        use axum::{Json, Router, routing::get};
         use serde_json::json;
 
         let app = Router::new()
@@ -689,7 +725,7 @@ mod tests {
 
     #[tokio::test]
     async fn ownership_blue_lock_canonical_regression_and_honest_denominators() {
-        use axum::{routing::get, Json, Router};
+        use axum::{Json, Router, routing::get};
         use serde_json::json;
 
         // Mock Komga returns 38 volumes for Blue Lock
@@ -789,7 +825,7 @@ mod tests {
 
     #[tokio::test]
     async fn ownership_volume_source_and_chapter_source_matching() {
-        use axum::{routing::get, Json, Router};
+        use axum::{Json, Router, routing::get};
         use serde_json::json;
 
         // Mock Komga returns 12 volumes and 3 chapters for Mixed Title
@@ -882,5 +918,191 @@ mod tests {
         assert_eq!(ownership.summary.owned_chapters_count, 3);
         assert_eq!(ownership.summary.total_source_chapters, Some(3));
         assert_eq!(ownership.summary.explanation, None);
+    }
+
+    #[tokio::test]
+    async fn ownership_bleach_regression_volumes_74_of_74() {
+        use axum::{Json, Router, routing::get};
+        use serde_json::json;
+
+        // Mock Komga returns 74 volume books for Bleach
+        let app = Router::new()
+            .route(
+                "/api/v1/series",
+                get(|| async {
+                    Json(json!({
+                        "content": [
+                            { "id": "s-bleach", "name": "Bleach", "libraryId": "lib-en", "booksCount": 74 }
+                        ]
+                    }))
+                }),
+            )
+            .route(
+                "/api/v1/series/s-bleach/books",
+                get(|| async {
+                    let mut books = Vec::new();
+                    for v in 1..=74 {
+                        books.push(json!({
+                            "id": format!("book-bleach-{v}"),
+                            "seriesId": "s-bleach",
+                            "name": format!("Bleach v{:02}.cbz", v),
+                            "number": v as f64,
+                            "metadata": { "numberSort": v as f64 }
+                        }));
+                    }
+                    Json(json!({ "content": books }))
+                }),
+            )
+            .route(
+                "/api/v1/libraries",
+                get(|| async {
+                    Json(json!([
+                        { "id": "lib-en", "name": "Manga", "root": "/manga", "unavailable": false }
+                    ]))
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let db = crate::pipeline::tests::test_db_instance();
+        db.call(move |conn| {
+            let mut map = serde_json::Map::new();
+            map.insert("pipeline.komga_enabled".into(), serde_json::json!(true));
+            map.insert("pipeline.komga_url".into(), serde_json::json!(format!("http://127.0.0.1:{port}")));
+            map.insert("pipeline.komga_library_id".into(), serde_json::json!("lib-en"));
+            crate::settings::put(conn, &map)?;
+            crate::db::set_state(conn, "pipeline.komga_api_key", "mock-key")?;
+
+            // Insert Bleach manga: 732 chapters grouped into 74 volume releases
+            conn.execute("INSERT INTO manga (id, source_id, url, title, in_library) VALUES (74, 1, '/bleach', 'Bleach', 1)", [])?;
+            for ch in 1..=732 {
+                // Chapters 1..732 distributed across 74 volumes (~10 chapters per volume)
+                let vol = ((ch - 1) / 10 + 1).min(74);
+                conn.execute(
+                    "INSERT INTO chapters (id, manga_id, url, name, source_order, fetched_at, read, chapter_number) VALUES (?1, 74, ?2, ?3, ?1, 0, 0, ?4)",
+                    rusqlite::params![10000 + ch, format!("/ch{ch}"), format!("Vol. {vol} Ch. {ch}"), ch as f64],
+                )?;
+            }
+
+            Ok(())
+        }).await.unwrap();
+
+        let ownership_svc = OwnershipService::new(Client::new(), db);
+        let ownership = ownership_svc.get_title_ownership(74, "Bleach").await;
+
+        assert!(ownership.komga_connected);
+        assert_eq!(ownership.series_id.as_deref(), Some("s-bleach"));
+
+        // Bleach must report 74 volumes owned, NOT chapters 74/732
+        assert_eq!(ownership.summary.owned_volumes_count, 74);
+        assert_eq!(ownership.summary.total_source_volumes, Some(74));
+        assert_eq!(
+            ownership.summary.owned_chapters_count, 0,
+            "Komga volumes must not be counted as chapters"
+        );
+        assert_eq!(
+            ownership.summary.total_source_chapters, None,
+            "No chapter denominator when 0 chapters owned"
+        );
+        assert_eq!(ownership.summary.unknown_books_count, 0);
+
+        // Volume ownership list must have all 74 volumes
+        assert_eq!(ownership.volumes.len(), 74);
+        assert_eq!(ownership.volumes[0].volume, 1.0);
+        assert_eq!(ownership.volumes[0].status, OwnershipStatus::Owned);
+        assert_eq!(ownership.volumes[73].volume, 74.0);
+        assert_eq!(ownership.volumes[73].status, OwnershipStatus::Owned);
+
+        // No fake chapter ownership records
+        assert!(
+            ownership.chapters.is_empty(),
+            "Volume ownership must not fabricate chapter records"
+        );
+    }
+
+    #[tokio::test]
+    async fn ownership_ambiguous_books_remain_unknown() {
+        use axum::{Json, Router, routing::get};
+        use serde_json::json;
+
+        // Mock Komga returns 1 book with bare number "001.cbz" in a series with no indicators
+        let app = Router::new()
+            .route(
+                "/api/v1/series",
+                get(|| async {
+                    Json(json!({
+                        "content": [
+                            { "id": "s-ambig", "name": "Ambiguous Series", "libraryId": "lib-en", "booksCount": 1 }
+                        ]
+                    }))
+                }),
+            )
+            .route(
+                "/api/v1/series/s-ambig/books",
+                get(|| async {
+                    Json(json!({
+                        "content": [
+                            {
+                                "id": "book-ambig-1",
+                                "seriesId": "s-ambig",
+                                "name": "001.cbz",
+                                "number": 1.0,
+                                "metadata": { "numberSort": 1.0 }
+                            }
+                        ]
+                    }))
+                }),
+            )
+            .route(
+                "/api/v1/libraries",
+                get(|| async {
+                    Json(json!([
+                        { "id": "lib-en", "name": "Manga", "root": "/manga", "unavailable": false }
+                    ]))
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let db = crate::pipeline::tests::test_db_instance();
+        db.call(move |conn| {
+            let mut map = serde_json::Map::new();
+            map.insert("pipeline.komga_enabled".into(), serde_json::json!(true));
+            map.insert("pipeline.komga_url".into(), serde_json::json!(format!("http://127.0.0.1:{port}")));
+            map.insert("pipeline.komga_library_id".into(), serde_json::json!("lib-en"));
+            crate::settings::put(conn, &map)?;
+            crate::db::set_state(conn, "pipeline.komga_api_key", "mock-key")?;
+
+            conn.execute("INSERT INTO manga (id, source_id, url, title, in_library) VALUES (88, 1, '/ambig', 'Ambiguous Series', 1)", [])?;
+            conn.execute("INSERT INTO chapters (id, manga_id, url, name, source_order, fetched_at, read, chapter_number) VALUES (8801, 88, '/c1', 'Chapter 1', 1, 0, 0, 1.0)", [])?;
+
+            Ok(())
+        }).await.unwrap();
+
+        let ownership_svc = OwnershipService::new(Client::new(), db);
+        let ownership = ownership_svc
+            .get_title_ownership(88, "Ambiguous Series")
+            .await;
+
+        assert!(ownership.komga_connected);
+        assert_eq!(ownership.summary.unknown_books_count, 1);
+        assert_eq!(
+            ownership.summary.owned_volumes_count, 0,
+            "Must not guess volume"
+        );
+        assert_eq!(
+            ownership.summary.owned_chapters_count, 0,
+            "Must not guess chapter"
+        );
+        assert!(ownership.volumes.is_empty());
+        assert!(ownership.chapters.is_empty());
     }
 }

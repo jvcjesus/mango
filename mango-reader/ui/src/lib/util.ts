@@ -50,6 +50,7 @@ export function chapterShort(chapter: { number: number; name: string }): string 
 }
 
 export type ReleaseType = 'chapter' | 'volume';
+export type ReleaseUnit = 'volume' | 'chapter' | 'unknown';
 
 export type ReleaseInfo = {
   releaseType: ReleaseType;
@@ -57,10 +58,17 @@ export type ReleaseInfo = {
   chapterNumber: number | null;
 };
 
+/** Strips common archive and document extensions. */
+export function stripArchiveExtension(name: string): string {
+  if (!name) return name;
+  return name.replace(/\.(cbz|cbr|zip|rar|pdf|tar|7z)$/i, '');
+}
+
 /** Parses volume number from a chapter name like "Vol. 1 Ch. 5" or "Volume 2 - 14", if present. */
 export function parseVolume(name: string): number | null {
   if (!name) return null;
-  const lower = name.toLowerCase();
+  const clean = stripArchiveExtension(name.trim());
+  const lower = clean.toLowerCase();
 
   // 1. Check for explicit "vol." / "volume" / "vol " / "vol_"
   const volMatch = lower.match(/(?:^|[^\w])vol(?:ume)?\.?\s*(\d+(?:\.\d+)?)/i);
@@ -101,11 +109,12 @@ export function parseVolume(name: string): number | null {
 
 /** Parses release semantics distinguishing pure Volume releases from Chapter releases. */
 export function parseRelease(name: string, knownNumber = -1): ReleaseInfo {
-  const volume = parseVolume(name);
-  if (!name) {
+  const clean = stripArchiveExtension(name.trim());
+  const volume = parseVolume(clean);
+  if (!clean) {
     return { releaseType: 'chapter', volume: null, chapterNumber: knownNumber >= 0 ? knownNumber : null };
   }
-  const lower = name.toLowerCase();
+  const lower = clean.toLowerCase();
   const hasChapterWord = /(?:^|[^\w])(?:chapter|ch\.|ch[\s\-_]|episode|ep\.|ep[\s\-_]|act|#)/i.test(lower);
   const hasCChapter = volume !== null && /\bv\d+\s*[-_ ]*\s*c\d+/i.test(lower);
 
