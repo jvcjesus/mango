@@ -249,6 +249,12 @@ pub fn has_explicit_chapter_signal(text: &str) -> bool {
 
     for word in lower.split_whitespace() {
         let w = word.trim_matches(|c: char| !c.is_alphanumeric());
+        if (w.starts_with("ch") || w.starts_with("ep"))
+            && w.len() > 2
+            && w[2..].chars().all(|c| c.is_ascii_digit() || c == '.')
+        {
+            return true;
+        }
         if w.starts_with('c')
             && w.len() > 1
             && w[1..].chars().all(|c| c.is_ascii_digit() || c == '.')

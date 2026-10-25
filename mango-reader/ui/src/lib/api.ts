@@ -221,6 +221,7 @@ export type Queued = {
   error: string | null;
   canRetryKomga?: boolean;
   failureStage?: string | null;
+  publishedPath?: string | null;
 };
 
 export type Queue = { paused: boolean; queue: Queued[] };

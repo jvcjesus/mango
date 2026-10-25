@@ -58,6 +58,7 @@ pub struct Queued {
     pub error: Option<String>,
     pub can_retry_komga: bool,
     pub failure_stage: Option<String>,
+    pub published_path: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -67,6 +68,7 @@ pub struct QueueView {
 }
 
 /// A chapter picked from the queue, with what its file name and ComicInfo need.
+#[derive(Clone)]
 pub(crate) struct Job {
     pub(crate) chapter: i64,
     pub(crate) manga_id: i64,
@@ -84,6 +86,8 @@ pub(crate) struct Job {
     pub(crate) volume: Option<f64>,
     pub(crate) release_type: crate::release::ReleaseType,
     pub(crate) chapter_number: Option<f64>,
+    pub(crate) published_path: Option<String>,
+    pub(crate) target_library_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -169,19 +173,35 @@ impl Downloads {
 
     /// Retries the Komga library scan stage without re-downloading or re-optimizing.
     pub async fn retry_komga(&self, chapter: i64) -> Result<String> {
-        let (manga_id, title, lang) = self
+        let (manga_id, title, lang, pub_path_opt, target_lib_opt, is_vol, rel_num) = self
             .db
             .call(move |conn| {
-                let (manga_id, title, lang): (i64, String, Option<String>) = conn.query_row(
-                    "SELECT m.id, m.title, s.lang
+                let (manga_id, title, lang, pub_path, target_lib, ch_name, ch_num): (
+                    i64,
+                    String,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                    String,
+                    f64,
+                ) = conn.query_row(
+                    "SELECT m.id, m.title, s.lang, d.published_path, d.target_library_id, c.name, c.chapter_number
                      FROM chapters c
                      JOIN manga m ON m.id = c.manga_id
+                     JOIN downloads d ON d.chapter_id = c.id
                      LEFT JOIN sources s ON s.id = m.source_id
                      WHERE c.id = ?1",
                     [chapter],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?)),
                 )?;
-                Ok((manga_id, title, lang))
+                let rel = crate::release::parse_release(&ch_name, ch_num);
+                let is_vol = rel.release_type == crate::release::ReleaseType::Volume;
+                let rel_num = if is_vol {
+                    rel.volume.unwrap_or(ch_num)
+                } else {
+                    rel.chapter_number.unwrap_or(ch_num)
+                };
+                Ok((manga_id, title, lang, pub_path, target_lib, is_vol, rel_num))
             })
             .await?;
 
@@ -191,27 +211,75 @@ impl Downloads {
                 return Err(AppError::bad_request("Komga integration is disabled in Pipeline settings"));
             }
 
-            let is_chinese = lang.as_deref().map(|l| l.to_lowercase()).map(|l| l == "zh" || l.contains("chinese") || l.contains("mandarin")).unwrap_or(false);
-            let target_library_id = if is_chinese {
-                config.komga_chinese_library_id.as_deref().or(config.komga_library_id.as_deref())
-            } else {
-                config.komga_library_id.as_deref()
+            // Verify the published canonical artifact exists and has valid archive integrity
+            let pub_path = match pub_path_opt {
+                Some(p) => p,
+                None => return Err(AppError::bad_request("No canonical published artifact recorded for this chapter")),
             };
 
+            let path = PathBuf::from(&pub_path);
+            if !path.is_file() {
+                return Err(AppError::bad_request(format!(
+                    "Canonical published artifact does not exist at {}",
+                    path.display()
+                )));
+            }
+            crate::pipeline::publisher::verify_cbz_integrity(&path)?;
+
+            let is_chinese = lang.as_deref().map(|l| l.to_lowercase()).map(|l| l == "zh" || l.contains("chinese") || l.contains("mandarin")).unwrap_or(false);
+            let target_library_id = target_lib_opt.or_else(|| {
+                if is_chinese {
+                    config.komga_chinese_library_id.or(config.komga_library_id)
+                } else {
+                    config.komga_library_id
+                }
+            });
+
             let komga_client = crate::pipeline::komga::KomgaClient::new(pipeline.http.clone(), config.komga_url, komga_key);
-            komga_client.trigger_scan(target_library_id).await?;
+            komga_client.trigger_scan(target_library_id.as_deref()).await?;
 
-            pipeline.ownership.invalidate(manga_id);
+            // Bounded quick check before returning (does not hang HTTP request)
+            let policy = crate::pipeline::VerificationPolicy {
+                timeout: Duration::from_secs(3),
+                initial_delay: Duration::from_millis(500),
+                max_interval: Duration::from_secs(1),
+                backoff_factor: 1.5,
+            };
 
-            // Remove from downloads queue as completed
-            self.db
-                .call(move |conn| {
-                    conn.execute("DELETE FROM downloads WHERE chapter_id = ?1", [chapter])?;
-                    Ok(())
-                })
-                .await?;
+            let verified = pipeline
+                .poll_verify_release(
+                    &komga_client,
+                    &title,
+                    target_library_id.as_deref(),
+                    is_vol,
+                    rel_num,
+                    policy,
+                )
+                .await
+                .unwrap_or(false);
 
-            Ok(format!("Komga library scan triggered successfully for {title}"))
+            if verified {
+                pipeline.ownership.invalidate(manga_id);
+                let _ = pipeline.ownership.get_title_ownership(manga_id, &title).await;
+                self.db
+                    .call(move |conn| {
+                        conn.execute("DELETE FROM downloads WHERE chapter_id = ?1", [chapter])?;
+                        Ok(())
+                    })
+                    .await?;
+                Ok(format!("Ownership verified in Komga — acquisition complete for {title}"))
+            } else {
+                self.db
+                    .call(move |conn| {
+                        conn.execute(
+                            "UPDATE downloads SET state = 'verifying', error = 'Published — waiting for Komga' WHERE chapter_id = ?1",
+                            [chapter],
+                        )?;
+                        Ok(())
+                    })
+                    .await?;
+                Ok(format!("Komga library scan triggered — ownership verification pending for {title}"))
+            }
         } else {
             Err(AppError::bad_request("Pipeline not configured"))
         }
@@ -266,27 +334,41 @@ impl Downloads {
             .await
     }
 
-    /// Deletes a chapter's file. The chapter and its progress stay.
+    /// Deletes a chapter's staging file. The chapter and its progress stay.
+    /// Canonical library artifacts are strictly preserved.
     pub async fn delete(&self, chapter: i64) -> Result<()> {
-        let path = self
+        let (path, is_published) = self
             .db
             .call(move |conn| {
-                let path: Option<String> =
-                    conn.query_row("SELECT download_path FROM chapters WHERE id = ?1", [chapter], |r| r.get(0)).optional()?.flatten();
-                conn.execute("UPDATE chapters SET download_path = NULL WHERE id = ?1", [chapter])?;
-                Ok(path)
+                let (path, pub_path): (Option<String>, Option<String>) = conn
+                    .query_row(
+                        "SELECT c.download_path, d.published_path FROM chapters c LEFT JOIN downloads d ON d.chapter_id = c.id WHERE c.id = ?1",
+                        [chapter],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?
+                    .unwrap_or((None, None));
+                let is_canonical = path.as_deref().map(|p| Path::new(p).is_absolute()).unwrap_or(false) || pub_path.is_some();
+                if !is_canonical {
+                    conn.execute("UPDATE chapters SET download_path = NULL WHERE id = ?1", [chapter])?;
+                }
+                Ok((path, is_canonical))
             })
             .await?;
         if let Some(relative) = path {
-            let file = self.dir.join(relative);
-            let _ = tokio::task::spawn_blocking(move || {
-                let _ = fs::remove_file(&file);
-                // The title's folder and the source's go too, when this was the last file in them.
-                for folder in file.ancestors().skip(1).take(2) {
-                    let _ = fs::remove_dir(folder);
-                }
-            })
-            .await;
+            // Requirement 12: Cancellation/delete must NEVER delete the valid canonical library artifact
+            let is_abs_or_canonical = Path::new(&relative).is_absolute() || is_published;
+            if !is_abs_or_canonical {
+                let file = self.dir.join(relative);
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = fs::remove_file(&file);
+                    // The title's folder and the source's go too, when this was the last file in them.
+                    for folder in file.ancestors().skip(1).take(2) {
+                        let _ = fs::remove_dir(folder);
+                    }
+                })
+                .await;
+            }
         }
         Ok(())
     }
@@ -303,20 +385,140 @@ impl Downloads {
 
     /// Works through the queue, one chapter at a time. Never returns.
     pub async fn run(self) {
-        // Whatever was being fetched when Mango stopped starts over.
+        // Whatever was being fetched when Mango stopped starts over,
+        // but downloads that were already published durably remain published (do NOT redownload!).
         let _ = self
             .db
             .call(|conn| {
-                conn.execute("UPDATE downloads SET state = 'queued' WHERE state = 'downloading'", [])?;
+                // 1. Verify any downloads marked with published_path
+                let mut stmt = conn.prepare("SELECT chapter_id, published_path FROM downloads WHERE published_path IS NOT NULL")?;
+                let published_items = stmt
+                    .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+                    .filter_map(std::result::Result::ok)
+                    .collect::<Vec<_>>();
+
+                for (ch_id, pub_path) in published_items {
+                    let path = PathBuf::from(&pub_path);
+                    if path.is_file() && crate::pipeline::publisher::verify_cbz_integrity(&path).is_ok() {
+                        conn.execute(
+                            "UPDATE downloads SET state = 'verifying', error = 'Published — waiting for Komga' WHERE chapter_id = ?1",
+                            [ch_id],
+                        )?;
+                    } else {
+                        conn.execute(
+                            "UPDATE downloads SET published_path = NULL, state = 'queued', error = NULL WHERE chapter_id = ?1",
+                            [ch_id],
+                        )?;
+                    }
+                }
+
+                // 2. Interrupted staging downloads reset to queued
+                conn.execute("UPDATE downloads SET state = 'queued' WHERE state = 'downloading' AND published_path IS NULL", [])?;
                 Ok(())
             })
             .await;
+
         loop {
             let Ok(Some(job)) = self.db.call(|conn| next_job(conn)).await else {
                 // Nothing due. Wait for a nudge, and look again before long in case a retry has come due.
                 let _ = tokio::time::timeout(Duration::from_secs(30), self.wake.notified()).await;
                 continue;
             };
+
+            // If this job was already published (e.g. restart recovery or retry from verification timeout):
+            if let Some(ref pub_path) = job.published_path {
+                let canonical_path = PathBuf::from(pub_path);
+                if canonical_path.is_file() && crate::pipeline::publisher::verify_cbz_integrity(&canonical_path).is_ok() {
+                    // Do NOT redownload! Proceed directly to Komga verification
+                    if let Some(pipeline) = &self.pipeline {
+                        let live_stage = self.live_stage.clone();
+                        let chapter_id = job.chapter;
+                        let update_stage = move |stage: &str, msg: &str, dest: Option<String>| {
+                            if let Ok(mut lock) = live_stage.lock() {
+                                *lock = Some(AcquisitionLiveState {
+                                    chapter_id,
+                                    stage: stage.to_string(),
+                                    status_message: msg.to_string(),
+                                    destination: dest,
+                                });
+                            }
+                        };
+
+                        let (config, _, komga_key) = pipeline.load_internal_config().await.unwrap_or_default();
+                        if config.komga_enabled && config.komga_scan_enabled {
+                            let komga_client = crate::pipeline::komga::KomgaClient::new(pipeline.http.clone(), config.komga_url, komga_key);
+                            update_stage("komga", "Triggering targeted Komga library scan...", Some(pub_path.clone()));
+                            let target_lib = job.target_library_id.as_deref().or(config.komga_library_id.as_deref());
+                            if let Ok(()) = komga_client.trigger_scan(target_lib).await {
+                                update_stage("verifying", "Ownership verification pending in Komga...", Some(pub_path.clone()));
+                                let policy = pipeline.verification_policy();
+                                let is_vol = job.release_type == crate::release::ReleaseType::Volume;
+                                let rel_num = if is_vol {
+                                    job.volume.unwrap_or(job.number)
+                                } else {
+                                    job.chapter_number.unwrap_or(job.number)
+                                };
+                                let verified = pipeline
+                                    .poll_verify_release(
+                                        &komga_client,
+                                        &job.title,
+                                        target_lib,
+                                        is_vol,
+                                        rel_num,
+                                        policy,
+                                    )
+                                    .await
+                                    .unwrap_or(false);
+                                if verified {
+                                    pipeline.ownership.invalidate(job.manga_id);
+                                    let _ = pipeline.ownership.get_title_ownership(job.manga_id, &job.title).await;
+                                    let _ = self
+                                        .db
+                                        .call(move |conn| {
+                                            conn.execute("DELETE FROM downloads WHERE chapter_id = ?1", [chapter_id])?;
+                                            Ok(())
+                                        })
+                                        .await;
+                                    update_stage("complete", "Acquisition complete — verified in Komga", Some(pub_path.clone()));
+                                } else {
+                                    let _ = self
+                                        .db
+                                        .call(move |conn| {
+                                            conn.execute(
+                                                "UPDATE downloads SET state = 'verifying', error = 'Published — waiting for Komga', attempts = attempts + 1 WHERE chapter_id = ?1",
+                                                [chapter_id],
+                                            )?;
+                                            Ok(())
+                                        })
+                                        .await;
+                                }
+                            } else {
+                                let _ = self
+                                    .db
+                                    .call(move |conn| {
+                                        conn.execute(
+                                            "UPDATE downloads SET state = 'failed', error = 'Published, but Komga scan trigger failed' WHERE chapter_id = ?1",
+                                            [chapter_id],
+                                        )?;
+                                        Ok(())
+                                    })
+                                    .await;
+                            }
+                        } else {
+                            let _ = self
+                                .db
+                                .call(move |conn| {
+                                    conn.execute("DELETE FROM downloads WHERE chapter_id = ?1", [chapter_id])?;
+                                    Ok(())
+                                })
+                                .await;
+                        }
+                    }
+                    *self.live_stage.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                    continue;
+                }
+            }
+
             let outcome = self.save(&job).await;
             *self.progress.lock().unwrap_or_else(|e| e.into_inner()) = None;
 
@@ -338,11 +540,24 @@ impl Downloads {
                         }
                     };
 
-                    if let Err(e) = pipeline.process_download_with_progress(&cbz_file, &job, update_stage).await {
-                        tracing::warn!("acquisition pipeline processing failed for {} / {}: {e}", job.title, job.name);
-                        final_outcome = Err(e);
-                    } else {
-                        pipeline.ownership.invalidate(job.manga_id);
+                    match pipeline.process_download_with_progress(&cbz_file, &job, update_stage).await {
+                        Ok(crate::pipeline::AcquisitionOutcome::Complete(_)) => {
+                            *self.live_stage.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                            continue;
+                        }
+                        Ok(crate::pipeline::AcquisitionOutcome::PublishedPendingKomga(_)) => {
+                            *self.live_stage.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                            continue;
+                        }
+                        Ok(crate::pipeline::AcquisitionOutcome::PublishedScanFailed { error, .. }) => {
+                            tracing::warn!("acquisition published for {} / {}, but Komga scan failed: {error}", job.title, job.name);
+                            *self.live_stage.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::warn!("acquisition pipeline processing failed for {} / {}: {e}", job.title, job.name);
+                            final_outcome = Err(e);
+                        }
                     }
                 }
             }
@@ -468,7 +683,7 @@ pub(crate) fn place_in(dir: &Path, job: &Job) -> PathBuf {
     path
 }
 
-fn add(conn: &mut Connection, chapters: &[i64]) -> Result<usize> {
+pub(crate) fn add(conn: &mut Connection, chapters: &[i64]) -> Result<usize> {
     let tx = conn.transaction()?;
     let mut added = 0;
     for chapter in chapters {
@@ -491,15 +706,15 @@ fn unread_of(conn: &Connection, titles: &[i64]) -> Result<Vec<i64>> {
     Ok(chapters)
 }
 
-fn read_queue(conn: &Connection) -> Result<QueueView> {
+pub(crate) fn read_queue(conn: &Connection) -> Result<QueueView> {
     let mut stmt = conn.prepare(
         "SELECT d.chapter_id, c.name, m.id, m.title, d.state, c.page_count, d.attempts, d.retry_at, d.error,
-                COALESCE(s.name, 'Unknown source'), c.scanlator, c.chapter_number
+                COALESCE(s.name, 'Unknown source'), c.scanlator, c.chapter_number, d.published_path
          FROM downloads d
          JOIN chapters c ON c.id = d.chapter_id
          JOIN manga m ON m.id = c.manga_id
          LEFT JOIN sources s ON s.id = m.source_id
-         ORDER BY d.state != 'downloading', d.position, d.chapter_id",
+         ORDER BY d.state != 'downloading' AND d.state != 'verifying', d.position, d.chapter_id",
     )?;
     let queue = stmt
         .query_map([], |r| {
@@ -508,12 +723,18 @@ fn read_queue(conn: &Connection) -> Result<QueueView> {
             let release_info = crate::release::parse_release(&chapter_name, chapter_number);
             let state: String = r.get(4)?;
             let error: Option<String> = r.get(8)?;
-            let can_retry_komga = state == "failed"
-                && error.as_deref().map(|e| e.to_lowercase().contains("komga")).unwrap_or(false);
+            let published_path: Option<String> = r.get(12)?;
+            let can_retry_komga = (state == "failed" || state == "verifying")
+                && (published_path.is_some() || error.as_deref().map(|e| e.to_lowercase().contains("komga")).unwrap_or(false));
             let failure_stage = if can_retry_komga {
                 Some("komga".to_string())
             } else if state == "failed" {
                 Some("download".to_string())
+            } else {
+                None
+            };
+            let status_message = if state == "verifying" {
+                Some(error.clone().unwrap_or_else(|| "Published — waiting for Komga".to_string()))
             } else {
                 None
             };
@@ -524,8 +745,8 @@ fn read_queue(conn: &Connection) -> Result<QueueView> {
                 title: r.get(3)?,
                 state: state.clone(),
                 stage: state,
-                status_message: None,
-                destination: None,
+                status_message,
+                destination: published_path.clone(),
                 source: r.get(9)?,
                 scanlator: r.get(10)?,
                 release_type: Some(match release_info.release_type {
@@ -540,6 +761,7 @@ fn read_queue(conn: &Connection) -> Result<QueueView> {
                 error,
                 can_retry_komga,
                 failure_stage,
+                published_path,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -551,60 +773,84 @@ fn next_job(conn: &Connection) -> Result<Option<Job>> {
     if settings::get::<bool>(conn, PAUSED).unwrap_or(false) {
         return Ok(None);
     }
-    let job = conn
+    let job_row = conn
         .query_row(
             "SELECT d.chapter_id, d.attempts, COALESCE(s.name, 'Unknown source'), m.title, c.name, c.chapter_number, c.scanlator,
-                    m.author, m.artist, m.genre, m.description, s.lang, m.id
+                    m.author, m.artist, m.genre, m.description, s.lang, m.id, d.published_path, d.target_library_id, d.state
              FROM downloads d JOIN chapters c ON c.id = d.chapter_id JOIN manga m ON m.id = c.manga_id
              LEFT JOIN sources s ON s.id = m.source_id
-             WHERE d.state = 'queued' AND (d.retry_at IS NULL OR d.retry_at <= ?1)
+             WHERE (d.state = 'queued' OR d.state = 'verifying') AND (d.retry_at IS NULL OR d.retry_at <= ?1)
              ORDER BY d.position, d.chapter_id LIMIT 1",
             [now()],
             |r| {
                 let name: String = r.get(4)?;
                 let number: f64 = r.get(5)?;
                 let release_info = crate::release::parse_release(&name, number);
-                Ok(Job {
-                    chapter: r.get(0)?,
-                    manga_id: r.get(12)?,
-                    attempts: r.get(1)?,
-                    source: r.get(2)?,
-                    title: r.get(3)?,
-                    name,
-                    number,
-                    scanlator: r.get(6)?,
-                    author: r.get(7)?,
-                    artist: r.get(8)?,
-                    genre: r.get(9)?,
-                    summary: r.get(10)?,
-                    lang: r.get(11)?,
-                    volume: release_info.volume,
-                    release_type: release_info.release_type,
-                    chapter_number: release_info.chapter_number,
-                })
+                let state: String = r.get(15)?;
+                Ok((
+                    Job {
+                        chapter: r.get(0)?,
+                        manga_id: r.get(12)?,
+                        attempts: r.get(1)?,
+                        source: r.get(2)?,
+                        title: r.get(3)?,
+                        name,
+                        number,
+                        scanlator: r.get(6)?,
+                        author: r.get(7)?,
+                        artist: r.get(8)?,
+                        genre: r.get(9)?,
+                        summary: r.get(10)?,
+                        lang: r.get(11)?,
+                        volume: release_info.volume,
+                        release_type: release_info.release_type,
+                        chapter_number: release_info.chapter_number,
+                        published_path: r.get(13)?,
+                        target_library_id: r.get(14)?,
+                    },
+                    state,
+                ))
             },
         )
         .optional()?;
-    if let Some(job) = &job {
-        conn.execute("UPDATE downloads SET state = 'downloading' WHERE chapter_id = ?1", [job.chapter])?;
+
+    if let Some((job, state)) = job_row {
+        if state == "queued" && job.published_path.is_none() {
+            conn.execute("UPDATE downloads SET state = 'downloading' WHERE chapter_id = ?1", [job.chapter])?;
+        }
+        return Ok(Some(job));
     }
-    Ok(job)
+    Ok(None)
 }
 
 /// Writes down how a fetch ended: saved, put back, or failed with a later try or none.
 fn record(conn: &Connection, chapter: i64, attempts: i64, outcome: Result<Option<(String, i64)>>) -> Result<()> {
+    // If the chapter was already published, do NOT overwrite its publication state or reset to download!
+    let published_path: Option<String> = conn
+        .query_row("SELECT published_path FROM downloads WHERE chapter_id = ?1", [chapter], |r| r.get(0))
+        .optional()?
+        .flatten();
+
     match outcome {
         Ok(Some((path, pages))) => {
             conn.execute("UPDATE chapters SET download_path = ?2, page_count = ?3 WHERE id = ?1", params![chapter, path, pages])?;
             conn.execute("DELETE FROM downloads WHERE chapter_id = ?1", [chapter])?;
         }
         Ok(None) => {
-            conn.execute("UPDATE downloads SET state = 'queued' WHERE chapter_id = ?1", [chapter])?;
+            if published_path.is_none() {
+                conn.execute("UPDATE downloads SET state = 'queued' WHERE chapter_id = ?1", [chapter])?;
+            }
         }
         Err(e) => {
             let tried = attempts + 1;
             let (state, retry_at) = match WAITS.get(tried as usize - 1) {
-                Some(wait) if tried < TRIES => ("queued", Some(now() + wait)),
+                Some(wait) if tried < TRIES => {
+                    if published_path.is_some() {
+                        ("verifying", Some(now() + wait))
+                    } else {
+                        ("queued", Some(now() + wait))
+                    }
+                }
                 _ => ("failed", None),
             };
             conn.execute(
@@ -824,6 +1070,8 @@ mod tests {
             volume: None,
             release_type: crate::release::ReleaseType::Chapter,
             chapter_number: Some(1.5),
+            published_path: None,
+            target_library_id: None,
         };
         let xml = comic_info(&job, 12);
         assert!(xml.contains("<Series>Tom &amp; Jerry &lt;3</Series>"));
@@ -858,6 +1106,8 @@ mod tests {
             volume: Some(1.0),
             release_type: crate::release::ReleaseType::Volume,
             chapter_number: None,
+            published_path: None,
+            target_library_id: None,
         };
         let vol_xml = comic_info(&vol_job, 192);
         assert!(vol_xml.contains("<Volume>1</Volume>"));
@@ -884,6 +1134,8 @@ mod tests {
             volume: Some(1.0),
             release_type: crate::release::ReleaseType::Chapter,
             chapter_number: Some(5.0),
+            published_path: None,
+            target_library_id: None,
         };
         let ch_vol_xml = comic_info(&ch_vol_job, 24);
         assert!(ch_vol_xml.contains("<Volume>1</Volume>"));
@@ -908,6 +1160,8 @@ mod tests {
             volume: None,
             release_type: crate::release::ReleaseType::Chapter,
             chapter_number: Some(1.0),
+            published_path: None,
+            target_library_id: None,
         };
         let ch_xml = comic_info(&ch_job, 75);
         assert!(ch_xml.contains("<Number>1</Number>"));
@@ -938,6 +1192,8 @@ mod tests {
             volume: Some(12.5),
             release_type: crate::release::ReleaseType::Volume,
             chapter_number: None,
+            published_path: None,
+            target_library_id: None,
         };
         let frac_xml = comic_info(&frac_job, 100);
         assert!(frac_xml.contains("<Volume>12.5</Volume>"));
@@ -991,5 +1247,260 @@ mod tests {
         assert_eq!(q12.state, "failed");
         assert_eq!(q12.can_retry_komga, true);
         assert_eq!(q12.failure_stage.as_deref(), Some("komga"));
+    }
+
+    fn make_test_cbz(path: &Path, content: &str) {
+        let file = fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        zip.start_file("ComicInfo.xml", options).unwrap();
+        zip.write_all(format!("<ComicInfo><Series>{content}</Series></ComicInfo>").as_bytes()).unwrap();
+        zip.start_file("001.webp", options).unwrap();
+        zip.write_all(b"fake image bytes").unwrap();
+        zip.finish().unwrap();
+    }
+
+    fn test_images(db: Db, dir: &Path) -> Images {
+        let host = crate::host::Host::new(crate::config::HostConfig::default(), dir.join("host_bin"), dir).unwrap();
+        let local = crate::local::Local::new(dir.join("local"));
+        Images::new(db, host, local, dir, 10)
+    }
+
+    #[tokio::test]
+    async fn test_scenario_e_retry_komga_does_not_redownload_or_republish() {
+        use axum::{routing::{get, post}, Json, Router};
+        use serde_json::json;
+
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now().duration_since(std::time::SystemTime::UNIX_EPOCH).unwrap().as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("mango-test-retry-e-{pid}-{nanos}"));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let db = Db::open(&temp_dir.join("test.db")).unwrap();
+        db.call(|conn| {
+            conn.execute("INSERT INTO manga (id, source_id, url, title, in_library) VALUES (1, 1, '/manga', 'Retry Series', 1)", [])?;
+            conn.execute("INSERT INTO chapters (id, manga_id, url, name, chapter_number, source_order, fetched_at, read) VALUES (10, 1, '/c10', 'Volume 1', 1.0, 1, 0, 0)", [])?;
+            Ok(())
+        }).await.unwrap();
+
+        let lib_dir = temp_dir.join("manga");
+        let series_dir = lib_dir.join("Retry Series");
+        fs::create_dir_all(&series_dir).unwrap();
+        let published_cbz = series_dir.join("Retry Series v01.cbz");
+        make_test_cbz(&published_cbz, "Retry Series");
+        let original_meta = fs::metadata(&published_cbz).unwrap();
+
+        let app = Router::new()
+            .route(
+                "/api/v1/libraries/lib-en/scan",
+                post(|| async { axum::http::StatusCode::NO_CONTENT }),
+            )
+            .route(
+                "/api/v1/series",
+                get(|| async {
+                    Json(json!({
+                        "content": [
+                            {
+                                "id": "series-ret",
+                                "name": "Retry Series",
+                                "libraryId": "lib-en",
+                                "booksCount": 1
+                            }
+                        ]
+                    }))
+                }),
+            )
+            .route(
+                "/api/v1/series/series-ret/books",
+                get(|| async {
+                    Json(json!({
+                        "content": [
+                            {
+                                "id": "book-ret",
+                                "seriesId": "series-ret",
+                                "name": "Retry Series v01",
+                                "number": 1.0,
+                                "metadata": {
+                                    "title": "Retry Series v01",
+                                    "number": "1",
+                                    "numberSort": 1.0
+                                }
+                            }
+                        ]
+                    }))
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let pipeline = Arc::new(crate::pipeline::Pipeline::new(db.clone()));
+        let mut config = crate::pipeline::PipelineConfig::default();
+        config.enabled = true;
+        config.library_dir = Some(lib_dir.to_string_lossy().to_string());
+        config.komga_enabled = true;
+        config.komga_scan_enabled = true;
+        config.komga_library_id = Some("lib-en".into());
+        config.komga_url = Some(format!("http://127.0.0.1:{port}"));
+        config.mangabaka_enabled = false;
+        config.optimize_enabled = false;
+        pipeline.save_config(config).await.unwrap();
+
+        let images = test_images(db.clone(), &temp_dir);
+        let mut downloads = Downloads::new(db.clone(), images, &temp_dir, 0);
+        downloads.set_pipeline(pipeline);
+
+        let pub_str = published_cbz.to_string_lossy().to_string();
+        db.call(move |conn| {
+            conn.execute(
+                "INSERT INTO downloads (chapter_id, state, position, added_at, published_path, target_library_id, error)
+                 VALUES (10, 'failed', 1, 1000, ?1, 'lib-en', 'Komga scan failed previously')",
+                rusqlite::params![pub_str],
+            )?;
+            conn.execute("UPDATE chapters SET download_path = ?1 WHERE id = 10", rusqlite::params![pub_str])?;
+            Ok(())
+        }).await.unwrap();
+
+        let res = downloads.retry_komga(10).await.unwrap();
+        assert!(res.contains("Ownership verified in Komga — acquisition complete"));
+
+        let dl_count: i64 = db.call(|conn| Ok(conn.query_row("SELECT COUNT(*) FROM downloads WHERE chapter_id = 10", [], |r| r.get(0))?)).await.unwrap();
+        assert_eq!(dl_count, 0);
+
+        assert!(published_cbz.exists());
+        let final_meta = fs::metadata(&published_cbz).unwrap();
+        assert_eq!(final_meta.len(), original_meta.len());
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_scenario_f_process_restart_during_ownership_verification_resumes() {
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now().duration_since(std::time::SystemTime::UNIX_EPOCH).unwrap().as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("mango-test-restart-f-{pid}-{nanos}"));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let db = Db::open(&temp_dir.join("test.db")).unwrap();
+        let lib_dir = temp_dir.join("manga");
+        fs::create_dir_all(&lib_dir).unwrap();
+        let published_cbz = lib_dir.join("Existing Series v01.cbz");
+        make_test_cbz(&published_cbz, "Existing Series");
+
+        let pub_str = published_cbz.to_string_lossy().to_string();
+
+        db.call(move |conn| {
+            conn.execute("INSERT INTO manga (id, source_id, url, title, in_library) VALUES (1, 1, '/m', 'Series', 1)", [])?;
+            conn.execute("INSERT INTO chapters (id, manga_id, url, name, chapter_number, source_order, fetched_at, read) VALUES (1, 1, '/c1', 'Vol 1', 1.0, 1, 0, 0)", [])?;
+            conn.execute("INSERT INTO chapters (id, manga_id, url, name, chapter_number, source_order, fetched_at, read) VALUES (2, 1, '/c2', 'Vol 2', 2.0, 2, 0, 0)", [])?;
+
+            // Item 1: Already published, interrupted in downloading
+            conn.execute(
+                "INSERT INTO downloads (chapter_id, state, position, added_at, published_path, target_library_id)
+                 VALUES (1, 'downloading', 1, 1000, ?1, 'lib-en')",
+                rusqlite::params![pub_str],
+            )?;
+
+            // Item 2: Staging download, interrupted during download (no published_path)
+            conn.execute(
+                "INSERT INTO downloads (chapter_id, state, position, added_at, published_path)
+                 VALUES (2, 'downloading', 2, 1000, NULL)",
+                [],
+            )?;
+            Ok(())
+        }).await.unwrap();
+
+        // Run the startup recovery logic as defined in Downloads::run()
+        db.call(|conn| {
+            let mut stmt = conn.prepare("SELECT chapter_id, published_path FROM downloads WHERE published_path IS NOT NULL")?;
+            let published_items = stmt
+                .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+                .filter_map(std::result::Result::ok)
+                .collect::<Vec<_>>();
+
+            for (ch_id, pub_path) in published_items {
+                let path = PathBuf::from(&pub_path);
+                if path.is_file() && crate::pipeline::publisher::verify_cbz_integrity(&path).is_ok() {
+                    conn.execute(
+                        "UPDATE downloads SET state = 'verifying', error = 'Published — waiting for Komga' WHERE chapter_id = ?1",
+                        [ch_id],
+                    )?;
+                } else {
+                    conn.execute(
+                        "UPDATE downloads SET published_path = NULL, state = 'queued', error = NULL WHERE chapter_id = ?1",
+                        [ch_id],
+                    )?;
+                }
+            }
+
+            conn.execute("UPDATE downloads SET state = 'queued' WHERE state = 'downloading' AND published_path IS NULL", [])?;
+            Ok(())
+        }).await.unwrap();
+
+        let (state1, pub1, state2, pub2): (String, Option<String>, String, Option<String>) = db.call(|conn| {
+            let (s1, p1) = conn.query_row("SELECT state, published_path FROM downloads WHERE chapter_id = 1", [], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            let (s2, p2) = conn.query_row("SELECT state, published_path FROM downloads WHERE chapter_id = 2", [], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            Ok((s1, p1, s2, p2))
+        }).await.unwrap();
+
+        assert_eq!(state1, "verifying");
+        assert_eq!(pub1.as_deref(), Some(published_cbz.to_str().unwrap()));
+
+        assert_eq!(state2, "queued");
+        assert_eq!(pub2, None);
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_scenario_j_cancellation_after_publication_preserves_canonical_artifact() {
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now().duration_since(std::time::SystemTime::UNIX_EPOCH).unwrap().as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("mango-test-cancel-j-{pid}-{nanos}"));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let db = Db::open(&temp_dir.join("test.db")).unwrap();
+        let lib_dir = temp_dir.join("manga");
+        fs::create_dir_all(&lib_dir).unwrap();
+        let published_cbz = lib_dir.join("Preserved Series v01.cbz");
+        make_test_cbz(&published_cbz, "Preserved Series");
+
+        let pub_str = published_cbz.to_string_lossy().to_string();
+
+        db.call(move |conn| {
+            conn.execute("INSERT INTO manga (id, source_id, url, title, in_library) VALUES (1, 1, '/m', 'Preserved Series', 1)", [])?;
+            conn.execute(
+                "INSERT INTO chapters (id, manga_id, url, name, chapter_number, source_order, fetched_at, read, download_path)
+                 VALUES (10, 1, '/c10', 'Volume 1', 1.0, 1, 0, 0, ?1)",
+                rusqlite::params![pub_str],
+            )?;
+            conn.execute(
+                "INSERT INTO downloads (chapter_id, state, position, added_at, published_path, target_library_id)
+                 VALUES (10, 'verifying', 1, 1000, ?1, 'lib-en')",
+                rusqlite::params![pub_str],
+            )?;
+            Ok(())
+        }).await.unwrap();
+
+        let images = test_images(db.clone(), &temp_dir);
+        let downloads = Downloads::new(db.clone(), images, &temp_dir, 0);
+
+        downloads.cancel(Some(10)).await.unwrap();
+
+        let dl_count: i64 = db.call(|conn| Ok(conn.query_row("SELECT COUNT(*) FROM downloads WHERE chapter_id = 10", [], |r| r.get(0))?)).await.unwrap();
+        assert_eq!(dl_count, 0);
+
+        downloads.delete(10).await.unwrap();
+
+        assert!(published_cbz.is_file(), "Canonical library artifact is never deleted on cancellation");
+        assert!(crate::pipeline::publisher::verify_cbz_integrity(&published_cbz).is_ok());
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }

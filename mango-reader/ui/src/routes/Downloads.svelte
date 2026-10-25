@@ -16,8 +16,16 @@
   let busyItems = $state<Record<number, boolean>>({});
 
   const queue = $derived(data?.queue ?? []);
-  // Only chapters still waiting can be moved; the one being fetched stays where it is.
-  const movable = $derived(queue.filter((q) => q.state !== 'downloading' && q.stage !== 'downloading'));
+  // Only chapters still waiting can be moved; active or verifying items stay where they are.
+  const movable = $derived(
+    queue.filter(
+      (q) =>
+        q.state !== 'downloading' &&
+        q.stage !== 'downloading' &&
+        q.state !== 'verifying' &&
+        q.stage !== 'verifying'
+    )
+  );
 
   async function load(isBackground = false) {
     try {
@@ -138,6 +146,7 @@
 
   function describe(entry: Queued): string {
     if (entry.statusMessage) return entry.statusMessage;
+    if (entry.state === 'verifying' || entry.stage === 'verifying') return 'Published — waiting for Komga';
     if (entry.state === 'downloading') return entry.total ? `Downloading, page ${entry.done} of ${entry.total}` : 'Downloading';
     if (entry.state === 'identifying') return 'Identifying release semantics';
     if (entry.state === 'metadata') return 'Querying MangaBaka metadata';
@@ -163,6 +172,7 @@
       case 'validating': return 'Validating';
       case 'publishing': return 'Publishing';
       case 'komga': return 'Komga';
+      case 'verifying': return 'Verifying';
       case 'complete': return 'Complete';
       case 'failed': return 'Failed';
       default: return 'Queued';

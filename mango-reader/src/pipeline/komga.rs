@@ -315,6 +315,100 @@ impl KomgaClient {
         tracing::info!("KOMGA: library scan triggered successfully ({endpoint})");
         Ok(())
     }
+
+    /// Verifies whether a specific canonical release (Volume N or Chapter N) of a series
+    /// has been indexed and is visible in Komga.
+    pub async fn verify_release_indexed(
+        &self,
+        series_title: &str,
+        library_id: Option<&str>,
+        is_volume: bool,
+        release_number: f64,
+    ) -> Result<bool> {
+        let trimmed_title = series_title.trim();
+        let wanted_norm = crate::pipeline::mangabaka::normalize_title(trimmed_title);
+
+        let series_candidates = match self.search_series(trimmed_title, library_id).await {
+            Ok(s) => s,
+            Err(e) => return Err(e),
+        };
+
+        let exact_matches: Vec<_> = series_candidates
+            .into_iter()
+            .filter(|s| {
+                s.name.eq_ignore_ascii_case(trimmed_title)
+                    || crate::pipeline::mangabaka::normalize_title(&s.name) == wanted_norm
+            })
+            .collect();
+
+        let matched_series = match exact_matches.first() {
+            Some(s) => s,
+            None => return Ok(false), // Series folder not yet indexed by Komga
+        };
+
+        let books = match self.get_books_in_series(&matched_series.id).await {
+            Ok(b) => b,
+            Err(e) => return Err(e),
+        };
+
+        let series_context = crate::release::determine_series_context(books.iter().map(|b| {
+            (
+                b.name.as_str(),
+                b.metadata.as_ref().and_then(|m| m.title.as_deref()),
+            )
+        }));
+
+        for b in &books {
+            let meta_title = b.metadata.as_ref().and_then(|m| m.title.as_deref());
+            let meta_num = b.metadata.as_ref().and_then(|m| m.number.as_deref());
+
+            let (unit, num_opt) = crate::release::classify_komga_book(
+                &b.name,
+                meta_title,
+                meta_num,
+                b.number,
+                series_context,
+            );
+
+            let matched = if is_volume {
+                if unit == crate::release::ReleaseUnit::Volume {
+                    let vol = num_opt
+                        .or_else(|| {
+                            b.metadata.as_ref().and_then(|m| {
+                                m.number_sort.or_else(|| {
+                                    m.number.as_deref().and_then(|n| n.parse::<f64>().ok())
+                                })
+                            })
+                        })
+                        .unwrap_or(b.number);
+                    (vol - release_number).abs() < 0.001
+                } else {
+                    false
+                }
+            } else {
+                if unit == crate::release::ReleaseUnit::Chapter {
+                    let ch = num_opt
+                        .or_else(|| {
+                            b.metadata.as_ref().and_then(|m| {
+                                m.number_sort.or_else(|| {
+                                    m.number.as_deref().and_then(|n| n.parse::<f64>().ok())
+                                })
+                            })
+                        })
+                        .unwrap_or(b.number);
+                    (ch - release_number).abs() < 0.001
+                } else {
+                    false
+                }
+            };
+
+            if matched {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
 }
 
 #[cfg(test)]
@@ -518,5 +612,148 @@ mod tests {
 
         assert!(valid_client.trigger_scan(Some("lib-en")).await.is_ok());
         assert!(scan_triggered.load(Ordering::SeqCst), "Targeted scan must fire");
+    }
+
+    #[tokio::test]
+    async fn test_volume_ownership_verification_checks_exact_volume() {
+        use axum::{routing::get, Json, Router};
+        use serde_json::json;
+
+        let app = Router::new()
+            .route(
+                "/api/v1/series",
+                get(|| async {
+                    Json(json!({
+                        "content": [
+                            {
+                                "id": "series-blue-lock",
+                                "name": "Blue Lock",
+                                "libraryId": "lib-en",
+                                "booksCount": 2
+                            }
+                        ]
+                    }))
+                }),
+            )
+            .route(
+                "/api/v1/series/series-blue-lock/books",
+                get(|| async {
+                    Json(json!({
+                        "content": [
+                            {
+                                "id": "book-v1",
+                                "seriesId": "series-blue-lock",
+                                "name": "Blue Lock v01",
+                                "number": 1.0,
+                                "metadata": {
+                                    "title": "Blue Lock v01",
+                                    "number": "1",
+                                    "numberSort": 1.0
+                                }
+                            },
+                            {
+                                "id": "book-v2",
+                                "seriesId": "series-blue-lock",
+                                "name": "Blue Lock v02",
+                                "number": 2.0,
+                                "metadata": {
+                                    "title": "Blue Lock v02",
+                                    "number": "2",
+                                    "numberSort": 2.0
+                                }
+                            }
+                        ]
+                    }))
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = KomgaClient::new(
+            Client::new(),
+            Some(format!("http://127.0.0.1:{port}")),
+            Some("key".into()),
+        );
+
+        // Exact volume 1 exists
+        assert!(client.verify_release_indexed("Blue Lock", Some("lib-en"), true, 1.0).await.unwrap());
+        // Exact volume 2 exists
+        assert!(client.verify_release_indexed("Blue Lock", Some("lib-en"), true, 2.0).await.unwrap());
+        // Volume 3 does NOT exist
+        assert!(!client.verify_release_indexed("Blue Lock", Some("lib-en"), true, 3.0).await.unwrap());
+        // Volume 1.5 does NOT exist
+        assert!(!client.verify_release_indexed("Blue Lock", Some("lib-en"), true, 1.5).await.unwrap());
+        // Chapter 1 does NOT match Volume 1 (unit mismatch)
+        assert!(!client.verify_release_indexed("Blue Lock", Some("lib-en"), false, 1.0).await.unwrap());
+        // Other series does NOT exist
+        assert!(!client.verify_release_indexed("Chainsaw Man", Some("lib-en"), true, 1.0).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_chapter_ownership_verification_checks_exact_chapter() {
+        use axum::{routing::get, Json, Router};
+        use serde_json::json;
+
+        let app = Router::new()
+            .route(
+                "/api/v1/series",
+                get(|| async {
+                    Json(json!({
+                        "content": [
+                            {
+                                "id": "series-dandadan",
+                                "name": "Dandadan",
+                                "libraryId": "lib-en",
+                                "booksCount": 1
+                            }
+                        ]
+                    }))
+                }),
+            )
+            .route(
+                "/api/v1/series/series-dandadan/books",
+                get(|| async {
+                    Json(json!({
+                        "content": [
+                            {
+                                "id": "book-c10",
+                                "seriesId": "series-dandadan",
+                                "name": "Dandadan ch010",
+                                "number": 10.0,
+                                "metadata": {
+                                    "title": "Dandadan ch010",
+                                    "number": "10",
+                                    "numberSort": 10.0
+                                }
+                            }
+                        ]
+                    }))
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = KomgaClient::new(
+            Client::new(),
+            Some(format!("http://127.0.0.1:{port}")),
+            Some("key".into()),
+        );
+
+        // Exact chapter 10 exists
+        assert!(client.verify_release_indexed("Dandadan", Some("lib-en"), false, 10.0).await.unwrap());
+        // Chapter 11 does NOT exist
+        assert!(!client.verify_release_indexed("Dandadan", Some("lib-en"), false, 11.0).await.unwrap());
+        // Chapter 9 does NOT exist
+        assert!(!client.verify_release_indexed("Dandadan", Some("lib-en"), false, 9.0).await.unwrap());
+        // Volume 10 does NOT match Chapter 10 (unit mismatch)
+        assert!(!client.verify_release_indexed("Dandadan", Some("lib-en"), true, 10.0).await.unwrap());
     }
 }

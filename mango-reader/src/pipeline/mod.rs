@@ -39,10 +39,48 @@ use std::{
     collections::VecDeque,
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
-    time::SystemTime,
+    time::{Duration, SystemTime},
 };
 
 const MAX_RECENT_EVENTS: usize = 50;
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct VerificationPolicy {
+    pub timeout: Duration,
+    pub initial_delay: Duration,
+    pub max_interval: Duration,
+    pub backoff_factor: f64,
+}
+
+impl Default for VerificationPolicy {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(60),
+            initial_delay: Duration::from_millis(1500),
+            max_interval: Duration::from_secs(10),
+            backoff_factor: 1.5,
+        }
+    }
+}
+
+impl VerificationPolicy {
+    #[allow(dead_code)]
+    pub fn fast_test() -> Self {
+        Self {
+            timeout: Duration::from_millis(600),
+            initial_delay: Duration::from_millis(20),
+            max_interval: Duration::from_millis(60),
+            backoff_factor: 1.2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcquisitionOutcome {
+    Complete(PathBuf),
+    PublishedPendingKomga(PathBuf),
+    PublishedScanFailed { destination: PathBuf, error: String },
+}
 
 fn default_target_height() -> u32 {
     optimizer::DEFAULT_TARGET_HEIGHT
@@ -167,6 +205,7 @@ pub struct Pipeline {
     pub(crate) http: Client,
     pub ownership: ownership::OwnershipService,
     events: Arc<RwLock<VecDeque<PipelineEvent>>>,
+    verification_policy: Arc<RwLock<VerificationPolicy>>,
 }
 
 impl Pipeline {
@@ -181,7 +220,19 @@ impl Pipeline {
             http,
             ownership,
             events: Arc::new(RwLock::new(VecDeque::with_capacity(MAX_RECENT_EVENTS))),
+            verification_policy: Arc::new(RwLock::new(VerificationPolicy::default())),
         }
+    }
+
+    #[allow(dead_code)]
+    pub fn set_verification_policy(&self, policy: VerificationPolicy) {
+        if let Ok(mut lock) = self.verification_policy.write() {
+            *lock = policy;
+        }
+    }
+
+    pub fn verification_policy(&self) -> VerificationPolicy {
+        self.verification_policy.read().map(|p| *p).unwrap_or_default()
     }
 
     /// Loads the active pipeline configuration from settings and state, enriched with live validation statuses.
@@ -503,9 +554,73 @@ impl Pipeline {
         }
     }
 
+    /// Polls Komga with bounded backoff until the release is indexed or timeout expires.
+    pub async fn poll_verify_release(
+        &self,
+        komga_client: &KomgaClient,
+        series_title: &str,
+        library_id: Option<&str>,
+        is_volume: bool,
+        release_number: f64,
+        policy: VerificationPolicy,
+    ) -> Result<bool> {
+        let start = std::time::Instant::now();
+        let mut interval = policy.initial_delay;
+
+        // Initial delay to allow Komga to receive and queue the scan
+        tokio::time::sleep(interval).await;
+
+        while start.elapsed() < policy.timeout {
+            match komga_client
+                .verify_release_indexed(series_title, library_id, is_volume, release_number)
+                .await
+            {
+                Ok(true) => {
+                    tracing::info!(
+                        "KOMGA: ownership verified for {} ({} {})",
+                        series_title,
+                        if is_volume { "volume" } else { "chapter" },
+                        release_number
+                    );
+                    return Ok(true);
+                }
+                Ok(false) => {
+                    tracing::debug!(
+                        "KOMGA: release {} ({} {}) not yet visible, waiting...",
+                        series_title,
+                        if is_volume { "volume" } else { "chapter" },
+                        release_number
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!("KOMGA: error checking release indexing during verification: {e}");
+                }
+            }
+
+            interval = Duration::from_secs_f64(
+                (interval.as_secs_f64() * policy.backoff_factor)
+                    .min(policy.max_interval.as_secs_f64()),
+            );
+            let remaining = policy.timeout.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+            tokio::time::sleep(interval.min(remaining)).await;
+        }
+
+        // Final check
+        komga_client
+            .verify_release_indexed(series_title, library_id, is_volume, release_number)
+            .await
+    }
+
     /// Executes the full native acquisition post-processing pipeline for a downloaded chapter/volume.
     #[allow(dead_code)]
-    pub async fn process_download(&self, source_cbz: &Path, job: &crate::downloads::Job) -> Result<()> {
+    pub async fn process_download(
+        &self,
+        source_cbz: &Path,
+        job: &crate::downloads::Job,
+    ) -> Result<AcquisitionOutcome> {
         self.process_download_with_progress(source_cbz, job, |_, _, _| {}).await
     }
 
@@ -515,14 +630,14 @@ impl Pipeline {
         source_cbz: &Path,
         job: &crate::downloads::Job,
         mut on_stage: F,
-    ) -> Result<()>
+    ) -> Result<AcquisitionOutcome>
     where
         F: FnMut(&str, &str, Option<String>),
     {
         let (config, mb_token, komga_key) = self.load_internal_config().await?;
 
         if !config.enabled {
-            return Ok(());
+            return Ok(AcquisitionOutcome::Complete(source_cbz.to_path_buf()));
         }
 
         on_stage("identifying", "Classifying release format...", None);
@@ -670,71 +785,196 @@ impl Pipeline {
         // 4. Safe, Atomic Publication into Komga Library
         on_stage("publishing", "Publishing to canonical Komga library...", None);
         let pub_res = publish_cbz(source_cbz, &dest_root, &job.title, is_volume, release_num);
-        let (outcome_str, dest_path_str, publish_err) = match &pub_res {
-            Ok(PublishOutcome::Published(p)) => ("published", Some(p.to_string_lossy().to_string()), None),
-            Ok(PublishOutcome::AlreadyPublished(p)) => ("already_published", Some(p.to_string_lossy().to_string()), None),
-            Err(e) if e.code == "destination_conflict" => ("conflict", None, Some(e.message.clone())),
-            Err(e) => ("error", None, Some(e.message.clone())),
+        let outcome_str = match &pub_res {
+            Ok(PublishOutcome::Published(_)) => "published",
+            Ok(PublishOutcome::AlreadyPublished(_)) => "already_published",
+            Err(e) if e.code == "destination_conflict" => "conflict",
+            Err(_) => "error",
         };
 
-        // 5. Automatic Komga Library Rescan Trigger
-        let mut komga_status = "skipped".to_string();
-        let mut komga_scan_error: Option<String> = None;
-        if config.komga_enabled && config.komga_scan_enabled && pub_res.is_ok() {
-            on_stage("komga", "Triggering targeted Komga library scan...", dest_path_str.clone());
-            let target_library_id = if is_chinese {
-                config.komga_chinese_library_id.as_deref().or(config.komga_library_id.as_deref())
-            } else {
-                config.komga_library_id.as_deref()
-            };
-            let komga_client = KomgaClient::new(self.http.clone(), config.komga_url.clone(), komga_key);
-            match komga_client.trigger_scan(target_library_id).await {
-                Ok(()) => {
-                    komga_status = match target_library_id {
-                        Some(id) => format!("scan triggered ({id})"),
-                        None => "scan triggered (all)".to_string(),
-                    };
-                }
-                Err(e) => {
-                    komga_status = format!("scan trigger failed: {e}");
-                    komga_scan_error = Some(e.message);
-                }
-            }
-        }
-
-        // 6. Record Audit Event
-        self.record_event(PipelineEvent {
-            id: format!("{}-{}", job.chapter, now),
-            timestamp: now,
-            chapter_id: job.chapter,
-            series: job.title.clone(),
-            release_name,
-            is_volume,
-            number: release_num,
-            outcome: outcome_str.to_string(),
-            destination: dest_path_str.clone(),
-            mangabaka_status,
-            optimizer_status,
-            komga_status,
-            error: publish_err.clone().or(komga_scan_error.clone()),
-        });
-
-        // Fail-safe: if publication failed (e.g. conflict), return error so downloads worker knows,
-        // but staging download remains preserved in Mango data directory.
+        // Fail-safe: if publication failed (e.g. conflict, directory error), fail closed now
+        // Staging download remains preserved in Mango data directory.
         if let Err(e) = pub_res {
+            self.record_event(PipelineEvent {
+                id: format!("{}-{}", job.chapter, now),
+                timestamp: now,
+                chapter_id: job.chapter,
+                series: job.title.clone(),
+                release_name,
+                is_volume,
+                number: release_num,
+                outcome: outcome_str.to_string(),
+                destination: None,
+                mangabaka_status,
+                optimizer_status,
+                komga_status: "skipped".to_string(),
+                error: Some(e.message.clone()),
+            });
             return Err(e);
         }
 
-        if let Some(err_msg) = komga_scan_error {
-            return Err(AppError::new(
-                502,
-                "komga_scan_failed",
-                format!("Published to {}, but Komga scan trigger failed: {}", dest_path_str.as_deref().unwrap_or(""), err_msg),
-            ));
+        let canonical_dest = match pub_res.unwrap() {
+            PublishOutcome::Published(p) | PublishOutcome::AlreadyPublished(p) => p,
+        };
+        let canonical_dest_str = canonical_dest.to_string_lossy().to_string();
+
+        // 5. Durably persist publication success BEFORE Komga scan or verification
+        let chapter_id = job.chapter;
+        let p_str = canonical_dest_str.clone();
+        let target_library_id = if is_chinese {
+            config.komga_chinese_library_id.as_deref().or(config.komga_library_id.as_deref())
+        } else {
+            config.komga_library_id.as_deref()
+        };
+        let t_lib = target_library_id.map(|s| s.to_string());
+
+        let _ = self.db.call(move |conn| {
+            conn.execute(
+                "UPDATE chapters SET download_path = ?2 WHERE id = ?1",
+                rusqlite::params![chapter_id, p_str],
+            )?;
+            conn.execute(
+                "UPDATE downloads SET published_path = ?2, published_at = ?3, target_library_id = ?4, state = 'verifying', error = 'Published — waiting for Komga' WHERE chapter_id = ?1",
+                rusqlite::params![chapter_id, p_str, now as i64, t_lib],
+            )?;
+            Ok(())
+        }).await;
+
+        if !config.komga_enabled || !config.komga_scan_enabled {
+            self.record_event(PipelineEvent {
+                id: format!("{}-{}", job.chapter, now),
+                timestamp: now,
+                chapter_id: job.chapter,
+                series: job.title.clone(),
+                release_name,
+                is_volume,
+                number: release_num,
+                outcome: outcome_str.to_string(),
+                destination: Some(canonical_dest_str.clone()),
+                mangabaka_status,
+                optimizer_status,
+                komga_status: "skipped: komga disabled".to_string(),
+                error: None,
+            });
+
+            let _ = self.db.call(move |conn| {
+                conn.execute("DELETE FROM downloads WHERE chapter_id = ?1", [chapter_id])?;
+                Ok(())
+            }).await;
+
+            on_stage("complete", "Acquisition complete", Some(canonical_dest_str));
+            return Ok(AcquisitionOutcome::Complete(canonical_dest));
         }
 
-        on_stage("complete", "Acquisition complete", dest_path_str);
-        Ok(())
+        // 6. Trigger only the configured destination Komga library scan
+        on_stage("komga", "Triggering targeted Komga library scan...", Some(canonical_dest_str.clone()));
+        let komga_client = KomgaClient::new(self.http.clone(), config.komga_url.clone(), komga_key);
+
+        if let Err(e) = komga_client.trigger_scan(target_library_id).await {
+            let err_msg = format!("Published to {}, but Komga scan trigger failed: {}", canonical_dest_str, e.message);
+            tracing::warn!("PIPELINE: {err_msg}");
+
+            self.record_event(PipelineEvent {
+                id: format!("{}-{}", job.chapter, now),
+                timestamp: now,
+                chapter_id: job.chapter,
+                series: job.title.clone(),
+                release_name,
+                is_volume,
+                number: release_num,
+                outcome: outcome_str.to_string(),
+                destination: Some(canonical_dest_str.clone()),
+                mangabaka_status,
+                optimizer_status,
+                komga_status: format!("scan trigger failed: {}", e.message),
+                error: Some(err_msg.clone()),
+            });
+
+            let err_clone = err_msg.clone();
+            let _ = self.db.call(move |conn| {
+                conn.execute(
+                    "UPDATE downloads SET state = 'failed', error = ?2, retry_at = ?3 WHERE chapter_id = ?1",
+                    rusqlite::params![chapter_id, err_clone, (now + 60) as i64],
+                )?;
+                Ok(())
+            }).await;
+
+            return Ok(AcquisitionOutcome::PublishedScanFailed {
+                destination: canonical_dest,
+                error: err_msg,
+            });
+        }
+
+        // 7. Bounded Asynchronous Ownership Verification
+        on_stage("verifying", "Ownership verification pending in Komga...", Some(canonical_dest_str.clone()));
+        let policy = self.verification_policy();
+
+        let verified = self.poll_verify_release(
+            &komga_client,
+            &job.title,
+            target_library_id,
+            is_volume,
+            release_num,
+            policy,
+        ).await.unwrap_or(false);
+
+        if verified {
+            self.ownership.invalidate(job.manga_id);
+            let _ = self.ownership.get_title_ownership(job.manga_id, &job.title).await;
+
+            self.record_event(PipelineEvent {
+                id: format!("{}-{}", job.chapter, now),
+                timestamp: now,
+                chapter_id: job.chapter,
+                series: job.title.clone(),
+                release_name,
+                is_volume,
+                number: release_num,
+                outcome: outcome_str.to_string(),
+                destination: Some(canonical_dest_str.clone()),
+                mangabaka_status,
+                optimizer_status,
+                komga_status: "verified in Komga".to_string(),
+                error: None,
+            });
+
+            let _ = self.db.call(move |conn| {
+                conn.execute("DELETE FROM downloads WHERE chapter_id = ?1", [chapter_id])?;
+                Ok(())
+            }).await;
+
+            on_stage("complete", "Acquisition complete — verified in Komga", Some(canonical_dest_str));
+            Ok(AcquisitionOutcome::Complete(canonical_dest))
+        } else {
+            // Indexing not visible yet within bounded timeout:
+            // Persist pending verification state (NOT corruption, NOT download failure)
+            self.record_event(PipelineEvent {
+                id: format!("{}-{}", job.chapter, now),
+                timestamp: now,
+                chapter_id: job.chapter,
+                series: job.title.clone(),
+                release_name,
+                is_volume,
+                number: release_num,
+                outcome: outcome_str.to_string(),
+                destination: Some(canonical_dest_str.clone()),
+                mangabaka_status,
+                optimizer_status,
+                komga_status: "pending verification (timeout)".to_string(),
+                error: Some("Published — waiting for Komga".to_string()),
+            });
+
+            let _ = self.db.call(move |conn| {
+                conn.execute(
+                    "UPDATE downloads SET state = 'verifying', error = 'Published — waiting for Komga', attempts = attempts + 1, retry_at = ?2 WHERE chapter_id = ?1",
+                    rusqlite::params![chapter_id, (now + 60) as i64],
+                )?;
+                Ok(())
+            }).await;
+
+            on_stage("verifying", "Published — waiting for Komga", Some(canonical_dest_str));
+            Ok(AcquisitionOutcome::PublishedPendingKomga(canonical_dest))
+        }
     }
 }
 
@@ -744,7 +984,8 @@ mod tests {
     use std::fs::{self, File};
     use std::io::Write;
 
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use rusqlite::OptionalExtension;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     static TEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     fn make_test_cbz(path: &Path, content: &str) {
@@ -976,6 +1217,8 @@ mod tests {
             volume: Some(1.0),
             release_type: crate::release::ReleaseType::Volume,
             chapter_number: None,
+            published_path: None,
+            target_library_id: None,
         };
 
         pipeline.process_download(&eng_cbz, &eng_job).await.unwrap();
@@ -1002,6 +1245,8 @@ mod tests {
             volume: Some(2.0),
             release_type: crate::release::ReleaseType::Volume,
             chapter_number: None,
+            published_path: None,
+            target_library_id: None,
         };
 
         pipeline.process_download(&zh_cbz, &zh_job).await.unwrap();
@@ -1116,6 +1361,8 @@ exit 0
             volume: None,
             release_type: crate::release::ReleaseType::Chapter,
             chapter_number: Some(1.0),
+            published_path: None,
+            target_library_id: None,
         };
 
         pipeline.process_download(&cbz, &job).await.unwrap();
@@ -1149,6 +1396,8 @@ exit 0
             volume: None,
             release_type: crate::release::ReleaseType::Chapter,
             chapter_number: Some(2.0),
+            published_path: None,
+            target_library_id: None,
         };
 
         pipeline.process_download(&cbz2, &job2).await.unwrap();
@@ -1246,5 +1495,547 @@ exit 0
         assert_eq!(parsed.target_height, 2400);
         assert_eq!(parsed.image_quality, 90);
         assert_eq!(parsed.min_savings_percent, 10);
+    }
+
+    async fn insert_test_manga_and_chapter(
+        db: &Db,
+        chapter_id: i64,
+        manga_id: i64,
+        title: &str,
+        name: &str,
+        number: f64,
+    ) {
+        let title = title.to_string();
+        let name = name.to_string();
+        db.call(move |conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO manga (id, source_id, url, title, in_library) VALUES (?1, 1, '/test', ?2, 1)",
+                rusqlite::params![manga_id, title],
+            )?;
+            conn.execute(
+                "INSERT OR IGNORE INTO chapters (id, manga_id, url, name, chapter_number, source_order, fetched_at, read) VALUES (?1, ?2, '/ch', ?3, ?4, 1, 0, 0)",
+                rusqlite::params![chapter_id, manga_id, name, number],
+            )?;
+            conn.execute(
+                "INSERT OR IGNORE INTO downloads (chapter_id, state, position, added_at) VALUES (?1, 'downloading', 1, 1000)",
+                rusqlite::params![chapter_id],
+            )?;
+            Ok(())
+        }).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_scenario_a_publish_scan_immediate_ownership_visibility() {
+        use axum::{http::StatusCode, routing::{get, post}, Json, Router};
+        use serde_json::json;
+
+        let db = test_db();
+        let pipeline = Pipeline::new(db.clone());
+        pipeline.set_verification_policy(VerificationPolicy::fast_test());
+
+        let test_root = TempDir::new("scenario-a");
+        let library_dir = test_root.path().join("manga");
+        let staging_dir = test_root.path().join("staging");
+        fs::create_dir_all(&library_dir).unwrap();
+        fs::create_dir_all(&staging_dir).unwrap();
+
+        let app = Router::new()
+            .route(
+                "/api/v1/libraries/lib-en/scan",
+                post(|| async { StatusCode::NO_CONTENT }),
+            )
+            .route(
+                "/api/v1/series",
+                get(|| async {
+                    Json(json!({
+                        "content": [
+                            {
+                                "id": "series-1",
+                                "name": "Solo Leveling",
+                                "libraryId": "lib-en",
+                                "booksCount": 1
+                            }
+                        ]
+                    }))
+                }),
+            )
+            .route(
+                "/api/v1/series/series-1/books",
+                get(|| async {
+                    Json(json!({
+                        "content": [
+                            {
+                                "id": "book-1",
+                                "seriesId": "series-1",
+                                "name": "Solo Leveling v01",
+                                "number": 1.0,
+                                "metadata": {
+                                    "title": "Solo Leveling v01",
+                                    "number": "1",
+                                    "numberSort": 1.0
+                                }
+                            }
+                        ]
+                    }))
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut config = PipelineConfig::default();
+        config.enabled = true;
+        config.library_dir = Some(library_dir.to_string_lossy().to_string());
+        config.komga_enabled = true;
+        config.komga_scan_enabled = true;
+        config.komga_library_id = Some("lib-en".into());
+        config.komga_url = Some(format!("http://127.0.0.1:{port}"));
+        config.mangabaka_enabled = false;
+        config.optimize_enabled = false;
+        pipeline.save_config(config).await.unwrap();
+
+        insert_test_manga_and_chapter(&db, 301, 1, "Solo Leveling", "Volume 1", 1.0).await;
+
+        let cbz = staging_dir.join("sl_vol1.cbz");
+        make_test_cbz(&cbz, "Solo Leveling");
+
+        let job = crate::downloads::Job {
+            chapter: 301,
+            manga_id: 1,
+            attempts: 0,
+            source: "TestSrc".into(),
+            title: "Solo Leveling".into(),
+            name: "Volume 1".into(),
+            number: 1.0,
+            scanlator: None,
+            author: None,
+            artist: None,
+            genre: None,
+            summary: None,
+            lang: Some("en".into()),
+            volume: Some(1.0),
+            release_type: crate::release::ReleaseType::Volume,
+            chapter_number: None,
+            published_path: None,
+            target_library_id: None,
+        };
+
+        let outcome = pipeline.process_download(&cbz, &job).await.unwrap();
+        let canonical = match outcome {
+            AcquisitionOutcome::Complete(p) => p,
+            other => panic!("Expected Complete, got {:?}", other),
+        };
+
+        assert!(canonical.is_file(), "Canonical published artifact exists on disk");
+        assert_eq!(
+            canonical,
+            library_dir.join("Solo Leveling").join("Solo Leveling v01.cbz")
+        );
+
+        let (ch_path, dl_count): (Option<String>, i64) = db
+            .call(|conn| {
+                let p: Option<String> = conn
+                    .query_row("SELECT download_path FROM chapters WHERE id = 301", [], |r| r.get(0))
+                    .optional()?
+                    .flatten();
+                let c: i64 = conn.query_row("SELECT COUNT(*) FROM downloads WHERE chapter_id = 301", [], |r| r.get(0))?;
+                Ok((p, c))
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(ch_path.as_deref(), Some(canonical.to_str().unwrap()));
+        assert_eq!(dl_count, 0, "Download queue entry deleted upon Komga verification");
+
+        let events = pipeline.recent_events();
+        assert!(!events.is_empty());
+        assert_eq!(events[0].komga_status, "verified in Komga");
+        assert_eq!(events[0].outcome, "published");
+    }
+
+    #[tokio::test]
+    async fn test_scenario_b_publish_scan_delayed_ownership_visibility() {
+        use axum::{http::StatusCode, routing::{get, post}, Json, Router};
+        use serde_json::json;
+
+        let db = test_db();
+        let pipeline = Pipeline::new(db.clone());
+        pipeline.set_verification_policy(VerificationPolicy::fast_test());
+
+        let test_root = TempDir::new("scenario-b");
+        let library_dir = test_root.path().join("manga");
+        let staging_dir = test_root.path().join("staging");
+        fs::create_dir_all(&library_dir).unwrap();
+        fs::create_dir_all(&staging_dir).unwrap();
+
+        let poll_count = Arc::new(AtomicUsize::new(0));
+        let poll_flag = poll_count.clone();
+
+        let app = Router::new()
+            .route(
+                "/api/v1/libraries/lib-en/scan",
+                post(|| async { StatusCode::NO_CONTENT }),
+            )
+            .route(
+                "/api/v1/series",
+                get(|| async {
+                    Json(json!({
+                        "content": [
+                            {
+                                "id": "series-delayed",
+                                "name": "Delayed Series",
+                                "libraryId": "lib-en",
+                                "booksCount": 1
+                            }
+                        ]
+                    }))
+                }),
+            )
+            .route(
+                "/api/v1/series/series-delayed/books",
+                get(move || {
+                    let poll_flag = poll_flag.clone();
+                    async move {
+                        let c = poll_flag.fetch_add(1, Ordering::SeqCst);
+                        if c == 0 {
+                            Json(json!({ "content": [] }))
+                        } else {
+                            Json(json!({
+                                "content": [
+                                    {
+                                        "id": "book-1",
+                                        "seriesId": "series-delayed",
+                                        "name": "Delayed Series v01",
+                                        "number": 1.0,
+                                        "metadata": {
+                                            "title": "Delayed Series v01",
+                                            "number": "1",
+                                            "numberSort": 1.0
+                                        }
+                                    }
+                                ]
+                            }))
+                        }
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut config = PipelineConfig::default();
+        config.enabled = true;
+        config.library_dir = Some(library_dir.to_string_lossy().to_string());
+        config.komga_enabled = true;
+        config.komga_scan_enabled = true;
+        config.komga_library_id = Some("lib-en".into());
+        config.komga_url = Some(format!("http://127.0.0.1:{port}"));
+        config.mangabaka_enabled = false;
+        config.optimize_enabled = false;
+        pipeline.save_config(config).await.unwrap();
+
+        insert_test_manga_and_chapter(&db, 302, 1, "Delayed Series", "Volume 1", 1.0).await;
+
+        let cbz = staging_dir.join("delayed_vol1.cbz");
+        make_test_cbz(&cbz, "Delayed Series");
+
+        let job = crate::downloads::Job {
+            chapter: 302,
+            manga_id: 1,
+            attempts: 0,
+            source: "TestSrc".into(),
+            title: "Delayed Series".into(),
+            name: "Volume 1".into(),
+            number: 1.0,
+            scanlator: None,
+            author: None,
+            artist: None,
+            genre: None,
+            summary: None,
+            lang: Some("en".into()),
+            volume: Some(1.0),
+            release_type: crate::release::ReleaseType::Volume,
+            chapter_number: None,
+            published_path: None,
+            target_library_id: None,
+        };
+
+        let outcome = pipeline.process_download(&cbz, &job).await.unwrap();
+        assert!(matches!(outcome, AcquisitionOutcome::Complete(_)));
+        assert!(poll_count.load(Ordering::SeqCst) >= 2, "Poll loop ran multiple iterations before Komga observed book");
+
+        let dl_count: i64 = db.call(|conn| Ok(conn.query_row("SELECT COUNT(*) FROM downloads WHERE chapter_id = 302", [], |r| r.get(0))?)).await.unwrap();
+        assert_eq!(dl_count, 0, "Download queue cleared after delayed visibility");
+    }
+
+    #[tokio::test]
+    async fn test_scenario_c_publish_scan_failure_preserves_artifact_and_retryable() {
+        use axum::{http::StatusCode, routing::post, Router};
+
+        let db = test_db();
+        let pipeline = Pipeline::new(db.clone());
+
+        let test_root = TempDir::new("scenario-c");
+        let library_dir = test_root.path().join("manga");
+        let staging_dir = test_root.path().join("staging");
+        fs::create_dir_all(&library_dir).unwrap();
+        fs::create_dir_all(&staging_dir).unwrap();
+
+        let app = Router::new()
+            .route(
+                "/api/v1/libraries/lib-en/scan",
+                post(|| async { (StatusCode::INTERNAL_SERVER_ERROR, "Komga internal crash") }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut config = PipelineConfig::default();
+        config.enabled = true;
+        config.library_dir = Some(library_dir.to_string_lossy().to_string());
+        config.komga_enabled = true;
+        config.komga_scan_enabled = true;
+        config.komga_library_id = Some("lib-en".into());
+        config.komga_url = Some(format!("http://127.0.0.1:{port}"));
+        config.mangabaka_enabled = false;
+        config.optimize_enabled = false;
+        pipeline.save_config(config).await.unwrap();
+
+        insert_test_manga_and_chapter(&db, 303, 1, "Failing Scan Series", "Volume 1", 1.0).await;
+
+        let cbz = staging_dir.join("failing_vol1.cbz");
+        make_test_cbz(&cbz, "Failing Scan Series");
+
+        let job = crate::downloads::Job {
+            chapter: 303,
+            manga_id: 1,
+            attempts: 0,
+            source: "TestSrc".into(),
+            title: "Failing Scan Series".into(),
+            name: "Volume 1".into(),
+            number: 1.0,
+            scanlator: None,
+            author: None,
+            artist: None,
+            genre: None,
+            summary: None,
+            lang: Some("en".into()),
+            volume: Some(1.0),
+            release_type: crate::release::ReleaseType::Volume,
+            chapter_number: None,
+            published_path: None,
+            target_library_id: None,
+        };
+
+        let outcome = pipeline.process_download(&cbz, &job).await.unwrap();
+        let (dest, err) = match outcome {
+            AcquisitionOutcome::PublishedScanFailed { destination, error } => (destination, error),
+            other => panic!("Expected PublishedScanFailed, got {:?}", other),
+        };
+
+        assert!(dest.is_file(), "Canonical artifact preserved on disk");
+        assert!(crate::pipeline::publisher::verify_cbz_integrity(&dest).is_ok());
+        assert!(err.contains("Komga scan trigger failed"));
+
+        let (state, pub_path, err_msg): (String, Option<String>, Option<String>) = db
+            .call(|conn| {
+                Ok(conn.query_row(
+                    "SELECT state, published_path, error FROM downloads WHERE chapter_id = 303",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )?)
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(state, "failed");
+        assert_eq!(pub_path.as_deref(), Some(dest.to_str().unwrap()));
+        assert!(err_msg.unwrap().contains("Komga scan trigger failed"));
+
+        let (can_retry_komga, failure_stage) = db
+            .call(|conn| {
+                let qv = crate::downloads::read_queue(conn).unwrap();
+                let item = qv.queue.into_iter().find(|q| q.chapter_id == 303).unwrap();
+                Ok((item.can_retry_komga, item.failure_stage))
+            })
+            .await
+            .unwrap();
+        assert!(can_retry_komga, "Exposes can_retry_komga = true");
+        assert_eq!(failure_stage.as_deref(), Some("komga"));
+    }
+
+    #[tokio::test]
+    async fn test_scenario_d_publish_scan_timeout_preserves_artifact_and_pending() {
+        use axum::{http::StatusCode, routing::{get, post}, Json, Router};
+        use serde_json::json;
+
+        let db = test_db();
+        let pipeline = Pipeline::new(db.clone());
+        pipeline.set_verification_policy(VerificationPolicy::fast_test());
+
+        let test_root = TempDir::new("scenario-d");
+        let library_dir = test_root.path().join("manga");
+        let staging_dir = test_root.path().join("staging");
+        fs::create_dir_all(&library_dir).unwrap();
+        fs::create_dir_all(&staging_dir).unwrap();
+
+        let app = Router::new()
+            .route(
+                "/api/v1/libraries/lib-en/scan",
+                post(|| async { StatusCode::NO_CONTENT }),
+            )
+            .route(
+                "/api/v1/series",
+                get(|| async {
+                    Json(json!({
+                        "content": [
+                            {
+                                "id": "series-slow",
+                                "name": "Slow Komga Series",
+                                "libraryId": "lib-en",
+                                "booksCount": 0
+                            }
+                        ]
+                    }))
+                }),
+            )
+            .route(
+                "/api/v1/series/series-slow/books",
+                get(|| async { Json(json!({ "content": [] })) }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut config = PipelineConfig::default();
+        config.enabled = true;
+        config.library_dir = Some(library_dir.to_string_lossy().to_string());
+        config.komga_enabled = true;
+        config.komga_scan_enabled = true;
+        config.komga_library_id = Some("lib-en".into());
+        config.komga_url = Some(format!("http://127.0.0.1:{port}"));
+        config.mangabaka_enabled = false;
+        config.optimize_enabled = false;
+        pipeline.save_config(config).await.unwrap();
+
+        insert_test_manga_and_chapter(&db, 304, 1, "Slow Komga Series", "Volume 1", 1.0).await;
+
+        let cbz = staging_dir.join("slow_vol1.cbz");
+        make_test_cbz(&cbz, "Slow Komga Series");
+
+        let job = crate::downloads::Job {
+            chapter: 304,
+            manga_id: 1,
+            attempts: 0,
+            source: "TestSrc".into(),
+            title: "Slow Komga Series".into(),
+            name: "Volume 1".into(),
+            number: 1.0,
+            scanlator: None,
+            author: None,
+            artist: None,
+            genre: None,
+            summary: None,
+            lang: Some("en".into()),
+            volume: Some(1.0),
+            release_type: crate::release::ReleaseType::Volume,
+            chapter_number: None,
+            published_path: None,
+            target_library_id: None,
+        };
+
+        let outcome = pipeline.process_download(&cbz, &job).await.unwrap();
+        let canonical = match outcome {
+            AcquisitionOutcome::PublishedPendingKomga(p) => p,
+            other => panic!("Expected PublishedPendingKomga, got {:?}", other),
+        };
+
+        assert!(canonical.is_file());
+        assert!(crate::pipeline::publisher::verify_cbz_integrity(&canonical).is_ok());
+
+        let (state, pub_path, err_msg): (String, Option<String>, Option<String>) = db
+            .call(|conn| {
+                Ok(conn.query_row(
+                    "SELECT state, published_path, error FROM downloads WHERE chapter_id = 304",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )?)
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(state, "verifying");
+        assert_eq!(pub_path.as_deref(), Some(canonical.to_str().unwrap()));
+        assert_eq!(err_msg.as_deref(), Some("Published — waiting for Komga"));
+
+        let (status_message, can_retry_komga) = db
+            .call(|conn| {
+                let qv = crate::downloads::read_queue(conn).unwrap();
+                let item = qv.queue.into_iter().find(|q| q.chapter_id == 304).unwrap();
+                Ok((item.status_message, item.can_retry_komga))
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(status_message.as_deref(), Some("Published — waiting for Komga"));
+        assert!(can_retry_komga);
+    }
+
+    #[tokio::test]
+    async fn test_scenario_g_duplicate_acquisition_blocked_while_komga_pending() {
+        use crate::pipeline::publisher::{publish_cbz, PublishOutcome};
+
+        let db = test_db();
+        let test_root = TempDir::new("scenario-g");
+        let library_dir = test_root.path().join("manga");
+        let staging_dir = test_root.path().join("staging");
+        fs::create_dir_all(&library_dir).unwrap();
+        fs::create_dir_all(&staging_dir).unwrap();
+
+        insert_test_manga_and_chapter(&db, 305, 1, "Duplicate Guard", "Volume 1", 1.0).await;
+
+        let cbz1 = staging_dir.join("dup_vol1.cbz");
+        make_test_cbz(&cbz1, "Duplicate Guard Content 1");
+
+        let res = publish_cbz(&cbz1, &library_dir, "Duplicate Guard", true, 1.0).unwrap();
+        let canonical = match res {
+            PublishOutcome::Published(p) => p,
+            _ => unreachable!(),
+        };
+
+        let can_str = canonical.to_string_lossy().to_string();
+        db.call(move |conn| {
+            conn.execute("UPDATE chapters SET download_path = ?2 WHERE id = ?1", rusqlite::params![305, can_str])?;
+            conn.execute(
+                "UPDATE downloads SET published_path = ?2, state = 'verifying', error = 'Published — waiting for Komga' WHERE chapter_id = ?1",
+                rusqlite::params![305, can_str],
+            )?;
+            Ok(())
+        }).await.unwrap();
+
+        // 1. Database-level duplicate protection
+        let added = db.call(|conn| crate::downloads::add(conn, &[305])).await.unwrap();
+        assert_eq!(added, 0, "Second acquisition blocked while ownership verification is pending");
+
+        // 2. Filesystem-level duplicate protection
+        let dup_same = publish_cbz(&cbz1, &library_dir, "Duplicate Guard", true, 1.0).unwrap();
+        assert!(matches!(dup_same, PublishOutcome::AlreadyPublished(_)));
+
+        let cbz2 = staging_dir.join("dup_vol1_different.cbz");
+        make_test_cbz(&cbz2, "Different Unrelated Scanlator Content");
+        let dup_conflict = publish_cbz(&cbz2, &library_dir, "Duplicate Guard", true, 1.0).unwrap_err();
+        assert_eq!(dup_conflict.code, "destination_conflict");
     }
 }
