@@ -94,16 +94,28 @@ pub fn files_are_identical(a: &Path, b: &Path) -> Result<bool> {
     Ok(true)
 }
 
-/// Verifies that a ZIP/CBZ file has valid structure and headers.
+/// Verifies that a ZIP/CBZ file has valid structure, readable headers, and contains plausible manga image content.
 pub fn verify_cbz_integrity(path: &Path) -> Result<()> {
     let file = File::open(path)?;
     let mut archive = zip::ZipArchive::new(file).map_err(|e| AppError::bad_request(format!("Invalid CBZ archive {}: {e}", path.display())))?;
     if archive.is_empty() {
         return Err(AppError::bad_request(format!("CBZ archive {} has 0 files", path.display())));
     }
-    // Quick header scan of all entries
+    // Quick header scan of all entries and check for plausible manga image content
+    let mut image_count = 0;
     for i in 0..archive.len() {
-        let _ = archive.by_index(i).map_err(|e| AppError::bad_request(format!("Corrupt entry {i} in {}: {e}", path.display())))?;
+        let entry = archive.by_index(i).map_err(|e| AppError::bad_request(format!("Corrupt entry {i} in {}: {e}", path.display())))?;
+        let name = entry.name();
+        let basename = name.rsplit_once('/').map(|(_, b)| b).unwrap_or(name);
+        if entry.is_file() && !name.starts_with("__MACOSX") && !basename.starts_with('.') && crate::local::is_image(name) {
+            image_count += 1;
+        }
+    }
+    if image_count == 0 {
+        return Err(AppError::bad_request(format!(
+            "Archive {} contains 0 manga images (non-manga or unsupported content)",
+            path.display()
+        )));
     }
     Ok(())
 }

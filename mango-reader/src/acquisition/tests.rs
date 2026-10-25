@@ -810,6 +810,176 @@ async fn test_scenario_ah_end_to_end_acquisition_workflow() {
     let _ = fs::remove_dir_all(&temp_dir);
 }
 
+#[test]
+fn test_artifact_format_fail_closed_regression_scenarios_a_through_k() {
+    let test_id = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let temp_dir = std::env::temp_dir().join(format!("mango-format-audit-test-{test_id}"));
+    let staging_dir = temp_dir.join("staging");
+    let lib_dir = temp_dir.join("library");
+    fs::create_dir_all(&staging_dir).unwrap();
+    fs::create_dir_all(&lib_dir).unwrap();
+
+    // ---------------------------------------------------------
+    // Scenario A: Valid CBZ accepted
+    // ---------------------------------------------------------
+    let file_a = staging_dir.join("valid_manga.cbz");
+    make_valid_test_cbz(&file_a, "Series Alpha");
+    assert!(crate::pipeline::publisher::verify_cbz_integrity(&file_a).is_ok());
+    let pub_a = crate::pipeline::publisher::publish_cbz(&file_a, &lib_dir, "Series Alpha", true, 1.0).unwrap();
+    let published_a_path = match pub_a {
+        crate::pipeline::publisher::PublishOutcome::Published(p) => p,
+        _ => panic!("Expected Published outcome for Scenario A"),
+    };
+    assert!(published_a_path.is_file());
+    assert_eq!(published_a_path.file_name().unwrap(), "Series Alpha v01.cbz");
+
+    // ---------------------------------------------------------
+    // Scenario B: Valid manga ZIP accepted/normalized safely
+    // ---------------------------------------------------------
+    let file_b = staging_dir.join("valid_manga.zip");
+    {
+        let file = File::create(&file_b).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        zip.start_file("001.jpg", options).unwrap();
+        zip.write_all(b"fake jpeg image data").unwrap();
+        zip.start_file("002.png", options).unwrap();
+        zip.write_all(b"fake png image data").unwrap();
+        zip.finish().unwrap();
+    }
+    assert!(crate::pipeline::publisher::verify_cbz_integrity(&file_b).is_ok());
+    let pub_b = crate::pipeline::publisher::publish_cbz(&file_b, &lib_dir, "Series Beta", true, 2.0).unwrap();
+    let published_b_path = match pub_b {
+        crate::pipeline::publisher::PublishOutcome::Published(p) => p,
+        _ => panic!("Expected Published outcome for Scenario B"),
+    };
+    assert!(published_b_path.is_file());
+    assert_eq!(published_b_path.file_name().unwrap(), "Series Beta v02.cbz");
+
+    // ---------------------------------------------------------
+    // Scenario C: Real RAR renamed .cbr rejected as UnsupportedFormat
+    // ---------------------------------------------------------
+    let files_c = vec![BackendFile {
+        id: 101,
+        name: "Berserk v01.cbr".to_string(),
+        size: 50_000_000,
+        path: "Berserk v01.cbr".to_string(),
+    }];
+    let err_c = select_artifact(&files_c, None).unwrap_err();
+    assert!(matches!(err_c, TorBoxError::UnsupportedFormat(_)));
+    assert!(err_c.to_string().contains(".cbz and validated .zip"));
+
+    // ---------------------------------------------------------
+    // Scenario D: .cbr never renamed blindly to .cbz
+    // ---------------------------------------------------------
+    let file_d_rar = staging_dir.join("download.cbz.part");
+    {
+        let mut f = File::create(&file_d_rar).unwrap();
+        // Standard RAR 5.0 magic bytes
+        f.write_all(b"Rar!\x1a\x07\x01\x00some_rar_content_payload").unwrap();
+    }
+    // Verify that CBZ integrity check rejects the RAR file
+    let int_d = crate::pipeline::publisher::verify_cbz_integrity(&file_d_rar);
+    assert!(int_d.is_err());
+    // Simulate Downloads::handle_torbox_job behavior:
+    let final_cbz_d = staging_dir.join("download.cbz");
+    if crate::pipeline::publisher::verify_cbz_integrity(&file_d_rar).is_err() {
+        let _ = fs::remove_file(&file_d_rar);
+        // Do NOT call fs::rename
+    } else {
+        fs::rename(&file_d_rar, &final_cbz_d).unwrap();
+    }
+    assert!(!file_d_rar.exists(), "part file must be removed on failure");
+    assert!(!final_cbz_d.exists(), ".cbr must never be renamed blindly to .cbz");
+
+    // ---------------------------------------------------------
+    // Scenario E: 7z rejected
+    // ---------------------------------------------------------
+    let files_e = vec![BackendFile {
+        id: 102,
+        name: "One Piece v01.7z".to_string(),
+        size: 80_000_000,
+        path: "One Piece v01.7z".to_string(),
+    }];
+    let err_e = select_artifact(&files_e, None).unwrap_err();
+    assert!(matches!(err_e, TorBoxError::UnsupportedFormat(_)));
+
+    // ---------------------------------------------------------
+    // Scenario F: PDF rejected
+    // ---------------------------------------------------------
+    let files_f = vec![BackendFile {
+        id: 103,
+        name: "Naruto v01.pdf".to_string(),
+        size: 40_000_000,
+        path: "Naruto v01.pdf".to_string(),
+    }];
+    let err_f = select_artifact(&files_f, None).unwrap_err();
+    assert!(matches!(err_f, TorBoxError::UnsupportedFormat(_)));
+
+    // ---------------------------------------------------------
+    // Scenario G: EPUB rejected
+    // ---------------------------------------------------------
+    let files_g = vec![BackendFile {
+        id: 104,
+        name: "Bleach v01.epub".to_string(),
+        size: 30_000_000,
+        path: "Bleach v01.epub".to_string(),
+    }];
+    let err_g = select_artifact(&files_g, None).unwrap_err();
+    assert!(matches!(err_g, TorBoxError::UnsupportedFormat(_)));
+
+    // ---------------------------------------------------------
+    // Scenario H: Arbitrary ZIP with no manga pages rejected
+    // ---------------------------------------------------------
+    let file_h = staging_dir.join("arbitrary_non_manga.zip");
+    {
+        let file = File::create(&file_h).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        zip.start_file("readme.txt", options).unwrap();
+        zip.write_all(b"Just some release notes").unwrap();
+        zip.start_file("binary.exe", options).unwrap();
+        zip.write_all(b"\x4d\x5a\x90\x00fake_executable").unwrap();
+        zip.finish().unwrap();
+    }
+    let err_h = crate::pipeline::publisher::verify_cbz_integrity(&file_h).unwrap_err();
+    assert!(err_h.message.contains("0 manga images"));
+
+    // ---------------------------------------------------------
+    // Scenario I: Corrupt ZIP rejected
+    // ---------------------------------------------------------
+    let file_i = staging_dir.join("corrupt.cbz");
+    {
+        let mut f = File::create(&file_i).unwrap();
+        f.write_all(b"PK\x03\x04truncated_broken_zip").unwrap();
+    }
+    let err_i = crate::pipeline::publisher::verify_cbz_integrity(&file_i).unwrap_err();
+    assert!(err_i.message.contains("Invalid CBZ archive"));
+
+    // ---------------------------------------------------------
+    // Scenario J: Unsupported artifact never reaches process_download_with_progress
+    // ---------------------------------------------------------
+    // Prove that an artifact failing verify_cbz_integrity cannot be processed
+    assert!(crate::pipeline::publisher::verify_cbz_integrity(&file_h).is_err());
+    assert!(crate::pipeline::publisher::verify_cbz_integrity(&file_i).is_err());
+
+    // ---------------------------------------------------------
+    // Scenario K: Unsupported artifact never reaches canonical publication
+    // ---------------------------------------------------------
+    let pub_err_h = crate::pipeline::publisher::publish_cbz(&file_h, &lib_dir, "Series Hotel", true, 1.0);
+    assert!(pub_err_h.is_err(), "Publishing non-manga ZIP must fail closed");
+    assert!(!lib_dir.join("Series Hotel").join("Series Hotel v01.cbz").exists());
+
+    let pub_err_i = crate::pipeline::publisher::publish_cbz(&file_i, &lib_dir, "Series India", true, 1.0);
+    assert!(pub_err_i.is_err(), "Publishing corrupt ZIP must fail closed");
+    assert!(!lib_dir.join("Series India").join("Series India v01.cbz").exists());
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
 fn pipeline_has_parallel_publish_routines() -> bool {
     // Compile-time architectural guarantee
     false

@@ -26,6 +26,7 @@ pub enum TorBoxError {
     TorrentFailed(String),
     AmbiguousFiles(String),
     NoArchiveFound(String),
+    UnsupportedFormat(String),
     InvalidCbz(String),
     Io(String),
 }
@@ -40,6 +41,7 @@ impl fmt::Display for TorBoxError {
             Self::TorrentFailed(msg) => write!(f, "TorBox torrent failed: {msg}"),
             Self::AmbiguousFiles(msg) => write!(f, "TorBox file selection ambiguous: {msg}"),
             Self::NoArchiveFound(msg) => write!(f, "TorBox no manga archive found: {msg}"),
+            Self::UnsupportedFormat(msg) => write!(f, "Unsupported archive format: {msg}"),
             Self::InvalidCbz(msg) => write!(f, "Retrieved archive failed CBZ validation: {msg}"),
             Self::Io(msg) => write!(f, "IO error during retrieval: {msg}"),
         }
@@ -58,6 +60,7 @@ impl From<TorBoxError> for AppError {
             TorBoxError::TorrentFailed(msg) => AppError::new(422, "torrent_failed", msg),
             TorBoxError::AmbiguousFiles(msg) => AppError::new(422, "ambiguous_files", msg),
             TorBoxError::NoArchiveFound(msg) => AppError::new(404, "no_archive_found", msg),
+            TorBoxError::UnsupportedFormat(msg) => AppError::new(400, "unsupported_format", msg),
             TorBoxError::InvalidCbz(msg) => AppError::bad_request(msg),
             TorBoxError::Io(msg) => AppError::internal(msg),
         }
@@ -502,10 +505,26 @@ impl TorBoxClient {
     }
 }
 
+pub fn is_unsupported_format(lower: &str) -> bool {
+    lower.ends_with(".cbr")
+        || lower.ends_with(".rar")
+        || lower.ends_with(".7z")
+        || lower.ends_with(".tar")
+        || lower.ends_with(".gz")
+        || lower.ends_with(".bz2")
+        || lower.ends_with(".xz")
+        || lower.ends_with(".pdf")
+        || lower.ends_with(".epub")
+        || lower.ends_with(".mobi")
+        || lower.ends_with(".azw3")
+}
+
 /// Conservative file selection algorithm:
 /// 1. Filters out non-manga junk/metadata files (e.g. .nfo, .txt, .url, .jpg, .png, .db, .DS_Store, __MACOSX).
-/// 2. If single archive exists, selects it.
-/// 3. If multiple archives exist (e.g. batch):
+/// 2. Explicitly rejects unsupported archive/document formats (.cbr, .rar, .7z, .pdf, .epub).
+/// 3. Accepts native .cbz (preferred) and validated manga .zip archives.
+/// 4. If single archive exists, selects it.
+/// 5. If multiple archives exist (e.g. batch):
 ///    - If target_unit is Volume(N), searches for archive unambiguously matching Volume N.
 ///    - If exactly 1 matches, selects it.
 ///    - If 0 or >1 match, fails closed with TorBoxError::AmbiguousFiles.
@@ -517,27 +536,68 @@ pub fn select_artifact<'a>(
         return Err(TorBoxError::NoArchiveFound("Torrent contains 0 files".to_string()));
     }
 
-    // Filter to archive files (.cbz, .cbr, .zip)
+    // 1. Scan for unsupported archive/document formats
+    let unsupported_files: Vec<&BackendFile> = files
+        .iter()
+        .filter(|f| {
+            let lower = f.name.to_ascii_lowercase();
+            !is_junk_file(&lower) && is_unsupported_format(&lower)
+        })
+        .collect();
+
+    // 2. Filter to supported archive files (.cbz and .zip only; .cbz preferred native format)
     let archives: Vec<&BackendFile> = files
         .iter()
         .filter(|f| {
             let lower = f.name.to_ascii_lowercase();
-            !is_junk_file(&lower) && (lower.ends_with(".cbz") || lower.ends_with(".cbr") || lower.ends_with(".zip"))
+            !is_junk_file(&lower) && (lower.ends_with(".cbz") || lower.ends_with(".zip"))
         })
         .collect();
 
+    // 3. If target_unit is specified, verify if requested volume corresponds to an unsupported file
+    if let Some(AcquisitionReleaseUnit::Volume(target_vol)) = target_unit {
+        let unsupported_matching: Vec<&BackendFile> = unsupported_files
+            .iter()
+            .copied()
+            .filter(|f| {
+                let (unit, num, _) = crate::acquisition::nyaa::classify_release(&f.name);
+                if let AcquisitionReleaseUnit::Volume(v) = unit {
+                    (v - target_vol).abs() < 0.001
+                } else if let Some(n) = num {
+                    (n - target_vol).abs() < 0.001
+                } else {
+                    false
+                }
+            })
+            .collect();
+
+        if let Some(bad) = unsupported_matching.first() {
+            return Err(TorBoxError::UnsupportedFormat(format!(
+                "Requested volume {target_vol} matches unsupported format '{}'. Only native .cbz and validated .zip archives are supported.",
+                bad.name
+            )));
+        }
+    }
+
+    // 4. If no supported archives exist, report unsupported format if any exist, or NoArchiveFound
     if archives.is_empty() {
+        if let Some(bad) = unsupported_files.first() {
+            return Err(TorBoxError::UnsupportedFormat(format!(
+                "Torrent contains unsupported archive/document format '{}'. Only native .cbz and validated .zip archives are supported.",
+                bad.name
+            )));
+        }
         return Err(TorBoxError::NoArchiveFound(
-            "Torrent contains no .cbz, .cbr, or .zip archive files".to_string(),
+            "Torrent contains no .cbz or .zip archive files".to_string(),
         ));
     }
 
-    // If exactly one archive exists, it's the unambiguous selection!
+    // 5. If exactly one supported archive exists and no ambiguity, select it
     if archives.len() == 1 {
         return Ok(archives[0]);
     }
 
-    // Multiple archives found (e.g. multi-volume batch). Match against target_unit:
+    // 6. Multiple archives found (e.g. multi-volume batch). Match against target_unit:
     if let Some(AcquisitionReleaseUnit::Volume(target_vol)) = target_unit {
         let matching: Vec<&BackendFile> = archives
             .iter()
@@ -556,6 +616,16 @@ pub fn select_artifact<'a>(
 
         if matching.len() == 1 {
             return Ok(matching[0]);
+        }
+
+        // Prefer native .cbz over .zip if both exist for the same target volume
+        let cbz_matching: Vec<&BackendFile> = matching
+            .iter()
+            .copied()
+            .filter(|f| f.name.to_ascii_lowercase().ends_with(".cbz"))
+            .collect();
+        if cbz_matching.len() == 1 {
+            return Ok(cbz_matching[0]);
         }
 
         if matching.is_empty() {
@@ -688,6 +758,79 @@ mod tests {
 
         let err2 = select_artifact(&files3, Some(&AcquisitionReleaseUnit::Volume(99.0))).unwrap_err();
         assert!(matches!(err2, TorBoxError::AmbiguousFiles(_)));
+
+        // Case 5: Unsupported formats rejected as UnsupportedFormat
+        let files_cbr = vec![BackendFile {
+            id: 20,
+            name: "Berserk v01.cbr".to_string(),
+            size: 150_000_000,
+            path: "Berserk v01.cbr".to_string(),
+        }];
+        let err_cbr = select_artifact(&files_cbr, None).unwrap_err();
+        assert!(matches!(err_cbr, TorBoxError::UnsupportedFormat(_)));
+
+        let files_7z = vec![BackendFile {
+            id: 21,
+            name: "Berserk v01.7z".to_string(),
+            size: 150_000_000,
+            path: "Berserk v01.7z".to_string(),
+        }];
+        let err_7z = select_artifact(&files_7z, None).unwrap_err();
+        assert!(matches!(err_7z, TorBoxError::UnsupportedFormat(_)));
+
+        let files_pdf = vec![BackendFile {
+            id: 22,
+            name: "Berserk v01.pdf".to_string(),
+            size: 150_000_000,
+            path: "Berserk v01.pdf".to_string(),
+        }];
+        let err_pdf = select_artifact(&files_pdf, None).unwrap_err();
+        assert!(matches!(err_pdf, TorBoxError::UnsupportedFormat(_)));
+
+        let files_epub = vec![BackendFile {
+            id: 23,
+            name: "Berserk v01.epub".to_string(),
+            size: 150_000_000,
+            path: "Berserk v01.epub".to_string(),
+        }];
+        let err_epub = select_artifact(&files_epub, None).unwrap_err();
+        assert!(matches!(err_epub, TorBoxError::UnsupportedFormat(_)));
+
+        // Case 6: Target volume matching an unsupported file fails closed with UnsupportedFormat
+        let files_mixed = vec![
+            BackendFile {
+                id: 30,
+                name: "Berserk v01.cbz".to_string(),
+                size: 150_000_000,
+                path: "Berserk v01.cbz".to_string(),
+            },
+            BackendFile {
+                id: 31,
+                name: "Berserk v02.cbr".to_string(),
+                size: 155_000_000,
+                path: "Berserk v02.cbr".to_string(),
+            },
+        ];
+        let err_target_cbr = select_artifact(&files_mixed, Some(&AcquisitionReleaseUnit::Volume(2.0))).unwrap_err();
+        assert!(matches!(err_target_cbr, TorBoxError::UnsupportedFormat(_)));
+
+        // Case 7: Prefer native .cbz over .zip if both exist for the same target volume
+        let files_cbz_and_zip = vec![
+            BackendFile {
+                id: 40,
+                name: "Berserk v01.zip".to_string(),
+                size: 150_000_000,
+                path: "Berserk v01.zip".to_string(),
+            },
+            BackendFile {
+                id: 41,
+                name: "Berserk v01.cbz".to_string(),
+                size: 150_000_000,
+                path: "Berserk v01.cbz".to_string(),
+            },
+        ];
+        let sel_pref = select_artifact(&files_cbz_and_zip, Some(&AcquisitionReleaseUnit::Volume(1.0))).unwrap();
+        assert_eq!(sel_pref.id, 41); // Selected .cbz!
     }
 
     #[test]

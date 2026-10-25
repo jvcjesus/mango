@@ -943,6 +943,12 @@ impl Downloads {
         update_stage("torbox_retrieving", &format!("Retrieving {} from TorBox CDN...", selected_file.name));
         client.retrieve_file(&external_job_id, selected_file.id, selected_file.size, &part_path).await?;
 
+        // Double-check CBZ archive integrity & plausible manga images before atomic promotion
+        if let Err(e) = crate::pipeline::publisher::verify_cbz_integrity(&part_path) {
+            let _ = std::fs::remove_file(&part_path);
+            return Err(AppError::bad_request(format!("Retrieved archive failed integrity verification: {e}")));
+        }
+
         // Atomic promotion
         std::fs::rename(&part_path, &full_cbz_path)?;
 
