@@ -1,5 +1,5 @@
 use super::{
-    identity::resolve_mangabaka_identity,
+    identity::{IdentityResolutionResult, resolve_mangabaka_identity},
     komga_reader::{calculate_contiguous_progress, evaluate_series_progress, parse_chapter_number},
     mapping::{
         delete_mapping, get_mapping, list_mappings, resolve_mapping, save_mapping,
@@ -465,12 +465,32 @@ async fn start_mock_mangabaka(
                 |axum::extract::Query(params): axum::extract::Query<
                     std::collections::HashMap<String, String>,
                 >| async move {
-                    let q = params.get("q").map(|s| s.as_str()).unwrap_or("");
-                    if q == "Berserk" {
+                    let q = params
+                        .get("query")
+                        .or_else(|| params.get("q"))
+                        .map(|s| s.as_str())
+                        .unwrap_or("");
+                    if q == "Error 400" {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({ "error": "Invalid search parameter" })),
+                        )
+                            .into_response()
+                    } else if q == "Error 429" {
+                        StatusCode::TOO_MANY_REQUESTS.into_response()
+                    } else if q == "Berserk" {
                         (
                             StatusCode::OK,
                             Json(serde_json::json!({
                                 "data": [{ "id": 202, "title": "Berserk" }]
+                            })),
+                        )
+                            .into_response()
+                    } else if q == "Pandora Hearts" {
+                        (
+                            StatusCode::OK,
+                            Json(serde_json::json!({
+                                "data": [{ "id": 303, "title": "Pandora Hearts" }]
                             })),
                         )
                             .into_response()
@@ -479,8 +499,8 @@ async fn start_mock_mangabaka(
                             StatusCode::OK,
                             Json(serde_json::json!({
                                 "data": [
-                                    { "id": 1, "title": "Ambiguous Title 1" },
-                                    { "id": 2, "title": "Ambiguous Title 2" }
+                                    { "id": 1, "title": "Ambiguous Title" },
+                                    { "id": 2, "title": "Ambiguous Title" }
                                 ]
                             })),
                         )
@@ -566,8 +586,10 @@ async fn test_mangabaka_identity_precedence_and_cross_ref() {
     let res1 = resolve_mangabaka_identity(&conn, &client, "series-manual", "Berserk")
         .await
         .unwrap();
-    assert!(res1.is_some());
-    let m1 = res1.unwrap();
+    let m1 = match res1 {
+        IdentityResolutionResult::Resolved(m) => m,
+        other => panic!("Expected Resolved, got {other:?}"),
+    };
     assert_eq!(m1.tracker_id, "777");
     assert!(m1.manual_override);
 
@@ -588,7 +610,12 @@ async fn test_mangabaka_identity_precedence_and_cross_ref() {
     let res2 = resolve_mangabaka_identity(&conn, &client, "series-persisted", "Berserk")
         .await
         .unwrap();
-    assert_eq!(res2.unwrap().mapping_source, MappingSource::CrossReference);
+    match res2 {
+        IdentityResolutionResult::Resolved(m) => {
+            assert_eq!(m.mapping_source, MappingSource::CrossReference);
+        }
+        other => panic!("Expected Resolved, got {other:?}"),
+    }
 
     // Tier 3: Automatic cross-reference lookup via known AniList mapping
     let anilist_map = TrackerMapping {
@@ -612,8 +639,10 @@ async fn test_mangabaka_identity_precedence_and_cross_ref() {
     )
     .await
     .unwrap();
-    assert!(res3.is_some());
-    let m3 = res3.unwrap();
+    let m3 = match res3 {
+        IdentityResolutionResult::Resolved(m) => m,
+        other => panic!("Expected Resolved, got {other:?}"),
+    };
     assert_eq!(m3.tracker_id, "202");
     assert_eq!(m3.mapping_source, MappingSource::CrossReference);
 
@@ -621,8 +650,10 @@ async fn test_mangabaka_identity_precedence_and_cross_ref() {
     let res4 = resolve_mangabaka_identity(&conn, &client, "series-title-only", "Berserk")
         .await
         .unwrap();
-    assert!(res4.is_some());
-    let m4 = res4.unwrap();
+    let m4 = match res4 {
+        IdentityResolutionResult::Resolved(m) => m,
+        other => panic!("Expected Resolved, got {other:?}"),
+    };
     assert_eq!(m4.tracker_id, "202");
     assert_eq!(m4.mapping_source, MappingSource::ExactTitle);
 
@@ -630,7 +661,7 @@ async fn test_mangabaka_identity_precedence_and_cross_ref() {
     let res5 = resolve_mangabaka_identity(&conn, &client, "series-ambig", "Ambiguous Title")
         .await
         .unwrap();
-    assert!(res5.is_none());
+    assert!(matches!(res5, IdentityResolutionResult::Ambiguous(_)));
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1468,6 +1499,249 @@ async fn test_manual_mapping_override_and_diagnostics() {
     let after_clear =
         super::mapping::get_mapping(&conn, "komga-blue-lock", SyncTarget::AniList).unwrap();
     assert!(after_clear.is_none());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn test_mangabaka_anilist_xref_success_avoids_title_search() {
+    let (url, _) = start_mock_mangabaka(vec![]).await;
+    let client = MangaBakaClient::new(
+        reqwest::Client::new(),
+        Some(url),
+        Some("valid-token".into()),
+    );
+
+    let dir = std::env::temp_dir().join(format!("mango-mb-xref-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = Db::open(&dir.join("test.db")).expect("test db");
+    let conn = db.second().expect("connection");
+
+    // Pre-populate AniList mapping for series-101
+    let anilist_map = TrackerMapping {
+        komga_series_id: "series-101".into(),
+        tracker: SyncTarget::AniList,
+        tracker_id: "101".into(),
+        tracker_title: Some("Berserk".into()),
+        edition_id: None,
+        mapping_source: MappingSource::ExactTitle,
+        confidence: MappingConfidence::Resolved,
+        manual_override: false,
+        last_validated: Some(1700000000),
+        updated_at: 1700000000,
+    };
+    save_mapping(&conn, &anilist_map).unwrap();
+
+    let res = resolve_mangabaka_identity(&conn, &client, "series-101", "Different Name In Komga")
+        .await
+        .unwrap();
+
+    match res {
+        IdentityResolutionResult::Resolved(m) => {
+            assert_eq!(m.tracker_id, "202");
+            assert_eq!(m.mapping_source, MappingSource::CrossReference);
+            assert_eq!(m.confidence, MappingConfidence::Resolved);
+        }
+        other => panic!("Expected Resolved from AniList xref, got {other:?}"),
+    }
+
+    // Proves mapping is persisted
+    let persisted = get_mapping(&conn, "series-101", SyncTarget::MangaBaka)
+        .unwrap()
+        .unwrap();
+    assert_eq!(persisted.tracker_id, "202");
+    assert_eq!(persisted.mapping_source, MappingSource::CrossReference);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn test_mangabaka_anilist_xref_404_falls_through_to_exact_title() {
+    let (url, _) = start_mock_mangabaka(vec![]).await;
+    let client = MangaBakaClient::new(
+        reqwest::Client::new(),
+        Some(url),
+        Some("valid-token".into()),
+    );
+
+    let dir = std::env::temp_dir().join(format!("mango-mb-xref-404-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = Db::open(&dir.join("test.db")).expect("test db");
+    let conn = db.second().expect("connection");
+
+    // Pre-populate AniList mapping with an ID that returns 404 on MangaBaka xref
+    let anilist_map = TrackerMapping {
+        komga_series_id: "series-404-xref".into(),
+        tracker: SyncTarget::AniList,
+        tracker_id: "99999".into(),
+        tracker_title: Some("Berserk".into()),
+        edition_id: None,
+        mapping_source: MappingSource::ExactTitle,
+        confidence: MappingConfidence::Resolved,
+        manual_override: false,
+        last_validated: Some(1700000000),
+        updated_at: 1700000000,
+    };
+    save_mapping(&conn, &anilist_map).unwrap();
+
+    // The Komga title is "Berserk", which exists on exact title search
+    let res = resolve_mangabaka_identity(&conn, &client, "series-404-xref", "Berserk")
+        .await
+        .unwrap();
+
+    match res {
+        IdentityResolutionResult::Resolved(m) => {
+            assert_eq!(m.tracker_id, "202");
+            assert_eq!(m.mapping_source, MappingSource::ExactTitle);
+        }
+        other => panic!("Expected Resolved via exact title fallback, got {other:?}"),
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn test_mangabaka_http_400_classified_as_api_error_never_skipped_no_mapping() {
+    let (url, _) = start_mock_mangabaka(vec![]).await;
+    let client = MangaBakaClient::new(
+        reqwest::Client::new(),
+        Some(url),
+        Some("valid-token".into()),
+    );
+
+    let dir = std::env::temp_dir().join(format!("mango-mb-400-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = Db::open(&dir.join("test.db")).expect("test db");
+    let conn = db.second().expect("connection");
+
+    // Title "Error 400" simulates 400 Bad Request response from MangaBaka API
+    let res = resolve_mangabaka_identity(&conn, &client, "series-400", "Error 400")
+        .await
+        .unwrap();
+
+    match res {
+        IdentityResolutionResult::ApiError(msg) => {
+            assert!(msg.contains("HTTP 400"));
+        }
+        other => panic!(
+            "Expected ApiError, got {other:?} - HTTP 400 must NEVER be swallowed as NotFound/SkippedNoMapping"
+        ),
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn test_mangabaka_http_429_classified_as_rate_limited() {
+    let (url, _) = start_mock_mangabaka(vec![]).await;
+    let client = MangaBakaClient::new(
+        reqwest::Client::new(),
+        Some(url),
+        Some("valid-token".into()),
+    );
+
+    let dir = std::env::temp_dir().join(format!("mango-mb-429-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = Db::open(&dir.join("test.db")).expect("test db");
+    let conn = db.second().expect("connection");
+
+    // Title "Error 429" simulates 429 Too Many Requests response from MangaBaka API
+    let res = resolve_mangabaka_identity(&conn, &client, "series-429", "Error 429")
+        .await
+        .unwrap();
+
+    assert_eq!(
+        res,
+        IdentityResolutionResult::RateLimited,
+        "HTTP 429 must be classified as RateLimited, never SkippedNoMapping"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn test_pandora_hearts_real_world_validation() {
+    // Pandora Hearts has 19 volumes completed in Komga and valid AniList mapping
+    let (url, state) = start_mock_mangabaka(vec![
+        // MangaBaka library entry for Pandora Hearts (id: 303) has 19 volumes completed
+        (303, Some(19.0), None, "completed".into()),
+    ])
+    .await;
+    let client = MangaBakaClient::new(
+        reqwest::Client::new(),
+        Some(url),
+        Some("valid-token".into()),
+    );
+
+    let dir = std::env::temp_dir().join(format!("mango-mb-pandora-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = Db::open(&dir.join("test.db")).expect("test db");
+    let conn = db.second().expect("connection");
+
+    // Step 1: Pre-populate known AniList mapping (media_id 303)
+    let anilist_map = TrackerMapping {
+        komga_series_id: "komga-pandora-hearts".into(),
+        tracker: SyncTarget::AniList,
+        tracker_id: "303".into(),
+        tracker_title: Some("Pandora Hearts".into()),
+        edition_id: None,
+        mapping_source: MappingSource::ExactTitle,
+        confidence: MappingConfidence::Resolved,
+        manual_override: false,
+        last_validated: Some(1700000000),
+        updated_at: 1700000000,
+    };
+    save_mapping(&conn, &anilist_map).unwrap();
+
+    // Step 2: Resolve MangaBaka identity for Pandora Hearts
+    let res = resolve_mangabaka_identity(&conn, &client, "komga-pandora-hearts", "Pandora Hearts")
+        .await
+        .unwrap();
+
+    let mapping = match res {
+        IdentityResolutionResult::Resolved(m) => m,
+        other => panic!("Expected Resolved for Pandora Hearts, got {other:?}"),
+    };
+    assert_eq!(mapping.tracker_id, "303");
+
+    // Step 3: Run dry-run MangaBaka progress sync for Pandora Hearts (19 volumes completed in Komga)
+    let progress = super::model::KomgaSeriesProgress {
+        series_id: "komga-pandora-hearts".into(),
+        series_title: "Pandora Hearts".into(),
+        library_id: "lib-en".into(),
+        total_books: 24,
+        completed_books: 19,
+        highest_completed_book: Some(19.0),
+        highest_completed_volume: Some(19.0),
+        highest_completed_chapter: None,
+        is_series_completed: false,
+        last_read_date: Some("2026-10-24T00:00:00Z".into()),
+        books: vec![],
+    };
+
+    let record = super::mangabaka::sync_series_to_mangabaka(
+        &client,
+        true,
+        &progress,
+        Some(&mapping),
+        true, // dry_run = true
+    )
+    .await;
+
+    // Both Komga and MangaBaka are at 19 volumes completed -> NoChange
+    assert_eq!(record.category, SyncResultCategory::NoChange);
+    assert_eq!(record.dimension.as_deref(), Some("volume"));
+    assert_eq!(record.old_progress, Some(19.0));
+    assert_eq!(record.new_progress, Some(19.0));
+
+    // Zero mutations performed
+    assert_eq!(state.patch_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(state.post_calls.load(Ordering::SeqCst), 0);
 
     let _ = std::fs::remove_dir_all(&dir);
 }

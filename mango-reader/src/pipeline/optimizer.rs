@@ -132,11 +132,11 @@ pub async fn check_executable_invocable(path: &Path) -> std::result::Result<Stri
     }
 
     let output = tokio::time::timeout(
-        Duration::from_secs(3),
+        Duration::from_secs(5),
         tokio::process::Command::new(path).arg("--version").output(),
     )
     .await
-    .map_err(|_| "Process invocation timed out after 3 seconds".to_string())?
+    .map_err(|_| "Process invocation timed out after 5 seconds".to_string())?
     .map_err(|e| format!("Failed to execute process: {e}"))?;
 
     if !output.status.success() {
