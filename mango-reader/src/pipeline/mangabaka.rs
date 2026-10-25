@@ -246,7 +246,83 @@ impl MangaBakaClient {
             ))
         })?;
 
-        // Support top-level and data-nested structures
+        // 1. Official MangaBaka response schema per OpenAPI spec:
+        // { "status": 200, "data": { "series": [ { "id": 83, "state": "active", "title": "Blue Lock", ... } ] } }
+        let series_array = raw
+            .get("data")
+            .and_then(|d| d.get("series"))
+            .and_then(|s| s.as_array())
+            .or_else(|| raw.get("series").and_then(|s| s.as_array()));
+
+        if let Some(series_list) = series_array {
+            if series_list.is_empty() {
+                return Ok(None);
+            }
+
+            // Filter for active series if state property exists
+            let active_series: Vec<&serde_json::Value> = series_list
+                .iter()
+                .filter(|s| {
+                    s.get("state")
+                        .and_then(|st| st.as_str())
+                        .map(|st| st == "active")
+                        .unwrap_or(true)
+                })
+                .collect();
+
+            let target_series = if active_series.len() == 1 {
+                active_series[0]
+            } else if active_series.is_empty() && series_list.len() == 1 {
+                &series_list[0]
+            } else if active_series.is_empty() {
+                &series_list[0]
+            } else {
+                return Err(AppError::new(
+                    409,
+                    "mangabaka_ambiguous",
+                    format!(
+                        "AniList cross-reference returned multiple active MangaBaka series (count: {})",
+                        active_series.len()
+                    ),
+                ));
+            };
+
+            let id_val = target_series
+                .get("id")
+                .or_else(|| target_series.get("series_id"))
+                .or_else(|| target_series.get("mangabaka_id"));
+
+            let mb_id = match id_val {
+                Some(v) => {
+                    if let Some(n) = v.as_i64() {
+                        n
+                    } else if let Some(s) = v.as_str() {
+                        s.parse::<i64>().map_err(|_| {
+                            AppError::internal(format!(
+                                "Invalid MangaBaka ID in cross-reference series item: {s}"
+                            ))
+                        })?
+                    } else {
+                        return Ok(None);
+                    }
+                }
+                None => return Ok(None),
+            };
+
+            let title = target_series
+                .get("title")
+                .or_else(|| target_series.get("romanized_title"))
+                .or_else(|| target_series.get("name"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            return Ok(Some(MangaBakaCrossReference {
+                mangabaka_id: mb_id,
+                title,
+            }));
+        }
+
+        // 2. Fallback for flat / legacy mock format: { "data": { "id": 202, ... } } or { "id": 202, ... }
         let data_node = raw.get("data").unwrap_or(&raw);
         let id_val = data_node
             .get("id")

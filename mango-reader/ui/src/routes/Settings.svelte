@@ -797,6 +797,11 @@
       syncHistory = await getSyncHistory(50);
       const status = await getSyncStatus();
       syncRunning = status.running;
+      pipeline.komga_enabled = status.komga_enabled;
+      pipeline.has_komga_api_key = status.has_komga_api_key;
+      pipeline.mangabaka_enabled = status.mangabaka_enabled;
+      pipeline.has_mangabaka_token = status.has_mangabaka_token;
+      pipeline.mangabaka_validated = status.mangabaka_validated;
       void loadSyncSchedule();
       void loadSyncDiagnostics();
     } catch (e) {
@@ -841,10 +846,34 @@
     }
   }
 
+  let auditFilter = $state<'all' | 'latest'>('all');
+
+  const latestRunTimestamp = $derived(syncHistory[0]?.timestamp);
+
+  function isLatestRun(rec: SyncRecord): boolean {
+    if (syncSummary && syncSummary.records.some((r) => r.id === rec.id)) return true;
+    if (!latestRunTimestamp) return false;
+    return Math.abs(rec.timestamp - latestRunTimestamp) <= 30;
+  }
+
+  const latestRunRecordsCount = $derived(
+    syncHistory.filter((r) => isLatestRun(r)).length
+  );
+
+  const filteredSyncHistory = $derived(
+    auditFilter === 'latest'
+      ? syncHistory.filter((r) => isLatestRun(r))
+      : syncHistory
+  );
+
   $effect(() => {
     if (tab.id !== 'trackers' || askedSyncHistory) return;
     askedSyncHistory = true;
     void loadSyncHistory();
+    if (session.admin && !askedPipeline) {
+      askedPipeline = true;
+      void loadPipeline();
+    }
   });
 
   // ---------- version ----------
@@ -1756,8 +1785,14 @@
           </p>
 
           <div class="path-status-row" style="margin-bottom: 12px;">
-            <span class="status-badge {pipeline.komga_enabled ? 'status-valid' : 'status-not_configured'}">
-              Komga: {pipeline.komga_enabled ? 'Connected' : 'Disabled'}
+            <span class="status-badge {pipeline.komga_enabled && pipeline.has_komga_api_key ? 'status-valid' : !pipeline.komga_enabled ? 'status-not_configured' : 'status-missing'}">
+              {#if !pipeline.komga_enabled}
+                Komga: Disabled
+              {:else if pipeline.has_komga_api_key}
+                Komga: Connected
+              {:else}
+                Komga: No API Key
+              {/if}
             </span>
             <span class="status-badge {trackers.find(x => x.name === 'AniList')?.signedIn ? 'status-valid' : 'status-not_configured'}">
               AniList: {trackers.find(x => x.name === 'AniList')?.signedIn ? 'Signed In' : 'Not Signed In'}
@@ -1887,16 +1922,43 @@
             <div class="sync-history-container">
               <div class="sync-history-header">
                 <h4>Recent Sync Audit Records</h4>
-                <button class="btn" onclick={loadSyncHistory} style="font-size: 11px; padding: 2px 8px;">Refresh</button>
+                <div style="display: flex; gap: 8px; align-items: center;">
+                  {#if latestRunRecordsCount > 0}
+                    <div class="audit-filter-pills" style="display: inline-flex; border: 1px solid var(--ink); border-radius: 4px; overflow: hidden; font-size: 11px;">
+                      <button
+                        type="button"
+                        class="btn-pill"
+                        onclick={() => (auditFilter = 'latest')}
+                        style="padding: 2px 8px; background: {auditFilter === 'latest' ? 'var(--ink)' : 'transparent'}; color: {auditFilter === 'latest' ? 'var(--paper)' : 'inherit'}; border: none; cursor: pointer;"
+                      >
+                        Latest Run ({latestRunRecordsCount})
+                      </button>
+                      <button
+                        type="button"
+                        class="btn-pill"
+                        onclick={() => (auditFilter = 'all')}
+                        style="padding: 2px 8px; background: {auditFilter === 'all' ? 'var(--ink)' : 'transparent'}; color: {auditFilter === 'all' ? 'var(--paper)' : 'inherit'}; border: none; cursor: pointer;"
+                      >
+                        All ({syncHistory.length})
+                      </button>
+                    </div>
+                  {/if}
+                  <button class="btn" onclick={loadSyncHistory} style="font-size: 11px; padding: 2px 8px;">Refresh</button>
+                </div>
               </div>
               <div class="sync-records-list">
-                {#each syncHistory as rec (rec.id)}
+                {#each filteredSyncHistory as rec (rec.id)}
                   <div class="sync-record-item">
                     <div class="rec-top">
                       <span class="rec-title">{rec.komgaSeriesTitle}</span>
                       <span class="rec-tracker badge">{rec.tracker.toUpperCase()}</span>
                       {#if rec.dimension}
                         <span class="badge" style="font-size: 10px; opacity: 0.8;">{rec.dimension.toUpperCase()}</span>
+                      {/if}
+                      {#if isLatestRun(rec)}
+                        <span class="status-badge status-valid" style="font-size: 10px; padding: 1px 6px;">
+                          Latest Run
+                        </span>
                       {/if}
                       <span class="status-badge {rec.category === 'updated' || rec.category === 'would_update' || rec.category === 'dry_run_would_update' ? 'status-valid' : rec.category.startsWith('skipped') ? 'status-not_configured' : rec.category.includes('error') ? 'status-failed' : 'status-not_configured'}">
                         {rec.category.replace(/_/g, ' ')}

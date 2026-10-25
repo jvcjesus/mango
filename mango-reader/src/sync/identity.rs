@@ -124,12 +124,10 @@ pub async fn resolve_mangabaka_identity(
     komga_title: &str,
 ) -> Result<IdentityResolutionResult> {
     // 1. Check existing mapping table (manual override or resolved mapping)
-    if let Some(existing) = get_mapping(conn, komga_series_id, SyncTarget::MangaBaka)? {
+    let existing_mb = get_mapping(conn, komga_series_id, SyncTarget::MangaBaka)?;
+    if let Some(ref existing) = existing_mb {
         if existing.manual_override || existing.confidence == MappingConfidence::Resolved {
-            return Ok(IdentityResolutionResult::Resolved(existing));
-        }
-        if existing.confidence == MappingConfidence::Ambiguous {
-            return Ok(IdentityResolutionResult::Ambiguous(vec![]));
+            return Ok(IdentityResolutionResult::Resolved(existing.clone()));
         }
     }
 
@@ -165,7 +163,7 @@ pub async fn resolve_mangabaka_identity(
                 return Ok(IdentityResolutionResult::Resolved(mapping));
             }
             Ok(None) => {
-                // Cross-reference returned 404: fall through to exact title search
+                // Cross-reference returned 404 or empty series: fall through to exact title search
             }
             Err(e) if e.status == 429 || e.code == "mangabaka_rate_limited" => {
                 return Ok(IdentityResolutionResult::RateLimited);
@@ -176,9 +174,32 @@ pub async fn resolve_mangabaka_identity(
             Err(e) if e.status == 400 || e.code == "mangabaka_bad_request" => {
                 return Ok(IdentityResolutionResult::ApiError(e.message));
             }
+            Err(e) if e.status == 409 || e.code == "mangabaka_ambiguous" => {
+                let ambiguous_mapping = TrackerMapping {
+                    komga_series_id: komga_series_id.to_string(),
+                    tracker: SyncTarget::MangaBaka,
+                    tracker_id: String::new(),
+                    tracker_title: None,
+                    edition_id: None,
+                    mapping_source: MappingSource::CrossReference,
+                    confidence: MappingConfidence::Ambiguous,
+                    manual_override: false,
+                    last_validated: Some(now()),
+                    updated_at: now(),
+                };
+                save_mapping(conn, &ambiguous_mapping)?;
+                return Ok(IdentityResolutionResult::Ambiguous(vec![]));
+            }
             Err(e) => {
                 return Ok(IdentityResolutionResult::NetworkError(e.message));
             }
+        }
+    }
+
+    // If existing mapping was already recorded as ambiguous and no cross-reference resolved it:
+    if let Some(existing) = existing_mb {
+        if existing.confidence == MappingConfidence::Ambiguous {
+            return Ok(IdentityResolutionResult::Ambiguous(vec![]));
         }
     }
 

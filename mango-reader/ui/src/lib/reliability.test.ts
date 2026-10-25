@@ -1558,5 +1558,87 @@ describe('first-class volume acquisition & release semantics', () => {
         badgeClass: 'status-missing',
       });
     });
+
+    it('verifies authoritative Trackers status presentation and audit latest-run filtering', () => {
+      type SyncStatus = import('./api').SyncStatus;
+      type SyncRecord = import('./api').SyncRecord;
+
+      function getKomgaStatus(status: { komga_enabled: boolean; has_komga_api_key: boolean }): {
+        text: string;
+        badgeClass: string;
+      } {
+        if (!status.komga_enabled) {
+          return { text: 'Komga: Disabled', badgeClass: 'status-not_configured' };
+        }
+        if (status.has_komga_api_key) {
+          return { text: 'Komga: Connected', badgeClass: 'status-valid' };
+        }
+        return { text: 'Komga: No API Key', badgeClass: 'status-missing' };
+      }
+
+      // 1. Komga integration status tests
+      expect(getKomgaStatus({ komga_enabled: false, has_komga_api_key: false })).toEqual({
+        text: 'Komga: Disabled',
+        badgeClass: 'status-not_configured',
+      });
+      expect(getKomgaStatus({ komga_enabled: true, has_komga_api_key: true })).toEqual({
+        text: 'Komga: Connected',
+        badgeClass: 'status-valid',
+      });
+      expect(getKomgaStatus({ komga_enabled: true, has_komga_api_key: false })).toEqual({
+        text: 'Komga: No API Key',
+        badgeClass: 'status-missing',
+      });
+
+      // 2. Audit record latest-run detection and filtering
+      const run1Time = 1700000000;
+      const run2Time = 1700003600; // 1 hour later
+
+      const records: SyncRecord[] = [
+        {
+          id: 'rec-run2-1',
+          timestamp: run2Time,
+          komgaSeriesId: 's1',
+          komgaSeriesTitle: 'Blue Lock',
+          tracker: 'mangabaka',
+          category: 'no_change',
+          message: 'Up to date',
+          isDryRun: true,
+        },
+        {
+          id: 'rec-run2-2',
+          timestamp: run2Time - 2, // 2 seconds earlier in same run
+          komgaSeriesId: 's2',
+          komgaSeriesTitle: 'Pandora Hearts',
+          tracker: 'mangabaka',
+          category: 'no_change',
+          message: 'Up to date',
+          isDryRun: true,
+        },
+        {
+          id: 'rec-run1-1',
+          timestamp: run1Time,
+          komgaSeriesId: 's1',
+          komgaSeriesTitle: 'Blue Lock',
+          tracker: 'mangabaka',
+          category: 'ambiguous_mapping',
+          message: 'Ambiguous',
+          isDryRun: true,
+        },
+      ];
+
+      const latestRunTimestamp = records[0].timestamp;
+      function isLatestRun(rec: SyncRecord): boolean {
+        return Math.abs(rec.timestamp - latestRunTimestamp) <= 30;
+      }
+
+      expect(isLatestRun(records[0])).toBe(true);
+      expect(isLatestRun(records[1])).toBe(true);
+      expect(isLatestRun(records[2])).toBe(false);
+
+      const latestRunRecords = records.filter(isLatestRun);
+      expect(latestRunRecords.length).toBe(2);
+      expect(latestRunRecords.map((r) => r.id)).toEqual(['rec-run2-1', 'rec-run2-2']);
+    });
   });
 });

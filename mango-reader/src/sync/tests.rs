@@ -433,6 +433,50 @@ async fn start_mock_mangabaka(
                         })),
                     )
                         .into_response()
+                } else if id == "106130" {
+                    // Real MangaBaka OpenAPI response schema with data.series array
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "status": 200,
+                            "data": {
+                                "source_response": null,
+                                "series": [
+                                    {
+                                        "id": 83,
+                                        "state": "active",
+                                        "merged_with": null,
+                                        "title": "Blue Lock"
+                                    }
+                                ]
+                            }
+                        })),
+                    )
+                        .into_response()
+                } else if id == "998" {
+                    // Multiple active series for one AniList ID
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "status": 200,
+                            "data": {
+                                "source_response": null,
+                                "series": [
+                                    { "id": 801, "state": "active", "title": "Candidate One" },
+                                    { "id": 802, "state": "active", "title": "Candidate Two" }
+                                ]
+                            }
+                        })),
+                    )
+                        .into_response()
+                } else if id == "502" {
+                    StatusCode::BAD_GATEWAY.into_response()
+                } else if id == "400" {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "error": "Invalid request" })),
+                    )
+                        .into_response()
                 } else {
                     StatusCode::NOT_FOUND.into_response()
                 }
@@ -2170,6 +2214,298 @@ async fn test_mangabaka_status_presentation_distinguishes_token_from_validation(
         "Token must be preserved on validation failure"
     );
     assert_eq!(cfg3.mangabaka_validated, Some(false));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn test_trackers_sync_status_shares_authoritative_config_without_secrets() {
+    let dir = std::env::temp_dir().join(format!("mango-status-auth-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = Db::open(&dir.join("test.db")).expect("test db");
+    let pipeline = crate::pipeline::Pipeline::new(db.clone());
+
+    // 1. Initial state: Komga disabled, no token
+    let (cfg0, mb_tok0, komga_key0) = pipeline.load_internal_config().await.unwrap();
+    assert!(!cfg0.komga_enabled);
+    assert!(!cfg0.has_komga_api_key);
+    assert!(!cfg0.has_mangabaka_token);
+    assert_eq!(cfg0.mangabaka_validated, None);
+    assert_eq!(mb_tok0, None);
+    assert_eq!(komga_key0, None);
+
+    let status0 = crate::api::SyncStatusResponse {
+        running: false,
+        komga_enabled: cfg0.komga_enabled,
+        has_komga_api_key: cfg0.has_komga_api_key,
+        mangabaka_enabled: cfg0.mangabaka_enabled,
+        has_mangabaka_token: cfg0.has_mangabaka_token,
+        mangabaka_validated: cfg0.mangabaka_validated,
+    };
+    let json0 = serde_json::to_value(&status0).unwrap();
+    assert_eq!(json0["komga_enabled"], false);
+    assert_eq!(json0["has_komga_api_key"], false);
+    assert_eq!(json0["has_mangabaka_token"], false);
+    assert_eq!(json0["mangabaka_validated"], serde_json::Value::Null);
+    assert!(json0.get("mangabaka_token").is_none());
+    assert!(json0.get("komga_api_key").is_none());
+
+    // 2. Configure Komga and MangaBaka token
+    let mut patch = cfg0.clone();
+    patch.komga_enabled = true;
+    patch.komga_api_key = Some("super-secret-komga-key".into());
+    patch.mangabaka_token = Some("super-secret-mb-token".into());
+    pipeline.save_config(patch).await.unwrap();
+
+    let (cfg1, mb_tok1, komga_key1) = pipeline.load_internal_config().await.unwrap();
+    assert!(cfg1.komga_enabled);
+    assert!(cfg1.has_komga_api_key);
+    assert!(cfg1.has_mangabaka_token);
+    assert_eq!(cfg1.mangabaka_validated, None); // Unverified
+    assert_eq!(mb_tok1.as_deref(), Some("super-secret-mb-token"));
+    assert_eq!(komga_key1.as_deref(), Some("super-secret-komga-key"));
+
+    let status1 = crate::api::SyncStatusResponse {
+        running: false,
+        komga_enabled: cfg1.komga_enabled,
+        has_komga_api_key: cfg1.has_komga_api_key,
+        mangabaka_enabled: cfg1.mangabaka_enabled,
+        has_mangabaka_token: cfg1.has_mangabaka_token,
+        mangabaka_validated: cfg1.mangabaka_validated,
+    };
+    let json1 = serde_json::to_value(&status1).unwrap();
+    assert_eq!(json1["komga_enabled"], true);
+    assert_eq!(json1["has_komga_api_key"], true);
+    assert_eq!(json1["has_mangabaka_token"], true);
+    assert_eq!(json1["mangabaka_validated"], serde_json::Value::Null); // Token Configured (Unverified)
+    assert!(json1.get("mangabaka_token").is_none());
+    assert!(json1.get("komga_api_key").is_none());
+    let raw_str = json1.to_string();
+    assert!(!raw_str.contains("super-secret"));
+
+    // 3. Mark validated (Validation succeeded)
+    db.call(|conn| crate::db::set_state(conn, "pipeline.mangabaka_validated", "valid"))
+        .await
+        .unwrap();
+    let (cfg2, _, _) = pipeline.load_internal_config().await.unwrap();
+    assert_eq!(cfg2.mangabaka_validated, Some(true)); // Validated
+
+    // 4. Mark validation failed (Stored token remains!)
+    db.call(|conn| {
+        crate::db::set_state(
+            conn,
+            "pipeline.mangabaka_validated",
+            "error: HTTP 400 Bad Request",
+        )
+    })
+    .await
+    .unwrap();
+    let (cfg3, mb_tok3, _) = pipeline.load_internal_config().await.unwrap();
+    assert!(cfg3.has_mangabaka_token);
+    assert_eq!(mb_tok3.as_deref(), Some("super-secret-mb-token"));
+    assert_eq!(cfg3.mangabaka_validated, Some(false)); // Validation Failed
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn test_mangabaka_source_anilist_official_schema_resolves_blue_lock() {
+    let (url, state) = start_mock_mangabaka(vec![]).await;
+    let client = MangaBakaClient::new(
+        reqwest::Client::new(),
+        Some(url),
+        Some("valid-token".into()),
+    );
+
+    // 1. Direct cross-reference query using real MangaBaka OpenAPI response structure
+    let xref = client.resolve_from_anilist(106130).await.unwrap();
+    assert!(xref.is_some());
+    let x = xref.unwrap();
+    assert_eq!(x.mangabaka_id, 83);
+    assert_eq!(x.title.as_deref(), Some("Blue Lock"));
+
+    // 2. Precedence test in identity resolver:
+    // When an AniList mapping exists (media ID 106130), resolve_mangabaka_identity
+    // resolves to MangaBaka ID 83 via cross-reference without falling through to title search!
+    let dir = std::env::temp_dir().join(format!("mango-bl-id-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = Db::open(&dir.join("test.db")).expect("test db");
+    let conn = db.second().expect("connection");
+
+    // Add AniList mapping for Blue Lock
+    let anilist_map = TrackerMapping {
+        komga_series_id: "komga-blue-lock".into(),
+        tracker: SyncTarget::AniList,
+        tracker_id: "106130".into(),
+        tracker_title: Some("Blue Lock".into()),
+        edition_id: None,
+        mapping_source: MappingSource::ExactTitle,
+        confidence: MappingConfidence::Resolved,
+        manual_override: false,
+        last_validated: Some(1700000000),
+        updated_at: 1700000000,
+    };
+    save_mapping(&conn, &anilist_map).unwrap();
+
+    let initial_search_calls = state.search_calls.load(Ordering::SeqCst);
+
+    let res = resolve_mangabaka_identity(&conn, &client, "komga-blue-lock", "Blue Lock")
+        .await
+        .unwrap();
+
+    let m = match res {
+        IdentityResolutionResult::Resolved(m) => m,
+        other => panic!("Expected Resolved, got {other:?}"),
+    };
+
+    assert_eq!(m.tracker_id, "83");
+    assert_eq!(m.mapping_source, MappingSource::CrossReference);
+    assert_eq!(m.confidence, MappingConfidence::Resolved);
+    // Search endpoint must NOT have been called because cross-reference succeeded!
+    assert_eq!(
+        state.search_calls.load(Ordering::SeqCst),
+        initial_search_calls
+    );
+
+    // 3. Proves upgrade from previously recorded Ambiguous mapping when AniList cross-reference is available
+    let ambig_map = TrackerMapping {
+        komga_series_id: "komga-blue-lock-2".into(),
+        tracker: SyncTarget::MangaBaka,
+        tracker_id: String::new(),
+        tracker_title: None,
+        edition_id: None,
+        mapping_source: MappingSource::ExactTitle,
+        confidence: MappingConfidence::Ambiguous,
+        manual_override: false,
+        last_validated: Some(1700000000),
+        updated_at: 1700000000,
+    };
+    save_mapping(&conn, &ambig_map).unwrap();
+
+    // Now add AniList mapping for that series
+    let anilist_map_2 = TrackerMapping {
+        komga_series_id: "komga-blue-lock-2".into(),
+        tracker: SyncTarget::AniList,
+        tracker_id: "106130".into(),
+        tracker_title: Some("Blue Lock".into()),
+        edition_id: None,
+        mapping_source: MappingSource::ExactTitle,
+        confidence: MappingConfidence::Resolved,
+        manual_override: false,
+        last_validated: Some(1700000000),
+        updated_at: 1700000000,
+    };
+    save_mapping(&conn, &anilist_map_2).unwrap();
+
+    let res_upgrade = resolve_mangabaka_identity(&conn, &client, "komga-blue-lock-2", "Blue Lock")
+        .await
+        .unwrap();
+    let m_up = match res_upgrade {
+        IdentityResolutionResult::Resolved(m) => m,
+        other => panic!("Expected Resolved from upgrade, got {other:?}"),
+    };
+    assert_eq!(m_up.tracker_id, "83");
+    assert_eq!(m_up.mapping_source, MappingSource::CrossReference);
+    assert_eq!(m_up.confidence, MappingConfidence::Resolved);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn test_mangabaka_cross_reference_multiple_active_series_fails_closed_as_ambiguous() {
+    let (url, _) = start_mock_mangabaka(vec![]).await;
+    let client = MangaBakaClient::new(
+        reqwest::Client::new(),
+        Some(url),
+        Some("valid-token".into()),
+    );
+
+    let dir = std::env::temp_dir().join(format!("mango-multi-active-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = Db::open(&dir.join("test.db")).expect("test db");
+    let conn = db.second().expect("connection");
+
+    // Map AniList ID 998 (which returns multiple active series)
+    let anilist_map = TrackerMapping {
+        komga_series_id: "komga-multi-series".into(),
+        tracker: SyncTarget::AniList,
+        tracker_id: "998".into(),
+        tracker_title: Some("Multiple Series".into()),
+        edition_id: None,
+        mapping_source: MappingSource::ExactTitle,
+        confidence: MappingConfidence::Resolved,
+        manual_override: false,
+        last_validated: Some(1700000000),
+        updated_at: 1700000000,
+    };
+    save_mapping(&conn, &anilist_map).unwrap();
+
+    let res = resolve_mangabaka_identity(&conn, &client, "komga-multi-series", "Multiple Series")
+        .await
+        .unwrap();
+
+    assert!(
+        matches!(res, IdentityResolutionResult::Ambiguous(_)),
+        "Multiple active series in cross-reference must fail closed as Ambiguous"
+    );
+
+    // Verify it saved an Ambiguous record in DB
+    let saved = get_mapping(&conn, "komga-multi-series", SyncTarget::MangaBaka).unwrap();
+    assert!(saved.is_some());
+    assert_eq!(saved.unwrap().confidence, MappingConfidence::Ambiguous);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn test_mangabaka_cross_reference_remote_error_does_not_fall_through_to_title_search() {
+    let (url, state) = start_mock_mangabaka(vec![]).await;
+    let client = MangaBakaClient::new(
+        reqwest::Client::new(),
+        Some(url),
+        Some("valid-token".into()),
+    );
+
+    let dir = std::env::temp_dir().join(format!("mango-xref-err-test-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = Db::open(&dir.join("test.db")).expect("test db");
+    let conn = db.second().expect("connection");
+
+    // AniList ID 502 returns HTTP 502 Bad Gateway
+    let anilist_map = TrackerMapping {
+        komga_series_id: "komga-error-502".into(),
+        tracker: SyncTarget::AniList,
+        tracker_id: "502".into(),
+        tracker_title: Some("Berserk".into()),
+        edition_id: None,
+        mapping_source: MappingSource::ExactTitle,
+        confidence: MappingConfidence::Resolved,
+        manual_override: false,
+        last_validated: Some(1700000000),
+        updated_at: 1700000000,
+    };
+    save_mapping(&conn, &anilist_map).unwrap();
+
+    let initial_searches = state.search_calls.load(Ordering::SeqCst);
+
+    let res = resolve_mangabaka_identity(&conn, &client, "komga-error-502", "Berserk")
+        .await
+        .unwrap();
+
+    // Must return NetworkError (or ApiError), NOT fall through to exact title search for "Berserk"!
+    assert!(
+        matches!(res, IdentityResolutionResult::NetworkError(_)),
+        "Remote error on AniList cross-reference must NOT fall through to title search"
+    );
+    assert_eq!(
+        state.search_calls.load(Ordering::SeqCst),
+        initial_searches,
+        "Search endpoint must NOT be queried when AniList cross-reference errors"
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }

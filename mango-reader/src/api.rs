@@ -22,17 +22,17 @@ use crate::{
     version::{self, Releases},
 };
 use axum::{
-    body::{to_bytes, Body, Bytes},
+    Json, Router,
+    body::{Body, Bytes, to_bytes},
     extract::{DefaultBodyLimit, FromRequestParts, Path, Query, RawQuery, Request, State},
-    http::{header, request::Parts, HeaderMap, HeaderValue, Method, StatusCode},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header, request::Parts},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post, put},
-    Json, Router,
 };
-use flate2::{write::GzEncoder, Compression};
-use serde::Deserialize;
-use serde_json::{json, Map, Value};
+use flate2::{Compression, write::GzEncoder};
+use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::{io::Write, sync::Arc};
 
@@ -1241,7 +1241,7 @@ async fn bulk(Me(app): Me, Json(body): Json<BulkChange>) -> Result<Json<Value>> 
         _ => {
             return Err(AppError::bad_request(
                 "action takes read, unread, remove or categories",
-            ))
+            ));
         }
     };
     let (ids, read) = (body.ids.clone(), matches!(action, Bulk::Read));
@@ -1483,9 +1483,25 @@ async fn sync_run(
     Ok(Json(summary))
 }
 
-async fn sync_status(Me(app): Me) -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "running": app.sync.is_running()
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncStatusResponse {
+    pub running: bool,
+    pub komga_enabled: bool,
+    pub has_komga_api_key: bool,
+    pub mangabaka_enabled: bool,
+    pub has_mangabaka_token: bool,
+    pub mangabaka_validated: Option<bool>,
+}
+
+async fn sync_status(Me(app): Me) -> Result<Json<SyncStatusResponse>> {
+    let (cfg, _mb_token, _komga_key) = app.pipeline.load_internal_config().await?;
+    Ok(Json(SyncStatusResponse {
+        running: app.sync.is_running(),
+        komga_enabled: cfg.komga_enabled,
+        has_komga_api_key: cfg.has_komga_api_key,
+        mangabaka_enabled: cfg.mangabaka_enabled,
+        has_mangabaka_token: cfg.has_mangabaka_token,
+        mangabaka_validated: cfg.mangabaka_validated,
     }))
 }
 

@@ -556,8 +556,17 @@ export const runSyncDryRun = (target?: string, libraryId?: string) =>
 export const runSync = (target?: string, libraryId?: string) =>
   send<SyncSummary>('POST', '/sync/run', { target, libraryId });
 
+export interface SyncStatus {
+  running: boolean;
+  komga_enabled: boolean;
+  has_komga_api_key: boolean;
+  mangabaka_enabled: boolean;
+  has_mangabaka_token: boolean;
+  mangabaka_validated: boolean | null;
+}
+
 export const getSyncStatus = () =>
-  get<{ running: boolean }>('/sync/status');
+  get<SyncStatus>('/sync/status');
 
 export const getSyncHistory = (limit: number = 100) =>
   get<SyncRecord[]>(`/sync/history?limit=${limit}`);
