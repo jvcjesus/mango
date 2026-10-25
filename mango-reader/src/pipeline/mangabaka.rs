@@ -456,7 +456,7 @@ impl MangaBakaClient {
     pub async fn test_connection(&self) -> Result<String> {
         let resp = self
             .request_builder(reqwest::Method::GET, "/series/search")
-            .query(&[("query", "test"), ("q", "test")])
+            .query(&[("q", "test")])
             .send()
             .await
             .map_err(|e| {
@@ -528,7 +528,7 @@ impl MangaBakaClient {
 
         let resp = match self
             .request_builder(reqwest::Method::GET, "/series/search")
-            .query(&[("query", trimmed_series), ("q", trimmed_series)])
+            .query(&[("q", trimmed_series)])
             .send()
             .await
         {
@@ -1279,7 +1279,7 @@ mod tests {
 
     #[tokio::test]
     async fn mangabaka_precision_matching_and_enrichment_flow() {
-        use axum::{Json, Router, routing::get};
+        use axum::{Json, Router, http::StatusCode, response::IntoResponse, routing::get};
         use serde_json::json;
 
         let app = Router::new()
@@ -1289,6 +1289,17 @@ mod tests {
                     |axum::extract::Query(params): axum::extract::Query<
                         std::collections::HashMap<String, String>,
                     >| async move {
+                        if params.contains_key("query") {
+                            return (
+                                StatusCode::BAD_REQUEST,
+                                Json(json!({
+                                    "message": "Validation error: Unrecognized key: \"query\"",
+                                    "status": 400,
+                                    "code": null
+                                })),
+                            )
+                                .into_response();
+                        }
                         let q = params.get("q").cloned().unwrap_or_default();
                         if q == "Blue Lock" {
                             Json(json!({
@@ -1306,6 +1317,7 @@ mod tests {
                                     }
                                 ]
                             }))
+                            .into_response()
                         } else if q == "Ambiguous Title" {
                             Json(json!({
                                 "data": [
@@ -1313,8 +1325,9 @@ mod tests {
                                     { "id": 202, "title": "Ambiguous Title" }
                                 ]
                             }))
+                            .into_response()
                         } else {
-                            Json(json!({ "data": [] }))
+                            Json(json!({ "data": [] })).into_response()
                         }
                     },
                 ),

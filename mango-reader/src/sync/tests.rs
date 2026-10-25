@@ -495,6 +495,18 @@ async fn start_mock_mangabaka(
                     if let Some(err) = check_simultaneous_auth(&headers) {
                         return err;
                     }
+                    // Real MangaBaka API strictly validates query parameters and rejects unrecognized keys like "query"
+                    if params.contains_key("query") {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({
+                                "message": "Validation error: Unrecognized key: \"query\"",
+                                "status": 400,
+                                "code": null
+                            })),
+                        )
+                            .into_response();
+                    }
                     let token = headers.get("x-api-key").and_then(|v| v.to_str().ok());
                     if token == Some("invalid-token") {
                         return StatusCode::UNAUTHORIZED.into_response();
@@ -509,11 +521,7 @@ async fn start_mock_mangabaka(
                         )
                             .into_response();
                     }
-                    let q = params
-                        .get("query")
-                        .or_else(|| params.get("q"))
-                        .map(|s| s.as_str())
-                        .unwrap_or("");
+                    let q = params.get("q").map(|s| s.as_str()).unwrap_or("");
                     if q == "Error 400" {
                         (
                             StatusCode::BAD_REQUEST,
@@ -1843,7 +1851,7 @@ async fn test_mangabaka_mock_server_rejects_simultaneous_auth() {
 
     // Directly send a request with BOTH Authorization and x-api-key headers
     let resp = http
-        .get(format!("{url}/series/search?query=Berserk"))
+        .get(format!("{url}/series/search?q=Berserk"))
         .header("Authorization", "Bearer test-token")
         .header("x-api-key", "test-token")
         .send()
@@ -1855,6 +1863,74 @@ async fn test_mangabaka_mock_server_rejects_simultaneous_auth() {
     assert_eq!(
         body.get("message").and_then(|v| v.as_str()),
         Some("Cannot use both Authorization and x-api-key headers simultaneously")
+    );
+}
+
+#[tokio::test]
+async fn test_mangabaka_search_rejects_query_parameter_and_requires_q() {
+    let (url, _state) = start_mock_mangabaka(vec![]).await;
+    let http = reqwest::Client::new();
+
+    // 1. Direct request sending `query=Berserk` must be rejected with HTTP 400
+    //    matching real MangaBaka production behavior: `Validation error: Unrecognized key: "query"`
+    let resp_query = http
+        .get(format!("{url}/series/search?query=Berserk"))
+        .header("x-api-key", "valid-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp_query.status(), StatusCode::BAD_REQUEST);
+    let body_query: serde_json::Value = resp_query.json().await.unwrap();
+    assert_eq!(
+        body_query.get("message").and_then(|v| v.as_str()),
+        Some("Validation error: Unrecognized key: \"query\"")
+    );
+
+    // 2. Direct request sending BOTH `q=Berserk&query=Berserk` must also be rejected with HTTP 400
+    let resp_both = http
+        .get(format!("{url}/series/search?q=Berserk&query=Berserk"))
+        .header("x-api-key", "valid-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp_both.status(), StatusCode::BAD_REQUEST);
+    let body_both: serde_json::Value = resp_both.json().await.unwrap();
+    assert_eq!(
+        body_both.get("message").and_then(|v| v.as_str()),
+        Some("Validation error: Unrecognized key: \"query\"")
+    );
+
+    // 3. Direct request sending `q=Berserk` succeeds with HTTP 200
+    let resp_q = http
+        .get(format!("{url}/series/search?q=Berserk"))
+        .header("x-api-key", "valid-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp_q.status(), StatusCode::OK);
+    let body_q: serde_json::Value = resp_q.json().await.unwrap();
+    assert_eq!(body_q["data"][0]["title"].as_str(), Some("Berserk"));
+
+    // 4. MangaBakaClient::test_connection() must send `q=test` (no `query`) and succeed
+    let client = MangaBakaClient::new(
+        reqwest::Client::new(),
+        Some(url.clone()),
+        Some("valid-token".into()),
+    );
+    let test_conn_res = client.test_connection().await;
+    assert!(
+        test_conn_res.is_ok(),
+        "test_connection must send q only and succeed: {test_conn_res:?}"
+    );
+
+    // 5. MangaBakaClient::match_series() must send `q=Berserk` (no `query`) and succeed
+    let match_res = client.match_series("Berserk").await.unwrap();
+    assert!(
+        matches!(
+            match_res,
+            crate::pipeline::mangabaka::MangaBakaSeriesMatch::Found { id: 202, .. }
+        ),
+        "match_series must send q only and find series: {match_res:?}"
     );
 }
 
