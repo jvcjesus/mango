@@ -27,6 +27,7 @@ pub enum TorBoxError {
     TorrentFailed(String),
     AmbiguousFiles(String),
     NoArchiveFound(String),
+    RequestedUnitNotFound(String),
     UnsupportedFormat(String),
     InvalidCbz(String),
     Io(String),
@@ -42,6 +43,7 @@ impl fmt::Display for TorBoxError {
             Self::TorrentFailed(msg) => write!(f, "TorBox torrent failed: {msg}"),
             Self::AmbiguousFiles(msg) => write!(f, "TorBox file selection ambiguous: {msg}"),
             Self::NoArchiveFound(msg) => write!(f, "TorBox no manga archive found: {msg}"),
+            Self::RequestedUnitNotFound(msg) => write!(f, "Requested unit not found in TorBox torrent: {msg}"),
             Self::UnsupportedFormat(msg) => write!(f, "Unsupported archive format: {msg}"),
             Self::InvalidCbz(msg) => write!(f, "Retrieved archive failed CBZ validation: {msg}"),
             Self::Io(msg) => write!(f, "IO error during retrieval: {msg}"),
@@ -61,6 +63,7 @@ impl From<TorBoxError> for AppError {
             TorBoxError::TorrentFailed(msg) => AppError::new(422, "torrent_failed", msg),
             TorBoxError::AmbiguousFiles(msg) => AppError::new(422, "ambiguous_files", msg),
             TorBoxError::NoArchiveFound(msg) => AppError::new(404, "no_archive_found", msg),
+            TorBoxError::RequestedUnitNotFound(msg) => AppError::new(404, "requested_unit_not_found", msg),
             TorBoxError::UnsupportedFormat(msg) => AppError::new(400, "unsupported_format", msg),
             TorBoxError::InvalidCbz(msg) => AppError::bad_request(msg),
             TorBoxError::Io(msg) => AppError::internal(msg),
@@ -523,15 +526,41 @@ pub fn is_unsupported_format(lower: &str) -> bool {
         || lower.ends_with(".azw3")
 }
 
+/// Extracts the numeric volume number from an archive filename (e.g. "BLAME! v01.cbz" -> 1.0,
+/// "Blue Lock v39 (2026) (Digital) (Stick).cbz" -> 39.0, "v001.cbz" -> 1.0, "vol. 1.cbz" -> 1.0).
+///
+/// Ensures years like "(2016)" or "(2026)" are never misinterpreted as volume numbers, and release
+/// markers like "(f)", "(Digital)", "(Stick)" are safely ignored.
+pub fn parse_archive_volume(filename: &str) -> Option<f64> {
+    let clean = crate::release::strip_archive_extension(filename.trim());
+    if clean.is_empty() {
+        return None;
+    }
+
+    // First attempt using crate::release::parse_volume which handles "v01", "v1", "v001",
+    // "vol 1", "vol. 1", "volume 1", "Volume 01", etc. and guards against chapter revisions
+    if let Some(vol) = crate::release::parse_volume(clean) {
+        return Some((vol.round() * 1000.0).round() / 1000.0);
+    }
+
+    // Fall back to classify_release if parse_volume did not identify it
+    let (unit, num, _) = crate::acquisition::nyaa::classify_release(clean);
+    match unit {
+        AcquisitionReleaseUnit::Volume(v) => Some((v.round() * 1000.0).round() / 1000.0),
+        _ => num.map(|n| (n.round() * 1000.0).round() / 1000.0),
+    }
+}
+
 /// Conservative file selection algorithm:
 /// 1. Filters out non-manga junk/metadata files (e.g. .nfo, .txt, .url, .jpg, .png, .db, .DS_Store, __MACOSX).
 /// 2. Explicitly rejects unsupported archive/document formats (.cbr, .rar, .7z, .pdf, .epub).
 /// 3. Accepts native .cbz (preferred) and validated manga .zip archives.
-/// 4. If single archive exists, selects it.
-/// 5. If multiple archives exist (e.g. batch):
-///    - If target_unit is Volume(N), searches for archive unambiguously matching Volume N.
-///    - If exactly 1 matches, selects it.
-///    - If 0 or >1 match, fails closed with TorBoxError::AmbiguousFiles.
+/// 4. If target_unit is Volume(N), searches for archive unambiguously matching Volume N.
+///    - If exactly 1 matches (preferring .cbz over .zip if both exist), selects it.
+///    - If 0 match, fails closed with TorBoxError::RequestedUnitNotFound.
+///    - If >1 match with same format, fails closed with TorBoxError::AmbiguousFiles.
+/// 5. If single archive exists and no target_unit specified, selects it.
+/// 6. If multiple archives exist and no target_unit specified, fails closed with TorBoxError::AmbiguousFiles.
 pub fn select_artifact<'a>(
     files: &'a [BackendFile],
     target_unit: Option<&AcquisitionReleaseUnit>,
@@ -564,14 +593,9 @@ pub fn select_artifact<'a>(
             .iter()
             .copied()
             .filter(|f| {
-                let (unit, num, _) = crate::acquisition::nyaa::classify_release(&f.name);
-                if let AcquisitionReleaseUnit::Volume(v) = unit {
-                    (v - target_vol).abs() < 0.001
-                } else if let Some(n) = num {
-                    (n - target_vol).abs() < 0.001
-                } else {
-                    false
-                }
+                parse_archive_volume(&f.name)
+                    .map(|v| (v - target_vol).abs() < 0.001)
+                    .unwrap_or(false)
             })
             .collect();
 
@@ -596,56 +620,104 @@ pub fn select_artifact<'a>(
         ));
     }
 
-    // 5. If exactly one supported archive exists and no ambiguity, select it
-    if archives.len() == 1 {
-        return Ok(archives[0]);
-    }
-
-    // 6. Multiple archives found (e.g. multi-volume batch). Match against target_unit:
+    // 5. Match against target_unit if specified
     if let Some(AcquisitionReleaseUnit::Volume(target_vol)) = target_unit {
-        let matching: Vec<&BackendFile> = archives
-            .iter()
-            .copied()
-            .filter(|f| {
-                let (unit, num, _) = crate::acquisition::nyaa::classify_release(&f.name);
-                if let AcquisitionReleaseUnit::Volume(v) = unit {
-                    (v - target_vol).abs() < 0.001
-                } else if let Some(n) = num {
-                    (n - target_vol).abs() < 0.001
-                } else {
-                    false
+        let mut parsed_vols = Vec::new();
+        let mut matching: Vec<&BackendFile> = Vec::new();
+
+        for arch in &archives {
+            if let Some(vol) = parse_archive_volume(&arch.name) {
+                parsed_vols.push(vol);
+                if (vol - target_vol).abs() < 0.001 {
+                    matching.push(arch);
                 }
-            })
-            .collect();
+            }
+        }
 
         if matching.len() == 1 {
             return Ok(matching[0]);
         }
 
         // Prefer native .cbz over .zip if both exist for the same target volume
-        let cbz_matching: Vec<&BackendFile> = matching
-            .iter()
-            .copied()
-            .filter(|f| f.name.to_ascii_lowercase().ends_with(".cbz"))
-            .collect();
-        if cbz_matching.len() == 1 {
-            return Ok(cbz_matching[0]);
-        }
-
-        if matching.is_empty() {
+        if matching.len() > 1 {
+            let cbz_matching: Vec<&BackendFile> = matching
+                .iter()
+                .copied()
+                .filter(|f| f.name.to_ascii_lowercase().ends_with(".cbz"))
+                .collect();
+            if cbz_matching.len() == 1 {
+                return Ok(cbz_matching[0]);
+            }
             return Err(TorBoxError::AmbiguousFiles(format!(
-                "Batch torrent has {} archives, but none matched requested Volume {target_vol}",
-                archives.len()
+                "Batch torrent has {} archives matching requested Volume {target_vol}",
+                matching.len()
             )));
         }
 
-        return Err(TorBoxError::AmbiguousFiles(format!(
-            "Batch torrent has {} archives matching requested Volume {target_vol}",
-            matching.len()
+        // 0 matches -> RequestedUnitNotFound with useful non-sensitive diagnostics
+        parsed_vols.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        parsed_vols.dedup();
+        let found_summary = if parsed_vols.is_empty() {
+            "none parsed".to_string()
+        } else {
+            parsed_vols
+                .iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+
+        return Err(TorBoxError::RequestedUnitNotFound(format!(
+            "Requested Volume {target_vol} not found among {} supported archive files (found volumes: [{}])",
+            archives.len(),
+            found_summary
         )));
     }
 
-    // Ambiguous multiple archives with no exact target volume specified
+    if let Some(AcquisitionReleaseUnit::Chapter(target_ch)) = target_unit {
+        let mut matching: Vec<&BackendFile> = Vec::new();
+        for arch in &archives {
+            let (unit, num, _) = crate::acquisition::nyaa::classify_release(&arch.name);
+            let is_match = match unit {
+                AcquisitionReleaseUnit::Chapter(c) => (c - target_ch).abs() < 0.001,
+                _ => num.map(|n| (n - target_ch).abs() < 0.001).unwrap_or(false),
+            };
+            if is_match {
+                matching.push(arch);
+            }
+        }
+
+        if matching.len() == 1 {
+            return Ok(matching[0]);
+        }
+
+        if matching.len() > 1 {
+            let cbz_matching: Vec<&BackendFile> = matching
+                .iter()
+                .copied()
+                .filter(|f| f.name.to_ascii_lowercase().ends_with(".cbz"))
+                .collect();
+            if cbz_matching.len() == 1 {
+                return Ok(cbz_matching[0]);
+            }
+            return Err(TorBoxError::AmbiguousFiles(format!(
+                "Batch torrent has {} archives matching requested Chapter {target_ch}",
+                matching.len()
+            )));
+        }
+
+        return Err(TorBoxError::RequestedUnitNotFound(format!(
+            "Requested Chapter {target_ch} not found among {} supported archive files",
+            archives.len()
+        )));
+    }
+
+    // 6. If exactly one supported archive exists and no specific target volume requested, select it
+    if archives.len() == 1 {
+        return Ok(archives[0]);
+    }
+
+    // 7. Ambiguous multiple archives with no exact target volume or unit specified
     Err(TorBoxError::AmbiguousFiles(format!(
         "Torrent contains {} archive files and no unambiguous volume match could be determined",
         archives.len()
@@ -659,7 +731,7 @@ pub fn select_artifact<'a>(
 /// 1. Filters out junk and metadata files.
 /// 2. If any archive is an unsupported format (.cbr, .rar, etc.), fails closed with TorBoxError::UnsupportedFormat.
 /// 3. Filters to supported archives (.cbz, .zip).
-/// 4. Classifies volume number using classify_release.
+/// 4. Classifies volume number using parse_archive_volume.
 /// 5. If multiple files map to the same volume:
 ///    - If one is .cbz and another is .zip, prefers .cbz.
 ///    - If both have identical extensions or duplicate archives exist, fails closed with TorBoxError::AmbiguousFiles.
@@ -701,11 +773,7 @@ pub fn map_torrent_files_to_volumes(
     let mut map: BTreeMap<i64, BackendFile> = BTreeMap::new();
 
     for arch in archives {
-        let (unit, num, _) = crate::acquisition::nyaa::classify_release(&arch.name);
-        let vol_opt = match unit {
-            AcquisitionReleaseUnit::Volume(v) => Some(v.round() as i64),
-            _ => num.map(|n| n.round() as i64),
-        };
+        let vol_opt = parse_archive_volume(&arch.name).map(|v| v.round() as i64);
 
         let Some(vol) = vol_opt else {
             return Err(TorBoxError::AmbiguousFiles(format!(
@@ -848,7 +916,7 @@ mod tests {
         assert!(matches!(err, TorBoxError::AmbiguousFiles(_)));
 
         let err2 = select_artifact(&files3, Some(&AcquisitionReleaseUnit::Volume(99.0))).unwrap_err();
-        assert!(matches!(err2, TorBoxError::AmbiguousFiles(_)));
+        assert!(matches!(err2, TorBoxError::RequestedUnitNotFound(_)));
 
         // Case 5: Unsupported formats rejected as UnsupportedFormat
         let files_cbr = vec![BackendFile {
@@ -955,5 +1023,136 @@ mod tests {
             BackendJobStatus::Completed
         };
         assert!(matches!(status, BackendJobStatus::Stalled { .. }));
+    }
+
+    #[test]
+    fn test_blame_filename_parsing_and_selection() {
+        let blame_files = vec![
+            BackendFile {
+                id: 101,
+                name: "BLAME! Master Edition v01 (2016) (Digital) (danke-Empire).cbz".to_string(),
+                size: 500_000_000,
+                path: "BLAME! Master Edition v01 (2016) (Digital) (danke-Empire).cbz".to_string(),
+            },
+            BackendFile {
+                id: 102,
+                name: "BLAME! Master Edition v02 (2016) (Digital) (danke-Empire).cbz".to_string(),
+                size: 510_000_000,
+                path: "BLAME! Master Edition v02 (2016) (Digital) (danke-Empire).cbz".to_string(),
+            },
+            BackendFile {
+                id: 103,
+                name: "BLAME! Master Edition v03 (2017) (Digital) (danke-Empire).cbz".to_string(),
+                size: 520_000_000,
+                path: "BLAME! Master Edition v03 (2017) (Digital) (danke-Empire).cbz".to_string(),
+            },
+            BackendFile {
+                id: 104,
+                name: "BLAME! Master Edition v04 (2017) (Digital) (danke-Empire).cbz".to_string(),
+                size: 530_000_000,
+                path: "BLAME! Master Edition v04 (2017) (Digital) (danke-Empire).cbz".to_string(),
+            },
+            BackendFile {
+                id: 105,
+                name: "BLAME! Master Edition v05 (2017) (Digital) (danke-Empire).cbz".to_string(),
+                size: 540_000_000,
+                path: "BLAME! Master Edition v05 (2017) (Digital) (danke-Empire).cbz".to_string(),
+            },
+            BackendFile {
+                id: 106,
+                name: "BLAME! Master Edition v06 (2017) (F) (Digital) (danke-Empire).cbz".to_string(),
+                size: 550_000_000,
+                path: "BLAME! Master Edition v06 (2017) (F) (Digital) (danke-Empire).cbz".to_string(),
+            },
+        ];
+
+        // 1. Unique mapping to Volumes 1-6
+        let mapped = map_torrent_files_to_volumes(&blame_files).expect("mapping failed");
+        assert_eq!(mapped.len(), 6);
+        for i in 1..=6 {
+            assert!(mapped.contains_key(&i));
+            assert_eq!(mapped.get(&i).unwrap().id, 100 + i);
+        }
+
+        // 2. parse_archive_volume handles (F) marker and rejects publication years (2016, 2017)
+        assert_eq!(parse_archive_volume(&blame_files[0].name), Some(1.0));
+        assert_eq!(parse_archive_volume(&blame_files[5].name), Some(6.0));
+
+        // 3. Selection of individual volumes
+        let sel1 = select_artifact(&blame_files, Some(&AcquisitionReleaseUnit::Volume(1.0))).unwrap();
+        assert_eq!(sel1.id, 101);
+
+        let sel6 = select_artifact(&blame_files, Some(&AcquisitionReleaseUnit::Volume(6.0))).unwrap();
+        assert_eq!(sel6.id, 106);
+
+        // Missing volume 7 fails with RequestedUnitNotFound
+        let err7 = select_artifact(&blame_files, Some(&AcquisitionReleaseUnit::Volume(7.0))).unwrap_err();
+        assert!(matches!(err7, TorBoxError::RequestedUnitNotFound(_)));
+    }
+
+    #[test]
+    fn test_blue_lock_v01_39_fixture_and_selective_retrieval() {
+        let mut blue_lock_files = Vec::new();
+        for i in 1..=39 {
+            let year = 2021 + (i / 8);
+            let f_marker = if i % 5 == 0 { " (f)" } else { "" };
+            let filename = format!("Blue Lock v{:02} ({year}){f_marker} (Digital) (Stick).cbz", i);
+            blue_lock_files.push(BackendFile {
+                id: 1000 + i as i64,
+                name: filename.clone(),
+                size: 80_000_000 + (i as u64 * 1_000_000),
+                path: filename,
+            });
+        }
+
+        // 1. Requested Volume 39 -> exactly v39 selected (ID 1039)
+        let sel39 = select_artifact(&blue_lock_files, Some(&AcquisitionReleaseUnit::Volume(39.0))).unwrap();
+        assert_eq!(sel39.id, 1039);
+        assert_eq!(sel39.name, "Blue Lock v39 (2025) (Digital) (Stick).cbz");
+
+        // 2. Requested Volume 26 -> exactly v26 selected (ID 1026)
+        let sel26 = select_artifact(&blue_lock_files, Some(&AcquisitionReleaseUnit::Volume(26.0))).unwrap();
+        assert_eq!(sel26.id, 1026);
+
+        // 3. Requested Volume 40 -> RequestedUnitNotFound
+        let err40 = select_artifact(&blue_lock_files, Some(&AcquisitionReleaseUnit::Volume(40.0))).unwrap_err();
+        assert!(matches!(err40, TorBoxError::RequestedUnitNotFound(_)));
+        let err_msg = err40.to_string();
+        assert!(err_msg.contains("Volume 40"));
+        assert!(err_msg.contains("found volumes"));
+
+        // 4. Multi-select: units [31, 32, 35, 39]
+        let selected_units = vec![31.0, 32.0, 35.0, 39.0];
+        let mut chosen_ids = Vec::new();
+        for u in selected_units {
+            let f = select_artifact(&blue_lock_files, Some(&AcquisitionReleaseUnit::Volume(u))).unwrap();
+            chosen_ids.push(f.id);
+        }
+        assert_eq!(chosen_ids, vec![1031, 1032, 1035, 1039]);
+    }
+
+    #[test]
+    fn test_genuine_ambiguity_fails_closed() {
+        // Case 1: Two files parsing as the exact same volume (same format)
+        let dup_files = vec![
+            BackendFile {
+                id: 201,
+                name: "Blue Lock v39 (Digital) (GroupA).cbz".to_string(),
+                size: 80_000_000,
+                path: "Blue Lock v39 (Digital) (GroupA).cbz".to_string(),
+            },
+            BackendFile {
+                id: 202,
+                name: "Blue Lock v39 (Digital) (GroupB).cbz".to_string(),
+                size: 85_000_000,
+                path: "Blue Lock v39 (Digital) (GroupB).cbz".to_string(),
+            },
+        ];
+        let err_dup = select_artifact(&dup_files, Some(&AcquisitionReleaseUnit::Volume(39.0))).unwrap_err();
+        assert!(matches!(err_dup, TorBoxError::AmbiguousFiles(_)));
+
+        // Case 2: Multiple archives with no target unit
+        let err_no_target = select_artifact(&dup_files, None).unwrap_err();
+        assert!(matches!(err_no_target, TorBoxError::AmbiguousFiles(_)));
     }
 }

@@ -17,6 +17,7 @@ pub enum OwnershipStatus {
     Owned,
     Available,
     Acquiring,
+    Failed,
     Unknown,
 }
 
@@ -27,6 +28,8 @@ pub struct VolumeOwnership {
     pub status: OwnershipStatus,
     pub book_id: Option<String>,
     pub book_name: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -36,6 +39,8 @@ pub struct ChapterOwnership {
     pub status: OwnershipStatus,
     pub book_id: Option<String>,
     pub book_name: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -60,6 +65,8 @@ pub struct OwnershipSummary {
 pub struct TitleOwnership {
     pub komga_connected: bool,
     pub error: Option<String>,
+    #[serde(default)]
+    pub active_error: Option<String>,
     pub series_id: Option<String>,
     pub series_name: Option<String>,
     pub library_id: Option<String>,
@@ -141,9 +148,9 @@ impl OwnershipService {
                     let key = crate::db::state(conn, "pipeline.komga_api_key")?;
                     let lib_id = crate::settings::get::<String>(conn, "pipeline.komga_library_id");
 
-                    // Get active downloads for this manga
+                    // Get active or failed downloads for this manga
                     let mut stmt = conn.prepare(
-                        "SELECT c.id, c.name, c.chapter_number, d.state
+                        "SELECT c.id, c.name, c.chapter_number, d.state, d.error
                      FROM downloads d
                      JOIN chapters c ON c.id = d.chapter_id
                      WHERE c.manga_id = ?1",
@@ -154,7 +161,8 @@ impl OwnershipService {
                             let name: String = row.get(1)?;
                             let chapter_number: f64 = row.get(2)?;
                             let state: String = row.get(3)?;
-                            Ok((id, name, chapter_number, state))
+                            let error: Option<String> = row.get(4)?;
+                            Ok((id, name, chapter_number, state, error))
                         })?
                         .filter_map(std::result::Result::ok)
                         .collect::<Vec<_>>();
@@ -181,6 +189,7 @@ impl OwnershipService {
                     return TitleOwnership {
                         komga_connected: false,
                         error: Some(format!("Database query failed: {e}")),
+                        active_error: None,
                         series_id: None,
                         series_name: None,
                         library_id: None,
@@ -235,6 +244,7 @@ impl OwnershipService {
             return TitleOwnership {
                 komga_connected: false,
                 error: Some("Komga integration is not enabled in Settings".to_string()),
+                active_error: None,
                 series_id: None,
                 series_name: None,
                 library_id: None,
@@ -270,6 +280,7 @@ impl OwnershipService {
                 return TitleOwnership {
                     komga_connected: false,
                     error: Some("Komga server is unreachable".to_string()),
+                    active_error: None,
                     series_id: None,
                     series_name: None,
                     library_id: lib_id,
@@ -306,15 +317,28 @@ impl OwnershipService {
 
         // Conservative matching: require exactly one match
         if exact_matches.is_empty() {
+            let mut volumes = Vec::new();
+            let mut chapters = Vec::new();
+            let empty_v = HashMap::new();
+            let empty_c = HashMap::new();
+            let active_error = populate_downloads_into_ownership(
+                &active_downloads,
+                &empty_v,
+                &empty_c,
+                &mut volumes,
+                &mut chapters,
+            );
+
             return TitleOwnership {
                 komga_connected: true,
                 error: None,
+                active_error,
                 series_id: None,
                 series_name: None,
                 library_id: lib_id,
                 library_name: None,
-                volumes: Vec::new(),
-                chapters: Vec::new(),
+                volumes,
+                chapters,
                 summary: OwnershipSummary {
                     owned_volumes_count: 0,
                     total_source_volumes: (source_release_type == "volume"
@@ -341,6 +365,7 @@ impl OwnershipService {
             return TitleOwnership {
                 komga_connected: true,
                 error: Some("Ambiguous match: multiple series found in Komga".to_string()),
+                active_error: None,
                 series_id: None,
                 series_name: None,
                 library_id: lib_id,
@@ -377,6 +402,7 @@ impl OwnershipService {
                 return TitleOwnership {
                     komga_connected: true,
                     error: Some(format!("Failed to fetch books: {e}")),
+                    active_error: None,
                     series_id: Some(matched_series.id.clone()),
                     series_name: Some(matched_series.name.clone()),
                     library_id: Some(matched_series.library_id.clone()),
@@ -474,35 +500,9 @@ impl OwnershipService {
                 status: OwnershipStatus::Owned,
                 book_id: Some(book_id.clone()),
                 book_name: Some(book_name.clone()),
+                error: None,
             });
         }
-
-        // Add acquiring volumes from active downloads queue if not already owned
-        for (_id, name, chapter_number, _state) in &active_downloads {
-            let rel = crate::release::parse_release(name, *chapter_number);
-            let vol_num = if rel.release_type == crate::release::ReleaseType::Volume {
-                rel.volume.or(Some(*chapter_number))
-            } else {
-                rel.volume
-            };
-            if let Some(vol) = vol_num {
-                if !owned_volumes.contains_key(&vol.to_bits()) {
-                    if !volumes.iter().any(|v| (v.volume - vol).abs() < 0.001) {
-                        volumes.push(VolumeOwnership {
-                            volume: vol,
-                            status: OwnershipStatus::Acquiring,
-                            book_id: None,
-                            book_name: None,
-                        });
-                    }
-                }
-            }
-        }
-        volumes.sort_by(|a, b| {
-            a.volume
-                .partial_cmp(&b.volume)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
 
         // Build chapter ownership list
         let mut chapters = Vec::new();
@@ -513,31 +513,18 @@ impl OwnershipService {
                 status: OwnershipStatus::Owned,
                 book_id: Some(book_id.clone()),
                 book_name: Some(book_name.clone()),
+                error: None,
             });
         }
 
-        // Add acquiring chapters from active downloads queue if not already owned
-        for (_id, name, chapter_number, _state) in &active_downloads {
-            let rel = crate::release::parse_release(name, *chapter_number);
-            if rel.release_type == crate::release::ReleaseType::Chapter {
-                let ch_num = rel.chapter_number.unwrap_or(*chapter_number);
-                if !owned_chapters.contains_key(&ch_num.to_bits()) {
-                    if !chapters.iter().any(|c| (c.chapter - ch_num).abs() < 0.001) {
-                        chapters.push(ChapterOwnership {
-                            chapter: ch_num,
-                            status: OwnershipStatus::Acquiring,
-                            book_id: None,
-                            book_name: None,
-                        });
-                    }
-                }
-            }
-        }
-        chapters.sort_by(|a, b| {
-            a.chapter
-                .partial_cmp(&b.chapter)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
+        // Add acquiring and failed volumes & chapters from active downloads queue
+        let active_error = populate_downloads_into_ownership(
+            &active_downloads,
+            &owned_volumes,
+            &owned_chapters,
+            &mut volumes,
+            &mut chapters,
+        );
 
         let owned_volumes_count = owned_volumes.len();
         let owned_chapters_count = owned_chapters.len();
@@ -572,6 +559,7 @@ impl OwnershipService {
         TitleOwnership {
             komga_connected: true,
             error: None,
+            active_error,
             series_id: Some(matched_series.id.clone()),
             series_name: Some(matched_series.name.clone()),
             library_id: Some(matched_series.library_id.clone()),
@@ -594,6 +582,80 @@ impl OwnershipService {
     }
 }
 
+fn populate_downloads_into_ownership(
+    downloads: &[(i64, String, f64, String, Option<String>)],
+    owned_volumes: &HashMap<u64, (String, String)>,
+    owned_chapters: &HashMap<u64, (String, String)>,
+    volumes: &mut Vec<VolumeOwnership>,
+    chapters: &mut Vec<ChapterOwnership>,
+) -> Option<String> {
+    let mut active_error: Option<String> = None;
+
+    for (_id, name, chapter_number, state, err) in downloads {
+        let rel = crate::release::parse_release(name, *chapter_number);
+        let vol_num = if rel.release_type == crate::release::ReleaseType::Volume {
+            rel.volume.or(Some(*chapter_number))
+        } else {
+            rel.volume
+        };
+        let is_failed = state == "failed";
+        if is_failed && active_error.is_none() {
+            active_error = err.clone();
+        }
+        if let Some(vol) = vol_num {
+            if !owned_volumes.contains_key(&vol.to_bits()) {
+                if let Some(existing) = volumes.iter_mut().find(|v| (v.volume - vol).abs() < 0.001) {
+                    if existing.status == OwnershipStatus::Failed && !is_failed {
+                        existing.status = OwnershipStatus::Acquiring;
+                        existing.error = None;
+                    }
+                } else {
+                    volumes.push(VolumeOwnership {
+                        volume: vol,
+                        status: if is_failed {
+                            OwnershipStatus::Failed
+                        } else {
+                            OwnershipStatus::Acquiring
+                        },
+                        book_id: None,
+                        book_name: None,
+                        error: if is_failed { err.clone() } else { None },
+                    });
+                }
+            }
+        }
+
+        if rel.release_type == crate::release::ReleaseType::Chapter {
+            let ch_num = rel.chapter_number.unwrap_or(*chapter_number);
+            if !owned_chapters.contains_key(&ch_num.to_bits()) {
+                if let Some(existing) = chapters.iter_mut().find(|c| (c.chapter - ch_num).abs() < 0.001) {
+                    if existing.status == OwnershipStatus::Failed && !is_failed {
+                        existing.status = OwnershipStatus::Acquiring;
+                        existing.error = None;
+                    }
+                } else {
+                    chapters.push(ChapterOwnership {
+                        chapter: ch_num,
+                        status: if is_failed {
+                            OwnershipStatus::Failed
+                        } else {
+                            OwnershipStatus::Acquiring
+                        },
+                        book_id: None,
+                        book_name: None,
+                        error: if is_failed { err.clone() } else { None },
+                    });
+                }
+            }
+        }
+    }
+
+    volumes.sort_by(|a, b| a.volume.partial_cmp(&b.volume).unwrap_or(std::cmp::Ordering::Equal));
+    chapters.sort_by(|a, b| a.chapter.partial_cmp(&b.chapter).unwrap_or(std::cmp::Ordering::Equal));
+
+    active_error
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -606,6 +668,8 @@ mod tests {
         assert_eq!(serde_json::to_string(&status).unwrap(), "\"available\"");
         let status = OwnershipStatus::Acquiring;
         assert_eq!(serde_json::to_string(&status).unwrap(), "\"acquiring\"");
+        let status = OwnershipStatus::Failed;
+        assert_eq!(serde_json::to_string(&status).unwrap(), "\"failed\"");
         let status = OwnershipStatus::Unknown;
         assert_eq!(serde_json::to_string(&status).unwrap(), "\"unknown\"");
     }
@@ -691,6 +755,7 @@ mod tests {
             Ok(())
         }).await.unwrap();
 
+        let db_clone = db.clone();
         let ownership_svc = OwnershipService::new(Client::new(), db);
 
         // 1. Query ownership for Blue Lock
@@ -708,6 +773,19 @@ mod tests {
 
         let v3 = ownership.volumes.iter().find(|v| v.volume == 3.0).unwrap();
         assert_eq!(v3.status, OwnershipStatus::Acquiring);
+
+        // Transition download to failed state -> ownership reflects Failed, not Acquiring
+        db_clone.call(|conn| {
+            conn.execute("UPDATE downloads SET state = 'failed', error = 'Ambiguous archive selection' WHERE chapter_id = 101", [])?;
+            Ok(())
+        }).await.unwrap();
+        ownership_svc.invalidate(10);
+
+        let ownership_failed = ownership_svc.get_title_ownership(10, "Blue Lock").await;
+        let v3_failed = ownership_failed.volumes.iter().find(|v| v.volume == 3.0).unwrap();
+        assert_eq!(v3_failed.status, OwnershipStatus::Failed);
+        assert_eq!(v3_failed.error.as_deref(), Some("Ambiguous archive selection"));
+        assert_eq!(ownership_failed.active_error.as_deref(), Some("Ambiguous archive selection"));
 
         // 2. Query ownership for ambiguous series
         let ambig = ownership_svc

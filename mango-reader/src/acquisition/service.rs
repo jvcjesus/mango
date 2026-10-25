@@ -334,7 +334,7 @@ impl AcquisitionService {
         let (title, _) = self.get_title_and_aliases(manga_id).await?;
         let (owned_set, acquiring_set) = self.get_title_acquisition_state(manga_id, &title).await?;
 
-        let vols = release.release_unit.included_volumes();
+        let mut vols = release.release_unit.included_volumes();
 
         // Optional TorBox file mapping if torrent files are already available
         let mut file_map = std::collections::BTreeMap::new();
@@ -348,6 +348,10 @@ impl AcquisitionService {
                     }
                 }
             }
+        }
+
+        if vols.is_empty() && !file_map.is_empty() {
+            vols = file_map.keys().map(|&k| k as f64).collect();
         }
 
         let mut units = Vec::new();

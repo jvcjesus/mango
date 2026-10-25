@@ -620,6 +620,9 @@ impl Downloads {
                                         Ok(())
                                     })
                                     .await;
+                                if let Some(p) = &self.pipeline {
+                                    p.ownership.invalidate(job.manga_id);
+                                }
                             }
                         } else {
                             let _ = self
@@ -654,6 +657,9 @@ impl Downloads {
                                 Ok(())
                             })
                             .await;
+                        if let Some(p) = &self.pipeline {
+                            p.ownership.invalidate(job.manga_id);
+                        }
                         if let Some(acq) = &self.acquisition {
                             let _ = acq
                                 .record_history(
@@ -958,7 +964,20 @@ impl Downloads {
                 ))
             })?
         } else {
-            crate::acquisition::torbox::select_artifact(&files, target_unit.as_ref())?
+            let sf = crate::acquisition::torbox::select_artifact(&files, target_unit.as_ref())?;
+            let ch_id = job.chapter;
+            let fid = sf.id;
+            let _ = self
+                .db
+                .call(move |conn| {
+                    conn.execute(
+                        "UPDATE downloads SET external_file_id = ?1 WHERE chapter_id = ?2",
+                        rusqlite::params![fid, ch_id],
+                    )?;
+                    Ok(())
+                })
+                .await;
+            sf
         };
 
         // 5. Staging path

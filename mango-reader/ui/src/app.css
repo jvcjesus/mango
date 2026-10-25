@@ -213,6 +213,12 @@ p {
   color: var(--paper);
 }
 
+.btn.danger,
+.btn.error {
+  border-color: var(--error, #e53935);
+  color: var(--error, #e53935);
+}
+
 .btn:disabled {
   opacity: 0.45;
   cursor: default;
@@ -303,6 +309,14 @@ select.btn {
   border-radius: 999px;
   background: var(--spot);
   color: var(--on-spot);
+  letter-spacing: 0.08em;
+}
+
+.tag.danger,
+.tag.error {
+  border-radius: 999px;
+  background: var(--error, #e53935);
+  color: #fff;
   letter-spacing: 0.08em;
 }
 

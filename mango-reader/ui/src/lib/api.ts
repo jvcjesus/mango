@@ -432,13 +432,14 @@ export interface PipelineEvent {
   error: string | null;
 }
 
-export type OwnershipStatus = 'owned' | 'available' | 'acquiring' | 'unknown';
+export type OwnershipStatus = 'owned' | 'available' | 'acquiring' | 'failed' | 'unknown';
 
 export interface VolumeOwnership {
   volume: number;
   status: OwnershipStatus;
   bookId?: string | null;
   bookName?: string | null;
+  error?: string | null;
 }
 
 export interface ChapterOwnership {
@@ -446,6 +447,7 @@ export interface ChapterOwnership {
   status: OwnershipStatus;
   bookId?: string | null;
   bookName?: string | null;
+  error?: string | null;
 }
 
 export interface OwnershipSummary {
@@ -462,6 +464,7 @@ export interface OwnershipSummary {
 export interface TitleOwnership {
   komgaConnected: boolean;
   error?: string | null;
+  activeError?: string | null;
   seriesId?: string | null;
   seriesName?: string | null;
   libraryId?: string | null;

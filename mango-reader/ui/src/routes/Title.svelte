@@ -168,9 +168,33 @@
   let refreshingOwnership = $state(false);
   let showOwnershipDetails = $state(false);
 
+  function updateCandidateStatusesFromOwnership(own: TitleOwnership | null) {
+    if (!own || !nyaaReleases.length) return;
+    for (const cand of nyaaReleases) {
+      if (cand.release.releaseUnit.type === 'volume') {
+        const vNum = cand.release.releaseUnit.value;
+        const vOwn = own.volumes?.find((v) => Math.abs(v.volume - vNum) < 0.001);
+        if (vOwn) {
+          cand.ownershipStatus = vOwn.status;
+        } else if (cand.ownershipStatus === 'acquiring') {
+          cand.ownershipStatus = 'available';
+        }
+      } else if (cand.release.releaseUnit.type === 'chapter') {
+        const cNum = cand.release.releaseUnit.value;
+        const cOwn = own.chapters?.find((c) => Math.abs(c.chapter - cNum) < 0.001);
+        if (cOwn) {
+          cand.ownershipStatus = cOwn.status;
+        } else if (cand.ownershipStatus === 'acquiring') {
+          cand.ownershipStatus = 'available';
+        }
+      }
+    }
+  }
+
   async function loadOwnership() {
     try {
       ownership = await get<TitleOwnership>(`/manga/${id}/ownership`);
+      updateCandidateStatusesFromOwnership(ownership);
       loadMissingAndProfile();
     } catch {
       ownership = null;
@@ -181,6 +205,7 @@
     refreshingOwnership = true;
     try {
       ownership = await send<TitleOwnership>('POST', `/manga/${id}/refresh-ownership`);
+      updateCandidateStatusesFromOwnership(ownership);
       loadMissingAndProfile();
       toast.success('Ownership refreshed from Komga');
     } catch (e) {
@@ -663,6 +688,7 @@
     isBusy: boolean;
     ownershipStatus: OwnershipStatus | null;
     ownedBookName: string | null;
+    error: string | null;
   };
   const volumeGroups = $derived.by<VolumeGroup[]>(() => {
     if (!view.volumes) {
@@ -679,6 +705,7 @@
         isBusy: listed.some((c) => busyChapter[c.id]),
         ownershipStatus: null,
         ownedBookName: null,
+        error: null,
       }];
     }
     const map = new Map<number | null, Chapter[]>();
@@ -709,6 +736,7 @@
         isBusy: chs.some((c) => busyChapter[c.id]),
         ownershipStatus: volOwnership?.status ?? null,
         ownedBookName: volOwnership?.bookName ?? null,
+        error: volOwnership?.error ?? null,
       };
     });
   });
@@ -1345,7 +1373,7 @@
               <ul class="candidate-list">
                 {#each nyaaReleases as cand (cand.release.sourceItemId)}
                   {@const isCollection = cand.release.releaseUnit.type === 'collection' || cand.matchType === 'collection' || cand.matchType === 'mixed_collection'}
-                  <li class="candidate-item" class:owned={cand.ownershipStatus === 'owned'} class:acquiring={cand.ownershipStatus === 'acquiring'}>
+                  <li class="candidate-item" class:owned={cand.ownershipStatus === 'owned'} class:acquiring={cand.ownershipStatus === 'acquiring'} class:failed={cand.ownershipStatus === 'failed'}>
                     <div class="candidate-main">
                       <div class="candidate-badges">
                         {#if cand.smartScore}
@@ -1377,6 +1405,8 @@
                           <span class="tag spot">OWNED IN KOMGA</span>
                         {:else if cand.ownershipStatus === 'acquiring'}
                           <span class="tag">ACQUIRING</span>
+                        {:else if cand.ownershipStatus === 'failed'}
+                          <span class="tag danger">FAILED</span>
                         {/if}
                       </div>
                       <div class="candidate-title" title={cand.release.rawTitle}>
@@ -1443,6 +1473,15 @@
                       {:else if cand.ownershipStatus === 'acquiring'}
                         <button class="btn pill" disabled title="Currently in download or verification queue">
                           <span class="spin"><Icon name="spinner" size={14} stroke={3} /></span> Acquiring
+                        </button>
+                      {:else if cand.ownershipStatus === 'failed'}
+                        <button
+                          class="btn pill danger"
+                          disabled={acquiringReleases[cand.release.sourceItemId]}
+                          onclick={() => acquireCandidate(cand)}
+                          title="Previous acquisition attempt failed: click to retry"
+                        >
+                          <Icon name="refresh" size={14} /> Failed · Retry
                         </button>
                       {:else}
                         <button
@@ -1560,6 +1599,9 @@
         {/if}
 
         <Notice loading={refreshing} error={refreshError} retry={refresh} />
+        {#if ownership?.activeError}
+          <Notice error={`Acquisition failed: ${ownership.activeError}`} retry={refreshOwnership} />
+        {/if}
         {#if note}<p role="status"><strong>{note}</strong> <a class="link" href="#/downloads">See downloads</a></p>{/if}
 
         {#each volumeGroups as grp (grp.volume ?? 'unassigned')}
@@ -1572,6 +1614,8 @@
                   <span class="tag spot" title="Present in canonical Komga library"><Icon name="check" size={14} /> Owned in Komga</span>
                 {:else if grp.ownershipStatus === 'acquiring'}
                   <span class="tag" title="In acquisition pipeline"><span class="spin"><Icon name="spinner" size={14} stroke={3} /></span> Acquiring</span>
+                {:else if grp.ownershipStatus === 'failed'}
+                  <span class="tag danger" title={grp.error ? `Acquisition failed: ${grp.error}` : 'Acquisition failed'}><Icon name="info" size={14} /> Failed</span>
                 {/if}
                 {#if grp.isFullyDownloaded}
                   <span class="tag spot">Downloaded</span>
