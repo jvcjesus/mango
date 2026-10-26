@@ -760,6 +760,7 @@ impl Pipeline {
             return Ok(AcquisitionOutcome::Complete(source_cbz.to_path_buf()));
         }
 
+        publisher::verify_cbz_integrity(source_cbz)?;
         on_stage("identifying", "Classifying release format...", None);
 
         let is_volume = job.release_type == crate::release::ReleaseType::Volume;
@@ -769,7 +770,7 @@ impl Pipeline {
             job.chapter_number.unwrap_or(job.number)
         };
 
-        let retrieval_identity = job
+        let mut retrieval_identity = job
             .retrieval_identity_json
             .as_deref()
             .map(serde_json::from_str::<crate::acquisition::edition::RetrievalIdentity>)
@@ -790,7 +791,16 @@ impl Pipeline {
                     None,
                 )
             });
-        let requested_edition = retrieval_identity.requested_edition.as_deref();
+        let requested_edition_owned = retrieval_identity.requested_edition.clone();
+        let requested_edition = requested_edition_owned.as_deref();
+        let identity_override = retrieval_identity.identity_override
+            && retrieval_identity.override_approved_at.is_some();
+        let mut metadata_scope = if config.mangabaka_enabled && is_volume {
+            "exact_edition"
+        } else {
+            "source_identity"
+        }
+        .to_string();
         // Edition-local units must not overwrite standard-edition canonical volumes.
         let publication_title = job.publication_title();
         let release_name =
@@ -892,27 +902,63 @@ impl Pipeline {
             on_stage("metadata", "Querying MangaBaka catalog...", None);
             let mb_client =
                 MangaBakaClient::new(self.http.clone(), config.mangabaka_url.clone(), mb_token);
-            match mb_client
-                .resolve_edition_volume_metadata(
+            let mut outcome = crate::acquisition::interactive::bounded(
+                crate::acquisition::interactive::PROVIDER_DEADLINE,
+                mb_client.resolve_edition_volume_metadata(
                     &job.title,
                     anilist_id,
                     mangabaka_id,
                     release_num,
                     requested_edition,
-                )
-                .await
+                ),
+            )
+            .await;
+            if identity_override && !matches!(outcome, Ok(mangabaka::MangaBakaOutcome::Success(_)))
             {
+                let title = job.title.clone();
+                let (mut fallback, mut scope) = self
+                    .db
+                    .call(move |conn| {
+                        metadata::acquisition_series_fallback(conn, &title, release_num)
+                    })
+                    .await?;
+                if scope != "series_fallback:mangabaka" {
+                    if let Ok(Some(general)) = crate::acquisition::interactive::bounded(
+                        crate::acquisition::interactive::PROVIDER_DEADLINE,
+                        mb_client.resolve_series_fallback(&job.title, mangabaka_id, release_num),
+                    )
+                    .await
+                    {
+                        fallback = Some(general);
+                        scope = "series_fallback:mangabaka".into();
+                    }
+                }
+                metadata_scope = scope;
+                outcome = Ok(fallback
+                    .map(mangabaka::MangaBakaOutcome::Success)
+                    .unwrap_or_else(|| {
+                        mangabaka::MangaBakaOutcome::CollectionNotFound(
+                            "Source identity; no verified descriptive catalog metadata".into(),
+                        )
+                    }));
+            }
+            match outcome {
                 Ok(mangabaka::MangaBakaOutcome::Success(mut enrichment)) => {
                     if requested_edition.is_some_and(|edition| edition != "standard") {
                         // Komga uses ComicInfo Series; retain the edition namespace even
                         // when MangaBaka's collection work points to the base series title.
                         enrichment.series_title = Some(publication_title.clone());
                     }
-                    resolved_mangabaka_id = Some(enrichment.series_id);
-                    resolved_release_id = enrichment
-                        .work_id
-                        .clone()
-                        .or_else(|| Some(enrichment.collection_id.clone()));
+                    if enrichment.series_id > 0 {
+                        resolved_mangabaka_id = Some(enrichment.series_id);
+                    }
+                    resolved_release_id = enrichment.work_id.clone().or_else(|| {
+                        if enrichment.collection_id.is_empty() {
+                            None
+                        } else {
+                            Some(enrichment.collection_id.clone())
+                        }
+                    });
                     mangabaka_status = format!(
                         "resolved: vol {} (series {})",
                         enrichment.volume, enrichment.series_id
@@ -996,6 +1042,9 @@ impl Pipeline {
                     return Err(AppError::new(502, "mangabaka_network_error", err));
                 }
                 Ok(outcome) => {
+                    if !identity_override {
+                        return Err(AppError::new(422, "identity_unverified", format!("{}. Review the release and explicitly confirm Use Release Anyway to permit series-level metadata.", outcome.description())));
+                    }
                     mangabaka_status = outcome.description();
                     tracing::info!("PIPELINE: MangaBaka outcome: {mangabaka_status}");
                 }
@@ -1023,6 +1072,38 @@ impl Pipeline {
                     return Err(AppError::new(502, "mangabaka_network_error", err));
                 }
             }
+        }
+
+        if identity_override && (!config.mangabaka_enabled || !is_volume) {
+            let title = job.title.clone();
+            let (fallback, scope) = self
+                .db
+                .call(move |conn| metadata::acquisition_series_fallback(conn, &title, release_num))
+                .await?;
+            resolved_enrichment = fallback;
+            metadata_scope = scope;
+        }
+        if let Some(enrichment) = resolved_enrichment.as_mut() {
+            if identity_override {
+                enrichment.series_title = Some(publication_title.clone());
+            }
+        }
+        if identity_override || job.retrieval_identity_json.is_some() {
+            retrieval_identity.metadata_confidence = Some(metadata_scope.clone());
+            let json = serde_json::to_string(&retrieval_identity)?;
+            let chapter = job.chapter;
+            self.db
+                .call(move |conn| {
+                    conn.execute(
+                        "UPDATE downloads SET retrieval_identity_json = ?1 WHERE chapter_id = ?2",
+                        rusqlite::params![json, chapter],
+                    )?;
+                    Ok(())
+                })
+                .await?;
+        }
+        if identity_override {
+            mangabaka_status = format!("user_override:{metadata_scope}");
         }
 
         // 3. Non-destructive Image Optimization
@@ -1092,6 +1173,12 @@ impl Pipeline {
 
         // 4. Authoritative ComicInfo.xml Generation & Safe CBZ Rewrite (before canonical publication)
         on_stage("metadata", "Writing ComicInfo.xml metadata...", None);
+        let override_notes = format!(
+            "User override · {} · Source release: {} · Group: {}",
+            metadata_scope,
+            retrieval_identity.source_release,
+            job.uploader.as_deref().unwrap_or("unknown")
+        );
         let comic_params = mangabaka::ComicInfoParams {
             series: &publication_title,
             volume: job
@@ -1101,7 +1188,11 @@ impl Pipeline {
             is_volume,
             title: Some(&job.name),
             scanlator: job.scanlator.as_deref().or(job.uploader.as_deref()),
-            notes: None,
+            notes: if identity_override {
+                Some(&override_notes)
+            } else {
+                None
+            },
         };
         match mangabaka::write_comic_info_to_cbz(
             source_cbz,
@@ -1110,8 +1201,10 @@ impl Pipeline {
         ) {
             Ok(pages) => {
                 if let Some(ref e) = resolved_enrichment {
-                    mangabaka_status =
-                        format!("enriched: vol {} (MangaBaka ID {})", e.volume, e.series_id);
+                    if !identity_override {
+                        mangabaka_status =
+                            format!("enriched: vol {} (MangaBaka ID {})", e.volume, e.series_id);
+                    }
                 }
                 tracing::info!(
                     "PIPELINE: ComicInfo.xml written successfully ({pages} pages verified)"
@@ -1209,7 +1302,9 @@ impl Pipeline {
         let req_unit_val = requested_unit.clone();
         let mb_stat_val = mangabaka_status.clone();
 
-        let _ = self.db.call(move |conn| {
+        self.db.call(move |conn| {
+            let transaction = conn.transaction()?;
+            let conn = &transaction;
             conn.execute(
                 "UPDATE chapters SET download_path = ?2 WHERE id = ?1",
                 rusqlite::params![chapter_id, p_str],
@@ -1218,6 +1313,7 @@ impl Pipeline {
                 "UPDATE downloads SET published_path = ?2, published_at = ?3, target_library_id = ?4, state = 'verifying', error = 'Published — waiting for Komga' WHERE chapter_id = ?1",
                 rusqlite::params![chapter_id, p_str, now as i64, t_lib],
             )?;
+            crate::acquisition::service::persist_publication_provenance(conn, chapter_id)?;
             conn.execute(
                 "UPDATE acquisition_history
                  SET mangabaka_id = COALESCE(?1, mangabaka_id),
@@ -1225,11 +1321,13 @@ impl Pipeline {
                      anilist_id = COALESCE(?3, anilist_id),
                      requested_unit = COALESCE(?4, requested_unit),
                      metadata_status = COALESCE(?5, metadata_status)
-                 WHERE chapter_id = ?6",
-                rusqlite::params![mb_id_val, mb_rel_val.as_deref(), a_id_val, &req_unit_val, &mb_stat_val, chapter_id],
+                 WHERE chapter_id = ?6 AND canonical_path = ?7
+                   AND outcome IN ('published','completed','verification_pending','published_scan_failed')",
+                rusqlite::params![mb_id_val, mb_rel_val.as_deref(), a_id_val, &req_unit_val, &mb_stat_val, chapter_id, &p_str],
             )?;
+            transaction.commit()?;
             Ok(())
-        }).await;
+        }).await?;
 
         if !config.komga_enabled || !config.komga_scan_enabled {
             self.record_event(PipelineEvent {
@@ -1254,7 +1352,7 @@ impl Pipeline {
             let _ = self
                 .db
                 .call(move |conn| {
-                    conn.execute("DELETE FROM downloads WHERE chapter_id = ?1", [chapter_id])?;
+                    crate::acquisition::service::complete_queued_publication(conn, chapter_id)?;
                     Ok(())
                 })
                 .await;
@@ -1361,7 +1459,7 @@ impl Pipeline {
             let _ = self
                 .db
                 .call(move |conn| {
-                    conn.execute("DELETE FROM downloads WHERE chapter_id = ?1", [chapter_id])?;
+                    crate::acquisition::service::complete_queued_publication(conn, chapter_id)?;
                     Ok(())
                 })
                 .await;
@@ -2979,5 +3077,166 @@ exit 0
             .collect();
         assert_eq!(dir_entries.len(), 1);
         assert_eq!(dir_entries[0].to_str().unwrap(), "Blue Lock v39.cbz");
+    }
+}
+
+#[cfg(test)]
+mod identity_override_pipeline_tests {
+    use super::*;
+    use crate::acquisition::{edition::RetrievalIdentity, AcquisitionReleaseUnit};
+    use std::io::{Read, Write};
+    #[tokio::test]
+    async fn strict_missing_edition_stops_but_confirmed_override_enriches_series_only() {
+        use axum::{routing::get, Json, Router};
+        use serde_json::json;
+        let app=Router::new()
+            .route("/series/search",get(||async{Json(json!({"data":[{"id":83,"title":"Series X","title_english":"Series X"}]}))}))
+            .route("/series/83/collections",get(||async{Json(json!({"data":[]}))}))
+            .route("/series/83",get(||async{Json(json!({"data":{"title":"Series X","description":"General series description","authors":["Series Author"],"genres":["Sci_fi"],"final_volume":12,"cover_url":"https://example.test/generic-cover.jpg"}}))}));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let dir = std::env::temp_dir().join(format!(
+            "mango-override-pipeline-{}-{}",
+            std::process::id(),
+            crate::db::now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let library = dir.join("library");
+        std::fs::create_dir_all(&library).unwrap();
+        let db = crate::db::Db::open(&dir.join("test.db")).unwrap();
+        let library_cfg = library.to_string_lossy().to_string();
+        db.call(move |conn|{
+            for (key,value) in [("pipeline.enabled",json!(true)),("pipeline.library_dir",json!(library_cfg)),("pipeline.mangabaka_url",json!(format!("http://{addr}"))),("pipeline.optimize_enabled",json!(false)),("pipeline.komga_enabled",json!(false))] {crate::settings::set(conn,key,&value)?;}
+            conn.execute("INSERT INTO manga (id,source_id,url,title) VALUES (1,0,'/x','Series X')",[])?;
+            conn.execute("INSERT INTO chapters (id,manga_id,url,name,chapter_number,source_order,fetched_at) VALUES (1,1,'/v4','Volume 4',4,0,0)",[])?;
+            conn.execute("INSERT INTO downloads (chapter_id,state,position,added_at) VALUES (1,'downloading',1,0)",[])?;Ok(())
+        }).await.unwrap();
+        let source = dir.join("source.cbz");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&source).unwrap());
+        zip.start_file(
+            "release-cover.jpg",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+        zip.write_all(b"source-specific cover").unwrap();
+        zip.finish().unwrap();
+        let pipeline = Pipeline::new(db.clone());
+        let mut identity = RetrievalIdentity::new(
+            "Series X",
+            "Series X Master Edition",
+            AcquisitionReleaseUnit::Volume(4.0),
+            Some("master"),
+        );
+        let mut job = crate::downloads::Job {
+            chapter: 1,
+            manga_id: 1,
+            title: "Series X".into(),
+            name: "Volume 4".into(),
+            number: 4.0,
+            volume: Some(4.0),
+            release_type: crate::release::ReleaseType::Volume,
+            retrieval_identity_json: Some(serde_json::to_string(&identity).unwrap()),
+            ..Default::default()
+        };
+        let strict_json = job.retrieval_identity_json.clone().unwrap();
+        db.call(move |conn| {
+            conn.execute(
+                "UPDATE downloads SET retrieval_identity_json=?1 WHERE chapter_id=1",
+                [strict_json],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            pipeline
+                .process_download(&source, &job)
+                .await
+                .unwrap_err()
+                .code,
+            "identity_unverified"
+        );
+        let service = crate::acquisition::service::AcquisitionService::new(
+            db.clone(),
+            reqwest::Client::new(),
+            None,
+            None,
+        );
+        service
+            .record_history(
+                Some(1),
+                1,
+                "Series X",
+                "Series X Master Edition",
+                "nyaa",
+                None,
+                None,
+                "torbox",
+                "failed",
+                None,
+                None,
+                Some("Strict edition metadata unverified"),
+            )
+            .await
+            .unwrap();
+        identity.identity_override = true;
+        identity.override_approved_at = Some(1);
+        job.retrieval_identity_json = Some(serde_json::to_string(&identity).unwrap());
+        pipeline.process_download(&source, &job).await.unwrap();
+        let published = library
+            .join("Series X (master Edition)")
+            .join("Series X (master Edition) v04.cbz");
+        assert!(published.is_file());
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(&published).unwrap()).unwrap();
+        let mut xml = String::new();
+        archive
+            .by_name("ComicInfo.xml")
+            .unwrap()
+            .read_to_string(&mut xml)
+            .unwrap();
+        assert!(xml.contains("General series description"));
+        assert!(xml.contains("Series Author"));
+        assert!(xml.contains("series_fallback:mangabaka"));
+        assert!(!xml.contains("<Count>12</Count>"));
+        assert!(xml.contains("Series X (master Edition)"));
+        let mut cover = Vec::new();
+        archive
+            .by_name("release-cover.jpg")
+            .unwrap()
+            .read_to_end(&mut cover)
+            .unwrap();
+        assert_eq!(cover, b"source-specific cover");
+        let stored: String = db
+            .call(|conn| {
+                Ok(conn.query_row(
+                    "SELECT retrieval_identity_json FROM acquisition_history WHERE chapter_id=1 AND outcome='completed'",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<RetrievalIdentity>(&stored)
+                .unwrap()
+                .metadata_confidence
+                .as_deref(),
+            Some("series_fallback:mangabaka")
+        );
+        let failed: (String, Option<String>) = db.call(|conn| Ok(conn.query_row("SELECT retrieval_identity_json, metadata_status FROM acquisition_history WHERE chapter_id=1 AND outcome='failed'", [], |row| Ok((row.get(0)?, row.get(1)?)))?)).await.unwrap();
+        assert!(
+            !serde_json::from_str::<RetrievalIdentity>(&failed.0)
+                .unwrap()
+                .identity_override
+        );
+        assert!(
+            failed.1.is_none(),
+            "Later override metadata must not rewrite an earlier rejected attempt"
+        );
+        server.abort();
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

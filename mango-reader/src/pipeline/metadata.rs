@@ -517,3 +517,135 @@ mod tests {
         assert_eq!(p3, SummaryProvenance::SeriesFallback);
     }
 }
+
+/// Descriptive fallback only. No edition work, dates, page count or standard totals
+/// are fabricated. Images/covers are handled by the existing lossless CBZ rewrite.
+pub fn acquisition_series_fallback(
+    conn: &Connection,
+    title: &str,
+    volume: f64,
+) -> Result<(Option<super::mangabaka::MangaBakaEnrichment>, String)> {
+    use super::mangabaka::MangaBakaEnrichment;
+    if let Some(series) = find_cached_series_by_title(conn, title)? {
+        return Ok((
+            Some(MangaBakaEnrichment {
+                series_id: series.series_id,
+                volume,
+                summary: series.summary,
+                writers: series.authors,
+                pencillers: series.artists,
+                genres: normalize_genres(&series.genres),
+                tags: normalize_tags(&series.tags, &series.genres),
+                web_url: series.web_url,
+                ..Default::default()
+            }),
+            "series_fallback:mangabaka".into(),
+        ));
+    }
+    let mut stmt = conn.prepare("SELECT raw_data FROM tracker_list_entries WHERE tracker = 'anilist' AND (title = ?1 OR english_title = ?1 OR romaji_title = ?1)")?;
+    let raw = stmt
+        .query_map([title], |r| r.get::<_, Option<String>>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if raw.len() == 1 {
+        if let Some(value) = raw[0]
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        {
+            let media = value
+                .get("media")
+                .or_else(|| value.get("Media"))
+                .unwrap_or(&value);
+            let summary = media
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
+            let genres = media
+                .get("genres")
+                .and_then(|v| v.as_array())
+                .map(|v| {
+                    v.iter()
+                        .filter_map(|g| g.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if summary.is_some() || !genres.is_empty() {
+                return Ok((
+                    Some(MangaBakaEnrichment {
+                        volume,
+                        summary,
+                        genres: normalize_genres(&genres),
+                        ..Default::default()
+                    }),
+                    "series_fallback:anilist".into(),
+                ));
+            }
+        }
+    }
+    Ok((None, "source_identity:user_override".into()))
+}
+
+#[cfg(test)]
+mod acquisition_fallback_tests {
+    use super::*;
+    #[test]
+    fn series_metadata_never_implies_edition_facts() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!(
+            "../../migrations/022_metadata_normalization_and_maintenance.sql"
+        ))
+        .unwrap();
+        let series = CachedMangaBakaSeries {
+            series_id: 83,
+            title: "Series X".into(),
+            english_title: None,
+            romaji_title: None,
+            native_title: None,
+            aliases: vec![],
+            cover_url: Some("https://example.test/generic.jpg".into()),
+            authors: vec!["Author".into()],
+            artists: vec![],
+            publisher: Some("General Publisher".into()),
+            genres: vec!["Sci_fi".into()],
+            tags: vec![],
+            summary: Some("General summary".into()),
+            total_volumes: Some(12),
+            status: None,
+            web_url: None,
+            raw_json: None,
+            updated_at: 0,
+        };
+        upsert_cached_series(&conn, &series).unwrap();
+        let (data, scope) = acquisition_series_fallback(&conn, "Series X", 4.0).unwrap();
+        assert_eq!(scope, "series_fallback:mangabaka");
+        let data = data.unwrap();
+        assert_eq!(data.summary.as_deref(), Some("General summary"));
+        assert!(data.work_id.is_none());
+        assert!(data.collection_id.is_empty());
+        assert!(data.total_volumes.is_none());
+        assert!(data.release_date.is_none());
+        assert!(data.pages.is_none());
+    }
+    #[test]
+    fn anilist_fallback_is_general_and_source_is_last_resort() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(include_str!(
+            "../../migrations/022_metadata_normalization_and_maintenance.sql"
+        ))
+        .unwrap();
+        conn.execute_batch("CREATE TABLE tracker_list_entries (tracker TEXT, title TEXT, english_title TEXT, romaji_title TEXT, raw_data TEXT);").unwrap();
+        conn.execute(
+            "INSERT INTO tracker_list_entries VALUES ('anilist','Series X',NULL,NULL,?1)",
+            [r#"{"media":{"description":"General AniList description","genres":["Action"]}}"#],
+        )
+        .unwrap();
+        let (data, scope) = acquisition_series_fallback(&conn, "Series X", 4.0).unwrap();
+        assert_eq!(scope, "series_fallback:anilist");
+        assert_eq!(data.unwrap().series_id, 0);
+        assert_eq!(
+            acquisition_series_fallback(&conn, "No metadata", 1.0)
+                .unwrap()
+                .1,
+            "source_identity:user_override"
+        );
+    }
+}

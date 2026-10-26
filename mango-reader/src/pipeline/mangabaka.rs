@@ -2068,6 +2068,54 @@ pub fn generate_comic_info_xml(
         }
     }
 
+    // Cover/page identity belongs to the source archive, not a generic catalog cover.
+    if let Some(doc) = existing_xml.and_then(|raw| roxmltree::Document::parse(raw).ok()) {
+        if let Some(pages) = doc.descendants().find(|node| node.has_tag_name("Pages")) {
+            let mut preserved = String::new();
+            for page in pages.children().filter(|node| node.has_tag_name("Page")) {
+                if page
+                    .attribute("Image")
+                    .and_then(|image| image.parse::<i64>().ok())
+                    .is_some_and(|image| image >= 0 && image < page_count)
+                {
+                    preserved.push_str("    <Page");
+                    for attr in page
+                        .attributes()
+                        .filter(|attr| matches!(attr.name(), "Image" | "Type" | "DoublePage"))
+                    {
+                        preserved.push_str(&format!(
+                            " {}=\"{}\"",
+                            attr.name(),
+                            crate::downloads::escape(attr.value())
+                        ));
+                    }
+                    preserved.push_str(" />\n");
+                }
+            }
+            if !preserved.is_empty() {
+                xml.push_str(&format!("  <Pages>\n{preserved}  </Pages>\n"));
+            }
+        }
+        if params
+            .notes
+            .is_some_and(|notes| notes.starts_with("User override"))
+        {
+            for tag in ["Summary", "Writer", "Penciller", "Genre", "Tags", "Web"] {
+                if !xml.contains(&format!("<{tag}>")) {
+                    if let Some(text) = doc
+                        .descendants()
+                        .find(|node| node.has_tag_name(tag))
+                        .and_then(|node| node.text())
+                    {
+                        xml.push_str(&format!(
+                            "  <{tag}>{}</{tag}>\n",
+                            crate::downloads::escape(text)
+                        ));
+                    }
+                }
+            }
+        }
+    }
     xml.push_str("</ComicInfo>\n");
     xml
 }
@@ -3083,5 +3131,122 @@ mod edition_collection_regressions {
             matches!(result, MangaBakaOutcome::Success(e) if e.collection_id == "master" && e.work_id.as_deref() == Some("work4") && e.total_volumes == Some(6))
         );
         server.abort();
+    }
+}
+
+impl MangaBakaClient {
+    /// General descriptive metadata only; never fabricates an edition/work mapping.
+    pub async fn resolve_series_fallback(
+        &self,
+        title: &str,
+        id: Option<i64>,
+        volume: f64,
+    ) -> Result<Option<MangaBakaEnrichment>> {
+        let id = if let Some(id) = id {
+            id
+        } else {
+            match self.match_series(title).await? {
+                MangaBakaSeriesMatch::Found { id, .. } => id,
+                _ => return Ok(None),
+            }
+        };
+        let response = self
+            .public_request(reqwest::Method::GET, &format!("/series/{id}"))
+            .send()
+            .await
+            .map_err(|_| {
+                AppError::new(502, "metadata_unavailable", "Series metadata unavailable")
+            })?;
+        if !response.status().is_success() {
+            return Ok(None);
+        }
+        let value: serde_json::Value = response
+            .json()
+            .await
+            .map_err(|_| AppError::bad_request("Invalid series metadata"))?;
+        let series = value.get("data").unwrap_or(&value);
+        let names = |key: &str| -> Vec<String> {
+            series
+                .get(key)
+                .and_then(|v| v.as_array())
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| {
+                            item.as_str()
+                                .or_else(|| item.get("name").and_then(|v| v.as_str()))
+                                .map(str::to_string)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        Ok(Some(MangaBakaEnrichment {
+            series_id: id,
+            volume,
+            summary: series
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(str::to_string),
+            writers: names("authors"),
+            pencillers: names("artists"),
+            genres: crate::pipeline::metadata::normalize_genres(&names("genres")),
+            tags: names("tags"),
+            web_url: Some(format!("https://mangabaka.org/series/{id}")),
+            ..Default::default()
+        }))
+    }
+}
+
+#[cfg(test)]
+mod override_source_tests {
+    use super::*;
+    use std::io::{Read, Write};
+    #[test]
+    fn source_cover_pages_and_descriptive_provenance_survive_rewrite() {
+        let path = std::env::temp_dir().join(format!(
+            "mango-source-cover-{}-{}.cbz",
+            std::process::id(),
+            crate::db::now()
+        ));
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        let options = zip::write::SimpleFileOptions::default();
+        zip.start_file("001.jpg", options).unwrap();
+        zip.write_all(b"original page").unwrap();
+        zip.start_file("release-cover.jpg", options).unwrap();
+        zip.write_all(b"release-specific cover").unwrap();
+        zip.start_file("ComicInfo.xml", options).unwrap();
+        zip.write_all(b"<ComicInfo><Summary>Source summary</Summary><Pages><Page Image=\"1\" Type=\"FrontCover\" /></Pages></ComicInfo>").unwrap();
+        zip.finish().unwrap();
+        let params = ComicInfoParams {
+            series: "Series X (master Edition)",
+            volume: Some(4.0),
+            number: None,
+            is_volume: true,
+            title: Some("Volume 4"),
+            scanlator: Some("Release Group"),
+            notes: Some("User override · source_identity"),
+        };
+        write_comic_info_to_cbz(&path, &params, None).unwrap();
+        let mut archive = zip::ZipArchive::new(std::fs::File::open(&path).unwrap()).unwrap();
+        let mut cover = Vec::new();
+        archive
+            .by_name("release-cover.jpg")
+            .unwrap()
+            .read_to_end(&mut cover)
+            .unwrap();
+        assert_eq!(cover, b"release-specific cover");
+        let mut xml = String::new();
+        archive
+            .by_name("ComicInfo.xml")
+            .unwrap()
+            .read_to_string(&mut xml)
+            .unwrap();
+        assert!(xml.contains("FrontCover"));
+        assert!(xml.contains("Source summary"));
+        assert!(xml.contains("User override"));
+        assert!(xml.contains("<PageCount>2</PageCount>"));
+        assert!(!xml.contains("MangaBaka Series 0"));
+        std::fs::remove_file(path).unwrap();
     }
 }
