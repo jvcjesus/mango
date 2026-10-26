@@ -232,6 +232,8 @@ pub struct ApprovePlanRequest {
     pub plan_id: String,
     #[serde(default = "crate::acquisition::service::default_true")]
     pub approved: bool,
+    #[serde(default)]
+    pub override_confirmed: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -359,7 +361,10 @@ pub fn validate_preflight_profile(
         );
     }
 
-    if !profile.allow_unsupported_editions && cand.quality_signals.edition_recognized {
+    if !profile.allow_unsupported_editions
+        && cand.quality_signals.edition_recognized
+        && !super::interactive::is_override(cand)
+    {
         return Err("Candidate has unrecognized edition variant forbidden by profile".to_string());
     }
 
@@ -448,6 +453,17 @@ pub fn create_execution(
     plan: &AcquisitionPlan,
     missing_summary: &MissingContentSummary,
 ) -> Result<AcquisitionExecution> {
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT id FROM acquisition_executions WHERE plan_id = ?1 ORDER BY created_at LIMIT 1",
+            [&plan.id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(id) = existing {
+        return get_execution(conn, &id)?
+            .ok_or_else(|| AppError::not_found("Existing approved execution unavailable"));
+    }
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
@@ -500,12 +516,24 @@ pub fn create_execution(
     )?;
 
     let mut items = Vec::new();
-    for plan_item in &plan.selected_items {
-        let item_id = format!("item-{}", nanoid());
-        let frozen_json = serde_json::to_string(&plan_item.candidate)?;
-        let units_json = serde_json::to_string(&plan_item.units_covered)?;
-        let expected_size = plan_item.candidate.size.unwrap_or(0) as i64;
-        let item_status = ExecutionItemStatus::Pending;
+    for original in &plan.selected_items {
+        let groups = if original.candidate.provider_metadata["interactive"] == true {
+            original
+                .units_covered
+                .iter()
+                .map(|unit| vec![*unit])
+                .collect::<Vec<_>>()
+        } else {
+            vec![original.units_covered.clone()]
+        };
+        for units in groups {
+            let mut plan_item = original.clone();
+            plan_item.units_covered = units;
+            let item_id = format!("item-{}", nanoid());
+            let frozen_json = serde_json::to_string(&plan_item.candidate)?;
+            let units_json = serde_json::to_string(&plan_item.units_covered)?;
+            let expected_size = plan_item.candidate.size.unwrap_or(0) as i64;
+            let item_status = ExecutionItemStatus::Pending;
 
         conn.execute(
             "INSERT INTO acquisition_execution_items (
@@ -515,37 +543,38 @@ pub fn create_execution(
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, ?9, ?10
             )",
-            params![
-                &item_id,
-                &execution_id,
-                &plan_item.candidate.provider,
-                &plan_item.candidate.provider_release_id,
-                &frozen_json,
-                &units_json,
-                expected_size,
-                item_status.as_str(),
-                now,
-                now
-            ],
-        )?;
+                params![
+                    &item_id,
+                    &execution_id,
+                    &plan_item.candidate.provider,
+                    &plan_item.candidate.provider_release_id,
+                    &frozen_json,
+                    &units_json,
+                    expected_size,
+                    item_status.as_str(),
+                    now,
+                    now
+                ],
+            )?;
 
-        items.push(AcquisitionExecutionItem {
-            id: item_id,
-            execution_id: execution_id.clone(),
-            provider: plan_item.candidate.provider.clone(),
-            provider_candidate_id: plan_item.candidate.provider_release_id.clone(),
-            frozen_candidate: plan_item.candidate.clone(),
-            expected_units: plan_item.units_covered.clone(),
-            expected_size: expected_size as u64,
-            status: item_status,
-            download_job_id: None,
-            verification_state: None,
-            publication_state: None,
-            retry_count: 0,
-            error_message: None,
-            created_at: now,
-            updated_at: now,
-        });
+            items.push(AcquisitionExecutionItem {
+                id: item_id,
+                execution_id: execution_id.clone(),
+                provider: plan_item.candidate.provider.clone(),
+                provider_candidate_id: plan_item.candidate.provider_release_id.clone(),
+                frozen_candidate: plan_item.candidate.clone(),
+                expected_units: plan_item.units_covered.clone(),
+                expected_size: expected_size as u64,
+                status: item_status,
+                download_job_id: None,
+                verification_state: None,
+                publication_state: None,
+                retry_count: 0,
+                error_message: None,
+                created_at: now,
+                updated_at: now,
+            });
+        }
     }
 
     Ok(AcquisitionExecution {

@@ -763,10 +763,7 @@ impl Downloads {
                                     let _ = self
                                         .db
                                         .call(move |conn| {
-                                            conn.execute(
-                                                "DELETE FROM downloads WHERE chapter_id = ?1",
-                                                [chapter_id],
-                                            )?;
+                                            crate::acquisition::service::complete_queued_publication(conn, chapter_id)?;
                                             Ok(())
                                         })
                                         .await;
@@ -806,9 +803,8 @@ impl Downloads {
                             let _ = self
                                 .db
                                 .call(move |conn| {
-                                    conn.execute(
-                                        "DELETE FROM downloads WHERE chapter_id = ?1",
-                                        [chapter_id],
+                                    crate::acquisition::service::complete_queued_publication(
+                                        conn, chapter_id,
                                     )?;
                                     Ok(())
                                 })
@@ -895,7 +891,7 @@ impl Downloads {
                         .process_download_with_progress(&cbz_file, &job, update_stage)
                         .await
                     {
-                        Ok(crate::pipeline::AcquisitionOutcome::Complete(_)) => {
+                        Ok(crate::pipeline::AcquisitionOutcome::Complete(destination)) => {
                             if let Some(acq) = &self.acquisition {
                                 let _ = acq
                                     .record_history(
@@ -908,7 +904,7 @@ impl Downloads {
                                         job.external_job_id.as_deref(),
                                         &job.backend_type,
                                         "completed",
-                                        Some(&cbz_file.display().to_string()),
+                                        Some(&destination.display().to_string()),
                                         job.release_size,
                                         None,
                                     )
@@ -917,7 +913,9 @@ impl Downloads {
                             *self.live_stage.lock().unwrap_or_else(|e| e.into_inner()) = None;
                             continue;
                         }
-                        Ok(crate::pipeline::AcquisitionOutcome::PublishedPendingKomga(_)) => {
+                        Ok(crate::pipeline::AcquisitionOutcome::PublishedPendingKomga(
+                            destination,
+                        )) => {
                             if let Some(acq) = &self.acquisition {
                                 let _ = acq
                                     .record_history(
@@ -930,7 +928,7 @@ impl Downloads {
                                         job.external_job_id.as_deref(),
                                         &job.backend_type,
                                         "verification_pending",
-                                        Some(&cbz_file.display().to_string()),
+                                        Some(&destination.display().to_string()),
                                         job.release_size,
                                         None,
                                     )
@@ -941,7 +939,7 @@ impl Downloads {
                         }
                         Ok(crate::pipeline::AcquisitionOutcome::PublishedScanFailed {
                             error,
-                            ..
+                            destination,
                         }) => {
                             tracing::warn!(
                                 "acquisition published for {} / {}, but Komga scan failed: {error}",
@@ -960,7 +958,7 @@ impl Downloads {
                                         job.external_job_id.as_deref(),
                                         &job.backend_type,
                                         "published_scan_failed",
-                                        Some(&cbz_file.display().to_string()),
+                                        Some(&destination.display().to_string()),
                                         job.release_size,
                                         Some(&error),
                                     )
@@ -1872,7 +1870,9 @@ fn next_job(conn: &Connection) -> Result<Option<Job>> {
                 let number: f64 = r.get(5)?;
                 let mut release_info = crate::release::parse_release(&name, number);
                 let identity_json: Option<String> = r.get(28)?;
+                let mut language: Option<String> = r.get(11)?;
                 if let Some(identity) = identity_json.as_deref().and_then(|json| serde_json::from_str::<crate::acquisition::edition::RetrievalIdentity>(json).ok()) {
+                    if identity.language.is_some() { language = identity.language.clone(); }
                     match identity.requested_unit {
                         crate::acquisition::AcquisitionReleaseUnit::Volume(v) => {
                             release_info.release_type = crate::release::ReleaseType::Volume;
@@ -1902,7 +1902,7 @@ fn next_job(conn: &Connection) -> Result<Option<Job>> {
                         artist: r.get(8)?,
                         genre: r.get(9)?,
                         summary: r.get(10)?,
-                        lang: r.get(11)?,
+                        lang: language,
                         volume: release_info.volume,
                         release_type: release_info.release_type,
                         chapter_number: release_info.chapter_number,

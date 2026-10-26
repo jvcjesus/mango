@@ -82,6 +82,14 @@ pub struct RetrievalIdentity {
     pub requested_unit: AcquisitionReleaseUnit,
     #[serde(default)]
     pub selected_archive: Option<SelectedArchive>,
+    #[serde(default)]
+    pub identity_override: bool,
+    #[serde(default)]
+    pub override_approved_at: Option<i64>,
+    #[serde(default)]
+    pub metadata_confidence: Option<String>,
+    #[serde(default)]
+    pub language: Option<String>,
 }
 
 impl RetrievalIdentity {
@@ -91,7 +99,10 @@ impl RetrievalIdentity {
             return Ok(());
         }
         if self.requested_unit != previous.requested_unit
-            || self.requested_edition != previous.requested_edition
+            || (self.requested_edition != previous.requested_edition
+                && !(previous.requested_edition.is_none()
+                    && self.identity_override
+                    && self.override_approved_at.is_some()))
             || self.source_release != previous.source_release
             || self
                 .selected_archive
@@ -119,6 +130,10 @@ impl RetrievalIdentity {
             source_release: source.into(),
             requested_unit: unit,
             selected_archive: None,
+            identity_override: false,
+            override_approved_at: None,
+            metadata_confidence: None,
+            language: None,
         }
     }
 }

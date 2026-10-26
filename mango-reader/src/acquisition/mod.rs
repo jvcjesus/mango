@@ -10,6 +10,7 @@ pub mod candidates;
 pub mod edition;
 pub mod execution;
 pub mod intelligence;
+pub mod interactive;
 pub mod missing;
 pub mod nyaa;
 pub mod planner;

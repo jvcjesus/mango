@@ -1088,8 +1088,18 @@ pub fn resolve_file_with_identity<'a>(
             other => other,
         };
         let edition_ok = match (&requested_edition, &file_edition) {
-            (Some(req), Some(actual)) => req == actual,
-            (Some(req), None) => req == "standard",
+            (Some(req), Some(actual)) => {
+                req == actual
+                    || (req.starts_with("source ")
+                        && identity.is_some_and(|i| {
+                            i.identity_override && i.override_approved_at.is_some()
+                        }))
+            }
+            (Some(req), None) => {
+                req == "standard"
+                    || identity
+                        .is_some_and(|i| i.identity_override && i.override_approved_at.is_some())
+            }
             (None, Some(actual)) => actual == "standard",
             (None, None) => true,
         };
@@ -1778,5 +1788,99 @@ mod structured_diagnostic_tests {
         }
         assert!(!logged.contains("TOKEN_SHOULD_NOT_APPEAR"));
         assert!(!logged.contains("https://cdn.example"));
+    }
+}
+
+#[cfg(test)]
+mod override_identity_tests {
+    use super::*;
+    use crate::acquisition::edition::{RetrievalIdentity, SelectedArchive};
+    #[test]
+    fn override_requires_approval_and_never_guesses_a_file() {
+        let mut identity = RetrievalIdentity::new(
+            "Series X",
+            "Unverified release",
+            AcquisitionReleaseUnit::Volume(4.0),
+            Some("source release4"),
+        );
+        identity.identity_override = true;
+        let files = vec![BackendFile {
+            id: 1,
+            name: "Series X v04.cbz".into(),
+            path: "Series X v04.cbz".into(),
+            size: 100,
+        }];
+        assert!(
+            resolve_file_with_identity(&files, None, None, None, None, Some(&identity)).is_err()
+        );
+        identity.override_approved_at = Some(1);
+        assert_eq!(
+            resolve_file_with_identity(&files, None, None, None, None, Some(&identity))
+                .unwrap()
+                .id,
+            1
+        );
+        let mut ambiguous = files.clone();
+        ambiguous.push(BackendFile {
+            id: 2,
+            name: "Series X v04 B.cbz".into(),
+            path: "Series X v04 B.cbz".into(),
+            size: 100,
+        });
+        assert!(matches!(
+            resolve_file_with_identity(&ambiguous, None, None, None, None, Some(&identity)),
+            Err(TorBoxError::AmbiguousFiles(_))
+        ));
+        identity.selected_archive = Some(SelectedArchive {
+            path: files[0].path.clone(),
+            size: 100,
+        });
+        assert_eq!(
+            resolve_file_with_identity(&ambiguous, None, None, None, None, Some(&identity))
+                .unwrap()
+                .id,
+            1
+        );
+        let changed = vec![BackendFile {
+            id: 1,
+            name: "Series X v04.cbz".into(),
+            path: "Series X v04.cbz".into(),
+            size: 200,
+        }];
+        assert!(
+            resolve_file_with_identity(&changed, None, None, None, None, Some(&identity)).is_err()
+        );
+    }
+    #[test]
+    fn override_cannot_bypass_unsupported_archive_or_known_edition_conflict() {
+        let mut identity = RetrievalIdentity::new(
+            "Series X",
+            "Series X Master Edition",
+            AcquisitionReleaseUnit::Volume(4.0),
+            Some("Standard Edition"),
+        );
+        identity.identity_override = true;
+        identity.override_approved_at = Some(1);
+        let files = vec![BackendFile {
+            id: 1,
+            name: "Series X Master Edition v04.cbz".into(),
+            path: "Series X Master Edition v04.cbz".into(),
+            size: 100,
+        }];
+        assert!(matches!(
+            resolve_file_with_identity(&files, None, None, None, None, Some(&identity)),
+            Err(TorBoxError::EditionMismatch(_))
+        ));
+        identity.requested_edition = Some("master".into());
+        let files = vec![BackendFile {
+            id: 1,
+            name: "Series X Master Edition v04.cbr".into(),
+            path: "Series X Master Edition v04.cbr".into(),
+            size: 100,
+        }];
+        assert!(matches!(
+            resolve_file_with_identity(&files, None, None, None, None, Some(&identity)),
+            Err(TorBoxError::UnsupportedFormat(_))
+        ));
     }
 }

@@ -27,6 +27,36 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::sync::Notify;
 
+/// Snapshot accepted identity while the queue row still exists. The existing
+/// publication history is the durable boundary; later worker completion updates
+/// this row instead of trying to recover provenance from a deleted download.
+pub(crate) fn persist_publication_provenance(
+    conn: &rusqlite::Connection,
+    chapter: i64,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO acquisition_history (chapter_id, manga_id, series, release_name, source_type, uploader,
+            external_job_id, backend_type, outcome, canonical_path, release_size, completed_at, retrieval_identity_json)
+         SELECT d.chapter_id, c.manga_id, m.title, COALESCE(d.raw_title,c.name), d.source_type, d.uploader,
+            d.external_job_id, d.backend_type, 'published', d.published_path, d.release_size, strftime('%s','now'), d.retrieval_identity_json
+         FROM downloads d JOIN chapters c ON c.id=d.chapter_id JOIN manga m ON m.id=c.manga_id
+         WHERE d.chapter_id=?1 AND d.published_path IS NOT NULL AND NOT EXISTS (
+            SELECT 1 FROM acquisition_history h WHERE h.chapter_id=d.chapter_id AND h.canonical_path=d.published_path
+            AND h.outcome IN ('published','completed','verification_pending','published_scan_failed'))",
+        [chapter],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn complete_queued_publication(conn: &rusqlite::Connection, chapter: i64) -> Result<()> {
+    persist_publication_provenance(conn, chapter)?;
+    conn.execute("UPDATE acquisition_history SET outcome='completed', completed_at=strftime('%s','now')
+        WHERE chapter_id=?1 AND canonical_path=(SELECT published_path FROM downloads WHERE chapter_id=?1)
+        AND outcome IN ('published','verification_pending','published_scan_failed')", [chapter])?;
+    conn.execute("DELETE FROM downloads WHERE chapter_id=?1", [chapter])?;
+    Ok(())
+}
+
 fn preserve_queued_identity(
     conn: &rusqlite::Connection,
     chapter_id: i64,
@@ -1094,6 +1124,16 @@ impl AcquisitionService {
                     .unwrap_or_default()
                     .as_secs() as i64;
 
+                // Publication may already have removed the operational queue row.
+                // Preserve its captured JSON/provider provenance while settling history.
+                let updated = conn.execute(
+                    "UPDATE acquisition_history SET outcome=?1, error=?2, completed_at=?3,
+                        mangabaka_id=COALESCE(?4,mangabaka_id), mangabaka_release_id=COALESCE(?5,mangabaka_release_id),
+                        anilist_id=COALESCE(?6,anilist_id), requested_unit=COALESCE(?7,requested_unit), metadata_status=COALESCE(?8,metadata_status)
+                     WHERE chapter_id=?9 AND canonical_path IS ?10 AND outcome IN ('published','completed','verification_pending','published_scan_failed')",
+                    rusqlite::params![&outcome,error.as_deref(),now,mangabaka_id,mangabaka_release_id.as_deref(),anilist_id,requested_unit.as_deref(),metadata_status.as_deref(),chapter_id,canonical_path.as_deref()],
+                )?;
+                if updated > 0 { return Ok(()); }
                 conn.execute(
                     "INSERT INTO acquisition_history (
                         chapter_id, manga_id, series, release_name, source_type, uploader,
@@ -1620,6 +1660,19 @@ impl AcquisitionService {
 
         let plan = plan_opt.ok_or_else(|| AppError::not_found("Acquisition plan not found"))?;
 
+        if plan
+            .selected_items
+            .iter()
+            .any(|item| super::interactive::is_override(&item.candidate))
+            && !req.override_confirmed
+        {
+            return Err(AppError::bad_request(
+                "Use Release Anyway requires explicit confirmation before approval",
+            ));
+        }
+        if plan.selected_items.is_empty() {
+            return Err(AppError::bad_request("No release has been selected"));
+        }
         if plan.manga_id != manga_id {
             return Err(AppError::bad_request(
                 "Plan does not belong to the specified title",
@@ -1634,7 +1687,11 @@ impl AcquisitionService {
         let mut live_missing_sorted = current_missing.missing_volumes.clone();
         live_missing_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
-        if plan_missing_sorted != live_missing_sorted {
+        let interactive = plan
+            .selected_items
+            .iter()
+            .all(|item| item.candidate.provider_metadata["interactive"] == true);
+        if !interactive && plan_missing_sorted != live_missing_sorted {
             return Err(AppError::bad_request(
                 "Plan is stale: library missing units have changed since plan generation. Please regenerate and review.",
             ));
@@ -1778,7 +1835,14 @@ impl AcquisitionService {
         for item in &mut exec.items {
             let (still_needed, _) = crate::acquisition::execution::reconcile_preflight_ownership(
                 &item.expected_units,
-                &owned_vols,
+                if item.frozen_candidate.provider_metadata["requestedEdition"]
+                    .as_str()
+                    .is_some_and(|e| e != "standard")
+                {
+                    &[]
+                } else {
+                    &owned_vols
+                },
             );
             item.expected_units = still_needed;
             if item.expected_units.is_empty() {
@@ -1930,11 +1994,10 @@ impl AcquisitionService {
                 cand.provider_release_id,
                 item.expected_units.first().copied().unwrap_or(1.0)
             );
-            let ch_name = if cand.release_unit.is_collection() {
-                format!("{} (Collection)", cand.title)
-            } else {
-                format!("Volume {:02}", cand.release_number.unwrap_or(1.0) as i64)
-            };
+            let ch_name = format!(
+                "Volume {}",
+                item.expected_units.first().copied().unwrap_or(1.0)
+            );
             let scanlator = cand.uploader.clone().unwrap_or_default();
             let release_size = cand.size.unwrap_or(0) as i64;
             let first_vol = item.expected_units.first().copied().unwrap_or(1.0);
@@ -1954,15 +2017,41 @@ impl AcquisitionService {
                 .and_then(|v| v.as_str())
                 .unwrap_or(&cand.title)
                 .to_string();
-            let identity_json = serde_json::to_string(&super::edition::RetrievalIdentity::new(
+            let mut retrieval_identity = super::edition::RetrievalIdentity::new(
                 &exec.title,
                 &raw_t,
                 AcquisitionReleaseUnit::Volume(first_vol),
                 cand.provider_metadata
                     .get("requestedEdition")
                     .and_then(|v| v.as_str()),
-            ))
-            .map_err(|e| AppError::internal(e.to_string()))?;
+            );
+            if let Some(selected) = cand
+                .provider_metadata
+                .get("selectedArchive")
+                .filter(|value| !value.is_null())
+            {
+                retrieval_identity.selected_archive = Some(
+                    serde_json::from_value(selected.clone())
+                        .map_err(|_| AppError::bad_request("Invalid frozen archive selection"))?,
+                );
+            }
+            retrieval_identity.language = Some(cand.language.clone());
+            retrieval_identity.identity_override = super::interactive::is_override(cand);
+            retrieval_identity.override_approved_at = if retrieval_identity.identity_override {
+                Some(exec.approved_at)
+            } else {
+                None
+            };
+            retrieval_identity.metadata_confidence = Some(
+                if retrieval_identity.identity_override {
+                    "user_override"
+                } else {
+                    "source_identity"
+                }
+                .into(),
+            );
+            let identity_json = serde_json::to_string(&retrieval_identity)
+                .map_err(|e| AppError::internal(e.to_string()))?;
             let thash = cand
                 .provider_metadata
                 .get("torrentHash")

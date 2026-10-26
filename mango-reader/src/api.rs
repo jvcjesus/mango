@@ -1780,7 +1780,7 @@ async fn get_acquisition_sources(Me(app): Me) -> Result<Json<Vec<AcquisitionSour
             description: "Installed Keiyoushi extensions for chapter-level reader releases"
                 .to_string(),
             is_default: false,
-            available: true,
+            available: false,
             supports_volumes: false,
             supports_chapters: true,
         },
@@ -1797,52 +1797,11 @@ async fn get_acquisition_sources(Me(app): Me) -> Result<Json<Vec<AcquisitionSour
     Ok(Json(sources))
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct PlanByTitleRequest {
-    pub title: String,
-    pub komga_series_id: Option<String>,
-    #[allow(dead_code)]
-    pub source_id: Option<String>,
-    #[allow(dead_code)]
-    pub content_mode: Option<String>,
-    #[allow(dead_code)]
-    pub requested_volumes: Option<Vec<f64>>,
-    #[allow(dead_code)]
-    pub total_volumes: Option<i64>,
-}
-
 async fn post_plan_by_title(
     Me(app): Me,
-    Json(payload): Json<PlanByTitleRequest>,
-) -> Result<Json<crate::acquisition::planner::AcquisitionPlan>> {
-    let title = payload.title.trim().to_string();
-    if title.is_empty() {
-        return Err(AppError::bad_request("Title cannot be empty"));
-    }
-    let komga_id = payload.komga_series_id.as_deref();
-
-    // 1. Ensure tracked_catalog has an entry for this title
-    let tracked_entry = app
-        .db
-        .call({
-            let t = title.clone();
-            let k = komga_id.map(str::to_string);
-            move |conn| {
-                crate::sync::catalog::add_or_update_tracked(conn, &t, "lists", k.as_deref(), None)
-            }
-        })
-        .await?;
-
-    let manga_id = tracked_entry.id;
-
-    // 2. Generate plan
-    let plan = app
-        .acquisition
-        .plan_title_missing_content(manga_id, true)
-        .await?;
-
-    Ok(Json(plan))
+    Json(payload): Json<crate::acquisition::interactive::PlanningRequest>,
+) -> Result<Json<crate::acquisition::interactive::InteractivePlan>> {
+    Ok(Json(app.acquisition.plan_interactive(payload).await?))
 }
 
 // ---------- acquisition (Nyaa + TorBox) ----------

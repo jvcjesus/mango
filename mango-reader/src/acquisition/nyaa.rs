@@ -57,6 +57,7 @@ impl NyaaClient {
         let resp = self
             .http
             .get(&url)
+            .timeout(super::interactive::PROVIDER_DEADLINE)
             .header("User-Agent", "Mango/1.0 (Manga Acquisition)")
             .send()
             .await

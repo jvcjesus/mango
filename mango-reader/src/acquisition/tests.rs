@@ -2273,6 +2273,7 @@ async fn test_matrix_41_approval_snapshot_suite() {
 
     // A. Plan can be approved
     let approve_req = crate::acquisition::execution::ApprovePlanRequest {
+        override_confirmed: false,
         plan_id: plan.id.clone(),
         approved: true,
     };
@@ -2310,15 +2311,30 @@ async fn test_matrix_41_approval_snapshot_suite() {
     // G. Stale plan rejected at approval
     // If tracker total volumes changes before approval, plan is stale
     db.call(|conn| {
-        conn.execute("UPDATE tracker_list_entries SET total_volumes = 40 WHERE title = 'Blue Lock'", [])?;
+        conn.execute(
+            "UPDATE tracker_list_entries SET total_volumes = 40 WHERE title = 'Blue Lock'",
+            [],
+        )?;
         Ok(())
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
 
-    let err = svc.approve_and_create_execution(1, crate::acquisition::execution::ApprovePlanRequest {
-        plan_id: plan.id.clone(),
-        approved: true,
-    }).await.unwrap_err();
-    assert!(err.message.contains("stale"), "Approval must reject stale plan when missing content changed");
+    let err = svc
+        .approve_and_create_execution(
+            1,
+            crate::acquisition::execution::ApprovePlanRequest {
+                override_confirmed: false,
+                plan_id: plan.id.clone(),
+                approved: true,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.message.contains("stale"),
+        "Approval must reject stale plan when missing content changed"
+    );
 
     // H. Newly generated plan cannot silently replace approved plan
     let new_plan = svc.plan_title_missing_content(1, false).await.unwrap();
@@ -2536,7 +2552,11 @@ async fn test_matrix_44_idempotency_suite() {
     let plan = svc.plan_title_missing_content(1, false).await.unwrap();
 
     // A. Double approval request does not duplicate execution
-    let req1 = crate::acquisition::execution::ApprovePlanRequest { plan_id: plan.id.clone(), approved: true };
+    let req1 = crate::acquisition::execution::ApprovePlanRequest {
+        override_confirmed: false,
+        plan_id: plan.id.clone(),
+        approved: true,
+    };
     let exec1 = svc.approve_and_create_execution(1, req1).await.unwrap();
 
     // B. Double execute request does not duplicate job
@@ -2645,10 +2665,17 @@ async fn test_matrix_45_collection_handling_suite() {
     }).await.unwrap();
 
     let svc = AcquisitionService::new(db.clone(), reqwest::Client::new(), None, None);
-    let exec = svc.approve_and_create_execution(1, crate::acquisition::execution::ApprovePlanRequest {
-        plan_id: plan.id.clone(),
-        approved: true,
-    }).await.unwrap();
+    let exec = svc
+        .approve_and_create_execution(
+            1,
+            crate::acquisition::execution::ApprovePlanRequest {
+                override_confirmed: false,
+                plan_id: plan.id.clone(),
+                approved: true,
+            },
+        )
+        .await
+        .unwrap();
 
     // A. Collection downloaded once: items list has 1 collection entry
     assert_eq!(exec.items.len(), 1);
@@ -2988,10 +3015,17 @@ async fn test_matrix_50_explicit_approval_proof() {
 
     // NOW PROVE: Explicit user approval crosses download boundary exactly once!
     let saved_plan = svc.plan_title_missing_content(1, false).await.unwrap();
-    let exec = svc.approve_and_create_execution(1, crate::acquisition::execution::ApprovePlanRequest {
-        plan_id: saved_plan.id.clone(),
-        approved: true,
-    }).await.unwrap();
+    let exec = svc
+        .approve_and_create_execution(
+            1,
+            crate::acquisition::execution::ApprovePlanRequest {
+                override_confirmed: false,
+                plan_id: saved_plan.id.clone(),
+                approved: true,
+            },
+        )
+        .await
+        .unwrap();
 
     let started = svc.start_execution(exec.id).await.unwrap();
     assert_eq!(started.status, crate::acquisition::execution::ExecutionStatus::Queued);
