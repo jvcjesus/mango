@@ -117,6 +117,29 @@ pub(crate) struct Job {
     #[allow(dead_code)]
     pub(crate) collection_name: Option<String>,
     pub(crate) magnet_url: Option<String>,
+    pub(crate) retrieval_identity_json: Option<String>,
+}
+
+impl Job {
+    pub(crate) fn publication_title(&self) -> String {
+        let edition = self
+            .retrieval_identity_json
+            .as_deref()
+            .and_then(|json| {
+                serde_json::from_str::<crate::acquisition::edition::RetrievalIdentity>(json).ok()
+            })
+            .and_then(|identity| identity.requested_edition);
+        match edition {
+            Some(edition)
+                if edition != "standard"
+                    && crate::acquisition::edition::edition_from_title(&self.title).as_deref()
+                        != Some(&edition) =>
+            {
+                format!("{} ({} Edition)", self.title, edition)
+            }
+            _ => self.title.clone(),
+        }
+    }
 }
 
 impl Default for Job {
@@ -152,6 +175,7 @@ impl Default for Job {
             collection_id: None,
             collection_name: None,
             magnet_url: None,
+            retrieval_identity_json: None,
         }
     }
 }
@@ -722,7 +746,7 @@ impl Downloads {
                                 let verified = pipeline
                                     .poll_verify_release(
                                         &komga_client,
-                                        &job.title,
+                                        &job.publication_title(),
                                         target_lib,
                                         is_vol,
                                         rel_num,
@@ -734,7 +758,7 @@ impl Downloads {
                                     pipeline.ownership.invalidate(job.manga_id);
                                     let _ = pipeline
                                         .ownership
-                                        .get_title_ownership(job.manga_id, &job.title)
+                                        .get_title_ownership(job.manga_id, &job.publication_title())
                                         .await;
                                     let _ = self
                                         .db
@@ -1356,13 +1380,60 @@ impl Downloads {
                 ))
             }
         };
-        let selected_file = crate::acquisition::torbox::resolve_selected_file(
+        let mut identity = match job.retrieval_identity_json.as_deref() {
+            Some(json) => {
+                serde_json::from_str::<crate::acquisition::edition::RetrievalIdentity>(json)
+                    .map_err(|_| {
+                        AppError::bad_request(
+                            "Invalid durable retrieval identity; replan acquisition",
+                        )
+                    })?
+            }
+            None => crate::acquisition::edition::RetrievalIdentity::new(
+                &job.title,
+                job.collection_name
+                    .as_deref()
+                    .or(job.raw_title.as_deref())
+                    .unwrap_or(&job.name),
+                target_unit
+                    .clone()
+                    .unwrap_or(crate::acquisition::AcquisitionReleaseUnit::Unknown),
+                None,
+            ),
+        };
+        tracing::debug!(series = %crate::acquisition::torbox::diagnostic_text(&identity.series),
+            requested_edition = ?identity.requested_edition, requested_unit = ?identity.requested_unit,
+            source_release = %crate::acquisition::torbox::diagnostic_text(&identity.source_release),
+            job_id = %external_job_id, file_count = files.len(), "Resolving TorBox retrieval identity");
+        let selected_file = crate::acquisition::torbox::resolve_file_with_identity(
             &files,
             job.raw_title.as_deref(),
             target_unit.as_ref(),
             job.release_size,
             job.external_file_id,
-        )?;
+            Some(&identity),
+        ).map_err(|error| {
+            tracing::warn!(job_id = %external_job_id, reason = %error, "TorBox file resolution failed");
+            AppError::from(error)
+        })?;
+        identity.selected_archive = Some(crate::acquisition::edition::SelectedArchive {
+            path: selected_file.path.clone(),
+            size: selected_file.size,
+        });
+        let identity_json =
+            serde_json::to_string(&identity).map_err(|e| AppError::internal(e.to_string()))?;
+        self.db
+            .call({
+                let chapter_id = job.chapter;
+                move |conn| {
+                    conn.execute(
+                        "UPDATE downloads SET retrieval_identity_json = ?1 WHERE chapter_id = ?2",
+                        rusqlite::params![identity_json, chapter_id],
+                    )?;
+                    Ok(())
+                }
+            })
+            .await?;
 
         let selected_id = selected_file.id;
         if job.external_file_id != Some(selected_id) {
@@ -1642,7 +1713,7 @@ impl Downloads {
 }
 
 pub(crate) fn place_in(dir: &Path, job: &Job) -> PathBuf {
-    let folder = Path::new(&clean(&job.source)).join(clean(&job.title));
+    let folder = Path::new(&clean(&job.source)).join(clean(&job.publication_title()));
     let base_name = sanitize_release_name(&job.name);
     let name = match job.scanlator.as_deref().filter(|s| !s.is_empty()) {
         Some(scanlator) => clean(&format!("{base_name} [{scanlator}]")),
@@ -1790,7 +1861,7 @@ fn next_job(conn: &Connection) -> Result<Option<Job>> {
             "SELECT d.chapter_id, d.attempts, COALESCE(s.name, 'Unknown source'), m.title, c.name, c.chapter_number, c.scanlator,
                     m.author, m.artist, m.genre, m.description, s.lang, m.id, d.published_path, d.target_library_id, d.state,
                     d.source_type, d.backend_type, d.external_job_id, d.external_file_id, d.torrent_hash, d.raw_title,
-                    d.uploader, d.release_size, d.retrieved_path, d.collection_id, d.collection_name, d.magnet_url
+                    d.uploader, d.release_size, d.retrieved_path, d.collection_id, d.collection_name, d.magnet_url, d.retrieval_identity_json
              FROM downloads d JOIN chapters c ON c.id = d.chapter_id JOIN manga m ON m.id = c.manga_id
              LEFT JOIN sources s ON s.id = m.source_id
              WHERE (d.state = 'queued' OR d.state = 'verifying') AND (d.retry_at IS NULL OR d.retry_at <= ?1)
@@ -1799,7 +1870,23 @@ fn next_job(conn: &Connection) -> Result<Option<Job>> {
             |r| {
                 let name: String = r.get(4)?;
                 let number: f64 = r.get(5)?;
-                let release_info = crate::release::parse_release(&name, number);
+                let mut release_info = crate::release::parse_release(&name, number);
+                let identity_json: Option<String> = r.get(28)?;
+                if let Some(identity) = identity_json.as_deref().and_then(|json| serde_json::from_str::<crate::acquisition::edition::RetrievalIdentity>(json).ok()) {
+                    match identity.requested_unit {
+                        crate::acquisition::AcquisitionReleaseUnit::Volume(v) => {
+                            release_info.release_type = crate::release::ReleaseType::Volume;
+                            release_info.volume = Some(v);
+                            release_info.chapter_number = None;
+                        }
+                        crate::acquisition::AcquisitionReleaseUnit::Chapter(c) => {
+                            release_info.release_type = crate::release::ReleaseType::Chapter;
+                            release_info.volume = None;
+                            release_info.chapter_number = Some(c);
+                        }
+                        _ => {}
+                    }
+                }
                 let state: String = r.get(15)?;
                 Ok((
                     Job {
@@ -1833,6 +1920,7 @@ fn next_job(conn: &Connection) -> Result<Option<Job>> {
                         collection_id: r.get(25)?,
                         collection_name: r.get(26)?,
                         magnet_url: r.get(27)?,
+                        retrieval_identity_json: r.get(28)?,
                     },
                     state,
                 ))
@@ -3511,5 +3599,97 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+}
+
+#[cfg(test)]
+mod retrieval_identity_persistence_tests {
+    use super::*;
+    use crate::acquisition::{
+        edition::{RetrievalIdentity, SelectedArchive},
+        AcquisitionReleaseUnit,
+    };
+
+    #[tokio::test]
+    async fn authoritative_unit_and_selection_survive_restart_and_history() {
+        let temp = std::env::temp_dir().join(format!(
+            "mango-retrieval-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&temp).unwrap();
+        let path = temp.join("test.db");
+        let mut identity = RetrievalIdentity::new(
+            "Series X",
+            "Series X Master Edition",
+            AcquisitionReleaseUnit::Volume(4.0),
+            Some("Master Edition"),
+        );
+        identity.selected_archive = Some(SelectedArchive {
+            path: "Series X Master Edition v04.cbz".into(),
+            size: 100,
+        });
+        let json = serde_json::to_string(&identity).unwrap();
+        {
+            let db = Db::open(&path).unwrap();
+            db.call(move |conn| {
+                conn.execute("INSERT INTO manga (id, source_id, url, title) VALUES (1, 1, '/m1', 'Series X')", [])?;
+                conn.execute("INSERT INTO chapters (id, manga_id, url, name, chapter_number, source_order, fetched_at) VALUES (1, 1, '/c1', 'Series X v01-06 (Collection)', 4, 0, 0)", [])?;
+                conn.execute("INSERT INTO downloads (chapter_id, state, position, added_at, retrieval_identity_json) VALUES (1, 'queued', 1, 0, ?1)", [json])?;
+                Ok(())
+            }).await.unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let job = db.call(|conn| next_job(conn)).await.unwrap().unwrap();
+        assert_eq!(
+            job.volume,
+            Some(4.0),
+            "Requested unit must override collection display title"
+        );
+        assert_eq!(job.release_type, crate::release::ReleaseType::Volume);
+        let restored: RetrievalIdentity =
+            serde_json::from_str(job.retrieval_identity_json.as_deref().unwrap()).unwrap();
+        assert_eq!(restored, identity);
+        let service = crate::acquisition::service::AcquisitionService::new(
+            db.clone(),
+            reqwest::Client::new(),
+            None,
+            None,
+        );
+        service
+            .record_history(
+                Some(1),
+                1,
+                "Series X",
+                "Volume 4",
+                "nyaa",
+                None,
+                None,
+                "torbox",
+                "failed",
+                None,
+                None,
+                Some("safe failure"),
+            )
+            .await
+            .unwrap();
+        let stored: String = db
+            .call(|conn| {
+                Ok(conn.query_row(
+                    "SELECT retrieval_identity_json FROM acquisition_history WHERE chapter_id = 1",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<RetrievalIdentity>(&stored).unwrap(),
+            identity
+        );
+        fs::remove_dir_all(temp).unwrap();
     }
 }

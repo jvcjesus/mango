@@ -1172,6 +1172,17 @@ impl MangaBakaClient {
 
     /// Resolves an exact English standard digital collection for a series on MangaBaka.
     pub async fn match_collection(&self, series_id: i64) -> Result<MangaBakaCollectionMatch> {
+        self.match_edition_collection(series_id, None).await
+    }
+
+    pub async fn match_edition_collection(
+        &self,
+        series_id: i64,
+        requested_edition: Option<&str>,
+    ) -> Result<MangaBakaCollectionMatch> {
+        let requested = requested_edition
+            .map(crate::acquisition::edition::normalize_edition)
+            .unwrap_or_else(|| "standard".into());
         let collections_url = format!("/series/{series_id}/collections");
         let c_resp = match self
             .public_request(reqwest::Method::GET, &collections_url)
@@ -1248,8 +1259,8 @@ impl MangaBakaClient {
                 .map(|u| u as u32);
 
             let is_en = language == "en" || language.starts_with("en");
-            let is_standard =
-                edition == "standard edition" || edition == "standard" || edition.is_empty();
+            let is_standard = crate::acquisition::edition::normalize_edition(&edition) == requested
+                || (edition.is_empty() && requested == "standard");
             let is_digital = medium == "digital";
 
             if is_en && is_standard && is_digital {
@@ -1299,7 +1310,8 @@ impl MangaBakaClient {
                     .map(|u| u as u32);
 
                 if (language == "en" || language.starts_with("en"))
-                    && (edition.contains("standard") || edition.is_empty())
+                    && (crate::acquisition::edition::normalize_edition(&edition) == requested
+                        || (edition.is_empty() && requested == "standard"))
                     && medium != "print"
                 {
                     if let Some(col_id) = col.get("id").and_then(|v| v.as_str()) {
@@ -1390,6 +1402,18 @@ impl MangaBakaClient {
         mangabaka_id: Option<i64>,
         volume: f64,
     ) -> Result<MangaBakaOutcome> {
+        self.resolve_edition_volume_metadata(series, anilist_id, mangabaka_id, volume, None)
+            .await
+    }
+
+    pub async fn resolve_edition_volume_metadata(
+        &self,
+        series: &str,
+        anilist_id: Option<i64>,
+        mangabaka_id: Option<i64>,
+        volume: f64,
+        requested_edition: Option<&str>,
+    ) -> Result<MangaBakaOutcome> {
         let trimmed_series = series.trim();
         if trimmed_series.is_empty() && mangabaka_id.is_none() && anilist_id.is_none() {
             return Ok(MangaBakaOutcome::SeriesNotFound("empty".into()));
@@ -1463,7 +1487,7 @@ impl MangaBakaClient {
 
         // 2. Resolve collection for standard digital edition
         let (matched_collection_id, matched_total_works) = match self
-            .match_collection(matched_series_id)
+            .match_edition_collection(matched_series_id, requested_edition)
             .await?
         {
             MangaBakaCollectionMatch::Found {
@@ -1473,9 +1497,10 @@ impl MangaBakaClient {
                 return Ok(MangaBakaOutcome::AmbiguousCollection(candidates.len()));
             }
             MangaBakaCollectionMatch::NotFound => {
-                return Ok(MangaBakaOutcome::CollectionNotFound(
-                    "No English digital Standard Edition found".to_string(),
-                ));
+                return Ok(MangaBakaOutcome::CollectionNotFound(format!(
+                    "No English digital {} edition found",
+                    requested_edition.unwrap_or("standard")
+                )));
             }
             MangaBakaCollectionMatch::AuthError(e) => return Ok(MangaBakaOutcome::AuthError(e)),
             MangaBakaCollectionMatch::NetworkError(e) => {
@@ -1760,7 +1785,15 @@ impl MangaBakaClient {
                             .and_then(|v| v.as_str())
                             .map(|s| s.trim().to_string())
                             .filter(|s| !s.is_empty());
-                        let total_volumes = matched_total_works.or(total_vols);
+                        let total_volumes = matched_total_works.or_else(|| {
+                            if requested_edition.is_none_or(|e| {
+                                crate::acquisition::edition::normalize_edition(e) == "standard"
+                            }) {
+                                total_vols
+                            } else {
+                                None
+                            }
+                        });
                         let web_url =
                             Some(format!("https://mangabaka.org/series/{matched_series_id}"));
 
@@ -2994,5 +3027,61 @@ mod tests {
             }
             other => panic!("Expected NetworkError, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod edition_collection_regressions {
+    use super::*;
+    use axum::{routing::get, Json, Router};
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn authoritative_collection_edition_is_respected() {
+        let app = Router::new()
+            .route("/series/101/collections", get(|| async { Json(json!({"data": [
+                {"id":"standard", "language":"en", "edition":{"name":"Standard Edition"}, "medium":"digital", "total_works":12},
+                {"id":"master", "language":"en", "edition":{"name":"Master Edition"}, "medium":"digital", "total_works":6},
+                {"id":"print-master", "language":"en", "edition":{"name":"Master Edition"}, "medium":"print"}
+            ]})) }))
+            .route("/series/101", get(|| async { Json(json!({"data": {"title":"Series X", "total_volumes":12}})) }))
+            .route("/collections/master/works", get(|| async { Json(json!({"data":[{"id":"work4", "sequence_numeric":4, "title":"Master volume four"}]})) }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = MangaBakaClient::new(
+            reqwest::Client::new(),
+            Some(format!("http://{address}")),
+            None,
+        );
+        assert!(
+            matches!(client.match_collection(101).await.unwrap(), MangaBakaCollectionMatch::Found { id, .. } if id == "standard")
+        );
+        assert!(
+            matches!(client.match_edition_collection(101, Some("Master Edition")).await.unwrap(), MangaBakaCollectionMatch::Found { id, total_works: Some(6), .. } if id == "master")
+        );
+        assert!(matches!(
+            client
+                .match_edition_collection(101, Some("Deluxe Edition"))
+                .await
+                .unwrap(),
+            MangaBakaCollectionMatch::NotFound
+        ));
+        let result = client
+            .resolve_edition_volume_metadata(
+                "Series X",
+                None,
+                Some(101),
+                4.0,
+                Some("Master Edition"),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(result, MangaBakaOutcome::Success(e) if e.collection_id == "master" && e.work_id.as_deref() == Some("work4") && e.total_volumes == Some(6))
+        );
+        server.abort();
     }
 }

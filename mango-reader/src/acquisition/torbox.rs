@@ -25,6 +25,7 @@ pub enum TorBoxError {
     NetworkError(String),
     TorrentFailed(String),
     AmbiguousFiles(String),
+    EditionMismatch(String),
     NoArchiveFound(String),
     RequestedUnitNotFound(String),
     UnsupportedFormat(String),
@@ -41,6 +42,7 @@ impl fmt::Display for TorBoxError {
             Self::RemoteError(code, msg) => write!(f, "TorBox remote error (HTTP {code}): {msg}"),
             Self::NetworkError(msg) => write!(f, "TorBox network error: {msg}"),
             Self::TorrentFailed(msg) => write!(f, "TorBox torrent failed: {msg}"),
+            Self::EditionMismatch(msg) => write!(f, "Edition mismatch: {msg}"),
             Self::AmbiguousFiles(msg) => write!(f, "TorBox file selection ambiguous: {msg}"),
             Self::NoArchiveFound(msg) => write!(f, "TorBox no manga archive found: {msg}"),
             Self::RequestedUnitNotFound(msg) => {
@@ -75,6 +77,7 @@ impl From<TorBoxError> for AppError {
             TorBoxError::RemoteError(status, msg) => AppError::new(status, "remote_error", msg),
             TorBoxError::NetworkError(msg) => AppError::new(502, "network_error", msg),
             TorBoxError::TorrentFailed(msg) => AppError::new(422, "torrent_failed", msg),
+            TorBoxError::EditionMismatch(msg) => AppError::new(422, "edition_mismatch", msg),
             TorBoxError::AmbiguousFiles(msg) => AppError::new(422, "ambiguous_files", msg),
             TorBoxError::NoArchiveFound(msg) => AppError::new(404, "no_archive_found", msg),
             TorBoxError::RequestedUnitNotFound(msg) => {
@@ -658,17 +661,9 @@ pub fn parse_archive_volume(filename: &str) -> Option<f64> {
         return None;
     }
 
-    // First attempt using crate::release::parse_volume which handles "v01", "v1", "v001",
-    // "vol 1", "vol. 1", "volume 1", "Volume 01", etc. and guards against chapter revisions
-    if let Some(vol) = crate::release::parse_volume(clean) {
-        return Some((vol.round() * 1000.0).round() / 1000.0);
-    }
-
-    // Fall back to classify_release if parse_volume did not identify it
-    let (unit, num, _) = crate::acquisition::nyaa::classify_release(clean);
-    match unit {
-        AcquisitionReleaseUnit::Volume(v) => Some((v.round() * 1000.0).round() / 1000.0),
-        _ => num.map(|n| (n.round() * 1000.0).round() / 1000.0),
+    match crate::acquisition::nyaa::classify_release(clean).0 {
+        AcquisitionReleaseUnit::Volume(v) => Some(v),
+        _ => None,
     }
 }
 
@@ -800,10 +795,10 @@ pub fn select_artifact<'a>(
     if let Some(AcquisitionReleaseUnit::Chapter(target_ch)) = target_unit {
         let mut matching: Vec<&BackendFile> = Vec::new();
         for arch in &archives {
-            let (unit, num, _) = crate::acquisition::nyaa::classify_release(&arch.name);
+            let (unit, _, _) = crate::acquisition::nyaa::classify_release(&arch.name);
             let is_match = match unit {
                 AcquisitionReleaseUnit::Chapter(c) => (c - target_ch).abs() < 0.001,
-                _ => num.map(|n| (n - target_ch).abs() < 0.001).unwrap_or(false),
+                _ => false,
             };
             if is_match {
                 matching.push(arch);
@@ -975,13 +970,10 @@ pub fn validate_download_url(url_str: &str) -> std::result::Result<(), TorBoxErr
     Ok(())
 }
 
-/// Deterministic file resolution algorithm for TorBox torrents:
-/// 1. Filters out junk and unsupported formats using the conservative selection rules.
-/// 2. If exact normalized raw_title matches an archive in files, selects it.
-/// 3. If target_unit is specified, selects the archive matching the requested volume/chapter via `select_artifact`.
-///    If release_size is known (> 0), corroborates that the selected file size matches or is within reasonable range.
-/// 4. If persisted_file_id is specified and matches a supported archive in the current torrent that is consistent with unit/title, selects it.
-/// 5. If multiple files match without resolution or 0 files match, fails closed with explicit error.
+/// Compatibility entrypoint for callers without durable edition provenance.
+/// Exact paths and unit evidence must corroborate selection; job-local IDs and
+/// aggregate torrent size never override ambiguity or a requested-unit failure.
+#[cfg(test)]
 pub fn resolve_selected_file<'a>(
     files: &'a [BackendFile],
     raw_title: Option<&str>,
@@ -995,116 +987,197 @@ pub fn resolve_selected_file<'a>(
         ));
     }
 
-    // 1. Scan and filter supported archives (.cbz / .zip)
-    let supported_archives: Vec<&BackendFile> = files
+    resolve_file_with_identity(
+        files,
+        raw_title,
+        target_unit,
+        release_size,
+        persisted_file_id,
+        None,
+    )
+}
+
+/// Safe, bounded provider text for diagnostics. Never include URLs or magnet data.
+pub fn diagnostic_text(value: &str) -> String {
+    value
+        .split_whitespace()
+        .map(|word| {
+            if word.contains("://")
+                || word.contains("magnet:")
+                || word.contains('?')
+                || word.contains("token=")
+            {
+                "[redacted]".to_string()
+            } else {
+                word.chars().filter(|c| !c.is_control()).take(160).collect()
+            }
+        })
+        .take(30)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+pub fn validate_edition_intent(
+    identity: &super::edition::RetrievalIdentity,
+) -> std::result::Result<(), TorBoxError> {
+    use super::edition::{edition_from_title, normalize_edition};
+    let requested = identity.requested_edition.as_deref().map(normalize_edition);
+    if let Some(release) = edition_from_title(&identity.source_release) {
+        if requested.as_ref().is_some_and(|ed| ed != &release)
+            || (requested.is_none() && release != "standard")
+        {
+            return Err(TorBoxError::EditionMismatch(format!(
+                "Release is {release} edition; requested edition is {}. Confirm edition-local numbering; no standard/combined-volume conversion is inferred.",
+                requested.as_deref().unwrap_or("unspecified")
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub fn resolve_file_with_identity<'a>(
+    files: &'a [BackendFile],
+    raw_title: Option<&str>,
+    target_unit: Option<&AcquisitionReleaseUnit>,
+    _release_size: Option<u64>,
+    persisted_file_id: Option<i64>,
+    identity: Option<&super::edition::RetrievalIdentity>,
+) -> std::result::Result<&'a BackendFile, TorBoxError> {
+    use super::edition::{edition_from_title, normalize_edition};
+    let target = identity.map(|i| &i.requested_unit).or(target_unit);
+    let source = identity
+        .map(|i| i.source_release.as_str())
+        .or(raw_title)
+        .unwrap_or("");
+    let requested_edition = identity
+        .and_then(|i| i.requested_edition.as_deref())
+        .map(normalize_edition);
+    let release_edition = edition_from_title(source);
+    let fallback_identity = super::edition::RetrievalIdentity::new(
+        "",
+        source,
+        target.cloned().unwrap_or(AcquisitionReleaseUnit::Unknown),
+        None,
+    );
+    validate_edition_intent(identity.unwrap_or(&fallback_identity))?;
+    if let Err(error @ TorBoxError::UnsupportedFormat(_)) = select_artifact(files, target) {
+        return Err(error);
+    }
+    let archives = files
         .iter()
         .filter(|f| {
             let lower = f.name.to_ascii_lowercase();
             !is_junk_file(&lower) && (lower.ends_with(".cbz") || lower.ends_with(".zip"))
         })
-        .collect();
-
-    if supported_archives.is_empty() {
-        // Run select_artifact to get the precise unsupported format error if applicable
-        return select_artifact(files, target_unit);
+        .collect::<Vec<_>>();
+    if archives.is_empty() {
+        return select_artifact(files, target);
     }
-
-    // 2. Exact normalized raw_title / file name matching
-    if let Some(raw) = raw_title.map(str::trim).filter(|s| !s.is_empty()) {
-        let clean_target = Path::new(raw)
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or(raw)
-            .trim();
-
-        let exact_matches: Vec<&BackendFile> = supported_archives
-            .iter()
-            .copied()
-            .filter(|f| {
-                let f_clean = Path::new(&f.name)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(&f.name)
-                    .trim();
-                let f_path_clean = Path::new(&f.path)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(&f.path)
-                    .trim();
-                f_clean.eq_ignore_ascii_case(clean_target)
-                    || f_path_clean.eq_ignore_ascii_case(clean_target)
-            })
-            .collect();
-
-        if exact_matches.len() == 1 {
-            let selected = exact_matches[0];
-            if let Some(expected_sz) = release_size.filter(|&sz| sz > 0) {
-                if selected.size > 0 && selected.size != expected_sz {
-                    tracing::info!(
-                        "[TorBox] File '{}' matched raw title '{}' (size {} vs corroborated expected size {})",
-                        selected.name,
-                        clean_target,
-                        selected.size,
-                        expected_sz
-                    );
-                }
+    let mut eligible = Vec::new();
+    let mut wrong_edition = 0;
+    let mut unknown_units = 0;
+    for file in &archives {
+        let file_edition = edition_from_title(&file.path)
+            .or_else(|| edition_from_title(&file.name))
+            .or_else(|| release_edition.clone());
+        let (parsed, _, _) = crate::acquisition::nyaa::classify_release(&file.name);
+        let parsed = match parsed {
+            AcquisitionReleaseUnit::Unknown => {
+                crate::acquisition::nyaa::classify_release(&file.path).0
             }
-            return Ok(selected);
+            other => other,
+        };
+        let edition_ok = match (&requested_edition, &file_edition) {
+            (Some(req), Some(actual)) => req == actual,
+            (Some(req), None) => req == "standard",
+            (None, Some(actual)) => actual == "standard",
+            (None, None) => true,
+        };
+        let unit_ok = match (target, &parsed) {
+            (Some(AcquisitionReleaseUnit::Volume(a)), AcquisitionReleaseUnit::Volume(b))
+            | (Some(AcquisitionReleaseUnit::Chapter(a)), AcquisitionReleaseUnit::Chapter(b)) => {
+                (a - b).abs() < 0.001
+            }
+            (None | Some(AcquisitionReleaseUnit::Unknown), _) => true,
+            _ => false,
+        };
+        if !edition_ok {
+            wrong_edition += 1;
         }
-
-        if exact_matches.len() > 1 {
-            // If multiple exact name matches, attempt to disambiguate by release_size
-            if let Some(expected_sz) = release_size.filter(|&sz| sz > 0) {
-                let size_matches: Vec<&BackendFile> = exact_matches
-                    .iter()
-                    .copied()
-                    .filter(|f| f.size == expected_sz)
-                    .collect();
-                if size_matches.len() == 1 {
-                    return Ok(size_matches[0]);
-                }
+        if matches!(parsed, AcquisitionReleaseUnit::Unknown) {
+            unknown_units += 1;
+        }
+        let selected = identity.and_then(|i| i.selected_archive.as_ref());
+        let exact_selection =
+            selected.is_some_and(|s| s.path == file.path && s.size > 0 && s.size == file.size);
+        let source_unit = crate::acquisition::nyaa::classify_release(source).0;
+        let source_unit_matches = match (target, &source_unit) {
+            (Some(AcquisitionReleaseUnit::Volume(a)), AcquisitionReleaseUnit::Volume(b))
+            | (Some(AcquisitionReleaseUnit::Chapter(a)), AcquisitionReleaseUnit::Chapter(b)) => {
+                (a - b).abs() < 0.001
             }
-            return Err(TorBoxError::AmbiguousFiles(format!(
-                "Multiple files ({}) match exact raw title '{clean_target}'",
-                exact_matches.len()
-            )));
+            _ => false,
+        };
+        let unknown_single = matches!(parsed, AcquisitionReleaseUnit::Unknown)
+            && archives.len() == 1
+            && source_unit_matches;
+        let accepted =
+            edition_ok && (unit_ok || unknown_single) && (selected.is_none() || exact_selection);
+        tracing::debug!(
+            file_id = file.id, filename = %diagnostic_text(&file.name), path = %diagnostic_text(&file.path),
+            parsed_unit = ?parsed, edition = ?file_edition, edition_ok, unit_ok,
+            persisted_id_matches = persisted_file_id == Some(file.id), exact_selection, accepted,
+            reason = if !edition_ok { "edition_mismatch_or_unproven" } else if selected.is_some() && !exact_selection { "persisted_path_size_mismatch" } else if !unit_ok && !unknown_single { "unit_mismatch_or_unknown" } else { "unit_and_edition_corroborated" },
+            "TorBox archive resolution candidate"
+        );
+        if accepted {
+            eligible.push(*file);
         }
     }
-
-    // 3. Requested unit semantics matching
-    if let Some(unit) = target_unit {
-        match select_artifact(files, Some(unit)) {
-            Ok(file) => {
-                if let Some(expected_sz) = release_size.filter(|&sz| sz > 0) {
-                    if file.size > 0 && file.size != expected_sz {
-                        tracing::info!(
-                            "[TorBox] File '{}' matched target unit {:?} (size {} vs corroborated expected size {})",
-                            file.name,
-                            unit,
-                            file.size,
-                            expected_sz
-                        );
-                    }
-                }
-                return Ok(file);
-            }
-            Err(e) => {
-                if target_unit.is_some() && raw_title.is_none() {
-                    return Err(e);
-                }
+    // IDs are local to a remote job. They never override unit, edition or exact path evidence.
+    // Release size is a torrent aggregate, never a per-volume tie breaker.
+    if eligible.len() == 1 {
+        return Ok(eligible[0]);
+    }
+    if eligible.len() > 1 {
+        if let Some(raw) = raw_title {
+            let exact = eligible
+                .iter()
+                .copied()
+                .filter(|f| f.path == raw || f.name == raw)
+                .collect::<Vec<_>>();
+            if exact.len() == 1 {
+                return Ok(exact[0]);
             }
         }
+        return Err(TorBoxError::AmbiguousFiles(format!(
+            "Requested {} {}, but {} of {} archives match; explicit file selection is required.",
+            requested_edition
+                .as_deref()
+                .unwrap_or("unspecified edition"),
+            target
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "unit".into()),
+            eligible.len(),
+            archives.len()
+        )));
     }
-
-    // 4. Corroborated persisted file ID (only if still matching and no other match found)
-    if let Some(fid) = persisted_file_id {
-        if let Some(file) = supported_archives.iter().copied().find(|f| f.id == fid) {
-            return Ok(file);
-        }
+    if wrong_edition == archives.len() {
+        return Err(TorBoxError::EditionMismatch(format!(
+            "No archive matches requested {} edition ({} supported archives).",
+            requested_edition.as_deref().unwrap_or("unspecified"),
+            archives.len()
+        )));
     }
-
-    // 5. Fall back to select_artifact without unit (single archive in torrent)
-    select_artifact(files, None)
+    let summary = format!("Requested {} {}, but no archive uniquely matched among {} supported archives ({} unlabelled).{}",
+        requested_edition.as_deref().unwrap_or("unspecified edition"),
+        target.map(ToString::to_string).unwrap_or_else(|| "unit".into()), archives.len(), unknown_units,
+        if identity.and_then(|i| i.selected_archive.as_ref()).is_some() { " Persisted path/size selection could not be corroborated." } else { "" });
+    if unknown_units > 0 {
+        Err(TorBoxError::AmbiguousFiles(summary))
+    } else {
+        Err(TorBoxError::RequestedUnitNotFound(summary))
+    }
 }
 
 #[cfg(test)]
@@ -1442,5 +1515,268 @@ mod tests {
         // Case 2: Multiple archives with no target unit
         let err_no_target = select_artifact(&dup_files, None).unwrap_err();
         assert!(matches!(err_no_target, TorBoxError::AmbiguousFiles(_)));
+    }
+}
+
+#[cfg(test)]
+mod identity_regressions {
+    use super::*;
+    use crate::acquisition::edition::{RetrievalIdentity, SelectedArchive};
+
+    fn archive(id: i64, name: &str) -> BackendFile {
+        BackendFile {
+            id,
+            name: name.into(),
+            path: format!("collection/{name}"),
+            size: 100,
+        }
+    }
+    fn request(source: &str, edition: Option<&str>, volume: f64) -> RetrievalIdentity {
+        RetrievalIdentity::new(
+            "Series X",
+            source,
+            AcquisitionReleaseUnit::Volume(volume),
+            edition,
+        )
+    }
+    fn resolve<'a>(
+        files: &'a [BackendFile],
+        identity: &RetrievalIdentity,
+        id: Option<i64>,
+    ) -> std::result::Result<&'a BackendFile, TorBoxError> {
+        resolve_file_with_identity(files, None, None, Some(600), id, Some(identity))
+    }
+
+    #[test]
+    fn ordinary_and_standard_collections() {
+        let files = vec![
+            archive(1, "Series X v01.cbz"),
+            archive(2, "Series X v02.cbz"),
+        ];
+        assert_eq!(
+            resolve(&files[..1], &request("Series X v01", None, 1.0), None)
+                .unwrap()
+                .id,
+            1
+        );
+        assert_eq!(
+            resolve(
+                &files,
+                &request("Series X v01-02", Some("Standard Edition"), 2.0),
+                None
+            )
+            .unwrap()
+            .id,
+            2
+        );
+    }
+
+    #[test]
+    fn master_collection_matches_edition_local_volume_in_any_order() {
+        let mut files = (1..=6)
+            .map(|n| archive(n, &format!("Series X Master Edition v{n:02}.cbz")))
+            .collect::<Vec<_>>();
+        let identity = request(
+            "Series X Master Edition (Digital)",
+            Some("Master Edition"),
+            4.0,
+        );
+        assert_eq!(resolve(&files, &identity, None).unwrap().id, 4);
+        files.reverse();
+        assert_eq!(resolve(&files, &identity, Some(1)).unwrap().id, 4);
+    }
+
+    #[test]
+    fn edition_mismatch_and_unknown_combined_mapping_fail_closed() {
+        let files = vec![archive(1, "Series X Master Edition v04.cbz")];
+        for edition in [Some("Standard Edition"), Some("Deluxe Edition"), None] {
+            assert!(matches!(
+                resolve(
+                    &files,
+                    &request("Series X Master Edition", edition, 4.0),
+                    Some(1)
+                ),
+                Err(TorBoxError::EditionMismatch(_))
+            ));
+        }
+        let files = vec![archive(1, "Series X 3-in-1 v02.cbz")];
+        assert!(matches!(
+            resolve(
+                &files,
+                &request("Series X 3-in-1", Some("Standard Edition"), 4.0),
+                None
+            ),
+            Err(TorBoxError::EditionMismatch(_))
+        ));
+    }
+
+    #[test]
+    fn same_edition_duplicates_fail_closed_even_with_id_or_torrent_size() {
+        let files = vec![
+            archive(1, "Series X Master Edition v04 A.cbz"),
+            archive(2, "Series X Master Edition v04 B.cbz"),
+        ];
+        assert!(matches!(
+            resolve(
+                &files,
+                &request("Series X Master Edition", Some("master"), 4.0),
+                Some(1)
+            ),
+            Err(TorBoxError::AmbiguousFiles(_))
+        ));
+    }
+
+    #[test]
+    fn absent_unit_and_no_order_guessing() {
+        let files = vec![
+            archive(4, "Series X v01.cbz"),
+            archive(1, "Series X v02.cbz"),
+        ];
+        assert!(matches!(
+            resolve(&files, &request("Series X v01-02", None, 4.0), Some(4)),
+            Err(TorBoxError::RequestedUnitNotFound(_))
+        ));
+        let files = vec![archive(4, "a.cbz"), archive(1, "b.cbz")];
+        assert!(matches!(
+            resolve(&files, &request("Series X", None, 1.0), Some(1)),
+            Err(TorBoxError::AmbiguousFiles(_))
+        ));
+    }
+
+    #[test]
+    fn exact_selection_roundtrip_and_recreated_job_ids() {
+        let files = vec![
+            archive(7, "Series X v04 A.cbz"),
+            archive(8, "Series X v04 B.cbz"),
+        ];
+        let mut identity = request("Series X v01-06", None, 4.0);
+        identity.selected_archive = Some(SelectedArchive {
+            path: files[1].path.clone(),
+            size: 100,
+        });
+        let identity: RetrievalIdentity =
+            serde_json::from_str(&serde_json::to_string(&identity).unwrap()).unwrap();
+        assert_eq!(resolve(&files, &identity, Some(8)).unwrap().id, 8);
+        let recreated = vec![
+            archive(8, "Series X v04 A.cbz"),
+            archive(99, "Series X v04 B.cbz"),
+        ];
+        assert_eq!(resolve(&recreated, &identity, Some(8)).unwrap().id, 99);
+        let changed = vec![archive(8, "Series X v04 A.cbz")];
+        assert!(resolve(&changed, &identity, Some(8)).is_err());
+    }
+
+    #[test]
+    fn exact_name_never_overrides_wrong_unit_or_edition() {
+        let files = vec![archive(1, "Series X v02.cbz")];
+        assert!(resolve_file_with_identity(
+            &files,
+            Some(&files[0].name),
+            Some(&AcquisitionReleaseUnit::Volume(4.0)),
+            None,
+            Some(1),
+            None
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn collection_controls_and_chapter_volume_distinction() {
+        for (series, total, requested) in [
+            ("Witch Hat Atelier", 14, 4),
+            ("Blue Lock", 39, 39),
+            ("Made in Abyss", 13, 4),
+        ] {
+            let mut files = (1..=total)
+                .map(|n| archive(n, &format!("{series} v{n:02} (Digital).cbz")))
+                .collect::<Vec<_>>();
+            files.reverse();
+            assert_eq!(
+                resolve(
+                    &files,
+                    &request(&format!("{series} v01-{total}"), None, requested as f64),
+                    None
+                )
+                .unwrap()
+                .id,
+                requested
+            );
+        }
+        assert_eq!(parse_archive_volume("Series X c04.cbz"), None);
+        assert_eq!(parse_archive_volume("Series X v04.5.cbz"), Some(4.5));
+        assert_eq!(parse_archive_volume("Series X v01-06.cbz"), None);
+    }
+
+    #[test]
+    fn diagnostics_are_bounded_unicode_safe_and_redact_urls() {
+        let safe = diagnostic_text(
+            "Series 나 v04.cbz https://cdn.example/file?token=SECRET magnet:?xt=SECRET",
+        );
+        assert!(safe.contains("나 v04.cbz"));
+        assert!(!safe.contains("SECRET"));
+        assert!(diagnostic_text(&"📚".repeat(500)).chars().count() <= 160);
+    }
+}
+
+#[cfg(test)]
+mod structured_diagnostic_tests {
+    use super::*;
+    use std::{
+        io::Write,
+        sync::{Arc, Mutex},
+    };
+
+    #[derive(Clone)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+    impl Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn candidate_trace_contains_evidence_without_signed_urls() {
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let writer = Capture(bytes.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(move || writer.clone())
+            .finish();
+        let files = vec![BackendFile {
+            id: 1,
+            name: "Series X 나 v04.cbz".into(),
+            size: 100,
+            path: "https://cdn.example/archive?token=TOKEN_SHOULD_NOT_APPEAR".into(),
+        }];
+        tracing::subscriber::with_default(subscriber, || {
+            resolve_selected_file(
+                &files,
+                None,
+                Some(&AcquisitionReleaseUnit::Volume(4.0)),
+                None,
+                None,
+            )
+            .unwrap();
+        });
+        let logged = String::from_utf8(bytes.lock().unwrap().clone()).unwrap();
+        for evidence in [
+            "Series X 나 v04.cbz",
+            "parsed_unit",
+            "edition_ok",
+            "unit_ok",
+            "reason",
+            "accepted",
+            "[redacted]",
+        ] {
+            assert!(logged.contains(evidence), "Missing {evidence} in {logged}");
+        }
+        assert!(!logged.contains("TOKEN_SHOULD_NOT_APPEAR"));
+        assert!(!logged.contains("https://cdn.example"));
     }
 }

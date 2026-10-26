@@ -27,6 +27,39 @@ use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::sync::Notify;
 
+fn preserve_queued_identity(
+    conn: &rusqlite::Connection,
+    chapter_id: i64,
+    next_json: &str,
+    torrent_hash: Option<&str>,
+) -> Result<String> {
+    let previous: Option<(Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT retrieval_identity_json, torrent_hash FROM downloads WHERE chapter_id = ?1",
+            [chapter_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let mut next: super::edition::RetrievalIdentity = serde_json::from_str(next_json)
+        .map_err(|_| AppError::bad_request("Invalid retrieval identity"))?;
+    if let Some((Some(json), old_hash)) = previous {
+        let previous: super::edition::RetrievalIdentity =
+            serde_json::from_str(&json).map_err(|_| {
+                AppError::bad_request("Invalid persisted retrieval identity; replan acquisition")
+            })?;
+        if previous.selected_archive.is_some() && old_hash.as_deref() != torrent_hash {
+            return Err(AppError::new(
+                409,
+                "selection_conflict",
+                "Selected archive torrent identity changed; preserve the existing partial transfer",
+            ));
+        }
+        next.preserve_selection_from(&previous)
+            .map_err(|error| AppError::new(409, "selection_conflict", error))?;
+    }
+    serde_json::to_string(&next).map_err(|e| AppError::internal(e.to_string()))
+}
+
 pub fn default_true() -> bool {
     true
 }
@@ -47,6 +80,8 @@ pub struct AcquisitionConfigPatch {
 pub struct AcquireReleaseRequest {
     pub release: AcquisitionRelease,
     pub target_unit: Option<AcquisitionReleaseUnit>,
+    pub requested_edition: Option<String>,
+    pub selected_archive: Option<super::edition::SelectedArchive>,
 }
 
 #[derive(Clone)]
@@ -483,6 +518,15 @@ impl AcquisitionService {
             ));
         }
 
+        crate::acquisition::torbox::validate_edition_intent(
+            &super::edition::RetrievalIdentity::new(
+                &title,
+                &req.release.raw_title,
+                req.release.release_unit.clone(),
+                req.requested_edition.as_deref(),
+            ),
+        )?;
+
         // Submit collection torrent to TorBox
         let client = TorBoxClient::new(self.http.clone(), config.torbox_url, Some(actual_token));
         let job_info = client.submit(&req.release).await?;
@@ -528,6 +572,13 @@ impl AcquisitionService {
                 )
             };
 
+            let identity_json = serde_json::to_string(&super::edition::RetrievalIdentity::new(
+                &title,
+                &req.release.raw_title,
+                AcquisitionReleaseUnit::Volume(v),
+                req.requested_edition.as_deref(),
+            ))
+            .map_err(|e| AppError::internal(e.to_string()))?;
             let ch_url = format!("nyaa:{}:{v_idx}", req.release.source_item_id);
             let ch_name = format!("Volume {v_idx}");
             let up_clone = uploader.clone();
@@ -556,14 +607,15 @@ impl AcquisitionService {
                     conn.last_insert_rowid()
                 };
 
+                let identity_json = preserve_queued_identity(conn, id, &identity_json, thash.as_deref())?;
                 conn.execute(
                     "INSERT INTO downloads (
                         chapter_id, state, position, attempts, added_at, source_type, backend_type,
                         external_job_id, external_file_id, raw_title, uploader, release_size, torrent_hash,
-                        collection_id, collection_name
+                        collection_id, collection_name, retrieval_identity_json
                     ) VALUES (
                         ?1, 'queued', (SELECT COALESCE(MAX(position), 0) + 1 FROM downloads), 0, ?2,
-                        'nyaa', 'torbox', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+                        'nyaa', 'torbox', ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11
                     ) ON CONFLICT(chapter_id) DO UPDATE SET
                         state = 'queued', attempts = 0, retry_at = NULL, error = NULL,
                         source_type = 'nyaa', backend_type = 'torbox',
@@ -571,10 +623,11 @@ impl AcquisitionService {
                         external_file_id = excluded.external_file_id,
                         raw_title = excluded.raw_title, uploader = excluded.uploader,
                         release_size = excluded.release_size, torrent_hash = excluded.torrent_hash,
-                        collection_id = excluded.collection_id, collection_name = excluded.collection_name",
+                        collection_id = excluded.collection_id, collection_name = excluded.collection_name,
+                        retrieval_identity_json = excluded.retrieval_identity_json",
                     rusqlite::params![
                         id, now, &ext_jid, ext_file_id, &raw_name, &up_clone, f_size as i64, &thash,
-                        &col_id, &col_name
+                        &col_id, &col_name, &identity_json
                     ],
                 )?;
 
@@ -684,11 +737,24 @@ impl AcquisitionService {
     /// Enqueues an external release for acquisition via TorBox.
     ///
     /// Performs strict PRE-SUBMISSION duplicate checks against canonical library and download queue (Requirement 11, Scenario W).
+    #[cfg(test)]
     pub async fn acquire_release(
         &self,
         manga_id: i64,
         release: AcquisitionRelease,
         target_unit: Option<AcquisitionReleaseUnit>,
+    ) -> Result<i64> {
+        self.acquire_release_with_identity(manga_id, release, target_unit, None, None)
+            .await
+    }
+
+    pub async fn acquire_release_with_identity(
+        &self,
+        manga_id: i64,
+        release: AcquisitionRelease,
+        target_unit: Option<AcquisitionReleaseUnit>,
+        requested_edition: Option<String>,
+        selected_archive: Option<super::edition::SelectedArchive>,
     ) -> Result<i64> {
         let (config, has_token) = self.load_internal_config().await?;
         if !config.torbox_enabled {
@@ -796,6 +862,20 @@ impl AcquisitionService {
 
         // 3. Create or link chapter record in database
         let chapter_unit = target_unit.unwrap_or_else(|| release.release_unit.clone());
+        if !matches!(&chapter_unit, AcquisitionReleaseUnit::Volume(v) | AcquisitionReleaseUnit::Chapter(v) if v.is_finite() && *v >= 0.0)
+        {
+            return Err(AppError::bad_request("Select an explicit edition-local volume or chapter; collection/unknown release numbering cannot identify one acquisition unit"));
+        }
+        let mut identity = super::edition::RetrievalIdentity::new(
+            &title,
+            &release.raw_title,
+            chapter_unit.clone(),
+            requested_edition.as_deref(),
+        );
+        identity.selected_archive = selected_archive;
+        crate::acquisition::torbox::validate_edition_intent(&identity)?;
+        let identity_json =
+            serde_json::to_string(&identity).map_err(|e| AppError::internal(e.to_string()))?;
         let (ch_name, ch_number) = match &chapter_unit {
             AcquisitionReleaseUnit::Volume(v) => (format!("Volume {v}"), *v),
             AcquisitionReleaseUnit::Chapter(c) => (format!("Chapter {c}"), *c),
@@ -859,19 +939,21 @@ impl AcquisitionService {
                 };
 
                 // Insert into downloads queue with external backend metadata
+                let identity_json = preserve_queued_identity(conn, id, &identity_json, torrent_hash.as_deref())?;
                 conn.execute(
                     "INSERT INTO downloads (
                         chapter_id, state, position, attempts, added_at, source_type, backend_type,
-                        raw_title, uploader, release_size, torrent_hash
+                        raw_title, uploader, release_size, torrent_hash, retrieval_identity_json
                     ) VALUES (
                         ?1, 'queued', (SELECT COALESCE(MAX(position), 0) + 1 FROM downloads), 0, ?2,
-                        'nyaa', 'torbox', ?3, ?4, ?5, ?6
+                        'nyaa', 'torbox', ?3, ?4, ?5, ?6, ?7
                     ) ON CONFLICT(chapter_id) DO UPDATE SET
                         state = 'queued', attempts = 0, retry_at = NULL, error = NULL,
                         source_type = 'nyaa', backend_type = 'torbox',
                         raw_title = excluded.raw_title, uploader = excluded.uploader,
-                        release_size = excluded.release_size, torrent_hash = excluded.torrent_hash",
-                    rusqlite::params![id, now, &raw_title, &uploader, release_size as i64, &torrent_hash],
+                        release_size = excluded.release_size, torrent_hash = excluded.torrent_hash,
+                        retrieval_identity_json = excluded.retrieval_identity_json",
+                    rusqlite::params![id, now, &raw_title, &uploader, release_size as i64, &torrent_hash, &identity_json],
                 )?;
 
                 Ok(id)
@@ -1017,8 +1099,8 @@ impl AcquisitionService {
                         chapter_id, manga_id, series, release_name, source_type, uploader,
                         external_job_id, backend_type, outcome, canonical_path, release_size,
                         completed_at, error, mangabaka_id, mangabaka_release_id, anilist_id,
-                        requested_unit, metadata_status
-                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+                        requested_unit, metadata_status, retrieval_identity_json
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, (SELECT retrieval_identity_json FROM downloads WHERE chapter_id = ?1))",
                     rusqlite::params![
                         chapter_id,
                         manga_id,
@@ -1866,7 +1948,21 @@ impl AcquisitionService {
             } else {
                 "internal"
             };
-            let raw_t = cand.title.clone();
+            let raw_t = cand
+                .provider_metadata
+                .get("rawTitle")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&cand.title)
+                .to_string();
+            let identity_json = serde_json::to_string(&super::edition::RetrievalIdentity::new(
+                &exec.title,
+                &raw_t,
+                AcquisitionReleaseUnit::Volume(first_vol),
+                cand.provider_metadata
+                    .get("requestedEdition")
+                    .and_then(|v| v.as_str()),
+            ))
+            .map_err(|e| AppError::internal(e.to_string()))?;
             let thash = cand
                 .provider_metadata
                 .get("torrentHash")
@@ -1893,22 +1989,24 @@ impl AcquisitionService {
                     conn.last_insert_rowid()
                 };
 
+                let identity_json = preserve_queued_identity(conn, id, &identity_json, thash.as_deref())?;
                 conn.execute(
                     "INSERT INTO downloads (
                         chapter_id, state, position, attempts, added_at, source_type, backend_type,
-                        raw_title, uploader, release_size, torrent_hash, execution_id, execution_item_id
+                        raw_title, uploader, release_size, torrent_hash, execution_id, execution_item_id, retrieval_identity_json
                     ) VALUES (
                         ?1, 'queued', (SELECT COALESCE(MAX(position), 0) + 1 FROM downloads), 0, ?2,
-                        ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10
+                        ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11
                     ) ON CONFLICT(chapter_id) DO UPDATE SET
                         state = 'queued', attempts = 0, retry_at = NULL, error = NULL,
                         source_type = excluded.source_type, backend_type = excluded.backend_type,
                         raw_title = excluded.raw_title, uploader = excluded.uploader,
                         release_size = excluded.release_size, torrent_hash = excluded.torrent_hash,
-                        execution_id = excluded.execution_id, execution_item_id = excluded.execution_item_id",
+                        execution_id = excluded.execution_id, execution_item_id = excluded.execution_item_id,
+                        retrieval_identity_json = excluded.retrieval_identity_json",
                     rusqlite::params![
                         id, now, src_type, bk_type, &raw_t, &scanlator, release_size, &thash,
-                        &exec_id, &item_id
+                        &exec_id, &item_id, &identity_json
                     ],
                 )?;
 

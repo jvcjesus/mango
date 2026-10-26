@@ -1894,7 +1894,13 @@ async fn post_title_acquire(
 ) -> Result<Json<serde_json::Value>> {
     let chapter_id = app
         .acquisition
-        .acquire_release(id, payload.release, payload.target_unit)
+        .acquire_release_with_identity(
+            id,
+            payload.release,
+            payload.target_unit,
+            payload.requested_edition,
+            payload.selected_archive,
+        )
         .await?;
     Ok(Json(json!({
         "success": true,

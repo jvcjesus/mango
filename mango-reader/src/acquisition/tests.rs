@@ -924,6 +924,7 @@ async fn test_scenario_ah_end_to_end_acquisition_workflow() {
         collection_id: None,
         collection_name: None,
         magnet_url: None,
+        retrieval_identity_json: None,
     };
 
     let outcome = pipeline.process_download(&staging_cbz, &job).await.unwrap();
@@ -1514,6 +1515,7 @@ async fn test_smart_ranking_scenario_j_collection_acquisition_execution() {
 
     let release = make_test_release("Blue Lock v01-03", "Blue Lock v01-03 (Digital)", 20);
     let request = crate::acquisition::AcquireCollectionRequest {
+        requested_edition: None,
         release,
         selected_volumes: vec![2.0, 3.0],
         mode: "missing_only".to_string(),
@@ -2454,6 +2456,16 @@ async fn test_matrix_43_candidate_revalidation_suite() {
     let res_ed = crate::acquisition::execution::revalidate_candidate(&cand, Some(&changed_edition), &profile);
     assert!(res_ed.is_err());
     assert!(res_ed.unwrap_err().contains("edition"));
+
+    // The normalized source edition itself must also remain frozen.
+    let mut changed_source_edition = cand.clone();
+    changed_source_edition.edition = Some("Master Edition".into());
+    let result = crate::acquisition::execution::revalidate_candidate(
+        &cand,
+        Some(&changed_source_edition),
+        &profile,
+    );
+    assert!(result.unwrap_err().contains("edition changed"));
 
     // F. Language change stops
     let mut changed_lang = cand.clone();

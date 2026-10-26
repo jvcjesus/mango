@@ -769,7 +769,32 @@ impl Pipeline {
             job.chapter_number.unwrap_or(job.number)
         };
 
-        let release_name = publisher::canonical_release_name(&job.title, is_volume, release_num);
+        let retrieval_identity = job
+            .retrieval_identity_json
+            .as_deref()
+            .map(serde_json::from_str::<crate::acquisition::edition::RetrievalIdentity>)
+            .transpose()
+            .map_err(|_| AppError::bad_request("Invalid durable retrieval identity"))?
+            .unwrap_or_else(|| {
+                crate::acquisition::edition::RetrievalIdentity::new(
+                    &job.title,
+                    job.collection_name
+                        .as_deref()
+                        .or(job.raw_title.as_deref())
+                        .unwrap_or(&job.name),
+                    if is_volume {
+                        crate::acquisition::AcquisitionReleaseUnit::Volume(release_num)
+                    } else {
+                        crate::acquisition::AcquisitionReleaseUnit::Chapter(release_num)
+                    },
+                    None,
+                )
+            });
+        let requested_edition = retrieval_identity.requested_edition.as_deref();
+        // Edition-local units must not overwrite standard-edition canonical volumes.
+        let publication_title = job.publication_title();
+        let release_name =
+            publisher::canonical_release_name(&publication_title, is_volume, release_num);
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
@@ -868,10 +893,21 @@ impl Pipeline {
             let mb_client =
                 MangaBakaClient::new(self.http.clone(), config.mangabaka_url.clone(), mb_token);
             match mb_client
-                .resolve_volume_metadata(&job.title, anilist_id, mangabaka_id, release_num)
+                .resolve_edition_volume_metadata(
+                    &job.title,
+                    anilist_id,
+                    mangabaka_id,
+                    release_num,
+                    requested_edition,
+                )
                 .await
             {
-                Ok(mangabaka::MangaBakaOutcome::Success(enrichment)) => {
+                Ok(mangabaka::MangaBakaOutcome::Success(mut enrichment)) => {
+                    if requested_edition.is_some_and(|edition| edition != "standard") {
+                        // Komga uses ComicInfo Series; retain the edition namespace even
+                        // when MangaBaka's collection work points to the base series title.
+                        enrichment.series_title = Some(publication_title.clone());
+                    }
                     resolved_mangabaka_id = Some(enrichment.series_id);
                     resolved_release_id = enrichment
                         .work_id
@@ -1057,7 +1093,7 @@ impl Pipeline {
         // 4. Authoritative ComicInfo.xml Generation & Safe CBZ Rewrite (before canonical publication)
         on_stage("metadata", "Writing ComicInfo.xml metadata...", None);
         let comic_params = mangabaka::ComicInfoParams {
-            series: &job.title,
+            series: &publication_title,
             volume: job
                 .volume
                 .or_else(|| if is_volume { Some(release_num) } else { None }),
@@ -1112,7 +1148,13 @@ impl Pipeline {
             "Publishing to canonical Komga library...",
             None,
         );
-        let pub_res = publish_cbz(source_cbz, &dest_root, &job.title, is_volume, release_num);
+        let pub_res = publish_cbz(
+            source_cbz,
+            &dest_root,
+            &publication_title,
+            is_volume,
+            release_num,
+        );
         let outcome_str = match &pub_res {
             Ok(PublishOutcome::Published(_)) => "published",
             Ok(PublishOutcome::AlreadyPublished(_)) => "already_published",
@@ -1281,7 +1323,7 @@ impl Pipeline {
         let verified = self
             .poll_verify_release(
                 &komga_client,
-                &job.title,
+                &publication_title,
                 target_library_id,
                 is_volume,
                 release_num,
@@ -1294,7 +1336,7 @@ impl Pipeline {
             self.ownership.invalidate(job.manga_id);
             let _ = self
                 .ownership
-                .get_title_ownership(job.manga_id, &job.title)
+                .get_title_ownership(job.manga_id, &publication_title)
                 .await;
 
             self.record_event(PipelineEvent {

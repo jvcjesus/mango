@@ -7,6 +7,7 @@
 //! 4. Seamless handoff into the existing native Mango downstream acquisition pipeline
 
 pub mod candidates;
+pub mod edition;
 pub mod execution;
 pub mod intelligence;
 pub mod missing;
@@ -237,6 +238,7 @@ pub struct CollectionInspection {
 pub struct AcquireCollectionRequest {
     pub release: AcquisitionRelease,
     pub selected_volumes: Vec<f64>,
+    pub requested_edition: Option<String>,
     pub mode: String, // "missing_only" | "entire" | "manual"
 }
 

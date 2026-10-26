@@ -339,6 +339,19 @@ pub fn validate_preflight_profile(
         }
     }
 
+    let identity = super::edition::RetrievalIdentity::new(
+        &cand.series_identity,
+        cand.provider_metadata
+            .get("rawTitle")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&cand.title),
+        cand.release_unit.clone(),
+        cand.provider_metadata
+            .get("requestedEdition")
+            .and_then(|v| v.as_str()),
+    );
+    super::torbox::validate_edition_intent(&identity).map_err(|e| e.to_string())?;
+
     if cand.mapping_provenance == UnitMappingProvenance::ChapterToVolumeInference {
         return Err(
             "Candidate volume mapping is inferred from chapter sequences; automated volume execution prohibited"
@@ -372,6 +385,18 @@ pub fn revalidate_candidate(
             "Candidate identifier mismatch (approved: {}, live: {}). Replanning required.",
             frozen.provider_release_id, live_cand.provider_release_id
         ));
+    }
+
+    if live_cand
+        .edition
+        .as_deref()
+        .map(super::edition::normalize_edition)
+        != frozen
+            .edition
+            .as_deref()
+            .map(super::edition::normalize_edition)
+    {
+        return Err("Candidate edition changed. Replanning required.".into());
     }
 
     if live_cand.uploader != frozen.uploader {

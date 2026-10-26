@@ -276,6 +276,20 @@ pub fn generate_plan(
     let owned_set: HashSet<i64> = missing_summary.owned_volumes.iter().map(|v| v.round() as i64).collect();
 
     for cand in available_candidates {
+        let identity = super::edition::RetrievalIdentity::new(
+            &cand.series_identity,
+            cand.provider_metadata
+                .get("rawTitle")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&cand.title),
+            cand.release_unit.clone(),
+            cand.provider_metadata
+                .get("requestedEdition")
+                .and_then(|v| v.as_str()),
+        );
+        if super::torbox::validate_edition_intent(&identity).is_err() {
+            continue;
+        }
         // Filter out completely disallowed editions
         if cand.quality_signals.edition_penalty >= 20.0 && !profile.allow_unsupported_editions {
             continue;

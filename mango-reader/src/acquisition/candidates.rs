@@ -103,7 +103,7 @@ impl NormalizedAcquisitionCandidate {
             release_number: r.release_number,
             release_range: r.release_range,
             language: language.to_string(),
-            edition: r.variant_name.clone(),
+            edition: super::edition::edition_from_title(&r.raw_title),
             format: if is_digital {
                 Some("Digital CBZ".to_string())
             } else {
@@ -135,6 +135,7 @@ impl NormalizedAcquisitionCandidate {
                 "sourceUrl": r.source_url,
                 "torrentHash": r.info_hash,
                 "rawTitle": r.raw_title,
+                "requestedEdition": super::edition::edition_from_title(series),
                 "smartScore": cand.smart_score,
             }),
         }
