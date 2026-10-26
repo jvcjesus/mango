@@ -12,8 +12,6 @@ use reqwest::{Client, StatusCode};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fmt;
-use std::fs::File;
-use std::io::Write;
 use std::path::Path;
 
 pub const DEFAULT_TORBOX_URL: &str = "https://api.torbox.app/v1/api";
@@ -421,51 +419,64 @@ impl TorBoxClient {
         expected_size: u64,
         destination_part: &Path,
     ) -> std::result::Result<u64, TorBoxError> {
+        self.retrieve_file_with_tracker(
+            external_job_id,
+            file_id,
+            expected_size,
+            destination_part,
+            file_id,
+            &crate::transfer::TransferTracker::default(),
+            &crate::transfer::TransferConfig::default(),
+            |_, _, _| {},
+        )
+        .await
+    }
+
+    /// Extended retrieval method taking a tracker, config, and progress observer for stall
+    /// detection, bounded retries, and Range resume.
+    pub async fn retrieve_file_with_tracker<F>(
+        &self,
+        external_job_id: &str,
+        file_id: i64,
+        expected_size: u64,
+        destination_part: &Path,
+        chapter_id: i64,
+        tracker: &crate::transfer::TransferTracker,
+        config: &crate::transfer::TransferConfig,
+        on_progress: F,
+    ) -> std::result::Result<u64, TorBoxError>
+    where
+        F: FnMut(u64, Option<u64>, bool) + Send + 'static,
+    {
         let download_url = self.request_download_link(external_job_id, file_id).await?;
 
         // URL safety verification (prevent SSRF/loopback bypass)
         validate_download_url(&download_url)?;
 
-        if let Some(parent) = destination_part.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| TorBoxError::Io(e.to_string()))?;
-        }
+        let exp_opt = if expected_size > 0 {
+            Some(expected_size)
+        } else {
+            None
+        };
 
-        let mut resp = self
-            .http
-            .get(&download_url)
-            .header("User-Agent", "Mango/1.0 (Acquisition Retrieval)")
-            .send()
-            .await
-            .map_err(|e| TorBoxError::NetworkError(format!("Failed to stream from CDN: {e}")))?;
-
-        if !resp.status().is_success() {
-            return Err(TorBoxError::RemoteError(
-                resp.status().as_u16(),
-                format!("CDN download link returned HTTP {}", resp.status()),
-            ));
-        }
-
-        let mut file = File::create(destination_part).map_err(|e| TorBoxError::Io(e.to_string()))?;
-        let mut bytes_downloaded: u64 = 0;
-
-        while let Some(chunk) = resp
-            .chunk()
-            .await
-            .map_err(|e| TorBoxError::NetworkError(format!("Error streaming chunk: {e}")))?
-        {
-            file.write_all(&chunk).map_err(|e| TorBoxError::Io(e.to_string()))?;
-            bytes_downloaded += chunk.len() as u64;
-        }
-
-        file.flush().map_err(|e| TorBoxError::Io(e.to_string()))?;
-        drop(file);
-
-        if expected_size > 0 && bytes_downloaded != expected_size {
-            let _ = std::fs::remove_file(destination_part);
-            return Err(TorBoxError::InvalidCbz(format!(
-                "Downloaded size ({bytes_downloaded}) does not match expected size ({expected_size})"
-            )));
-        }
+        let bytes = crate::transfer::stream_http_to_file(
+            &self.http,
+            &download_url,
+            destination_part,
+            exp_opt,
+            config,
+            chapter_id,
+            tracker,
+            on_progress,
+        )
+        .await
+        .map_err(|e| {
+            if e.code == "truncated_download" || e.code == "invalid_cbz" {
+                TorBoxError::InvalidCbz(e.message)
+            } else {
+                TorBoxError::NetworkError(e.message)
+            }
+        })?;
 
         // Verify CBZ integrity on the temporary staging file
         if let Err(e) = crate::pipeline::publisher::verify_cbz_integrity(destination_part) {
@@ -475,7 +486,7 @@ impl TorBoxClient {
             )));
         }
 
-        Ok(bytes_downloaded)
+        Ok(bytes)
     }
 
     /// Cancels / deletes a torrent from TorBox remote storage.

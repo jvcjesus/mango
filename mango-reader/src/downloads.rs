@@ -67,6 +67,12 @@ pub struct Queued {
     pub release_size: Option<u64>,
     pub collection_id: Option<String>,
     pub collection_name: Option<String>,
+    pub bytes_downloaded: Option<u64>,
+    pub total_bytes: Option<u64>,
+    pub is_stalled: bool,
+    pub attempt: Option<u32>,
+    pub max_attempts: Option<u32>,
+    pub transfer_status: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -162,6 +168,7 @@ pub struct Downloads {
     live_stage: Arc<StdMutex<Option<AcquisitionLiveState>>>,
     pipeline: Option<Arc<crate::pipeline::Pipeline>>,
     pub(crate) acquisition: Option<Arc<crate::acquisition::service::AcquisitionService>>,
+    pub(crate) tracker: crate::transfer::TransferTracker,
 }
 
 impl Downloads {
@@ -177,6 +184,7 @@ impl Downloads {
             live_stage: Arc::default(),
             pipeline: None,
             acquisition: None,
+            tracker: crate::transfer::TransferTracker::default(),
         }
     }
 
@@ -233,6 +241,24 @@ impl Downloads {
                 entry.status_message = Some(st.status_message);
                 if st.destination.is_some() {
                     entry.destination = st.destination;
+                }
+            }
+        }
+        for entry in &mut view.queue {
+            if let Some(p) = self.tracker.get_progress(entry.chapter_id) {
+                entry.bytes_downloaded = Some(p.bytes_downloaded);
+                if p.total_bytes.is_some() {
+                    entry.total_bytes = p.total_bytes;
+                }
+                entry.is_stalled = p.is_stalled;
+                entry.attempt = Some(p.attempt);
+                entry.max_attempts = Some(p.max_attempts);
+                entry.transfer_status = Some(p.status.to_string());
+                if p.is_stalled {
+                    entry.stage = "stalled".to_string();
+                    entry.status_message = Some("Transfer stalled — waiting for progress".to_string());
+                } else if p.status == crate::transfer::TransferStatus::Retrying {
+                    entry.stage = "retrying".to_string();
                 }
             }
         }
@@ -404,6 +430,12 @@ impl Downloads {
             }
         }
 
+        if let Some(id) = chapter {
+            self.tracker.remove(id);
+        } else {
+            self.tracker.clear();
+        }
+
         self.db
             .call(move |conn| {
                 match chapter {
@@ -417,10 +449,11 @@ impl Downloads {
 
     /// Gives a parked chapter a fresh set of tries.
     pub async fn retry(&self, chapter: i64) -> Result<()> {
+        self.tracker.remove(chapter);
         self.db
             .call(move |conn| {
                 conn.execute(
-                    "UPDATE downloads SET state = 'queued', attempts = 0, retry_at = NULL, error = NULL WHERE chapter_id = ?1 AND state != 'downloading'",
+                    "UPDATE downloads SET state = 'queued', attempts = 0, retry_at = NULL, error = NULL, is_stalled = 0 WHERE chapter_id = ?1 AND state != 'downloading'",
                     [chapter],
                 )?;
                 Ok(())
@@ -529,8 +562,24 @@ impl Downloads {
                     }
                 }
 
-                // 2. Interrupted staging downloads reset to queued
-                conn.execute("UPDATE downloads SET state = 'queued' WHERE state = 'downloading' AND published_path IS NULL", [])?;
+                // 2. Interrupted staging downloads reset to queued with recovery message
+                let mut stmt = conn.prepare(
+                    "SELECT d.chapter_id, m.title, c.name FROM downloads d
+                     JOIN chapters c ON c.id = d.chapter_id
+                     JOIN manga m ON m.id = c.manga_id
+                     WHERE d.state = 'downloading' AND d.published_path IS NULL",
+                )?;
+                let orphaned = stmt
+                    .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?
+                    .filter_map(std::result::Result::ok)
+                    .collect::<Vec<_>>();
+                for (ch_id, title, name) in orphaned {
+                    tracing::info!("Orphaned transfer recovered after startup for {} ({})", title, name);
+                    conn.execute(
+                        "UPDATE downloads SET state = 'queued', error = 'Interrupted by server restart — queued for recovery' WHERE chapter_id = ?1",
+                        [ch_id],
+                    )?;
+                }
                 Ok(())
             })
             .await;
@@ -541,6 +590,14 @@ impl Downloads {
                 let _ = tokio::time::timeout(Duration::from_secs(30), self.wake.notified()).await;
                 continue;
             };
+
+            let ch_id = job.chapter;
+            let attempt = (job.attempts + 1) as u32;
+            if !self.tracker.try_claim_worker(ch_id, attempt, job.release_size, None) {
+                // Another worker is actively handling this job (prevents duplicate retry workers)
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
 
             // If this job was already published (e.g. restart recovery or retry from verification timeout):
             if let Some(ref pub_path) = job.published_path {
@@ -642,8 +699,12 @@ impl Downloads {
             let outcome = if job.backend_type == "torbox" {
                 match self.handle_torbox_job(&job).await {
                     Ok(Some(res)) => Ok(Some(res)),
-                    Ok(None) => continue, // in progress or stalled waiting for retry
+                    Ok(None) => {
+                        self.tracker.release_worker(ch_id);
+                        continue;
+                    } // in progress or stalled waiting for retry
                     Err(e) => {
+                        self.tracker.release_worker(ch_id);
                         let ch_id = job.chapter;
                         let err_msg = e.to_string();
                         let err_msg_db = err_msg.clone();
@@ -685,6 +746,7 @@ impl Downloads {
             } else {
                 self.save(&job).await
             };
+            self.tracker.release_worker(ch_id);
             *self.progress.lock().unwrap_or_else(|e| e.into_inner()) = None;
 
             let mut final_outcome = outcome.clone();
@@ -805,6 +867,21 @@ impl Downloads {
                 tracing::warn!("acquisition of {} / {} failed: {e}", job.title, job.name);
             }
             let (chapter, attempts) = (job.chapter, job.attempts);
+            if let Some(p) = self.tracker.get_progress(chapter) {
+                let bytes = p.bytes_downloaded as i64;
+                let tot = p.total_bytes.map(|t| t as i64);
+                let stalled = p.is_stalled as i64;
+                let _ = self
+                    .db
+                    .call(move |conn| {
+                        conn.execute(
+                            "UPDATE downloads SET bytes_downloaded = ?2, total_bytes = ?3, is_stalled = ?4 WHERE chapter_id = ?1",
+                            rusqlite::params![chapter, bytes, tot, stalled],
+                        )?;
+                        Ok(())
+                    })
+                    .await;
+            }
             if let Err(e) = self.db.call(move |conn| record(conn, chapter, attempts, final_outcome)).await {
                 tracing::warn!("could not record a download: {e}");
             }
@@ -991,7 +1068,20 @@ impl Downloads {
 
         // 6. Stream retrieve to staging .part
         update_stage("torbox_retrieving", &format!("Retrieving {} from TorBox CDN...", selected_file.name));
-        client.retrieve_file(&external_job_id, selected_file.id, selected_file.size, &part_path).await?;
+        let tracker = self.tracker.clone();
+        let ch_id = job.chapter;
+        client
+            .retrieve_file_with_tracker(
+                &external_job_id,
+                selected_file.id,
+                selected_file.size,
+                &part_path,
+                ch_id,
+                &tracker,
+                &tracker.config,
+                move |_bytes, _total, _stalled| {},
+            )
+            .await?;
 
         // Double-check CBZ archive integrity & plausible manga images before atomic promotion
         if let Err(e) = crate::pipeline::publisher::verify_cbz_integrity(&part_path) {
@@ -1045,6 +1135,10 @@ impl Downloads {
             let _ = fs::remove_file(&part);
             return outcome.map(|_| None);
         }
+        if let Err(e) = crate::pipeline::publisher::verify_cbz_integrity(&part) {
+            let _ = fs::remove_file(&part);
+            return Err(AppError::bad_request(format!("Candidate archive failed integrity verification: {e}")));
+        }
         fs::rename(&part, &file)?;
         Ok(Some((relative.to_string_lossy().replace('\\', "/"), total)))
     }
@@ -1060,17 +1154,38 @@ impl Downloads {
 
         // Two pages are fetched at a time and written in order, so memory holds two pages at most.
         let mut next = 0;
+        let config = self.tracker.config.clone();
         while next < total {
             if !self.wanted(job.chapter).await {
                 return Ok(false);
             }
             let second = (next + 1 < total).then_some(next + 1);
-            let (first, other) = tokio::join!(self.images.page(job.chapter, next), async {
-                match second {
-                    Some(index) => Some(self.images.page(job.chapter, index).await),
-                    None => None,
+
+            let first_fetch = {
+                let images = self.images.clone();
+                let ch = job.chapter;
+                let idx = next;
+                let cfg = config.clone();
+                let trk = self.tracker.clone();
+                async move {
+                    crate::transfer::fetch_page_with_lifecycle(ch, idx, || images.page(ch, idx), &cfg, &trk).await
                 }
-            });
+            };
+
+            let second_fetch = {
+                let images = self.images.clone();
+                let ch = job.chapter;
+                let cfg = config.clone();
+                let trk = self.tracker.clone();
+                async move {
+                    match second {
+                        Some(idx) => Some(crate::transfer::fetch_page_with_lifecycle(ch, idx, || images.page(ch, idx), &cfg, &trk).await),
+                        None => None,
+                    }
+                }
+            };
+
+            let (first, other) = tokio::join!(first_fetch, second_fetch);
             let mut pages = vec![first?];
             if let Some(page) = other {
                 pages.push(page?);
@@ -1103,6 +1218,7 @@ impl Downloads {
         })
         .await
         .map_err(blocking)??;
+        self.tracker.mark_completed(job.chapter);
         Ok(true)
     }
 
@@ -1166,7 +1282,7 @@ pub(crate) fn read_queue(conn: &Connection) -> Result<QueueView> {
         "SELECT d.chapter_id, c.name, m.id, m.title, d.state, c.page_count, d.attempts, d.retry_at, d.error,
                 COALESCE(s.name, 'Unknown source'), c.scanlator, c.chapter_number, d.published_path,
                 d.source_type, d.backend_type, d.external_job_id, d.raw_title, d.uploader, d.release_size,
-                d.collection_id, d.collection_name
+                d.collection_id, d.collection_name, d.bytes_downloaded, d.total_bytes, d.is_stalled
          FROM downloads d
          JOIN chapters c ON c.id = d.chapter_id
          JOIN manga m ON m.id = c.manga_id
@@ -1195,6 +1311,9 @@ pub(crate) fn read_queue(conn: &Connection) -> Result<QueueView> {
             } else {
                 None
             };
+            let bytes_downloaded = r.get::<_, Option<i64>>(21)?.map(|b| b as u64);
+            let total_bytes = r.get::<_, Option<i64>>(22)?.map(|b| b as u64);
+            let is_stalled = r.get::<_, Option<i64>>(23)?.map(|v| v != 0).unwrap_or(false);
             Ok(Queued {
                 chapter_id: r.get(0)?,
                 chapter_name,
@@ -1227,6 +1346,12 @@ pub(crate) fn read_queue(conn: &Connection) -> Result<QueueView> {
                 release_size: r.get::<_, Option<i64>>(18)?.map(|s| s as u64),
                 collection_id: r.get(19)?,
                 collection_name: r.get(20)?,
+                bytes_downloaded,
+                total_bytes,
+                is_stalled,
+                attempt: None,
+                max_attempts: None,
+                transfer_status: None,
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
