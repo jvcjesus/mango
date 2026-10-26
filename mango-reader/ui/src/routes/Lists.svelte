@@ -6,6 +6,7 @@
     getAcquisitionSources,
     planByTitle,
     createExecution,
+    startExecution,
     message,
     type UnifiedTrackedItem,
     type UnifiedCatalogResponse,
@@ -14,6 +15,10 @@
     type AcquisitionPlan,
     type AcquisitionSourceOption,
   } from '../lib/api';
+  import { onDestroy } from 'svelte';
+  import { PlanningSession, parseRequestedVolumes } from '../lib/planning';
+  import { confirm } from '../lib/confirm.svelte';
+  import type { InteractivePlan } from '../lib/api';
   import Cover from '../lib/Cover.svelte';
   import Icon from '../lib/Icon.svelte';
   import Notice from '../lib/Notice.svelte';
@@ -48,7 +53,14 @@
   let selectedSourceId = $state<string>('auto');
   let contentMode = $state<'missing' | 'complete' | 'specific'>('missing');
   let specificVolumesInput = $state<string>('');
-  let titlePlan = $state<AcquisitionPlan | null>(null);
+  let titlePlan = $state<InteractivePlan | null>(null);
+  const planningSession = new PlanningSession();
+  onDestroy(() => planningSession.cancel());
+  let requestedEdition = $state('');
+  let selectedReleaseId = $state('');
+  let overrideConfirmed = $state(false);
+  function closePlanningModal() { planningSession.cancel(); generatingPlan = false; planModalOpen = false; }
+  $effect(() => { if (!planModalOpen) { planningSession.cancel(); generatingPlan = false; } });
   let generatingPlan = $state<boolean>(false);
   let approvingPlan = $state<boolean>(false);
   let planError = $state<string | null>(null);
@@ -64,7 +76,7 @@
       if (event.key === 'Escape') {
         event.preventDefault();
         event.stopPropagation();
-        planModalOpen = false;
+        closePlanningModal();
       } else if (event.key === 'Tab') {
         const controls = focusable();
         const first = controls[0];
@@ -92,76 +104,56 @@
     planModalItem = item;
     contentMode = mode ?? (item.ownershipStatus === 'Partially Owned' ? 'missing' : 'complete');
     selectedSourceId = 'auto';
+    requestedEdition = ''; selectedReleaseId = ''; overrideConfirmed = false;
     specificVolumesInput = '';
     titlePlan = null;
     planError = null;
     planModalOpen = true;
 
-    if (sources.length === 0) {
-      try {
-        sources = await getAcquisitionSources();
-      } catch (e) {
-        console.warn('Failed to load acquisition sources:', e);
-      }
-    }
-
     generateTitlePlan();
+    if (sources.length === 0) getAcquisitionSources(AbortSignal.timeout(10_000)).then(result => { if (planModalOpen) sources = result; }).catch(() => {});
   }
-
   async function generateTitlePlan() {
     if (!planModalItem) return;
-    generatingPlan = true;
-    planError = null;
+    planningSession.cancel(); generatingPlan = true; planError = null;
+    const request = { title: planModalItem.title, komgaSeriesId: planModalItem.komgaSeriesId,
+      sourceId: selectedSourceId, contentMode, requestedVolumes: null as number[] | null,
+      requestedEdition: requestedEdition || null, selectedReleaseId: selectedReleaseId || null, useReleaseAnyway: overrideConfirmed };
     titlePlan = null;
-
-    let requestedVolumes: number[] | null = null;
-    if (contentMode === 'specific' && specificVolumesInput.trim()) {
-      const vols: number[] = [];
-      const parts = specificVolumesInput.split(',');
-      for (const p of parts) {
-        const trimmed = p.trim();
-        if (trimmed.includes('-')) {
-          const [start, end] = trimmed.split('-').map(Number);
-          if (!isNaN(start) && !isNaN(end)) {
-            for (let v = start; v <= end; v++) vols.push(v);
-          }
-        } else {
-          const num = Number(trimmed);
-          if (!isNaN(num)) vols.push(num);
-        }
-      }
-      requestedVolumes = vols;
-    }
-
-    try {
-      const plan = await planByTitle({
-        title: planModalItem.title,
-        komgaSeriesId: planModalItem.komgaSeriesId,
-        sourceId: selectedSourceId,
-        contentMode,
-        requestedVolumes,
-        totalVolumes: planModalItem.catalog?.totalVolumes ?? planModalItem.totalUnits ?? null,
-      });
-      titlePlan = plan;
-    } catch (e) {
-      planError = message(e);
-    } finally {
-      generatingPlan = false;
-    }
+    try { if (contentMode === 'specific') request.requestedVolumes = parseRequestedVolumes(specificVolumesInput); }
+    catch (error) { planError = message(error); generatingPlan = false; return; }
+    const result = await planningSession.run(signal => planByTitle(request, signal));
+    if (result.status === 'stale') return;
+    generatingPlan = false;
+    if (result.status === 'ready') titlePlan = result.value; else planError = result.error.message;
+  }
+  async function useReleaseAnyway() {
+    const candidate = titlePlan?.candidates.find(c => c.providerReleaseId === selectedReleaseId);
+    if (!candidate || !planModalItem) return;
+    const selectedAtConfirmation = selectedReleaseId;
+    const titleAtConfirmation = planModalItem;
+    const approved = await confirm({ title: 'Use Release Anyway', confirmText: 'Use Release Anyway',
+      message: `Mango cannot verify this release's exact edition against the catalog. Continue using the release's own edition/content and series-level metadata? Series: ${planModalItem.title}. Release: ${candidate.title}. Detected edition: ${candidate.edition ?? 'Unknown'}. Catalog edition: Unverified. Metadata: Series-level fallback. Existing files will not be replaced.` });
+    if (!approved || !planModalOpen || selectedReleaseId !== selectedAtConfirmation || planModalItem !== titleAtConfirmation) return;
+    overrideConfirmed = true; generateTitlePlan();
   }
 
   async function approveTitlePlan() {
     if (!titlePlan || !planModalItem) return;
+    const approvedPlan = titlePlan;
+    const approvedItem = planModalItem;
     approvingPlan = true;
     try {
-      await createExecution(titlePlan.mangaId, {
-        planId: titlePlan.id,
+      const execution = await createExecution(approvedPlan.mangaId, {
+        planId: approvedPlan.id,
         approved: true,
+        overrideConfirmed,
       });
-      toast.success(`Acquisition approved and started for ${titlePlan.title}!`);
-      planModalItem.acquisitionStatus = 'Acquiring';
-      planModalOpen = false;
-      if (selectedItem && selectedItem.id === planModalItem.id) {
+      await startExecution(execution.id);
+      toast.success(`Acquisition approved and started for ${approvedPlan.seriesTitle}!`);
+      approvedItem.acquisitionStatus = 'Acquiring';
+      if (planModalItem === approvedItem && titlePlan?.id === approvedPlan.id) closePlanningModal();
+      if (selectedItem && selectedItem.id === approvedItem.id) {
         selectedItem.acquisitionStatus = 'Acquiring';
       }
     } catch (e) {
@@ -947,7 +939,7 @@
 {#if planModalOpen && planModalItem}
   <!-- svelte-ignore a11y_click_events_have_key_events -->
   <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div class="modal-backdrop" onclick={() => (planModalOpen = false)}>
+  <div class="modal-backdrop" onclick={closePlanningModal}>
     <div
       class="modal planning-modal"
       role="dialog"
@@ -962,7 +954,7 @@
           <h2 id="plan-modal-title" class="modal-title">Acquisition Plan — {planModalItem.title}</h2>
           <span class="modal-subtitle">Review release candidates, target missing content, and approve safe execution</span>
         </div>
-        <button class="btn icon close-btn" onclick={() => (planModalOpen = false)} aria-label="Close dialog">
+        <button class="btn icon close-btn" onclick={closePlanningModal} aria-label="Close dialog">
           <Icon name="close" size={20} />
         </button>
       </div>
@@ -978,7 +970,7 @@
                 class="segment-btn"
                 class:active={contentMode === 'missing'}
                 onclick={() => {
-                  contentMode = 'missing';
+                  overrideConfirmed = false; contentMode = 'missing';
                   generateTitlePlan();
                 }}
               >
@@ -988,7 +980,7 @@
                 class="segment-btn"
                 class:active={contentMode === 'complete'}
                 onclick={() => {
-                  contentMode = 'complete';
+                  overrideConfirmed = false; contentMode = 'complete';
                   generateTitlePlan();
                 }}
               >
@@ -998,7 +990,7 @@
                 class="segment-btn"
                 class:active={contentMode === 'specific'}
                 onclick={() => {
-                  contentMode = 'specific';
+                  planningSession.cancel(); generatingPlan = false; titlePlan = null; overrideConfirmed = false; contentMode = 'specific';
                 }}
               >
                 Specific Volumes
@@ -1026,7 +1018,7 @@
               id="plan-source-select"
               class="source-select"
               bind:value={selectedSourceId}
-              onchange={generateTitlePlan}
+              onchange={() => { overrideConfirmed = false; selectedReleaseId = ''; generateTitlePlan(); }}
             >
               {#if sources.length === 0}
                 <option value="auto">Auto (Recommended)</option>
@@ -1046,17 +1038,44 @@
         {#if generatingPlan}
           <div class="loading-state">
             <Icon name="spinner" size={28} />
-            <p>Discovering candidates and generating dry-run plan…</p>
+            <p>Searching available releases… Discovery has a bounded timeout.</p>
           </div>
         {:else if planError}
           <div class="plan-error-box">
             <Icon name="alert-triangle" size={20} />
             <div>
               <strong>Plan Generation Warning</strong>
-              <p>{planError}</p>
+              <p>{planError}</p><button class="btn small" onclick={generateTitlePlan}>Try Again</button>
             </div>
           </div>
         {:else if titlePlan}
+          {#if titlePlan.editions.some(ed => ed !== 'standard') || titlePlan.editions.length > 1}
+            <label for="plan-edition">Edition (numbering is edition-local)</label>
+            <select class="source-select" id="plan-edition" bind:value={requestedEdition} onchange={() => { overrideConfirmed = false; selectedReleaseId = ''; generateTitlePlan(); }}>
+              <option value="">Choose a discovered edition</option>
+              {#each titlePlan.editions as edition}<option value={edition}>{edition} Edition</option>{/each}
+            </select>
+          {/if}
+          <details open={titlePlan.selectedItems.length === 0 || !!selectedReleaseId}>
+            <summary>Choose source release or review identity</summary>
+          {#if titlePlan.candidates.length > 0}
+            <label for="plan-release">Source release</label>
+            <select class="source-select" id="plan-release" bind:value={selectedReleaseId} onchange={() => {
+              overrideConfirmed = false;
+              const release = titlePlan?.candidates.find(candidate => candidate.providerReleaseId === selectedReleaseId);
+              if (release?.edition) requestedEdition = release.edition;
+              generateTitlePlan();
+            }}>
+              <option value="">Automatic strict selection</option>
+              {#each titlePlan.candidates as candidate}<option value={candidate.providerReleaseId}>{candidate.title}</option>{/each}
+            </select>
+          {/if}
+          {#if selectedReleaseId}
+            <p>Catalog edition: Unverified until metadata resolution. {overrideConfirmed ? 'User override confirmed; series-level fallback is allowed.' : 'Strict metadata checks apply.'}</p>
+            <button class="btn small" onclick={useReleaseAnyway}>Use Release Anyway</button>
+          {/if}
+          </details>
+          {#if titlePlan.staleReason}<p role="status">{titlePlan.staleReason}</p>{/if}
           <!-- Plan Summary Cards -->
           <div class="plan-summary-metrics">
             <div class="metric-card">
@@ -1072,7 +1091,7 @@
               <span class="metric-lbl">Releases to Acquire</span>
             </div>
             <div class="metric-card">
-              <span class="metric-val">{titlePlan.unresolvedUnits.length}</span>
+              <span class="metric-val">{Math.max(0, titlePlan.missingUnits.length - titlePlan.missingUnitsCoveredCount)}</span>
               <span class="metric-lbl">Unresolved Units</span>
             </div>
           </div>
@@ -1085,7 +1104,7 @@
                 <strong>No Candidate Releases Selected</strong>
                 <p>
                   {#if titlePlan.missingUnits.length === 0}
-                    All volumes in the requested range are already present in your Komga library.
+                    No eligible units are selected. Choose a release and specify edition-local volumes when coverage is unknown.
                   {:else}
                     No releases matched the quality and profile criteria for the missing content.
                   {/if}
@@ -1099,19 +1118,19 @@
                 <div class="planned-candidate-row">
                   <div class="cand-header">
                     <span class="cand-idx">#{idx + 1}</span>
-                    <strong class="cand-title">{item.candidate.releaseTitle}</strong>
+                    <strong class="cand-title">{item.candidate.title}</strong>
                     <span class="cand-score-badge">
-                      Score: {item.candidate.smartScore.total.toFixed(0)}/100
+                      Score: {item.candidate.score.toFixed(0)}/100
                     </span>
                   </div>
                   <div class="cand-meta">
-                    <span>Source: <strong>{item.candidate.source}</strong></span>
+                    <span>Source: <strong>{item.candidate.provider}</strong></span>
                     {#if item.candidate.uploader}
                       <span>Group: <strong>{item.candidate.uploader}</strong></span>
                     {/if}
-                    <span>Seeders: <strong>{item.candidate.seeders}</strong></span>
-                    <span>Size: <strong>{((item.candidate.fileSizeBytes ?? 0) / 1024 / 1024).toFixed(1)} MB</strong></span>
-                    <span>Units Covered: <strong>v{item.expectedUnits.join(', v')}</strong></span>
+                    <span>Seeders: <strong>{item.candidate.health.seeders ?? 0}</strong></span>
+                    <span>Size: <strong>{((item.candidate.size ?? 0) / 1024 / 1024).toFixed(1)} MB</strong></span>
+                    <span>Units Covered: <strong>v{item.unitsCovered.join(', v')}</strong></span>
                   </div>
                 </div>
               {/each}
@@ -1119,14 +1138,14 @@
           {/if}
 
           <!-- Warnings -->
-          {#if titlePlan.warnings.length > 0}
+          {#if titlePlan.diagnostics.length > 0}
             <div class="plan-warnings-box">
               <div class="warning-title">
                 <Icon name="alert-triangle" size={16} />
                 <strong>Pre-flight Warnings:</strong>
               </div>
               <ul>
-                {#each titlePlan.warnings as w}
+                {#each titlePlan.diagnostics as w}
                   <li>{w}</li>
                 {/each}
               </ul>
@@ -1136,11 +1155,11 @@
       </div>
 
       <div class="modal-footer">
-        <button class="btn" onclick={() => (planModalOpen = false)}>Cancel</button>
+        <button class="btn" onclick={closePlanningModal}>Cancel</button>
         <button
           class="btn primary"
           onclick={approveTitlePlan}
-          disabled={!titlePlan || titlePlan.selectedItems.length === 0 || approvingPlan}
+          disabled={generatingPlan || !titlePlan || titlePlan.selectedItems.length === 0 || approvingPlan}
         >
           <Icon name={approvingPlan ? 'spinner' : 'check'} size={18} />
           <span>{approvingPlan ? 'Approving…' : 'Approve Acquisition'}</span>

@@ -24,7 +24,8 @@ export async function api<T>(path: string, options: Options = {}): Promise<T> {
       headers: options.json === undefined ? undefined : { 'Content-Type': 'application/json' },
       body: options.json === undefined ? undefined : JSON.stringify(options.json),
     });
-  } catch {
+  } catch (error) {
+    if (options.signal?.aborted) throw error;
     throw new ApiError(0, 'offline', 'Mango did not answer. Is it still running?');
   }
   let data: any = null;
@@ -42,7 +43,7 @@ export async function api<T>(path: string, options: Options = {}): Promise<T> {
 }
 
 export const get = <T>(path: string, signal?: AbortSignal) => api<T>(path, { signal });
-export const send = <T = unknown>(method: string, path: string, json?: unknown) => api<T>(path, { method, json });
+export const send = <T = unknown>(method: string, path: string, json?: unknown, signal?: AbortSignal) => api<T>(path, { method, json, signal });
 
 /** A sentence for the screen, whatever was thrown. */
 export function message(error: unknown): string {
@@ -1192,6 +1193,7 @@ export interface AcquisitionExecution {
 }
 
 export interface ApprovePlanRequest {
+  overrideConfirmed?: boolean;
   planId: string;
   approved: boolean;
 }
@@ -1222,10 +1224,15 @@ export interface PlanByTitleRequest {
   contentMode?: string | null;
   requestedVolumes?: number[] | null;
   totalVolumes?: number | null;
+  requestedEdition?: string | null;
+  selectedReleaseId?: string | null;
+  selectedArchive?: { path: string; size: number } | null;
+  useReleaseAnyway?: boolean;
 }
 
-export const getAcquisitionSources = () => get<AcquisitionSourceOption[]>('/acquisition/sources');
-export const planByTitle = (req: PlanByTitleRequest) => send<AcquisitionPlan>('POST', '/acquisition/plan-by-title', req);
+export const getAcquisitionSources = (signal?: AbortSignal) => get<AcquisitionSourceOption[]>('/acquisition/sources', signal);
+export interface InteractivePlan extends AcquisitionPlan { editions: string[]; candidates: NormalizedAcquisitionCandidate[]; diagnostics: string[]; }
+export const planByTitle = (req: PlanByTitleRequest, signal?: AbortSignal) => send<InteractivePlan>('POST', '/acquisition/plan-by-title', req, signal);
 
 // ---------- Library Normalization & Maintenance ----------
 
