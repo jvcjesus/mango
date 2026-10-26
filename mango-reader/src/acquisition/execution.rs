@@ -332,6 +332,11 @@ pub fn validate_preflight_profile(
     profile: &AcquisitionProfile,
     cand: &NormalizedAcquisitionCandidate,
 ) -> StdResult<(), String> {
+    if let (Some(limit), Some(size)) = (profile.max_acquisition_size_bytes, cand.size) {
+        if size > limit {
+            return Err("Candidate exceeds the acquisition size limit; identity override does not bypass profile limits".into());
+        }
+    }
     if let Some(seeders) = cand.health.seeders {
         if seeders < profile.min_seeders {
             return Err(format!(

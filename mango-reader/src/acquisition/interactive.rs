@@ -118,6 +118,15 @@ pub fn is_override(candidate: &NormalizedAcquisitionCandidate) -> bool {
     candidate.provider_metadata["identityOverride"] == true
 }
 
+fn confident_source_identity(candidate: &NormalizedAcquisitionCandidate) -> bool {
+    candidate.provider_metadata["requiresIdentityOverride"] != true
+        && (candidate.confidence == "high"
+            || (candidate.provider_metadata["smartScore"]["identity"]
+                .as_f64()
+                .is_some_and(|score| score >= 18.0)
+                && !candidate.quality_signals.edition_recognized))
+}
+
 pub fn prepare_plan(
     manga_id: i64,
     title: &str,
@@ -265,7 +274,7 @@ pub fn prepare_plan(
             .unwrap()
             .clone();
         plan.selected_items.clear();
-        if !units.is_empty() && (candidate.confidence == "high" || req.use_release_anyway) {
+        if !units.is_empty() && (confident_source_identity(&candidate) || req.use_release_anyway) {
             // Explicit units express user intent, not inferred source coverage. Retrieval
             // still requires labelled unit evidence (or a future explicit file mapping).
             plan.selected_items = units.iter().map(|unit| AcquisitionPlanItem {
@@ -447,8 +456,14 @@ impl AcquisitionService {
                     Ok(names
                         .iter()
                         .filter_map(|name| {
-                            crate::release::parse_volume(name).map(|v| {
-                                NormalizedAcquisitionCandidate::from_mangadot_release(
+                            let parsed = crate::release::parse_release(name, -1.0);
+                            parsed
+                                .volume
+                                .filter(|_| {
+                                    parsed.release_type == crate::release::ReleaseType::Volume
+                                })
+                                .map(|v| {
+                                    NormalizedAcquisitionCandidate::from_mangadot_release(
                                     &series,
                                     v,
                                     name,
@@ -645,6 +660,26 @@ mod tests {
             "master"
         );
         assert!(!is_override(&result.plan.selected_items[0].candidate));
+        let mut cached_source = result.plan.selected_items[0].candidate.clone();
+        cached_source.confidence = "review_recommended".into();
+        cached_source.health.seeders = Some(0);
+        let mut cache_profile = AcquisitionProfile::default();
+        cache_profile.min_seeders = 0;
+        let cached = prepare_plan(
+            1,
+            "Series X",
+            &cache_profile,
+            &missing(),
+            vec![cached_source],
+            &req,
+            vec![],
+        )
+        .unwrap();
+        assert!(
+            !cached.plan.selected_items.is_empty(),
+            "Health/availability review must not require an identity override for a known source"
+        );
+        assert!(!is_override(&cached.plan.selected_items[0].candidate));
         assert_eq!(result.plan.selected_items[0].units_covered, vec![4.0]);
     }
     #[test]
@@ -715,6 +750,14 @@ mod tests {
         .unwrap()
         .plan;
         assert!(is_override(&p.selected_items[0].candidate));
+        let mut limited_profile = AcquisitionProfile::default();
+        limited_profile.max_acquisition_size_bytes = Some(50);
+        assert!(super::super::execution::validate_preflight_profile(
+            &limited_profile,
+            &p.selected_items[0].candidate
+        )
+        .unwrap_err()
+        .contains("size limit"));
         assert_eq!(
             p.selected_items[0].candidate.provider_metadata["requestedEdition"],
             "source release4"
@@ -961,7 +1004,8 @@ mod discovery_tests {
         let db = Db::open(&path).unwrap();
         db.call(|conn| {
             conn.execute("INSERT INTO manga (id,source_id,url,title) VALUES (90,1,'/s','Series X')",[])?;
-            conn.execute("INSERT INTO chapters (manga_id,url,name,chapter_number,source_order,fetched_at) VALUES (90,'/v4','Volume 4',4,0,0)",[])?;Ok(())
+            conn.execute("INSERT INTO chapters (manga_id,url,name,chapter_number,source_order,fetched_at) VALUES (90,'/v4','Volume 4',4,0,0)",[])?;
+            conn.execute("INSERT INTO chapters (manga_id,url,name,chapter_number,source_order,fetched_at) VALUES (90,'/c5','Vol. 4 Ch. 5',5,1,0)",[])?;Ok(())
         }).await.unwrap();
         let service = AcquisitionService::new(db.clone(), reqwest::Client::new(), None, None);
         service
@@ -988,6 +1032,13 @@ mod discovery_tests {
         assert_eq!(
             result.plan.manga_id, 90,
             "Catalog IDs must never replace manga IDs"
+        );
+        assert!(
+            result
+                .candidates
+                .iter()
+                .all(|candidate| candidate.title != "Vol. 4 Ch. 5"),
+            "Chapter membership is not a first-class volume"
         );
         assert!(!result.diagnostics.is_empty());
         assert!(!result.plan.selected_items.is_empty());
