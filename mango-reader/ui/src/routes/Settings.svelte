@@ -23,6 +23,7 @@
     getSourceHealthReports,
     runLibraryDryRun,
     executeBatchNormalize,
+    retryNormalizationRefresh,
     getNormalizationHistory,
     rollbackNormalizationRecord,
     type LibraryAnalysisSummary,
@@ -726,6 +727,7 @@
 
   async function handleNormalizeSelected() {
     if (!analysisSummary || selectedBookKeys.size === 0) return;
+    const previewId = analysisSummary.previewId;
     maintenanceNormalizing = true;
     maintenanceError = null;
 
@@ -735,27 +737,24 @@
         const key = `${s.komgaSeriesId}:${b.komgaBookId}`;
         if (selectedBookKeys.has(key) && b.canonicalPath && b.mangabakaId) {
           itemsToNormalize.push({
-            canonicalPath: b.canonicalPath,
-            seriesTitle: s.seriesTitle,
-            volume: b.volume ?? 1.0,
             komgaBookId: b.komgaBookId,
-            komgaSeriesId: s.komgaSeriesId,
-            mangabakaId: b.mangabakaId,
-            mangabakaReleaseId: b.mangabakaReleaseId,
-            anilistId: b.anilistId,
           });
         }
       }
     }
 
-    if (itemsToNormalize.length === 0) {
-      toast.error('No selected books have valid paths and MangaBaka metadata.');
+    if (itemsToNormalize.length === 0 || itemsToNormalize.length > 25) {
+      toast.error('Select between 1 and 25 eligible books per batch.');
       maintenanceNormalizing = false;
       return;
     }
 
     try {
-      const res = await executeBatchNormalize(itemsToNormalize, false);
+      const approved = await confirm({ title: 'REAL MUTATION — normalize existing books?',
+        message: `Replace metadata in ${itemsToNormalize.length} canonical CBZs using the reviewed dry run? Full original archives will be retained for rollback.`,
+        confirmText: 'Normalize canonical files', danger: true });
+      if (!approved) return;
+      const res = await executeBatchNormalize(previewId, itemsToNormalize, false);
       toast.success(`Batch normalization finished: ${res.normalizedCount} normalized, ${res.alreadyNormalizedCount} already normalized, ${res.failedCount} failed.`);
       await loadNormalizationHistory();
       await handleRunDryRun();
@@ -769,19 +768,13 @@
 
   async function handleNormalizeBatch25() {
     if (!analysisSummary) return;
+    const previewId = analysisSummary.previewId;
     const candidates: NormalizeItemRequest[] = [];
     for (const s of analysisSummary.series) {
       for (const b of s.books) {
         if (b.status === 'NEEDS_UPDATE' && b.canonicalPath && b.mangabakaId) {
           candidates.push({
-            canonicalPath: b.canonicalPath,
-            seriesTitle: s.seriesTitle,
-            volume: b.volume ?? 1.0,
             komgaBookId: b.komgaBookId,
-            komgaSeriesId: s.komgaSeriesId,
-            mangabakaId: b.mangabakaId,
-            mangabakaReleaseId: b.mangabakaReleaseId,
-            anilistId: b.anilistId,
           });
           if (candidates.length >= 25) break;
         }
@@ -796,7 +789,11 @@
 
     maintenanceNormalizing = true;
     try {
-      const res = await executeBatchNormalize(candidates, false);
+      const approved = await confirm({ title: 'REAL MUTATION — normalize batch?',
+        message: `Replace metadata in ${candidates.length} canonical CBZs? This changes files; the dry run itself does not.`,
+        confirmText: 'Normalize canonical files', danger: true });
+      if (!approved) return;
+      const res = await executeBatchNormalize(previewId, candidates, false);
       toast.success(`Normalized batch of ${res.normalizedCount} books (${res.failedCount} failed).`);
       await loadNormalizationHistory();
       await handleRunDryRun();
@@ -808,6 +805,9 @@
   }
 
   async function handleRollbackRecord(recordId: string) {
+    if (!await confirm({ title: 'REAL MUTATION — restore original archive?',
+      message: 'Restore the full original CBZ from its verified backup? Books changed since normalization will be rejected.',
+      confirmText: 'Restore original', danger: true })) return;
     maintenanceRollingBack = recordId;
     try {
       await rollbackNormalizationRecord(recordId);
@@ -2189,7 +2189,7 @@
             <div class="set stack">
               <div class="what">
                 <strong>Select Komga Library</strong>
-                <span>Choose which library to analyze. Western Comics libraries are automatically detected and safely skipped with zero errors.</span>
+                <span>Choose a library for DRY RUN. Comics and Chinese libraries are skipped; only identifiable English Manga libraries are eligible.</span>
               </div>
               <div class="how wide">
                 <div class="library-select-row">
@@ -2198,19 +2198,17 @@
                     {#if komgaLibraries.length > 0}
                       {#each komgaLibraries as lib}
                         <option value={lib.id}>
-                          {lib.name} ({lib.root}) {lib.id === '0RNH705VV374H' || lib.name.toLowerCase().includes('comic') ? '— [Comics - Will Skip]' : '— [Manga Eligible]'}
+                          {lib.name} ({lib.root}) — policy checked by server
                         </option>
                       {/each}
                     {:else}
-                      <option value="0RMWEXC3T10TY">English Manga (0RMWEXC3T10TY)</option>
-                      <option value="0RZVF3P8MEC03">Chinese Manga (0RZVF3P8MEC03)</option>
-                      <option value="0RNH705VV374H">Comics (0RNH705VV374H) [Will Skip]</option>
+                      <option value="" disabled>Discover Komga libraries in Pipeline settings first</option>
                     {/if}
                   </select>
                   <button
                     class="btn spot"
                     onclick={handleRunDryRun}
-                    disabled={!maintenanceLibraryId || maintenanceAnalyzing}
+                    disabled={!maintenanceLibraryId || maintenanceAnalyzing || maintenanceNormalizing}
                   >
                     <Icon name={maintenanceAnalyzing ? 'spinner' : 'search'} size={16} />
                     {maintenanceAnalyzing ? 'Analyzing…' : 'Run Dry-Run Analysis'}
@@ -2226,11 +2224,12 @@
             {/if}
 
             {#if analysisSummary}
+              <p class="muted">DRY RUN — {analysisSummary.totalBooks} books considered. No canonical files changed. Review per-book changes before approving mutation.</p>
               <!-- Metric Badges / Summary Cards -->
               <div class="analysis-summary-grid">
                 <div class="metric-card metric-matched">
                   <span class="metric-val">{analysisSummary.matchedCount}</span>
-                  <span class="metric-lbl">Matched Series</span>
+                  <span class="metric-lbl">Matched Books</span>
                 </div>
                 <div class="metric-card metric-already">
                   <span class="metric-val">{analysisSummary.alreadyNormalizedCount}</span>
@@ -2262,23 +2261,23 @@
               <div class="maintenance-actions-bar">
                 <div class="left-actions">
                   <button
-                    class="btn primary"
+                    class="btn ink"
                     onclick={handleNormalizeSelected}
-                    disabled={selectedBookKeys.size === 0 || maintenanceNormalizing}
+                    disabled={selectedBookKeys.size === 0 || selectedBookKeys.size > 25 || maintenanceNormalizing || maintenanceAnalyzing}
                   >
                     <Icon name={maintenanceNormalizing ? 'spinner' : 'check'} size={16} />
                     Normalize Selected ({selectedBookKeys.size})
                   </button>
                   <button
-                    class="btn"
+                    class="btn ink"
                     onclick={handleNormalizeBatch25}
-                    disabled={analysisSummary.needsUpdateCount === 0 || maintenanceNormalizing}
+                    disabled={analysisSummary.needsUpdateCount === 0 || maintenanceNormalizing || maintenanceAnalyzing}
                   >
                     Normalize Batch of 25
                   </button>
                 </div>
                 <span class="muted font-small">
-                  All normalization stages CBZ before replacing and saves original ComicInfo for lossless rollback.
+                  REAL MUTATION: replaces canonical CBZ metadata, up to 25 books per batch. Verified full-file backups are retained for rollback.
                 </span>
               </div>
 
@@ -2301,6 +2300,7 @@
                       </span>
                     </div>
 
+                    <p class="muted font-small">{series.reason}</p>
                     {#if series.books.length > 0}
                       <div class="books-norm-list">
                         {#each series.books as book}
@@ -2312,14 +2312,16 @@
                                   type="checkbox"
                                   checked={selectedBookKeys.has(bookKey)}
                                   onchange={(e) => {
-                                    if (e.currentTarget.checked) selectedBookKeys.add(bookKey);
-                                    else selectedBookKeys.delete(bookKey);
+                                    const next = new Set(selectedBookKeys);
+                                    if (e.currentTarget.checked) next.add(bookKey);
+                                    else next.delete(bookKey);
+                                    selectedBookKeys = next;
                                   }}
                                 />
                               {:else}
                                 <span class="checkbox-spacer"></span>
                               {/if}
-                              <span class="book-name">
+                              <span class="book-name" title={book.canonicalPath}>
                                 {book.bookName}
                                 {#if book.volume !== null && book.volume !== undefined}
                                   (Vol {book.volume})
@@ -2328,13 +2330,16 @@
                             </div>
 
                             <div class="book-row-right">
+                              <span class="muted font-small">{book.reason}</span>
                               <span class="status-badge status-{book.status.toLowerCase()}">
                                 {book.status}
                               </span>
                               {#if book.diffs.length > 0}
-                                <span class="diff-badge" title={book.diffs.map(d => `${d.field}: ${d.current ?? '∅'} -> ${d.proposed ?? '∅'}`).join('\n')}>
-                                  {book.diffs.length} diffs
-                                </span>
+                                <details class="diff-badge"><summary>{book.diffs.length} changes</summary>
+                                    {#each book.diffs as diff}
+                                      <div>{diff.field}: {diff.current ?? '∅'} → {diff.proposed ?? '∅'}</div>
+                                    {/each}
+                                </details>
                               {/if}
                             </div>
                           </div>
@@ -2369,7 +2374,14 @@
                         <span class="hist-time">{ago(rec.normalizedAt * 1000)}</span>
                       </div>
                       <div class="hist-path monospace font-small">{rec.canonicalPath}</div>
-                      {#if rec.status === 'normalized'}
+                      {#if rec.errorMessage}<p class="muted font-small">{rec.errorMessage}</p>{/if}
+                      {#if rec.refreshPending}
+                        <button class="btn small" onclick={async () => {
+                          try { await retryNormalizationRefresh(rec.id); await loadNormalizationHistory(); }
+                          catch (e) { toast.error(message(e)); }
+                        }}>Retry Komga metadata refresh</button>
+                      {/if}
+                      {#if rec.status === 'normalized' && rec.rollbackAvailable}
                         <div class="hist-actions">
                           <button
                             class="btn small"
@@ -2380,6 +2392,8 @@
                             {maintenanceRollingBack === rec.id ? 'Reverting…' : 'Revert to Original'}
                           </button>
                         </div>
+                      {:else if rec.status === 'normalized'}
+                        <p class="muted font-small">Legacy history: no verified full-file backup; automatic rollback unavailable.</p>
                       {:else if rec.status === 'reverted'}
                         <div class="hist-reverted-note font-small muted">
                           ✓ Reverted {rec.revertedAt ? ago(rec.revertedAt * 1000) : ''}
@@ -4120,6 +4134,8 @@
 
   .book-norm-row {
     display: flex;
+    flex-wrap: wrap;
+    min-width: 0;
     justify-content: space-between;
     align-items: center;
     padding: 0.35rem 0.5rem;
@@ -4133,6 +4149,8 @@
 
   .book-row-left {
     display: flex;
+    flex-wrap: wrap;
+    min-width: 0;
     align-items: center;
     gap: 0.5rem;
   }
@@ -4144,6 +4162,8 @@
 
   .book-row-right {
     display: flex;
+    flex-wrap: wrap;
+    min-width: 0;
     align-items: center;
     gap: 0.5rem;
   }
@@ -4151,10 +4171,16 @@
   .diff-badge {
     font-size: 0.72rem;
     background: rgba(255, 122, 0, 0.15);
-    color: var(--spot, #ff7a00);
+    color: var(--ink);
     padding: 1px 6px;
     border-radius: 4px;
-    cursor: help;
+    max-width: 100%;
+    overflow-wrap: anywhere;
+  }
+
+  .diff-badge summary {
+    cursor: pointer;
+    font-weight: 700;
   }
 
   .history-section {

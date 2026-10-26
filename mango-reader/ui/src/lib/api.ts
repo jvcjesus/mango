@@ -1276,6 +1276,7 @@ export interface SeriesNormalizationItem {
 }
 
 export interface LibraryAnalysisSummary {
+  previewId: string;
   libraryId: string;
   libraryName: string;
   libraryRoot: string;
@@ -1308,6 +1309,8 @@ export interface NormalizationHistoryRecord {
   errorMessage?: string | null;
   normalizedAt: number;
   revertedAt?: number | null;
+  refreshPending: boolean;
+  rollbackAvailable: boolean;
 }
 
 export interface NormalizationExecutionResult {
@@ -1321,21 +1324,19 @@ export interface NormalizationExecutionResult {
 }
 
 export interface NormalizeItemRequest {
-  canonicalPath: string;
-  seriesTitle: string;
-  volume?: number | null;
-  komgaBookId?: string | null;
-  komgaSeriesId?: string | null;
-  mangabakaId?: number | null;
-  mangabakaReleaseId?: string | null;
-  anilistId?: number | null;
+  komgaBookId: string;
 }
 
 export const runLibraryDryRun = (libraryId: string, seriesId?: string) =>
   send<LibraryAnalysisSummary>('POST', '/pipeline/maintenance/dry-run', { libraryId, seriesId: seriesId ?? null });
 
-export const executeBatchNormalize = (items: NormalizeItemRequest[], dryRun: boolean = false) =>
-  send<NormalizationExecutionResult>('POST', '/pipeline/maintenance/normalize', { items, dryRun });
+export const executeBatchNormalize = (previewId: string, items: NormalizeItemRequest[], dryRun: boolean = true) =>
+  send<NormalizationExecutionResult>('POST', '/pipeline/maintenance/normalize', {
+    previewId, bookIds: items.map(item => item.komgaBookId), dryRun, approved: !dryRun,
+  });
+
+export const retryNormalizationRefresh = (id: string) =>
+  send<NormalizationHistoryRecord>('POST', `/pipeline/maintenance/refresh/${encodeURIComponent(id)}`, {});
 
 export const getNormalizationHistory = (limit: number = 50) =>
   get<NormalizationHistoryRecord[]>(`/pipeline/maintenance/history?limit=${limit}`);
