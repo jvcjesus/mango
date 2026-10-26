@@ -81,6 +81,26 @@ pub struct TrackerItemDetail {
     pub updated_at: i64,
 }
 
+/// Canonical MangaBaka catalog information populated from local series cache or tracker entries.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MangaBakaCatalogInfo {
+    pub series_id: i64,
+    pub title: String,
+    pub english_title: Option<String>,
+    pub romaji_title: Option<String>,
+    pub native_title: Option<String>,
+    pub cover_url: Option<String>,
+    pub authors: Vec<String>,
+    pub artists: Vec<String>,
+    pub publisher: Option<String>,
+    pub genres: Vec<String>,
+    pub tags: Vec<String>,
+    pub summary: Option<String>,
+    pub total_volumes: Option<u32>,
+    pub web_url: Option<String>,
+}
+
 /// Unified tracked title displayed on the Lists page.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -95,6 +115,7 @@ pub struct UnifiedTrackedItem {
 
     pub anilist: Option<TrackerItemDetail>,
     pub mangabaka: Option<TrackerItemDetail>,
+    pub catalog: Option<MangaBakaCatalogInfo>,
 
     pub ownership_status: String, // "Owned", "Partially Owned", "Not Owned", "Unknown"
     pub owned_units: Option<usize>,
@@ -108,15 +129,20 @@ pub struct UnifiedTrackedItem {
 }
 
 /// Deterministic display title resolver:
-/// 1. English title (AniList english or MangaBaka english)
-/// 2. AniList userPreferred (if Latin script)
-/// 3. Romanized Latin script title (AniList romaji or MangaBaka romaji)
-/// 4. Provider canonical title (if Latin script)
-/// 5. AniList userPreferred (any script)
-/// 6. Provider canonical title (any script)
-/// 7. AniList romaji
-/// 8. Native title (AniList native or MangaBaka native)
-/// 9. Safe fallback
+/// MangaBaka-first presentation:
+/// 1. MangaBaka English title
+/// 2. AniList English title
+/// 3. MangaBaka canonical title (if Latin script)
+/// 4. MangaBaka romaji title (if Latin script)
+/// 5. AniList userPreferred (if Latin script)
+/// 6. AniList romaji (if Latin script)
+/// 7. MangaBaka canonical title (any script)
+/// 8. AniList userPreferred (any script)
+/// 9. MangaBaka romaji
+/// 10. AniList romaji
+/// 11. MangaBaka native title
+/// 12. AniList native title
+/// 13. Safe fallback
 pub fn resolve_display_title(
     al_english: Option<&str>,
     al_user_preferred: Option<&str>,
@@ -128,48 +154,55 @@ pub fn resolve_display_title(
     mb_native: Option<&str>,
     fallback: &str,
 ) -> String {
-    // 1. English title
-    if let Some(t) = al_english.filter(|s| !s.trim().is_empty()) {
-        return t.trim().to_string();
-    }
+    // 1. MangaBaka English title
     if let Some(t) = mb_english.filter(|s| !s.trim().is_empty()) {
         return t.trim().to_string();
     }
-    // 2. AniList userPreferred if Latin-script
-    if let Some(t) = al_user_preferred.filter(|s| !s.trim().is_empty() && is_latin_script(s)) {
+    // 2. AniList English title
+    if let Some(t) = al_english.filter(|s| !s.trim().is_empty()) {
         return t.trim().to_string();
     }
-    // 3. Romanized Latin-script title
-    if let Some(t) = al_romaji.filter(|s| !s.trim().is_empty() && is_latin_script(s)) {
-        return t.trim().to_string();
-    }
-    if let Some(t) = mb_romaji.filter(|s| !s.trim().is_empty() && is_latin_script(s)) {
-        return t.trim().to_string();
-    }
-    // 4. Any provider title that is Latin-script
+    // 3. MangaBaka canonical title if Latin-script
     if let Some(t) = mb_canonical.filter(|s| !s.trim().is_empty() && is_latin_script(s)) {
         return t.trim().to_string();
     }
-    // 5. AniList userPreferred (even if non-Latin)
-    if let Some(t) = al_user_preferred.filter(|s| !s.trim().is_empty()) {
+    // 4. MangaBaka romaji if Latin-script
+    if let Some(t) = mb_romaji.filter(|s| !s.trim().is_empty() && is_latin_script(s)) {
         return t.trim().to_string();
     }
-    // 6. MangaBaka canonical title
+    // 5. AniList userPreferred if Latin-script
+    if let Some(t) = al_user_preferred.filter(|s| !s.trim().is_empty() && is_latin_script(s)) {
+        return t.trim().to_string();
+    }
+    // 6. AniList romaji if Latin-script
+    if let Some(t) = al_romaji.filter(|s| !s.trim().is_empty() && is_latin_script(s)) {
+        return t.trim().to_string();
+    }
+    // 7. MangaBaka canonical title (any script)
     if let Some(t) = mb_canonical.filter(|s| !s.trim().is_empty()) {
         return t.trim().to_string();
     }
-    // 7. AniList romaji
+    // 8. AniList userPreferred (even if non-Latin)
+    if let Some(t) = al_user_preferred.filter(|s| !s.trim().is_empty()) {
+        return t.trim().to_string();
+    }
+    // 9. MangaBaka romaji
+    if let Some(t) = mb_romaji.filter(|s| !s.trim().is_empty()) {
+        return t.trim().to_string();
+    }
+    // 10. AniList romaji
     if let Some(t) = al_romaji.filter(|s| !s.trim().is_empty()) {
         return t.trim().to_string();
     }
-    // 8. Native title
-    if let Some(t) = al_native.filter(|s| !s.trim().is_empty()) {
-        return t.trim().to_string();
-    }
+    // 11. MangaBaka native title
     if let Some(t) = mb_native.filter(|s| !s.trim().is_empty()) {
         return t.trim().to_string();
     }
-    // 9. Fallback
+    // 12. AniList native title
+    if let Some(t) = al_native.filter(|s| !s.trim().is_empty()) {
+        return t.trim().to_string();
+    }
+    // 13. Fallback
     let fb = fallback.trim();
     if !fb.is_empty() {
         return fb.to_string();
@@ -177,12 +210,12 @@ pub fn resolve_display_title(
     "Unknown Title".to_string()
 }
 
-/// Deterministic cover selection:
-/// 1. AniList extraLarge
-/// 2. AniList large
-/// 3. AniList cover_url
-/// 4. AniList medium
-/// 5. MangaBaka cover_url
+/// Deterministic cover selection (MangaBaka preferred over AniList):
+/// 1. MangaBaka cover_url
+/// 2. AniList extraLarge
+/// 3. AniList large
+/// 4. AniList cover_url
+/// 5. AniList medium
 /// 6. None
 pub fn resolve_cover_url(
     al_xl: Option<&str>,
@@ -191,7 +224,7 @@ pub fn resolve_cover_url(
     al_m: Option<&str>,
     mb_cover: Option<&str>,
 ) -> Option<String> {
-    for candidate in [al_xl, al_l, al_cover, al_m, mb_cover] {
+    for candidate in [mb_cover, al_xl, al_l, al_cover, al_m] {
         if let Some(u) = candidate {
             let tr = u.trim();
             if !tr.is_empty() && is_safe_cover_url(tr) {
@@ -442,6 +475,86 @@ pub fn get_refresh_statuses(conn: &Connection) -> Result<Vec<TrackerListRefreshS
     Ok(rows)
 }
 
+/// Resolves MangaBaka catalog details from local cache or tracker entry.
+fn resolve_catalog_info(
+    conn: &Connection,
+    mb: Option<&TrackerListEntry>,
+    fallback_title: &str,
+) -> Option<MangaBakaCatalogInfo> {
+    // 1. Try to fetch from mangabaka_series_cache if mb exists with a numeric ID
+    if let Some(mb_entry) = mb {
+        if let Ok(id) = mb_entry.tracker_id.parse::<i64>() {
+            if let Ok(Some(cached)) = crate::pipeline::metadata::get_cached_series(conn, id) {
+                return Some(MangaBakaCatalogInfo {
+                    series_id: cached.series_id,
+                    title: cached.title,
+                    english_title: cached.english_title,
+                    romaji_title: cached.romaji_title,
+                    native_title: cached.native_title,
+                    cover_url: cached.cover_url,
+                    authors: cached.authors,
+                    artists: cached.artists,
+                    publisher: cached.publisher,
+                    genres: crate::pipeline::metadata::normalize_genres(&cached.genres),
+                    tags: crate::pipeline::metadata::normalize_tags(&cached.tags, &cached.genres),
+                    summary: cached.summary,
+                    total_volumes: cached.total_volumes.map(|v| v as u32),
+                    web_url: Some(format!("https://mangabaka.org/series/{}", cached.series_id)),
+                });
+            }
+        }
+    }
+
+    // 2. Try looking up cache by fallback title
+    if let Ok(Some(cached)) =
+        crate::pipeline::metadata::find_cached_series_by_title(conn, fallback_title)
+    {
+        return Some(MangaBakaCatalogInfo {
+            series_id: cached.series_id,
+            title: cached.title,
+            english_title: cached.english_title,
+            romaji_title: cached.romaji_title,
+            native_title: cached.native_title,
+            cover_url: cached.cover_url,
+            authors: cached.authors,
+            artists: cached.artists,
+            publisher: cached.publisher,
+            genres: crate::pipeline::metadata::normalize_genres(&cached.genres),
+            tags: crate::pipeline::metadata::normalize_tags(&cached.tags, &cached.genres),
+            summary: cached.summary,
+            total_volumes: cached.total_volumes.map(|v| v as u32),
+            web_url: Some(format!("https://mangabaka.org/series/{}", cached.series_id)),
+        });
+    }
+
+    // 3. Fallback: synthesize from mb TrackerListEntry if available
+    if let Some(mb_entry) = mb {
+        let sid = mb_entry.tracker_id.parse::<i64>().unwrap_or(0);
+        return Some(MangaBakaCatalogInfo {
+            series_id: sid,
+            title: mb_entry.title.clone(),
+            english_title: mb_entry.english_title.clone(),
+            romaji_title: mb_entry.romaji_title.clone(),
+            native_title: mb_entry.native_title.clone(),
+            cover_url: mb_entry.cover_url.clone(),
+            authors: Vec::new(),
+            artists: Vec::new(),
+            publisher: None,
+            genres: Vec::new(),
+            tags: Vec::new(),
+            summary: None,
+            total_volumes: mb_entry.total_volumes.map(|v| v as u32),
+            web_url: if sid > 0 {
+                Some(format!("https://mangabaka.org/series/{sid}"))
+            } else {
+                None
+            },
+        });
+    }
+
+    None
+}
+
 /// Assembles the unified catalog from cached tracker list entries, DB mappings,
 /// tracked catalog entries, and Komga series ownership.
 pub fn build_unified_catalog(
@@ -499,7 +612,12 @@ pub fn build_unified_catalog(
 
         // Build normalized title/alias set for AniList entry
         let mut al_norm_set: Vec<String> = Vec::new();
-        for t in [&Some(al.title.clone()), &al.english_title, &al.romaji_title, &al.native_title] {
+        for t in [
+            &Some(al.title.clone()),
+            &al.english_title,
+            &al.romaji_title,
+            &al.native_title,
+        ] {
             if let Some(s) = t {
                 let n = normalize_title(s);
                 if !n.is_empty() && !al_norm_set.contains(&n) {
@@ -549,7 +667,12 @@ pub fn build_unified_catalog(
                         return false;
                     }
                     let mut mb_norm_set: Vec<String> = Vec::new();
-                    for t in [&Some(mb.title.clone()), &mb.english_title, &mb.romaji_title, &mb.native_title] {
+                    for t in [
+                        &Some(mb.title.clone()),
+                        &mb.english_title,
+                        &mb.romaji_title,
+                        &mb.native_title,
+                    ] {
                         if let Some(s) = t {
                             let n = normalize_title(s);
                             if !n.is_empty() && !mb_norm_set.contains(&n) {
@@ -567,7 +690,9 @@ pub fn build_unified_catalog(
                             }
                         }
                     }
-                    mb_norm_set.iter().any(|m_norm| al_norm_set.contains(m_norm))
+                    mb_norm_set
+                        .iter()
+                        .any(|m_norm| al_norm_set.contains(m_norm))
                 })
                 .collect();
 
@@ -712,7 +837,12 @@ pub fn build_unified_catalog(
         );
 
         let mut unified_aliases: Vec<String> = Vec::new();
-        for t in [&Some(al.title.clone()), &al.english_title, &al.romaji_title, &al.native_title] {
+        for t in [
+            &Some(al.title.clone()),
+            &al.english_title,
+            &al.romaji_title,
+            &al.native_title,
+        ] {
             if let Some(s) = t {
                 let tr = s.trim().to_string();
                 if !tr.is_empty() && !unified_aliases.contains(&tr) {
@@ -731,7 +861,12 @@ pub fn build_unified_catalog(
             }
         }
         if let Some(mb) = matched_mb {
-            for t in [&Some(mb.title.clone()), &mb.english_title, &mb.romaji_title, &mb.native_title] {
+            for t in [
+                &Some(mb.title.clone()),
+                &mb.english_title,
+                &mb.romaji_title,
+                &mb.native_title,
+            ] {
                 if let Some(s) = t {
                     let tr = s.trim().to_string();
                     if !tr.is_empty() && !unified_aliases.contains(&tr) {
@@ -756,6 +891,7 @@ pub fn build_unified_catalog(
             .clone()
             .or_else(|| matched_mb.and_then(|m| m.format.clone()));
         let updated_at = al.updated_at.max(matched_mb.map_or(0, |m| m.updated_at));
+        let catalog = resolve_catalog_info(conn, matched_mb, &display_title);
 
         unified_items.push(UnifiedTrackedItem {
             id: composite_id,
@@ -766,6 +902,7 @@ pub fn build_unified_catalog(
             format,
             anilist: Some(al_detail),
             mangabaka: mb_detail,
+            catalog,
             ownership_status,
             owned_units,
             total_units,
@@ -867,16 +1004,15 @@ pub fn build_unified_catalog(
             &mb.title,
         );
 
-        let cover_url = resolve_cover_url(
-            None,
-            None,
-            None,
-            None,
-            mb.cover_url.as_deref(),
-        );
+        let cover_url = resolve_cover_url(None, None, None, None, mb.cover_url.as_deref());
 
         let mut unified_aliases: Vec<String> = Vec::new();
-        for t in [&Some(mb.title.clone()), &mb.english_title, &mb.romaji_title, &mb.native_title] {
+        for t in [
+            &Some(mb.title.clone()),
+            &mb.english_title,
+            &mb.romaji_title,
+            &mb.native_title,
+        ] {
             if let Some(s) = t {
                 let tr = s.trim().to_string();
                 if !tr.is_empty() && !unified_aliases.contains(&tr) {
@@ -895,6 +1031,8 @@ pub fn build_unified_catalog(
             }
         }
 
+        let catalog = resolve_catalog_info(conn, Some(mb), &display_title);
+
         unified_items.push(UnifiedTrackedItem {
             id: format!("mb-{}", mb.tracker_id),
             title: display_title,
@@ -904,6 +1042,7 @@ pub fn build_unified_catalog(
             format: mb.format.clone(),
             anilist: None,
             mangabaka: Some(mb_detail),
+            catalog,
             ownership_status,
             owned_units,
             total_units,
@@ -980,7 +1119,10 @@ pub fn build_unified_catalog(
                 let trimmed = q.trim().to_lowercase();
                 if !trimmed.is_empty() {
                     let match_title = item.title.to_lowercase().contains(&trimmed);
-                    let match_alias = item.aliases.iter().any(|a| a.to_lowercase().contains(&trimmed));
+                    let match_alias = item
+                        .aliases
+                        .iter()
+                        .any(|a| a.to_lowercase().contains(&trimmed));
                     if !match_title && !match_alias {
                         return false;
                     }
@@ -1304,4 +1446,84 @@ pub async fn refresh_tracker_lists(
         errors,
         statuses,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mangabaka_first_title_precedence() {
+        // 1. MangaBaka English beats AniList English
+        let title1 = resolve_display_title(
+            Some("Blue Lock (AL)"),
+            Some("Blue Lock UP"),
+            Some("Burū Rokku"),
+            Some("ブルーロック"),
+            Some("Blue Lock (MB)"),
+            Some("Buruu Rokku"),
+            Some("Blue Lock Canonical"),
+            Some("ブルーロック"),
+            "Fallback",
+        );
+        assert_eq!(title1, "Blue Lock (MB)");
+
+        // 2. When MangaBaka English is missing, AniList English wins
+        let title2 = resolve_display_title(
+            Some("Blue Lock (AL)"),
+            Some("Blue Lock UP"),
+            None,
+            None,
+            None,
+            None,
+            Some("Blue Lock MB Canonical"),
+            None,
+            "Fallback",
+        );
+        assert_eq!(title2, "Blue Lock (AL)");
+
+        // 3. MangaBaka canonical Latin wins over AniList userPreferred
+        let title3 = resolve_display_title(
+            None,
+            Some("Blue Lock UP"),
+            Some("Burū Rokku"),
+            None,
+            None,
+            None,
+            Some("Blue Lock Canonical"),
+            None,
+            "Fallback",
+        );
+        assert_eq!(title3, "Blue Lock Canonical");
+    }
+
+    #[test]
+    fn test_mangabaka_first_cover_precedence() {
+        // 1. MangaBaka cover beats AniList extraLarge, large, and standard
+        let cover1 = resolve_cover_url(
+            Some("https://anilist.co/img/xl.jpg"),
+            Some("https://anilist.co/img/l.jpg"),
+            Some("https://anilist.co/img/c.jpg"),
+            Some("https://anilist.co/img/m.jpg"),
+            Some("https://mangabaka.org/covers/mb.jpg"),
+        );
+        assert_eq!(
+            cover1.as_deref(),
+            Some("https://mangabaka.org/covers/mb.jpg")
+        );
+
+        // 2. When MangaBaka cover is absent, AniList extraLarge wins
+        let cover2 = resolve_cover_url(
+            Some("https://anilist.co/img/xl.jpg"),
+            Some("https://anilist.co/img/l.jpg"),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(cover2.as_deref(), Some("https://anilist.co/img/xl.jpg"));
+
+        // 3. Reject dangerous or non-http URLs
+        let cover_safe = resolve_cover_url(Some("javascript:alert(1)"), None, None, None, None);
+        assert_eq!(cover_safe, None);
+    }
 }

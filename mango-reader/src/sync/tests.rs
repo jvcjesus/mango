@@ -61,6 +61,7 @@ fn test_evaluate_volume_series_progress() {
                 completed: true,
                 read_date: Some("2024-01-01T00:00:00Z".into()),
             }),
+            url: None,
         },
         KomgaBook {
             id: "b2".into(),
@@ -77,6 +78,7 @@ fn test_evaluate_volume_series_progress() {
                 completed: true,
                 read_date: Some("2024-01-02T00:00:00Z".into()),
             }),
+            url: None,
         },
         KomgaBook {
             id: "b3".into(),
@@ -93,6 +95,7 @@ fn test_evaluate_volume_series_progress() {
                 completed: false,
                 read_date: None,
             }),
+            url: None,
         },
     ];
 
@@ -126,6 +129,7 @@ fn test_evaluate_chapter_series_completed() {
                 completed: true,
                 read_date: Some("2024-02-01T00:00:00Z".into()),
             }),
+            url: None,
         },
         KomgaBook {
             id: "b2".into(),
@@ -138,6 +142,7 @@ fn test_evaluate_chapter_series_completed() {
                 completed: true,
                 read_date: Some("2024-02-02T00:00:00Z".into()),
             }),
+            url: None,
         },
     ];
 
@@ -3241,7 +3246,7 @@ fn test_display_title_selection_precedence() {
 
 #[test]
 fn test_cover_precedence_and_url_safety() {
-    // 1. AniList extraLarge has highest priority
+    // 1. MangaBaka cover has highest priority
     let c1 = resolve_cover_url(
         Some("https://s4.anilist.co/file/anilistcdn/media/manga/cover/extraLarge/bx30001.jpg"),
         Some("https://s4.anilist.co/file/anilistcdn/media/manga/cover/large/bx30001.jpg"),
@@ -3251,40 +3256,47 @@ fn test_cover_precedence_and_url_safety() {
     );
     assert_eq!(
         c1,
-        Some("https://s4.anilist.co/file/anilistcdn/media/manga/cover/extraLarge/bx30001.jpg".to_string())
+        Some("https://images.mangabaka.dev/covers/350.webp".to_string())
     );
 
-    // 2. Fallback to large when extraLarge missing
+    // 2. When MangaBaka cover is absent, fallback to AniList extraLarge
     let c2 = resolve_cover_url(
+        Some("https://s4.anilist.co/file/anilistcdn/media/manga/cover/extraLarge/bx30001.jpg"),
+        Some("https://s4.anilist.co/file/anilistcdn/media/manga/cover/large/bx30001.jpg"),
+        None,
+        Some("https://s4.anilist.co/file/anilistcdn/media/manga/cover/medium/bx30001.jpg"),
+        None,
+    );
+    assert_eq!(
+        c2,
+        Some(
+            "https://s4.anilist.co/file/anilistcdn/media/manga/cover/extraLarge/bx30001.jpg"
+                .to_string()
+        )
+    );
+
+    // 3. Fallback to AniList large when MangaBaka and extraLarge are missing
+    let c3 = resolve_cover_url(
         None,
         Some("https://s4.anilist.co/file/anilistcdn/media/manga/cover/large/bx30001.jpg"),
         None,
         Some("https://s4.anilist.co/file/anilistcdn/media/manga/cover/medium/bx30001.jpg"),
-        Some("https://images.mangabaka.dev/covers/350.webp"),
-    );
-    assert_eq!(
-        c2,
-        Some("https://s4.anilist.co/file/anilistcdn/media/manga/cover/large/bx30001.jpg".to_string())
-    );
-
-    // 3. Fallback to MangaBaka when AniList covers are missing
-    let c3 = resolve_cover_url(
         None,
-        None,
-        None,
-        None,
-        Some("https://images.mangabaka.dev/covers/350.webp"),
     );
     assert_eq!(
         c3,
-        Some("https://images.mangabaka.dev/covers/350.webp".to_string())
+        Some(
+            "https://s4.anilist.co/file/anilistcdn/media/manga/cover/large/bx30001.jpg".to_string()
+        )
     );
 
     // 4. URL safety validation
     assert!(is_safe_cover_url("https://s4.anilist.co/cover.jpg"));
     assert!(is_safe_cover_url("http://images.mangabaka.dev/img.png"));
     assert!(!is_safe_cover_url("javascript:alert(1)"));
-    assert!(!is_safe_cover_url("data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="));
+    assert!(!is_safe_cover_url(
+        "data:image/png;base64,iVBORw0KGgoAAAANSUhEUg=="
+    ));
     assert!(!is_safe_cover_url("file:///etc/passwd"));
     assert!(!is_safe_cover_url("blob:http://localhost/uuid"));
     assert!(!is_safe_cover_url(""));
