@@ -53,6 +53,41 @@
   let approvingPlan = $state<boolean>(false);
   let planError = $state<string | null>(null);
 
+  // Keep keyboard focus in the top overlay and return to its opener on close.
+  function planningFocus(node: HTMLDivElement) {
+    const opener = document.activeElement;
+    const focusable = () => Array.from(node.querySelectorAll<HTMLElement>(
+      'button:not(:disabled), select:not(:disabled), input:not(:disabled), [tabindex="0"]',
+    ));
+    node.focus();
+    function keydown(event: KeyboardEvent) {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        event.stopPropagation();
+        planModalOpen = false;
+      } else if (event.key === 'Tab') {
+        const controls = focusable();
+        const first = controls[0];
+        const last = controls[controls.length - 1];
+        if (!first) {
+          event.preventDefault();
+          node.focus();
+        } else if (event.shiftKey && (document.activeElement === first || document.activeElement === node)) {
+          event.preventDefault();
+          last.focus();
+        } else if (!event.shiftKey && (document.activeElement === last || document.activeElement === node)) {
+          event.preventDefault();
+          first.focus();
+        }
+      }
+    }
+    node.addEventListener('keydown', keydown);
+    return { destroy() {
+      node.removeEventListener('keydown', keydown);
+      if (opener instanceof HTMLElement && opener.isConnected) opener.focus();
+    } };
+  }
+
   async function openPlanningModal(item: UnifiedTrackedItem, mode?: 'missing' | 'complete' | 'specific') {
     planModalItem = item;
     contentMode = mode ?? (item.ownershipStatus === 'Partially Owned' ? 'missing' : 'complete');
@@ -913,10 +948,18 @@
   <!-- svelte-ignore a11y_click_events_have_key_events -->
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div class="modal-backdrop" onclick={() => (planModalOpen = false)}>
-    <div class="modal-content planning-modal" onclick={(e) => e.stopPropagation()}>
+    <div
+      class="modal planning-modal"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="plan-modal-title"
+      tabindex="-1"
+      use:planningFocus
+      onclick={(e) => e.stopPropagation()}
+    >
       <div class="modal-header">
         <div>
-          <h2 class="modal-title">Acquisition Plan — {planModalItem.title}</h2>
+          <h2 id="plan-modal-title" class="modal-title">Acquisition Plan — {planModalItem.title}</h2>
           <span class="modal-subtitle">Review release candidates, target missing content, and approve safe execution</span>
         </div>
         <button class="btn icon close-btn" onclick={() => (planModalOpen = false)} aria-label="Close dialog">
@@ -1901,7 +1944,22 @@
   /* Planning Modal Styles */
   .planning-modal {
     max-width: 650px;
-    width: 95%;
+    min-width: 0;
+    max-height: calc(100dvh - 32px);
+    background: var(--surface);
+  }
+
+  .planning-modal .modal-header,
+  .planning-modal .modal-footer {
+    flex-shrink: 0;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+
+  .planning-modal .modal-header > div {
+    flex: 1;
+    min-width: 0;
+    overflow-wrap: anywhere;
   }
 
   .modal-subtitle {
@@ -1914,7 +1972,7 @@
     flex-direction: column;
     gap: 1.25rem;
     padding: 1.25rem;
-    max-height: 70vh;
+    min-height: 0;
     overflow-y: auto;
   }
 
@@ -1922,7 +1980,7 @@
     display: flex;
     flex-direction: column;
     gap: 1rem;
-    background: var(--shade);
+    background: var(--paper);
     border-radius: 8px;
     padding: 1rem;
   }
@@ -1939,7 +1997,8 @@
 
   .segmented-control {
     display: flex;
-    background: rgba(0, 0, 0, 0.2);
+    flex-wrap: wrap;
+    background: var(--paper);
     border-radius: 6px;
     padding: 3px;
     gap: 3px;
@@ -1959,8 +2018,8 @@
   }
 
   .segment-btn.active {
-    background: var(--card-bg, #222);
-    color: var(--text, #fff);
+    background: var(--surface);
+    color: var(--ink);
     box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
   }
 
@@ -1972,21 +2031,29 @@
 
   .specific-input {
     flex: 1;
-    background: var(--card-bg, #1a1a1a);
-    border: 1px solid var(--border-color, rgba(255, 255, 255, 0.15));
+    min-width: 0;
+    background: var(--surface);
+    border: 1px solid var(--muted);
     border-radius: 4px;
     padding: 6px 10px;
-    color: var(--text, #fff);
+    color: var(--ink);
     font-size: 0.85rem;
   }
 
   .source-select {
-    background: var(--card-bg, #1a1a1a);
-    border: 1px solid var(--border-color, rgba(255, 255, 255, 0.15));
+    width: 100%;
+    min-width: 0;
+    background: var(--surface);
+    border: 1px solid var(--muted);
     border-radius: 4px;
     padding: 8px 10px;
-    color: var(--text, #fff);
+    color: var(--ink);
     font-size: 0.88rem;
+  }
+
+  .segment-btn:hover {
+    background: var(--surface);
+    color: var(--ink);
   }
 
   .plan-summary-metrics {
