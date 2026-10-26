@@ -3,11 +3,16 @@
     getLists,
     refreshLists,
     planAllMissingContent,
+    getAcquisitionSources,
+    planByTitle,
+    createExecution,
     message,
     type UnifiedTrackedItem,
     type UnifiedCatalogResponse,
     type TrackerListRefreshStatus,
     type GlobalPlanSummary,
+    type AcquisitionPlan,
+    type AcquisitionSourceOption,
   } from '../lib/api';
   import Cover from '../lib/Cover.svelte';
   import Icon from '../lib/Icon.svelte';
@@ -35,6 +40,101 @@
 
   // Selected title for modal
   let selectedItem = $state<UnifiedTrackedItem | null>(null);
+
+  // Title-level Acquisition Planning Modal state
+  let planModalOpen = $state(false);
+  let planModalItem = $state<UnifiedTrackedItem | null>(null);
+  let sources = $state<AcquisitionSourceOption[]>([]);
+  let selectedSourceId = $state<string>('auto');
+  let contentMode = $state<'missing' | 'complete' | 'specific'>('missing');
+  let specificVolumesInput = $state<string>('');
+  let titlePlan = $state<AcquisitionPlan | null>(null);
+  let generatingPlan = $state<boolean>(false);
+  let approvingPlan = $state<boolean>(false);
+  let planError = $state<string | null>(null);
+
+  async function openPlanningModal(item: UnifiedTrackedItem, mode?: 'missing' | 'complete' | 'specific') {
+    planModalItem = item;
+    contentMode = mode ?? (item.ownershipStatus === 'Partially Owned' ? 'missing' : 'complete');
+    selectedSourceId = 'auto';
+    specificVolumesInput = '';
+    titlePlan = null;
+    planError = null;
+    planModalOpen = true;
+
+    if (sources.length === 0) {
+      try {
+        sources = await getAcquisitionSources();
+      } catch (e) {
+        console.warn('Failed to load acquisition sources:', e);
+      }
+    }
+
+    generateTitlePlan();
+  }
+
+  async function generateTitlePlan() {
+    if (!planModalItem) return;
+    generatingPlan = true;
+    planError = null;
+    titlePlan = null;
+
+    let requestedVolumes: number[] | null = null;
+    if (contentMode === 'specific' && specificVolumesInput.trim()) {
+      const vols: number[] = [];
+      const parts = specificVolumesInput.split(',');
+      for (const p of parts) {
+        const trimmed = p.trim();
+        if (trimmed.includes('-')) {
+          const [start, end] = trimmed.split('-').map(Number);
+          if (!isNaN(start) && !isNaN(end)) {
+            for (let v = start; v <= end; v++) vols.push(v);
+          }
+        } else {
+          const num = Number(trimmed);
+          if (!isNaN(num)) vols.push(num);
+        }
+      }
+      requestedVolumes = vols;
+    }
+
+    try {
+      const plan = await planByTitle({
+        title: planModalItem.title,
+        komgaSeriesId: planModalItem.komgaSeriesId,
+        sourceId: selectedSourceId,
+        contentMode,
+        requestedVolumes,
+        totalVolumes: planModalItem.catalog?.totalVolumes ?? planModalItem.totalUnits ?? null,
+      });
+      titlePlan = plan;
+    } catch (e) {
+      planError = message(e);
+    } finally {
+      generatingPlan = false;
+    }
+  }
+
+  async function approveTitlePlan() {
+    if (!titlePlan || !planModalItem) return;
+    approvingPlan = true;
+    try {
+      await createExecution(titlePlan.mangaId, {
+        planId: titlePlan.id,
+        approved: true,
+      });
+      toast.success(`Acquisition approved and started for ${titlePlan.title}!`);
+      planModalItem.acquisitionStatus = 'Acquiring';
+      planModalOpen = false;
+      if (selectedItem && selectedItem.id === planModalItem.id) {
+        selectedItem.acquisitionStatus = 'Acquiring';
+      }
+    } catch (e) {
+      toast.error(`Failed to approve acquisition: ${message(e)}`);
+    } finally {
+      approvingPlan = false;
+    }
+  }
 
   // Global Plan All Dry-Run state
   let planningAll = $state(false);
@@ -518,7 +618,7 @@
   {/if}
 </div>
 
-<!-- Title Detail Modal -->
+<!-- Title Detail Modal (4 Distinct Sections) -->
 {#if selectedItem}
   <div
     class="modal-backdrop"
@@ -529,7 +629,7 @@
     role="presentation"
   >
     <div
-      class="modal"
+      class="modal four-section-modal"
       role="dialog"
       aria-modal="true"
       aria-labelledby="modal-title"
@@ -595,59 +695,413 @@
           </div>
         </div>
 
-        <div class="modal-sections">
-          <!-- AniList Tracking Breakdown -->
-          <div class="tracker-box">
-            <div class="tracker-box-header">
-              <span class="tracker-title">AniList</span>
-              {#if selectedItem.anilist}
-                <span class="pill-badge active">Tracked</span>
-              {:else}
-                <span class="pill-badge inactive">Not in list</span>
+        <div class="modal-sections-four">
+          <!-- 1. CATALOG (MangaBaka) -->
+          <div class="section-box catalog-box">
+            <div class="section-box-header">
+              <span class="section-title">
+                <Icon name="bookmark" size={16} />
+                1. CATALOG (MangaBaka)
+              </span>
+              {#if selectedItem.catalog?.webUrl}
+                <a href={selectedItem.catalog.webUrl} target="_blank" rel="noreferrer" class="external-link">
+                  MangaBaka Entry ↗
+                </a>
               {/if}
             </div>
-            {#if selectedItem.anilist}
-              <div class="tracker-details">
-                {#if selectedItem.anilist.title && selectedItem.anilist.title.toLowerCase() !== selectedItem.title.toLowerCase()}
-                  <div><strong>Provider Title:</strong> {selectedItem.anilist.title}</div>
-                {/if}
-                <div><strong>Native Status:</strong> {selectedItem.anilist.status}</div>
-                <div><strong>Progress:</strong> Vol {selectedItem.anilist.progressVolume ?? 0} / Ch {selectedItem.anilist.progressChapter ?? 0}</div>
-                <div><strong>Total Known:</strong> {selectedItem.anilist.totalVolumes ? `${selectedItem.anilist.totalVolumes} volumes` : 'Unknown volumes'}</div>
+            <div class="catalog-details">
+              {#if selectedItem.catalog?.title && selectedItem.catalog.title.toLowerCase() !== selectedItem.title.toLowerCase()}
+                <div class="detail-row"><strong>Canonical Title:</strong> {selectedItem.catalog.title}</div>
+              {/if}
+              {#if selectedItem.catalog?.authors && selectedItem.catalog.authors.length > 0}
+                <div class="detail-row"><strong>Authors:</strong> {selectedItem.catalog.authors.join(', ')}</div>
+              {/if}
+              {#if selectedItem.catalog?.artists && selectedItem.catalog.artists.length > 0}
+                <div class="detail-row"><strong>Artists:</strong> {selectedItem.catalog.artists.join(', ')}</div>
+              {/if}
+              {#if selectedItem.catalog?.publisher}
+                <div class="detail-row"><strong>Publisher:</strong> {selectedItem.catalog.publisher}</div>
+              {/if}
+              <div class="detail-row">
+                <strong>Total Volumes:</strong> {selectedItem.catalog?.totalVolumes ?? selectedItem.totalUnits ?? 'Unknown'}
               </div>
-            {:else}
-              <p class="tracker-empty">This title is not currently in your AniList library.</p>
-            {/if}
+              {#if selectedItem.catalog?.genres && selectedItem.catalog.genres.length > 0}
+                <div class="detail-tags-row">
+                  <strong>Genres:</strong>
+                  <div class="tag-list">
+                    {#each selectedItem.catalog.genres as genre}
+                      <span class="genre-pill">{genre}</span>
+                    {/each}
+                  </div>
+                </div>
+              {/if}
+              {#if selectedItem.catalog?.tags && selectedItem.catalog.tags.length > 0}
+                <div class="detail-tags-row">
+                  <strong>Tags:</strong>
+                  <div class="tag-list">
+                    {#each selectedItem.catalog.tags.slice(0, 8) as tag}
+                      <span class="tag-pill">{tag}</span>
+                    {/each}
+                  </div>
+                </div>
+              {/if}
+              {#if selectedItem.catalog?.summary}
+                <div class="detail-summary">
+                  <strong>Summary:</strong>
+                  <p class="summary-text">{selectedItem.catalog.summary}</p>
+                </div>
+              {/if}
+            </div>
           </div>
 
-          <!-- MangaBaka Tracking Breakdown -->
-          <div class="tracker-box">
-            <div class="tracker-box-header">
-              <span class="tracker-title">MangaBaka</span>
-              {#if selectedItem.mangabaka}
-                <span class="pill-badge active">Tracked</span>
+          <!-- 2. LOCAL OWNERSHIP (Komga) -->
+          <div class="section-box ownership-box">
+            <div class="section-box-header">
+              <span class="section-title">
+                <Icon name="book" size={16} />
+                2. LOCAL OWNERSHIP (Komga)
+              </span>
+              <span class="badge {getOwnershipClass(selectedItem.ownershipStatus)}">
+                {selectedItem.ownershipStatus}
+              </span>
+            </div>
+            <div class="ownership-details">
+              <div class="detail-row">
+                <strong>Physical Media:</strong>
+                <span>
+                  {selectedItem.ownedUnits ?? 0}
+                  {selectedItem.totalUnits ? `/ ${selectedItem.totalUnits} volumes owned` : 'volumes owned'}
+                </span>
+              </div>
+              {#if selectedItem.komgaSeriesId}
+                <div class="detail-row">
+                  <strong>Komga Series ID:</strong>
+                  <span class="monospace">{selectedItem.komgaSeriesId}</span>
+                </div>
+              {/if}
+              <div class="detail-row">
+                <strong>Source of Truth:</strong> Canonical Komga library on disk
+              </div>
+            </div>
+          </div>
+
+          <!-- 3. TRACKERS (AniList & MangaBaka) -->
+          <div class="section-box trackers-box">
+            <div class="section-box-header">
+              <span class="section-title">
+                <Icon name="link" size={16} />
+                3. TRACKERS (Personal Progress)
+              </span>
+            </div>
+            <div class="trackers-columns">
+              <!-- AniList -->
+              <div class="tracker-subcol">
+                <div class="tracker-subcol-title">
+                  <strong>AniList</strong>
+                  <span class="pill-badge {selectedItem.anilist ? 'active' : 'inactive'}">
+                    {selectedItem.anilist ? 'Tracked' : 'Not in list'}
+                  </span>
+                </div>
+                {#if selectedItem.anilist}
+                  <div class="tracker-meta">
+                    <div>Status: <strong>{selectedItem.anilist.status}</strong></div>
+                    <div>Progress: <strong>Vol {selectedItem.anilist.progressVolume ?? 0} / Ch {selectedItem.anilist.progressChapter ?? 0}</strong></div>
+                    <div>Known: <strong>{selectedItem.anilist.totalVolumes ? `${selectedItem.anilist.totalVolumes} vols` : 'Unknown'}</strong></div>
+                  </div>
+                {:else}
+                  <p class="dim">Not tracked on AniList</p>
+                {/if}
+              </div>
+
+              <!-- MangaBaka -->
+              <div class="tracker-subcol">
+                <div class="tracker-subcol-title">
+                  <strong>MangaBaka</strong>
+                  <span class="pill-badge {selectedItem.mangabaka ? 'active' : 'inactive'}">
+                    {selectedItem.mangabaka ? 'Tracked' : 'Not in library'}
+                  </span>
+                </div>
+                {#if selectedItem.mangabaka}
+                  <div class="tracker-meta">
+                    <div>Status: <strong>{selectedItem.mangabaka.status}</strong></div>
+                    <div>Progress: <strong>Vol {selectedItem.mangabaka.progressVolume ?? 0} / Ch {selectedItem.mangabaka.progressChapter ?? 0}</strong></div>
+                    <div>Known: <strong>{selectedItem.mangabaka.totalVolumes ? `${selectedItem.mangabaka.totalVolumes} vols` : 'Unknown'}</strong></div>
+                  </div>
+                {:else}
+                  <p class="dim">Not in MangaBaka personal library</p>
+                {/if}
+              </div>
+            </div>
+          </div>
+
+          <!-- 4. ACQUISITION -->
+          <div class="section-box acquisition-box">
+            <div class="section-box-header">
+              <span class="section-title">
+                <Icon name="download" size={16} />
+                4. ACQUISITION
+              </span>
+              <span class="pill-badge {selectedItem.acquisitionStatus === 'Acquiring' ? 'active' : 'idle'}">
+                {selectedItem.acquisitionStatus}
+              </span>
+            </div>
+            <div class="acquisition-actions">
+              {#if selectedItem.ownershipStatus === 'Owned'}
+                <div class="acquisition-status-note">
+                  ✓ Library Complete: All known volumes are owned in Komga.
+                </div>
+                <button
+                  class="btn small"
+                  onclick={() => {
+                    const it = selectedItem;
+                    selectedItem = null;
+                    if (it) openPlanningModal(it, 'specific');
+                  }}
+                >
+                  <Icon name="search" size={16} />
+                  Re-check / Re-acquire Specific Volumes
+                </button>
+              {:else if selectedItem.acquisitionStatus === 'Acquiring'}
+                <div class="acquisition-status-note">
+                  ⏳ Acquisition is currently in progress via execution pipeline.
+                </div>
+              {:else if selectedItem.ownershipStatus === 'Partially Owned'}
+                <div class="acquisition-status-note">
+                  Missing {selectedItem.totalUnits ? `${selectedItem.totalUnits - (selectedItem.ownedUnits ?? 0)} volumes` : 'volumes'}.
+                </div>
+                <button
+                  class="btn spot"
+                  onclick={() => {
+                    const it = selectedItem;
+                    selectedItem = null;
+                    if (it) openPlanningModal(it, 'missing');
+                  }}
+                >
+                  <Icon name="download" size={16} />
+                  Add Missing to Library
+                </button>
               {:else}
-                <span class="pill-badge inactive">Not in library</span>
+                <div class="acquisition-status-note">
+                  Not currently in Komga library.
+                </div>
+                <button
+                  class="btn spot"
+                  onclick={() => {
+                    const it = selectedItem;
+                    selectedItem = null;
+                    if (it) openPlanningModal(it, 'complete');
+                  }}
+                >
+                  <Icon name="download" size={16} />
+                  Add to Library
+                </button>
               {/if}
             </div>
-            {#if selectedItem.mangabaka}
-              <div class="tracker-details">
-                {#if selectedItem.mangabaka.title && selectedItem.mangabaka.title.toLowerCase() !== selectedItem.title.toLowerCase()}
-                  <div><strong>Provider Title:</strong> {selectedItem.mangabaka.title}</div>
-                {/if}
-                <div><strong>Native State:</strong> {selectedItem.mangabaka.status}</div>
-                <div><strong>Progress:</strong> Vol {selectedItem.mangabaka.progressVolume ?? 0} / Ch {selectedItem.mangabaka.progressChapter ?? 0}</div>
-                <div><strong>Total Known:</strong> {selectedItem.mangabaka.totalVolumes ? `${selectedItem.mangabaka.totalVolumes} volumes` : 'Unknown volumes'}</div>
-              </div>
-            {:else}
-              <p class="tracker-empty">This title is not currently in your MangaBaka personal library.</p>
-            {/if}
           </div>
         </div>
       </div>
 
       <div class="modal-footer">
         <button class="btn" onclick={() => (selectedItem = null)}>Close</button>
+      </div>
+    </div>
+  </div>
+{/if}
+
+<!-- Acquisition Planning Modal -->
+{#if planModalOpen && planModalItem}
+  <!-- svelte-ignore a11y_click_events_have_key_events -->
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <div class="modal-backdrop" onclick={() => (planModalOpen = false)}>
+    <div class="modal-content planning-modal" onclick={(e) => e.stopPropagation()}>
+      <div class="modal-header">
+        <div>
+          <h2 class="modal-title">Acquisition Plan — {planModalItem.title}</h2>
+          <span class="modal-subtitle">Review release candidates, target missing content, and approve safe execution</span>
+        </div>
+        <button class="btn icon close-btn" onclick={() => (planModalOpen = false)} aria-label="Close dialog">
+          <Icon name="close" size={20} />
+        </button>
+      </div>
+
+      <div class="modal-body-scroll">
+        <!-- Configuration Controls -->
+        <div class="plan-controls-grid">
+          <!-- Content Selection -->
+          <div class="control-group">
+            <span class="control-label"><strong>Content to Acquire:</strong></span>
+            <div class="segmented-control">
+              <button
+                class="segment-btn"
+                class:active={contentMode === 'missing'}
+                onclick={() => {
+                  contentMode = 'missing';
+                  generateTitlePlan();
+                }}
+              >
+                Missing Volumes
+              </button>
+              <button
+                class="segment-btn"
+                class:active={contentMode === 'complete'}
+                onclick={() => {
+                  contentMode = 'complete';
+                  generateTitlePlan();
+                }}
+              >
+                Complete Series
+              </button>
+              <button
+                class="segment-btn"
+                class:active={contentMode === 'specific'}
+                onclick={() => {
+                  contentMode = 'specific';
+                }}
+              >
+                Specific Volumes
+              </button>
+            </div>
+            {#if contentMode === 'specific'}
+              <div class="specific-input-wrap">
+                <input
+                  type="text"
+                  class="specific-input"
+                  bind:value={specificVolumesInput}
+                  placeholder="e.g. 1, 2, 5-8, 39"
+                />
+                <button class="btn small" onclick={generateTitlePlan} disabled={generatingPlan}>
+                  Apply
+                </button>
+              </div>
+            {/if}
+          </div>
+
+          <!-- Source Selection -->
+          <div class="control-group">
+            <label class="control-label" for="plan-source-select"><strong>Acquisition Source:</strong></label>
+            <select
+              id="plan-source-select"
+              class="source-select"
+              bind:value={selectedSourceId}
+              onchange={generateTitlePlan}
+            >
+              {#if sources.length === 0}
+                <option value="auto">Auto (Recommended)</option>
+                <option value="nyaa">Nyaa (BitTorrent / TorBox)</option>
+              {:else}
+                {#each sources as src}
+                  <option value={src.id} disabled={!src.available}>
+                    {src.name} {!src.available ? '(Unavailable)' : src.isDefault ? '(Default)' : ''}
+                  </option>
+                {/each}
+              {/if}
+            </select>
+          </div>
+        </div>
+
+        <!-- Plan Status / Feedback -->
+        {#if generatingPlan}
+          <div class="loading-state">
+            <Icon name="spinner" size={28} />
+            <p>Discovering candidates and generating dry-run plan…</p>
+          </div>
+        {:else if planError}
+          <div class="plan-error-box">
+            <Icon name="alert-triangle" size={20} />
+            <div>
+              <strong>Plan Generation Warning</strong>
+              <p>{planError}</p>
+            </div>
+          </div>
+        {:else if titlePlan}
+          <!-- Plan Summary Cards -->
+          <div class="plan-summary-metrics">
+            <div class="metric-card">
+              <span class="metric-val">{titlePlan.missingUnits.length}</span>
+              <span class="metric-lbl">Missing Units</span>
+            </div>
+            <div class="metric-card">
+              <span class="metric-val">{titlePlan.missingUnitsCoveredCount}</span>
+              <span class="metric-lbl">Covered Units</span>
+            </div>
+            <div class="metric-card">
+              <span class="metric-val">{titlePlan.selectedItems.length}</span>
+              <span class="metric-lbl">Releases to Acquire</span>
+            </div>
+            <div class="metric-card">
+              <span class="metric-val">{titlePlan.unresolvedUnits.length}</span>
+              <span class="metric-lbl">Unresolved Units</span>
+            </div>
+          </div>
+
+          <!-- Candidates Preview -->
+          {#if titlePlan.selectedItems.length === 0}
+            <div class="plan-empty-notice">
+              <Icon name="info" size={24} />
+              <div>
+                <strong>No Candidate Releases Selected</strong>
+                <p>
+                  {#if titlePlan.missingUnits.length === 0}
+                    All volumes in the requested range are already present in your Komga library.
+                  {:else}
+                    No releases matched the quality and profile criteria for the missing content.
+                  {/if}
+                </p>
+              </div>
+            </div>
+          {:else}
+            <div class="planned-items-list">
+              <h4>Matched Candidate Releases ({titlePlan.selectedItems.length})</h4>
+              {#each titlePlan.selectedItems as item, idx}
+                <div class="planned-candidate-row">
+                  <div class="cand-header">
+                    <span class="cand-idx">#{idx + 1}</span>
+                    <strong class="cand-title">{item.candidate.releaseTitle}</strong>
+                    <span class="cand-score-badge">
+                      Score: {item.candidate.smartScore.total.toFixed(0)}/100
+                    </span>
+                  </div>
+                  <div class="cand-meta">
+                    <span>Source: <strong>{item.candidate.source}</strong></span>
+                    {#if item.candidate.uploader}
+                      <span>Group: <strong>{item.candidate.uploader}</strong></span>
+                    {/if}
+                    <span>Seeders: <strong>{item.candidate.seeders}</strong></span>
+                    <span>Size: <strong>{((item.candidate.fileSizeBytes ?? 0) / 1024 / 1024).toFixed(1)} MB</strong></span>
+                    <span>Units Covered: <strong>v{item.expectedUnits.join(', v')}</strong></span>
+                  </div>
+                </div>
+              {/each}
+            </div>
+          {/if}
+
+          <!-- Warnings -->
+          {#if titlePlan.warnings.length > 0}
+            <div class="plan-warnings-box">
+              <div class="warning-title">
+                <Icon name="alert-triangle" size={16} />
+                <strong>Pre-flight Warnings:</strong>
+              </div>
+              <ul>
+                {#each titlePlan.warnings as w}
+                  <li>{w}</li>
+                {/each}
+              </ul>
+            </div>
+          {/if}
+        {/if}
+      </div>
+
+      <div class="modal-footer">
+        <button class="btn" onclick={() => (planModalOpen = false)}>Cancel</button>
+        <button
+          class="btn primary"
+          onclick={approveTitlePlan}
+          disabled={!titlePlan || titlePlan.selectedItems.length === 0 || approvingPlan}
+        >
+          <Icon name={approvingPlan ? 'spinner' : 'check'} size={18} />
+          <span>{approvingPlan ? 'Approving…' : 'Approve Acquisition'}</span>
+        </button>
       </div>
     </div>
   </div>
@@ -1295,5 +1749,364 @@
     gap: 1rem;
     font-size: 0.82rem;
     color: var(--muted, #888);
+  }
+
+  /* 4-Section Detail Modal Styles */
+  .four-section-modal {
+    max-width: 680px;
+    width: 95%;
+    max-height: 90vh;
+    overflow-y: auto;
+  }
+
+  .modal-sections-four {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+    margin-top: 1rem;
+  }
+
+  .section-box {
+    background: var(--shade);
+    border-radius: 8px;
+    padding: 1rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    border: 1px solid var(--border-color, rgba(255, 255, 255, 0.08));
+  }
+
+  .section-box-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    padding-bottom: 0.5rem;
+  }
+
+  .section-title {
+    font-weight: 700;
+    font-size: 0.95rem;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .external-link {
+    font-size: 0.8rem;
+    color: var(--spot, #ff7a00);
+    text-decoration: none;
+  }
+
+  .external-link:hover {
+    text-decoration: underline;
+  }
+
+  .detail-row {
+    font-size: 0.88rem;
+    display: flex;
+    gap: 0.5rem;
+    align-items: baseline;
+  }
+
+  .detail-tags-row {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    font-size: 0.85rem;
+  }
+
+  .tag-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.35rem;
+  }
+
+  .genre-pill {
+    font-size: 0.75rem;
+    background: rgba(255, 122, 0, 0.12);
+    color: var(--spot, #ff7a00);
+    padding: 2px 8px;
+    border-radius: 4px;
+  }
+
+  .tag-pill {
+    font-size: 0.72rem;
+    background: rgba(255, 255, 255, 0.08);
+    color: var(--text, #eee);
+    padding: 2px 6px;
+    border-radius: 4px;
+  }
+
+  .detail-summary {
+    font-size: 0.85rem;
+    margin-top: 0.25rem;
+  }
+
+  .summary-text {
+    font-size: 0.82rem;
+    line-height: 1.4;
+    color: var(--muted, #aaa);
+    margin: 0.25rem 0 0;
+    max-height: 120px;
+    overflow-y: auto;
+  }
+
+  .trackers-columns {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+  }
+
+  @media (max-width: 540px) {
+    .trackers-columns {
+      grid-template-columns: 1fr;
+    }
+  }
+
+  .tracker-subcol {
+    background: rgba(0, 0, 0, 0.15);
+    border-radius: 6px;
+    padding: 0.75rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+
+  .tracker-subcol-title {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 0.85rem;
+  }
+
+  .tracker-meta {
+    font-size: 0.82rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+
+  .acquisition-actions {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+  }
+
+  .acquisition-status-note {
+    font-size: 0.88rem;
+    color: var(--muted, #aaa);
+  }
+
+  /* Planning Modal Styles */
+  .planning-modal {
+    max-width: 650px;
+    width: 95%;
+  }
+
+  .modal-subtitle {
+    font-size: 0.8rem;
+    color: var(--muted, #888);
+  }
+
+  .modal-body-scroll {
+    display: flex;
+    flex-direction: column;
+    gap: 1.25rem;
+    padding: 1.25rem;
+    max-height: 70vh;
+    overflow-y: auto;
+  }
+
+  .plan-controls-grid {
+    display: flex;
+    flex-direction: column;
+    gap: 1rem;
+    background: var(--shade);
+    border-radius: 8px;
+    padding: 1rem;
+  }
+
+  .control-group {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+
+  .control-label {
+    font-size: 0.85rem;
+  }
+
+  .segmented-control {
+    display: flex;
+    background: rgba(0, 0, 0, 0.2);
+    border-radius: 6px;
+    padding: 3px;
+    gap: 3px;
+  }
+
+  .segment-btn {
+    flex: 1;
+    background: transparent;
+    border: none;
+    color: var(--muted, #888);
+    padding: 6px 12px;
+    font-size: 0.82rem;
+    font-weight: 600;
+    border-radius: 4px;
+    cursor: pointer;
+    transition: background 0.15s, color 0.15s;
+  }
+
+  .segment-btn.active {
+    background: var(--card-bg, #222);
+    color: var(--text, #fff);
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+  }
+
+  .specific-input-wrap {
+    display: flex;
+    gap: 0.5rem;
+    margin-top: 0.25rem;
+  }
+
+  .specific-input {
+    flex: 1;
+    background: var(--card-bg, #1a1a1a);
+    border: 1px solid var(--border-color, rgba(255, 255, 255, 0.15));
+    border-radius: 4px;
+    padding: 6px 10px;
+    color: var(--text, #fff);
+    font-size: 0.85rem;
+  }
+
+  .source-select {
+    background: var(--card-bg, #1a1a1a);
+    border: 1px solid var(--border-color, rgba(255, 255, 255, 0.15));
+    border-radius: 4px;
+    padding: 8px 10px;
+    color: var(--text, #fff);
+    font-size: 0.88rem;
+  }
+
+  .plan-summary-metrics {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 0.5rem;
+  }
+
+  .metric-card {
+    background: var(--shade);
+    border-radius: 6px;
+    padding: 0.75rem;
+    text-align: center;
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+
+  .metric-val {
+    font-size: 1.3rem;
+    font-weight: 700;
+  }
+
+  .metric-lbl {
+    font-size: 0.72rem;
+    color: var(--muted, #888);
+  }
+
+  .planned-items-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+
+  .planned-items-list h4 {
+    margin: 0 0 0.25rem;
+    font-size: 0.9rem;
+  }
+
+  .planned-candidate-row {
+    background: var(--shade);
+    border: 1px solid var(--border-color, rgba(255, 255, 255, 0.08));
+    border-radius: 6px;
+    padding: 0.75rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+  }
+
+  .cand-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .cand-idx {
+    font-size: 0.8rem;
+    color: var(--muted, #888);
+  }
+
+  .cand-title {
+    font-size: 0.85rem;
+    flex: 1;
+  }
+
+  .cand-score-badge {
+    font-size: 0.75rem;
+    background: rgba(34, 197, 94, 0.15);
+    color: #22c55e;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-weight: 600;
+  }
+
+  .cand-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+    font-size: 0.78rem;
+    color: var(--muted, #888);
+  }
+
+  .plan-empty-notice {
+    display: flex;
+    gap: 0.75rem;
+    background: rgba(255, 255, 255, 0.03);
+    border-radius: 6px;
+    padding: 1rem;
+    font-size: 0.85rem;
+  }
+
+  .plan-warnings-box {
+    background: rgba(234, 179, 8, 0.1);
+    border: 1px solid rgba(234, 179, 8, 0.3);
+    border-radius: 6px;
+    padding: 0.75rem 1rem;
+    font-size: 0.82rem;
+  }
+
+  .warning-title {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    color: #eab308;
+    margin-bottom: 0.35rem;
+  }
+
+  .plan-warnings-box ul {
+    margin: 0;
+    padding-left: 1.25rem;
+  }
+
+  .plan-error-box {
+    display: flex;
+    gap: 0.75rem;
+    background: rgba(239, 68, 68, 0.1);
+    border: 1px solid rgba(239, 68, 68, 0.3);
+    border-radius: 6px;
+    padding: 0.75rem 1rem;
+    font-size: 0.85rem;
   }
 </style>

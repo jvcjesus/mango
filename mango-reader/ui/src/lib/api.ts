@@ -674,6 +674,23 @@ export interface TrackerItemDetail {
   updatedAt: number;
 }
 
+export interface MangaBakaCatalogInfo {
+  seriesId: number;
+  title: string;
+  englishTitle?: string | null;
+  romajiTitle?: string | null;
+  nativeTitle?: string | null;
+  coverUrl?: string | null;
+  authors: string[];
+  artists: string[];
+  publisher?: string | null;
+  genres: string[];
+  tags: string[];
+  summary?: string | null;
+  totalVolumes?: number | null;
+  webUrl?: string | null;
+}
+
 export interface UnifiedTrackedItem {
   id: string;
   title: string;
@@ -683,6 +700,7 @@ export interface UnifiedTrackedItem {
   format?: string | null;
   anilist?: TrackerItemDetail | null;
   mangabaka?: TrackerItemDetail | null;
+  catalog?: MangaBakaCatalogInfo | null;
   ownershipStatus: string; // "Owned" | "Partially Owned" | "Not Owned" | "Unknown"
   ownedUnits?: number | null;
   totalUnits?: number | null;
@@ -1178,4 +1196,144 @@ export const getAcquisitionExecution = (id: string) => get<AcquisitionExecution>
 export const startExecution = (id: string) => send<AcquisitionExecution>('POST', `/acquisition/executions/${encodeURIComponent(id)}/start`, {});
 export const cancelExecution = (id: string, reason?: string) => send<AcquisitionExecution>('POST', `/acquisition/executions/${encodeURIComponent(id)}/cancel`, { reason });
 export const retryExecution = (id: string) => send<AcquisitionExecution>('POST', `/acquisition/executions/${encodeURIComponent(id)}/retry`, {});
+
+// ---------- Sources & Planning by Title ----------
+
+export interface AcquisitionSourceOption {
+  id: string;
+  name: string;
+  description: string;
+  isDefault: boolean;
+  available: boolean;
+  supportsVolumes: boolean;
+  supportsChapters: boolean;
+}
+
+export interface PlanByTitleRequest {
+  title: string;
+  komgaSeriesId?: string | null;
+  sourceId?: string | null;
+  contentMode?: string | null;
+  requestedVolumes?: number[] | null;
+  totalVolumes?: number | null;
+}
+
+export const getAcquisitionSources = () => get<AcquisitionSourceOption[]>('/acquisition/sources');
+export const planByTitle = (req: PlanByTitleRequest) => send<AcquisitionPlan>('POST', '/acquisition/plan-by-title', req);
+
+// ---------- Library Normalization & Maintenance ----------
+
+export type NormalizationStatus =
+  | 'MATCHED'
+  | 'ALREADY_NORMALIZED'
+  | 'NEEDS_UPDATE'
+  | 'AMBIGUOUS'
+  | 'UNMATCHED'
+  | 'SKIPPED_PROVIDER_NOT_APPLICABLE'
+  | 'INVALID_ARCHIVE'
+  | 'ERROR';
+
+export interface BookMetadataDiff {
+  field: string;
+  current?: string | null;
+  proposed?: string | null;
+}
+
+export interface BookNormalizationItem {
+  komgaBookId: string;
+  komgaSeriesId: string;
+  seriesTitle: string;
+  bookName: string;
+  canonicalPath: string;
+  volume?: number | null;
+  status: NormalizationStatus;
+  reason: string;
+  mangabakaId?: number | null;
+  mangabakaReleaseId?: string | null;
+  anilistId?: number | null;
+  diffs: BookMetadataDiff[];
+  currentSha256?: string | null;
+}
+
+export interface SeriesNormalizationItem {
+  komgaSeriesId: string;
+  libraryId: string;
+  seriesTitle: string;
+  status: NormalizationStatus;
+  reason: string;
+  mangabakaId?: number | null;
+  anilistId?: number | null;
+  totalBooks: number;
+  needsUpdateCount: number;
+  alreadyNormalizedCount: number;
+  books: BookNormalizationItem[];
+}
+
+export interface LibraryAnalysisSummary {
+  libraryId: string;
+  libraryName: string;
+  libraryRoot: string;
+  totalSeries: number;
+  totalBooks: number;
+  matchedCount: number;
+  alreadyNormalizedCount: number;
+  needsUpdateCount: number;
+  ambiguousCount: number;
+  unmatchedCount: number;
+  skippedCount: number;
+  errorCount: number;
+  series: SeriesNormalizationItem[];
+}
+
+export interface NormalizationHistoryRecord {
+  id: string;
+  batchId: string;
+  canonicalPath: string;
+  seriesTitle: string;
+  volume: number;
+  komgaSeriesId?: string | null;
+  komgaBookId?: string | null;
+  mangabakaId?: number | null;
+  mangabakaReleaseId?: string | null;
+  anilistId?: number | null;
+  originalSha256?: string | null;
+  normalizedSha256?: string | null;
+  status: string;
+  errorMessage?: string | null;
+  normalizedAt: number;
+  revertedAt?: number | null;
+}
+
+export interface NormalizationExecutionResult {
+  batchId: string;
+  totalProcessed: number;
+  normalizedCount: number;
+  alreadyNormalizedCount: number;
+  failedCount: number;
+  skippedCount: number;
+  items: NormalizationHistoryRecord[];
+}
+
+export interface NormalizeItemRequest {
+  canonicalPath: string;
+  seriesTitle: string;
+  volume?: number | null;
+  komgaBookId?: string | null;
+  komgaSeriesId?: string | null;
+  mangabakaId?: number | null;
+  mangabakaReleaseId?: string | null;
+  anilistId?: number | null;
+}
+
+export const runLibraryDryRun = (libraryId: string, seriesId?: string) =>
+  send<LibraryAnalysisSummary>('POST', '/pipeline/maintenance/dry-run', { libraryId, seriesId: seriesId ?? null });
+
+export const executeBatchNormalize = (items: NormalizeItemRequest[], dryRun: boolean = false) =>
+  send<NormalizationExecutionResult>('POST', '/pipeline/maintenance/normalize', { items, dryRun });
+
+export const getNormalizationHistory = (limit: number = 50) =>
+  get<NormalizationHistoryRecord[]>(`/pipeline/maintenance/history?limit=${limit}`);
+
+export const rollbackNormalizationRecord = (id: string) =>
+  send<NormalizationHistoryRecord>('POST', `/pipeline/maintenance/rollback/${encodeURIComponent(id)}`, {});
 

@@ -21,6 +21,13 @@
     deleteAcquisitionProfile,
     duplicateAcquisitionProfile,
     getSourceHealthReports,
+    runLibraryDryRun,
+    executeBatchNormalize,
+    getNormalizationHistory,
+    rollbackNormalizationRecord,
+    type LibraryAnalysisSummary,
+    type NormalizationHistoryRecord,
+    type NormalizeItemRequest,
     type AcquisitionProfile,
     type SourceHealthReport,
     type AcquisitionConfig,
@@ -657,10 +664,162 @@
 
       loadProfiles();
       loadSourceHealth();
+      loadNormalizationHistory();
     } catch (e) {
       pipelineError = message(e);
     } finally {
       pipelineLoading = false;
+    }
+  }
+
+  // ---------- Library Normalization & Maintenance ----------
+  let maintenanceLibraryId = $state<string>('');
+  let maintenanceAnalyzing = $state<boolean>(false);
+  let maintenanceNormalizing = $state<boolean>(false);
+  let maintenanceRollingBack = $state<string | null>(null);
+  let analysisSummary = $state<LibraryAnalysisSummary | null>(null);
+  let selectedBookKeys = $state<Set<string>>(new Set());
+  let normalizationHistory = $state<NormalizationHistoryRecord[]>([]);
+  let historyLoading = $state<boolean>(false);
+  let maintenanceError = $state<string | null>(null);
+
+  async function loadNormalizationHistory() {
+    historyLoading = true;
+    try {
+      normalizationHistory = await getNormalizationHistory(50);
+    } catch (e) {
+      console.warn('Failed to load normalization history:', e);
+    } finally {
+      historyLoading = false;
+    }
+  }
+
+  async function handleRunDryRun() {
+    if (!maintenanceLibraryId) {
+      toast.error('Please select a library to analyze.');
+      return;
+    }
+    maintenanceAnalyzing = true;
+    maintenanceError = null;
+    analysisSummary = null;
+    selectedBookKeys = new Set();
+    try {
+      const summary = await runLibraryDryRun(maintenanceLibraryId);
+      analysisSummary = summary;
+      const newSelected = new Set<string>();
+      for (const s of summary.series) {
+        for (const b of s.books) {
+          if (b.status === 'NEEDS_UPDATE') {
+            newSelected.add(`${s.komgaSeriesId}:${b.komgaBookId}`);
+          }
+        }
+      }
+      selectedBookKeys = newSelected;
+      toast.info(`Dry-run analysis complete: ${summary.needsUpdateCount} books need update, ${summary.alreadyNormalizedCount} already normalized, ${summary.skippedCount} skipped.`);
+    } catch (e) {
+      maintenanceError = message(e);
+      toast.error(`Dry-run analysis failed: ${message(e)}`);
+    } finally {
+      maintenanceAnalyzing = false;
+    }
+  }
+
+  async function handleNormalizeSelected() {
+    if (!analysisSummary || selectedBookKeys.size === 0) return;
+    maintenanceNormalizing = true;
+    maintenanceError = null;
+
+    const itemsToNormalize: NormalizeItemRequest[] = [];
+    for (const s of analysisSummary.series) {
+      for (const b of s.books) {
+        const key = `${s.komgaSeriesId}:${b.komgaBookId}`;
+        if (selectedBookKeys.has(key) && b.canonicalPath && b.mangabakaId) {
+          itemsToNormalize.push({
+            canonicalPath: b.canonicalPath,
+            seriesTitle: s.seriesTitle,
+            volume: b.volume ?? 1.0,
+            komgaBookId: b.komgaBookId,
+            komgaSeriesId: s.komgaSeriesId,
+            mangabakaId: b.mangabakaId,
+            mangabakaReleaseId: b.mangabakaReleaseId,
+            anilistId: b.anilistId,
+          });
+        }
+      }
+    }
+
+    if (itemsToNormalize.length === 0) {
+      toast.error('No selected books have valid paths and MangaBaka metadata.');
+      maintenanceNormalizing = false;
+      return;
+    }
+
+    try {
+      const res = await executeBatchNormalize(itemsToNormalize, false);
+      toast.success(`Batch normalization finished: ${res.normalizedCount} normalized, ${res.alreadyNormalizedCount} already normalized, ${res.failedCount} failed.`);
+      await loadNormalizationHistory();
+      await handleRunDryRun();
+    } catch (e) {
+      maintenanceError = message(e);
+      toast.error(`Normalization failed: ${message(e)}`);
+    } finally {
+      maintenanceNormalizing = false;
+    }
+  }
+
+  async function handleNormalizeBatch25() {
+    if (!analysisSummary) return;
+    const candidates: NormalizeItemRequest[] = [];
+    for (const s of analysisSummary.series) {
+      for (const b of s.books) {
+        if (b.status === 'NEEDS_UPDATE' && b.canonicalPath && b.mangabakaId) {
+          candidates.push({
+            canonicalPath: b.canonicalPath,
+            seriesTitle: s.seriesTitle,
+            volume: b.volume ?? 1.0,
+            komgaBookId: b.komgaBookId,
+            komgaSeriesId: s.komgaSeriesId,
+            mangabakaId: b.mangabakaId,
+            mangabakaReleaseId: b.mangabakaReleaseId,
+            anilistId: b.anilistId,
+          });
+          if (candidates.length >= 25) break;
+        }
+      }
+      if (candidates.length >= 25) break;
+    }
+
+    if (candidates.length === 0) {
+      toast.info('No eligible books needing update found.');
+      return;
+    }
+
+    maintenanceNormalizing = true;
+    try {
+      const res = await executeBatchNormalize(candidates, false);
+      toast.success(`Normalized batch of ${res.normalizedCount} books (${res.failedCount} failed).`);
+      await loadNormalizationHistory();
+      await handleRunDryRun();
+    } catch (e) {
+      toast.error(`Batch normalize failed: ${message(e)}`);
+    } finally {
+      maintenanceNormalizing = false;
+    }
+  }
+
+  async function handleRollbackRecord(recordId: string) {
+    maintenanceRollingBack = recordId;
+    try {
+      await rollbackNormalizationRecord(recordId);
+      toast.success('Successfully reverted to original ComicInfo.xml!');
+      await loadNormalizationHistory();
+      if (analysisSummary) {
+        await handleRunDryRun();
+      }
+    } catch (e) {
+      toast.error(`Revert failed: ${message(e)}`);
+    } finally {
+      maintenanceRollingBack = null;
     }
   }
 
@@ -2017,6 +2176,221 @@
               Refresh
             </button>
           </div>
+
+          <!-- Library Metadata Normalization & Maintenance -->
+          <section class="card">
+            <div class="card-header-row">
+              <div>
+                <h3>Library Metadata Normalization & Maintenance</h3>
+                <span class="muted">Safe, dry-run-first metadata inspection and atomic ComicInfo.xml normalization for existing library CBZs</span>
+              </div>
+            </div>
+
+            <div class="set stack">
+              <div class="what">
+                <strong>Select Komga Library</strong>
+                <span>Choose which library to analyze. Western Comics libraries are automatically detected and safely skipped with zero errors.</span>
+              </div>
+              <div class="how wide">
+                <div class="library-select-row">
+                  <select class="field grow" bind:value={maintenanceLibraryId}>
+                    <option value="" disabled>Select a library…</option>
+                    {#if komgaLibraries.length > 0}
+                      {#each komgaLibraries as lib}
+                        <option value={lib.id}>
+                          {lib.name} ({lib.root}) {lib.id === '0RNH705VV374H' || lib.name.toLowerCase().includes('comic') ? '— [Comics - Will Skip]' : '— [Manga Eligible]'}
+                        </option>
+                      {/each}
+                    {:else}
+                      <option value="0RMWEXC3T10TY">English Manga (0RMWEXC3T10TY)</option>
+                      <option value="0RZVF3P8MEC03">Chinese Manga (0RZVF3P8MEC03)</option>
+                      <option value="0RNH705VV374H">Comics (0RNH705VV374H) [Will Skip]</option>
+                    {/if}
+                  </select>
+                  <button
+                    class="btn spot"
+                    onclick={handleRunDryRun}
+                    disabled={!maintenanceLibraryId || maintenanceAnalyzing}
+                  >
+                    <Icon name={maintenanceAnalyzing ? 'spinner' : 'search'} size={16} />
+                    {maintenanceAnalyzing ? 'Analyzing…' : 'Run Dry-Run Analysis'}
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {#if maintenanceError}
+              <div class="set stack">
+                <Notice error={maintenanceError} />
+              </div>
+            {/if}
+
+            {#if analysisSummary}
+              <!-- Metric Badges / Summary Cards -->
+              <div class="analysis-summary-grid">
+                <div class="metric-card metric-matched">
+                  <span class="metric-val">{analysisSummary.matchedCount}</span>
+                  <span class="metric-lbl">Matched Series</span>
+                </div>
+                <div class="metric-card metric-already">
+                  <span class="metric-val">{analysisSummary.alreadyNormalizedCount}</span>
+                  <span class="metric-lbl">Already Normalized</span>
+                </div>
+                <div class="metric-card metric-update">
+                  <span class="metric-val">{analysisSummary.needsUpdateCount}</span>
+                  <span class="metric-lbl">Needs Update</span>
+                </div>
+                <div class="metric-card metric-ambiguous">
+                  <span class="metric-val">{analysisSummary.ambiguousCount}</span>
+                  <span class="metric-lbl">Ambiguous</span>
+                </div>
+                <div class="metric-card metric-unmatched">
+                  <span class="metric-val">{analysisSummary.unmatchedCount}</span>
+                  <span class="metric-lbl">Unmatched</span>
+                </div>
+                <div class="metric-card metric-skipped">
+                  <span class="metric-val">{analysisSummary.skippedCount}</span>
+                  <span class="metric-lbl">Skipped (Not Applicable)</span>
+                </div>
+                <div class="metric-card metric-error">
+                  <span class="metric-val">{analysisSummary.errorCount}</span>
+                  <span class="metric-lbl">Errors</span>
+                </div>
+              </div>
+
+              <!-- Batch Action Buttons -->
+              <div class="maintenance-actions-bar">
+                <div class="left-actions">
+                  <button
+                    class="btn primary"
+                    onclick={handleNormalizeSelected}
+                    disabled={selectedBookKeys.size === 0 || maintenanceNormalizing}
+                  >
+                    <Icon name={maintenanceNormalizing ? 'spinner' : 'check'} size={16} />
+                    Normalize Selected ({selectedBookKeys.size})
+                  </button>
+                  <button
+                    class="btn"
+                    onclick={handleNormalizeBatch25}
+                    disabled={analysisSummary.needsUpdateCount === 0 || maintenanceNormalizing}
+                  >
+                    Normalize Batch of 25
+                  </button>
+                </div>
+                <span class="muted font-small">
+                  All normalization stages CBZ before replacing and saves original ComicInfo for lossless rollback.
+                </span>
+              </div>
+
+              <!-- Results Tree / Table -->
+              <div class="normalization-table-wrap">
+                {#each analysisSummary.series as series}
+                  <div class="series-norm-card">
+                    <div class="series-norm-header">
+                      <div class="series-norm-title">
+                        <strong>{series.seriesTitle}</strong>
+                        <span class="status-badge status-{series.status.toLowerCase()}">
+                          {series.status}
+                        </span>
+                        {#if series.mangabakaId}
+                          <span class="pill-badge active">MB #{series.mangabakaId}</span>
+                        {/if}
+                      </div>
+                      <span class="series-stats">
+                        {series.books.length} books ({series.needsUpdateCount} needs update, {series.alreadyNormalizedCount} current)
+                      </span>
+                    </div>
+
+                    {#if series.books.length > 0}
+                      <div class="books-norm-list">
+                        {#each series.books as book}
+                          {@const bookKey = `${series.komgaSeriesId}:${book.komgaBookId}`}
+                          <div class="book-norm-row" class:needs-update={book.status === 'NEEDS_UPDATE'}>
+                            <div class="book-row-left">
+                              {#if book.status === 'NEEDS_UPDATE'}
+                                <input
+                                  type="checkbox"
+                                  checked={selectedBookKeys.has(bookKey)}
+                                  onchange={(e) => {
+                                    if (e.currentTarget.checked) selectedBookKeys.add(bookKey);
+                                    else selectedBookKeys.delete(bookKey);
+                                  }}
+                                />
+                              {:else}
+                                <span class="checkbox-spacer"></span>
+                              {/if}
+                              <span class="book-name">
+                                {book.bookName}
+                                {#if book.volume !== null && book.volume !== undefined}
+                                  (Vol {book.volume})
+                                {/if}
+                              </span>
+                            </div>
+
+                            <div class="book-row-right">
+                              <span class="status-badge status-{book.status.toLowerCase()}">
+                                {book.status}
+                              </span>
+                              {#if book.diffs.length > 0}
+                                <span class="diff-badge" title={book.diffs.map(d => `${d.field}: ${d.current ?? '∅'} -> ${d.proposed ?? '∅'}`).join('\n')}>
+                                  {book.diffs.length} diffs
+                                </span>
+                              {/if}
+                            </div>
+                          </div>
+                        {/each}
+                      </div>
+                    {/if}
+                  </div>
+                {/each}
+              </div>
+            {/if}
+
+            <!-- Normalization Journal & Rollback History -->
+            <div class="history-section">
+              <div class="history-header">
+                <h4>Normalization Journal & Rollback</h4>
+                <button class="btn icon small" onclick={loadNormalizationHistory} disabled={historyLoading} title="Refresh history">
+                  <Icon name="refresh" size={14} />
+                </button>
+              </div>
+
+              {#if normalizationHistory.length === 0}
+                <p class="muted font-small">No library normalization executions recorded yet.</p>
+              {:else}
+                <div class="history-list">
+                  {#each normalizationHistory as rec (rec.id)}
+                    <div class="history-item">
+                      <div class="hist-top">
+                        <span class="hist-series"><strong>{rec.seriesTitle}</strong> (Vol {rec.volume})</span>
+                        <span class="status-badge status-{rec.status}">
+                          {rec.status.toUpperCase()}
+                        </span>
+                        <span class="hist-time">{ago(rec.normalizedAt * 1000)}</span>
+                      </div>
+                      <div class="hist-path monospace font-small">{rec.canonicalPath}</div>
+                      {#if rec.status === 'normalized'}
+                        <div class="hist-actions">
+                          <button
+                            class="btn small"
+                            onclick={() => handleRollbackRecord(rec.id)}
+                            disabled={maintenanceRollingBack === rec.id}
+                          >
+                            <Icon name="refresh" size={14} />
+                            {maintenanceRollingBack === rec.id ? 'Reverting…' : 'Revert to Original'}
+                          </button>
+                        </div>
+                      {:else if rec.status === 'reverted'}
+                        <div class="hist-reverted-note font-small muted">
+                          ✓ Reverted {rec.revertedAt ? ago(rec.revertedAt * 1000) : ''}
+                        </div>
+                      {/if}
+                    </div>
+                  {/each}
+                </div>
+              {/if}
+            </div>
+          </section>
 
           <section class="card">
             <h3>Recent Pipeline Activity</h3>
@@ -3638,5 +4012,235 @@
     border-radius: 6px;
     font-size: 0.82rem;
     color: var(--spot, #ff7a00);
+  }
+
+  /* Library Normalization & Maintenance Styles */
+  .library-select-row {
+    display: flex;
+    gap: 0.75rem;
+    align-items: center;
+  }
+
+  .analysis-summary-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+    gap: 0.65rem;
+    margin: 1rem 0;
+  }
+
+  .analysis-summary-grid .metric-card {
+    background: var(--shade);
+    border: 1px solid var(--border-color, rgba(255, 255, 255, 0.08));
+    border-radius: 6px;
+    padding: 0.75rem;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.25rem;
+    text-align: center;
+  }
+
+  .analysis-summary-grid .metric-val {
+    font-size: 1.4rem;
+    font-weight: 700;
+  }
+
+  .analysis-summary-grid .metric-lbl {
+    font-size: 0.72rem;
+    color: var(--muted, #888);
+  }
+
+  .metric-matched .metric-val { color: #22c55e; }
+  .metric-already .metric-val { color: #3b82f6; }
+  .metric-update .metric-val { color: var(--spot, #ff7a00); }
+  .metric-ambiguous .metric-val { color: #eab308; }
+  .metric-unmatched .metric-val { color: #a855f7; }
+  .metric-skipped .metric-val { color: #888; }
+  .metric-error .metric-val { color: #ef4444; }
+
+  .maintenance-actions-bar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 1rem;
+    padding: 0.75rem 0;
+    border-bottom: 1px solid var(--border-color, rgba(255, 255, 255, 0.08));
+    margin-bottom: 1rem;
+  }
+
+  .left-actions {
+    display: flex;
+    gap: 0.5rem;
+  }
+
+  .normalization-table-wrap {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    max-height: 480px;
+    overflow-y: auto;
+    margin-bottom: 1.5rem;
+  }
+
+  .series-norm-card {
+    background: var(--shade);
+    border: 1px solid var(--border-color, rgba(255, 255, 255, 0.08));
+    border-radius: 6px;
+    padding: 0.75rem 1rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+
+  .series-norm-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+
+  .series-norm-title {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .series-stats {
+    font-size: 0.78rem;
+    color: var(--muted, #888);
+  }
+
+  .books-norm-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    padding-left: 0.5rem;
+    border-left: 2px solid rgba(255, 255, 255, 0.08);
+  }
+
+  .book-norm-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 0.35rem 0.5rem;
+    border-radius: 4px;
+    font-size: 0.82rem;
+  }
+
+  .book-norm-row.needs-update {
+    background: rgba(255, 122, 0, 0.06);
+  }
+
+  .book-row-left {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .checkbox-spacer {
+    width: 14px;
+    display: inline-block;
+  }
+
+  .book-row-right {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .diff-badge {
+    font-size: 0.72rem;
+    background: rgba(255, 122, 0, 0.15);
+    color: var(--spot, #ff7a00);
+    padding: 1px 6px;
+    border-radius: 4px;
+    cursor: help;
+  }
+
+  .history-section {
+    margin-top: 1.5rem;
+    border-top: 1px solid var(--border-color, rgba(255, 255, 255, 0.08));
+    padding-top: 1rem;
+  }
+
+  .history-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 0.75rem;
+  }
+
+  .history-header h4 {
+    margin: 0;
+  }
+
+  .history-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    max-height: 280px;
+    overflow-y: auto;
+  }
+
+  .history-item {
+    background: var(--shade);
+    border: 1px solid var(--border-color, rgba(255, 255, 255, 0.08));
+    border-radius: 6px;
+    padding: 0.65rem 0.85rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+  }
+
+  .hist-top {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .hist-time {
+    margin-left: auto;
+    font-size: 0.75rem;
+    color: var(--muted, #888);
+  }
+
+  .hist-actions {
+    display: flex;
+    margin-top: 0.25rem;
+  }
+
+  .status-badge.status-needs_update {
+    background: rgba(255, 122, 0, 0.15);
+    color: var(--spot, #ff7a00);
+  }
+
+  .status-badge.status-already_normalized {
+    background: rgba(59, 130, 246, 0.15);
+    color: #3b82f6;
+  }
+
+  .status-badge.status-skipped_provider_not_applicable {
+    background: rgba(255, 255, 255, 0.06);
+    color: #888;
+  }
+
+  .status-badge.status-matched {
+    background: rgba(34, 197, 94, 0.15);
+    color: #22c55e;
+  }
+
+  .status-badge.status-ambiguous {
+    background: rgba(234, 179, 8, 0.15);
+    color: #eab308;
+  }
+
+  .status-badge.status-unmatched {
+    background: rgba(168, 85, 247, 0.15);
+    color: #a855f7;
+  }
+
+  .status-badge.status-reverted {
+    background: rgba(100, 116, 139, 0.15);
+    color: #94a3b8;
   }
 </style>
