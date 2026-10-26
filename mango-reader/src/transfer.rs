@@ -485,6 +485,25 @@ where
                         }
                         Err(e) => (is_recoverable_error(&e), retry_after_duration, e.message),
                     }
+                } else if status == StatusCode::RANGE_NOT_SATISFIABLE && existing_len > 0 {
+                    tracing::warn!(
+                        "[Transfer] Server returned 416 Range Not Satisfiable for chapter {} at offset {}",
+                        chapter_id,
+                        existing_len
+                    );
+                    if crate::pipeline::publisher::verify_cbz_integrity(destination_part).is_ok() {
+                        tracing::info!(
+                            "[Transfer] Existing .part file is already complete and valid for chapter {}",
+                            chapter_id
+                        );
+                        return Ok(existing_len);
+                    }
+                    tracing::info!(
+                        "[Transfer] Removing invalid/oversized .part file and restarting cleanly from byte 0 for chapter {}",
+                        chapter_id
+                    );
+                    let _ = std::fs::remove_file(destination_part);
+                    (true, None, "Range not satisfiable — resetting partial file".to_string())
                 } else {
                     let err = AppError::new(
                         status.as_u16(),
