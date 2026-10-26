@@ -34,7 +34,7 @@ Before editing any subsystem, inspect its implementation, relevant tests, migrat
 | `mango-extension-host/` | Separate JVM/Kotlin extension host; protocol in `protocol/openapi.yaml` |
 | `mango-desktop/` | Separate Rust desktop shell crate |
 
-There is no root Cargo workspace manifest: run Rust commands in the relevant crate. Migrations currently run through `024_torbox_provenance_and_recovery.sql` and are explicitly included in `src/db.rs`. Relevant groups: 012–015 sync/provenance/lists; 016–020 verification, Nyaa/TorBox, collections, planning/execution; 021 metadata provenance; 022 normalization/history; 023 transfer state; 024 durable magnet provenance. Add forward-safe migrations and register them in order for future schema changes; preserve user data and never rewrite applied migrations to change existing installations.
+There is no root Cargo workspace manifest: run Rust commands in the relevant crate. Migrations currently run through `025_normalization_safety.sql` and are explicitly included in `src/db.rs`. Relevant groups: 012–015 sync/provenance/lists; 016–020 verification, Nyaa/TorBox, collections, planning/execution; 021 metadata provenance; 022 normalization/history; 023 transfer state; 024 durable magnet provenance; 025 saved normalization previews and durable backup/recovery fields. Add forward-safe migrations and register them in order for future schema changes; preserve user data and never rewrite applied migrations to change existing installations.
 
 Keep changes focused and commits logically isolated. Extend existing abstractions rather than create parallel systems. Avoid unrelated cleanup, gratuitous dependencies, and stylistic rewrites of working systems.
 
