@@ -9,6 +9,8 @@
 
 pub mod komga;
 pub mod mangabaka;
+pub mod metadata;
+pub mod normalization;
 pub mod optimizer;
 pub mod ownership;
 pub mod publisher;
@@ -230,6 +232,7 @@ pub struct Pipeline {
     db: Db,
     pub(crate) http: Client,
     pub ownership: ownership::OwnershipService,
+    pub normalization: normalization::LibraryNormalizationService,
     events: Arc<RwLock<VecDeque<PipelineEvent>>>,
     verification_policy: Arc<RwLock<VerificationPolicy>>,
 }
@@ -241,10 +244,13 @@ impl Pipeline {
             .build()
             .unwrap_or_default();
         let ownership = ownership::OwnershipService::new(http.clone(), db.clone());
+        let normalization =
+            normalization::LibraryNormalizationService::new(db.clone(), http.clone());
         Self {
             db,
             http,
             ownership,
+            normalization,
             events: Arc::new(RwLock::new(VecDeque::with_capacity(MAX_RECENT_EVENTS))),
             verification_policy: Arc::new(RwLock::new(VerificationPolicy::default())),
         }

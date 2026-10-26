@@ -55,6 +55,8 @@ pub struct KomgaBook {
     pub metadata: Option<KomgaBookMetadata>,
     #[serde(default)]
     pub read_progress: Option<KomgaReadProgress>,
+    #[serde(default)]
+    pub url: Option<String>,
 }
 
 #[derive(Clone)]
@@ -79,7 +81,11 @@ impl KomgaClient {
         let url = if endpoint.starts_with("http://") || endpoint.starts_with("https://") {
             endpoint.to_string()
         } else {
-            format!("{}/{}", self.base_url.trim_end_matches('/'), endpoint.trim_start_matches('/'))
+            format!(
+                "{}/{}",
+                self.base_url.trim_end_matches('/'),
+                endpoint.trim_start_matches('/')
+            )
         };
 
         let mut req = self
@@ -104,7 +110,13 @@ impl KomgaClient {
             .request_builder(reqwest::Method::GET, "/api/v1/libraries")
             .send()
             .await
-            .map_err(|e| AppError::new(502, "komga_offline", format!("Cannot reach Komga at {}: {e}", self.base_url)))?;
+            .map_err(|e| {
+                AppError::new(
+                    502,
+                    "komga_offline",
+                    format!("Cannot reach Komga at {}: {e}", self.base_url),
+                )
+            })?;
 
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
@@ -125,7 +137,10 @@ impl KomgaClient {
             return Err(AppError::new(
                 404,
                 "komga_not_found",
-                format!("Komga endpoint /api/v1/libraries not found at {}", self.base_url),
+                format!(
+                    "Komga endpoint /api/v1/libraries not found at {}",
+                    self.base_url
+                ),
             ));
         }
 
@@ -138,11 +153,7 @@ impl KomgaClient {
             ));
         }
 
-        let library_count = resp
-            .json::<Vec<KomgaLibrary>>()
-            .await
-            .map(|l| l.len())
-            .ok();
+        let library_count = resp.json::<Vec<KomgaLibrary>>().await.map(|l| l.len()).ok();
 
         let msg = match library_count {
             Some(count) => format!(
@@ -162,7 +173,13 @@ impl KomgaClient {
             .request_builder(reqwest::Method::GET, "/api/v1/libraries")
             .send()
             .await
-            .map_err(|e| AppError::new(502, "komga_offline", format!("Cannot fetch Komga libraries: {e}")))?;
+            .map_err(|e| {
+                AppError::new(
+                    502,
+                    "komga_offline",
+                    format!("Cannot fetch Komga libraries: {e}"),
+                )
+            })?;
 
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED {
@@ -183,39 +200,64 @@ impl KomgaClient {
             return Err(AppError::new(
                 404,
                 "komga_not_found",
-                format!("Komga endpoint /api/v1/libraries not found at {}", self.base_url),
+                format!(
+                    "Komga endpoint /api/v1/libraries not found at {}",
+                    self.base_url
+                ),
             ));
         }
 
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(AppError::new(status.as_u16(), "komga_error", format!("Komga returned HTTP {status}: {body}")));
+            return Err(AppError::new(
+                status.as_u16(),
+                "komga_error",
+                format!("Komga returned HTTP {status}: {body}"),
+            ));
         }
 
-        let libs: Vec<KomgaLibrary> = resp.json().await.map_err(|e| AppError::internal(e.to_string()))?;
+        let libs: Vec<KomgaLibrary> = resp
+            .json()
+            .await
+            .map_err(|e| AppError::internal(e.to_string()))?;
         Ok(libs)
     }
 
     /// Searches for series matching a title query in Komga.
-    pub async fn search_series(&self, title: &str, library_id: Option<&str>) -> Result<Vec<KomgaSeries>> {
+    pub async fn search_series(
+        &self,
+        title: &str,
+        library_id: Option<&str>,
+    ) -> Result<Vec<KomgaSeries>> {
         let mut req = self.request_builder(reqwest::Method::GET, "/api/v1/series");
         req = req.query(&[("search", title)]);
         if let Some(lib_id) = library_id.filter(|s| !s.trim().is_empty()) {
             req = req.query(&[("library_id", lib_id)]);
         }
 
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| AppError::new(502, "komga_offline", format!("Cannot search Komga series: {e}")))?;
+        let resp = req.send().await.map_err(|e| {
+            AppError::new(
+                502,
+                "komga_offline",
+                format!("Cannot search Komga series: {e}"),
+            )
+        })?;
 
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            return Err(AppError::new(status.as_u16(), "komga_unauthorized", "Komga authentication failed"));
+            return Err(AppError::new(
+                status.as_u16(),
+                "komga_unauthorized",
+                "Komga authentication failed",
+            ));
         }
 
         if !status.is_success() {
-            return Err(AppError::new(status.as_u16(), "komga_error", format!("Komga series search returned HTTP {status}")));
+            return Err(AppError::new(
+                status.as_u16(),
+                "komga_error",
+                format!("Komga series search returned HTTP {status}"),
+            ));
         }
 
         #[derive(Deserialize)]
@@ -224,7 +266,10 @@ impl KomgaClient {
             content: Vec<KomgaSeries>,
         }
 
-        let page: Page = resp.json().await.map_err(|e| AppError::internal(e.to_string()))?;
+        let page: Page = resp
+            .json()
+            .await
+            .map_err(|e| AppError::internal(e.to_string()))?;
         Ok(page.content)
     }
 
@@ -238,15 +283,29 @@ impl KomgaClient {
             .request_builder(reqwest::Method::GET, &endpoint)
             .send()
             .await
-            .map_err(|e| AppError::new(502, "komga_offline", format!("Cannot fetch Komga series: {e}")))?;
+            .map_err(|e| {
+                AppError::new(
+                    502,
+                    "komga_offline",
+                    format!("Cannot fetch Komga series: {e}"),
+                )
+            })?;
 
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            return Err(AppError::new(status.as_u16(), "komga_unauthorized", "Komga authentication failed"));
+            return Err(AppError::new(
+                status.as_u16(),
+                "komga_unauthorized",
+                "Komga authentication failed",
+            ));
         }
 
         if !status.is_success() {
-            return Err(AppError::new(status.as_u16(), "komga_error", format!("Komga series fetch returned HTTP {status}")));
+            return Err(AppError::new(
+                status.as_u16(),
+                "komga_error",
+                format!("Komga series fetch returned HTTP {status}"),
+            ));
         }
 
         #[derive(Deserialize)]
@@ -255,7 +314,10 @@ impl KomgaClient {
             content: Vec<KomgaSeries>,
         }
 
-        let page: Page = resp.json().await.map_err(|e| AppError::internal(e.to_string()))?;
+        let page: Page = resp
+            .json()
+            .await
+            .map_err(|e| AppError::internal(e.to_string()))?;
         Ok(page.content)
     }
 
@@ -266,15 +328,29 @@ impl KomgaClient {
             .request_builder(reqwest::Method::GET, &endpoint)
             .send()
             .await
-            .map_err(|e| AppError::new(502, "komga_offline", format!("Cannot fetch Komga books: {e}")))?;
+            .map_err(|e| {
+                AppError::new(
+                    502,
+                    "komga_offline",
+                    format!("Cannot fetch Komga books: {e}"),
+                )
+            })?;
 
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            return Err(AppError::new(status.as_u16(), "komga_unauthorized", "Komga authentication failed"));
+            return Err(AppError::new(
+                status.as_u16(),
+                "komga_unauthorized",
+                "Komga authentication failed",
+            ));
         }
 
         if !status.is_success() {
-            return Err(AppError::new(status.as_u16(), "komga_error", format!("Komga books fetch returned HTTP {status}")));
+            return Err(AppError::new(
+                status.as_u16(),
+                "komga_error",
+                format!("Komga books fetch returned HTTP {status}"),
+            ));
         }
 
         #[derive(Deserialize)]
@@ -283,7 +359,10 @@ impl KomgaClient {
             content: Vec<KomgaBook>,
         }
 
-        let page: Page = resp.json().await.map_err(|e| AppError::internal(e.to_string()))?;
+        let page: Page = resp
+            .json()
+            .await
+            .map_err(|e| AppError::internal(e.to_string()))?;
         Ok(page.content)
     }
 
@@ -300,7 +379,13 @@ impl KomgaClient {
             .request_builder(reqwest::Method::POST, &endpoint)
             .send()
             .await
-            .map_err(|e| AppError::new(502, "komga_offline", format!("Failed to trigger Komga scan: {e}")))?;
+            .map_err(|e| {
+                AppError::new(
+                    502,
+                    "komga_offline",
+                    format!("Failed to trigger Komga scan: {e}"),
+                )
+            })?;
 
         if !resp.status().is_success() && resp.status() != reqwest::StatusCode::NO_CONTENT {
             let status = resp.status();
@@ -313,6 +398,64 @@ impl KomgaClient {
         }
 
         tracing::info!("KOMGA: library scan triggered successfully ({endpoint})");
+        Ok(())
+    }
+
+    /// Triggers metadata analysis and refresh for a specific book in Komga.
+    pub async fn refresh_book_metadata(&self, book_id: &str) -> Result<()> {
+        let endpoint = format!("/api/v1/books/{book_id}/analyze");
+        let resp = self
+            .request_builder(reqwest::Method::POST, &endpoint)
+            .send()
+            .await
+            .map_err(|e| {
+                AppError::new(
+                    502,
+                    "komga_offline",
+                    format!("Failed to refresh Komga book metadata: {e}"),
+                )
+            })?;
+
+        if !resp.status().is_success() && resp.status() != reqwest::StatusCode::NO_CONTENT {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(AppError::new(
+                status.as_u16(),
+                "komga_error",
+                format!("Komga book analyze failed with HTTP {status}: {body}"),
+            ));
+        }
+
+        tracing::info!("KOMGA: book metadata refresh triggered ({book_id})");
+        Ok(())
+    }
+
+    /// Triggers metadata analysis and refresh for a specific series in Komga.
+    pub async fn refresh_series_metadata(&self, series_id: &str) -> Result<()> {
+        let endpoint = format!("/api/v1/series/{series_id}/analyze");
+        let resp = self
+            .request_builder(reqwest::Method::POST, &endpoint)
+            .send()
+            .await
+            .map_err(|e| {
+                AppError::new(
+                    502,
+                    "komga_offline",
+                    format!("Failed to refresh Komga series metadata: {e}"),
+                )
+            })?;
+
+        if !resp.status().is_success() && resp.status() != reqwest::StatusCode::NO_CONTENT {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(AppError::new(
+                status.as_u16(),
+                "komga_error",
+                format!("Komga series analyze failed with HTTP {status}: {body}"),
+            ));
+        }
+
+        tracing::info!("KOMGA: series metadata refresh triggered ({series_id})");
         Ok(())
     }
 
@@ -417,9 +560,19 @@ mod tests {
 
     #[test]
     fn komga_client_url_formatting() {
-        let client = KomgaClient::new(Client::new(), Some("http://localhost:25600/".into()), Some("secret".into()));
-        let req = client.request_builder(reqwest::Method::GET, "/api/v1/libraries").build().unwrap();
-        assert_eq!(req.url().as_str(), "http://localhost:25600/api/v1/libraries");
+        let client = KomgaClient::new(
+            Client::new(),
+            Some("http://localhost:25600/".into()),
+            Some("secret".into()),
+        );
+        let req = client
+            .request_builder(reqwest::Method::GET, "/api/v1/libraries")
+            .build()
+            .unwrap();
+        assert_eq!(
+            req.url().as_str(),
+            "http://localhost:25600/api/v1/libraries"
+        );
         assert_eq!(req.headers().get("X-API-Key").unwrap(), "secret");
         assert_eq!(req.headers().get("X-Auth-Token").unwrap(), "secret");
     }
@@ -427,14 +580,14 @@ mod tests {
     #[tokio::test]
     async fn komga_client_mock_api_tests() {
         use axum::{
+            Json, Router,
             http::{HeaderMap, StatusCode},
             response::IntoResponse,
             routing::{get, post},
-            Json, Router,
         };
         use serde_json::json;
-        use std::sync::atomic::{AtomicBool, Ordering};
         use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
 
         let scan_triggered = Arc::new(AtomicBool::new(false));
         let scan_flag = scan_triggered.clone();
@@ -544,7 +697,10 @@ mod tests {
             conn_res.unwrap(),
             "Successfully connected to Komga (2 libraries accessible)"
         );
-        assert!(!scan_triggered.load(Ordering::SeqCst), "Validation must NEVER trigger scan");
+        assert!(
+            !scan_triggered.load(Ordering::SeqCst),
+            "Validation must NEVER trigger scan"
+        );
 
         // 2. Missing credentials + 401
         let no_auth_client = KomgaClient::new(Client::new(), Some(base_url.clone()), None);
@@ -601,22 +757,31 @@ mod tests {
         assert_eq!(libs[1].id, "lib-zh");
         assert_eq!(libs[1].name, "Manga Chinese");
 
-        let series = valid_client.search_series("Blue Lock", Some("lib-en")).await.unwrap();
+        let series = valid_client
+            .search_series("Blue Lock", Some("lib-en"))
+            .await
+            .unwrap();
         assert_eq!(series.len(), 1);
         assert_eq!(series[0].id, "series-100");
 
-        let books = valid_client.get_books_in_series("series-100").await.unwrap();
+        let books = valid_client
+            .get_books_in_series("series-100")
+            .await
+            .unwrap();
         assert_eq!(books.len(), 1);
         assert_eq!(books[0].name, "Blue Lock v01");
         assert_eq!(books[0].number, 1.0);
 
         assert!(valid_client.trigger_scan(Some("lib-en")).await.is_ok());
-        assert!(scan_triggered.load(Ordering::SeqCst), "Targeted scan must fire");
+        assert!(
+            scan_triggered.load(Ordering::SeqCst),
+            "Targeted scan must fire"
+        );
     }
 
     #[tokio::test]
     async fn test_volume_ownership_verification_checks_exact_volume() {
-        use axum::{routing::get, Json, Router};
+        use axum::{Json, Router, routing::get};
         use serde_json::json;
 
         let app = Router::new()
@@ -680,22 +845,52 @@ mod tests {
         );
 
         // Exact volume 1 exists
-        assert!(client.verify_release_indexed("Blue Lock", Some("lib-en"), true, 1.0).await.unwrap());
+        assert!(
+            client
+                .verify_release_indexed("Blue Lock", Some("lib-en"), true, 1.0)
+                .await
+                .unwrap()
+        );
         // Exact volume 2 exists
-        assert!(client.verify_release_indexed("Blue Lock", Some("lib-en"), true, 2.0).await.unwrap());
+        assert!(
+            client
+                .verify_release_indexed("Blue Lock", Some("lib-en"), true, 2.0)
+                .await
+                .unwrap()
+        );
         // Volume 3 does NOT exist
-        assert!(!client.verify_release_indexed("Blue Lock", Some("lib-en"), true, 3.0).await.unwrap());
+        assert!(
+            !client
+                .verify_release_indexed("Blue Lock", Some("lib-en"), true, 3.0)
+                .await
+                .unwrap()
+        );
         // Volume 1.5 does NOT exist
-        assert!(!client.verify_release_indexed("Blue Lock", Some("lib-en"), true, 1.5).await.unwrap());
+        assert!(
+            !client
+                .verify_release_indexed("Blue Lock", Some("lib-en"), true, 1.5)
+                .await
+                .unwrap()
+        );
         // Chapter 1 does NOT match Volume 1 (unit mismatch)
-        assert!(!client.verify_release_indexed("Blue Lock", Some("lib-en"), false, 1.0).await.unwrap());
+        assert!(
+            !client
+                .verify_release_indexed("Blue Lock", Some("lib-en"), false, 1.0)
+                .await
+                .unwrap()
+        );
         // Other series does NOT exist
-        assert!(!client.verify_release_indexed("Chainsaw Man", Some("lib-en"), true, 1.0).await.unwrap());
+        assert!(
+            !client
+                .verify_release_indexed("Chainsaw Man", Some("lib-en"), true, 1.0)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]
     async fn test_chapter_ownership_verification_checks_exact_chapter() {
-        use axum::{routing::get, Json, Router};
+        use axum::{Json, Router, routing::get};
         use serde_json::json;
 
         let app = Router::new()
@@ -748,12 +943,32 @@ mod tests {
         );
 
         // Exact chapter 10 exists
-        assert!(client.verify_release_indexed("Dandadan", Some("lib-en"), false, 10.0).await.unwrap());
+        assert!(
+            client
+                .verify_release_indexed("Dandadan", Some("lib-en"), false, 10.0)
+                .await
+                .unwrap()
+        );
         // Chapter 11 does NOT exist
-        assert!(!client.verify_release_indexed("Dandadan", Some("lib-en"), false, 11.0).await.unwrap());
+        assert!(
+            !client
+                .verify_release_indexed("Dandadan", Some("lib-en"), false, 11.0)
+                .await
+                .unwrap()
+        );
         // Chapter 9 does NOT exist
-        assert!(!client.verify_release_indexed("Dandadan", Some("lib-en"), false, 9.0).await.unwrap());
+        assert!(
+            !client
+                .verify_release_indexed("Dandadan", Some("lib-en"), false, 9.0)
+                .await
+                .unwrap()
+        );
         // Volume 10 does NOT match Chapter 10 (unit mismatch)
-        assert!(!client.verify_release_indexed("Dandadan", Some("lib-en"), true, 10.0).await.unwrap());
+        assert!(
+            !client
+                .verify_release_indexed("Dandadan", Some("lib-en"), true, 10.0)
+                .await
+                .unwrap()
+        );
     }
 }
