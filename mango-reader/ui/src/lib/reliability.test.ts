@@ -3,6 +3,7 @@ import { runAction } from './action';
 import { ApiError, message } from './api';
 import { confirm, confirmation } from './confirm.svelte';
 import { toast } from './toast.svelte';
+import { formatBytes } from './util';
 
 describe('toast store', () => {
   it('adds and dismisses toasts', () => {
@@ -1390,6 +1391,53 @@ describe('first-class volume acquisition & release semantics', () => {
       expect(optimizingQueued.stage).toBe('optimizing');
       expect(komgaFailedQueued.canRetryKomga).toBe(true);
       expect(komgaFailedQueued.failureStage).toBe('komga');
+    });
+
+    it('formats transfer progress bytes, stall badges, and bounded retry states', () => {
+      expect(formatBytes(0)).toBe('0 B');
+      expect(formatBytes(512)).toBe('512 B');
+      expect(formatBytes(1024)).toBe('1.0 KB');
+      expect(formatBytes(357105190)).toBe('340.6 MB');
+      expect(formatBytes(1073741824)).toBe('1.00 GB');
+
+      const stalledTransfer: import('./api').Queued = {
+        chapterId: 201,
+        chapterName: 'Volume 1',
+        mangaId: 5,
+        title: 'Made in Abyss',
+        state: 'downloading',
+        stage: 'stalled',
+        source: 'MangaDot',
+        releaseType: 'volume',
+        done: 0,
+        total: 1,
+        attempts: 1,
+        retryAt: null,
+        error: null,
+        bytesDownloaded: 357105190,
+        totalBytes: 500000000,
+        isStalled: true,
+        attempt: 1,
+        maxAttempts: 5,
+        transferStatus: 'stalled',
+      };
+
+      expect(stalledTransfer.isStalled).toBe(true);
+      expect(stalledTransfer.bytesDownloaded).toBe(357105190);
+      expect(stalledTransfer.attempt).toBe(1);
+      expect(stalledTransfer.maxAttempts).toBe(5);
+
+      const retryingTransfer: import('./api').Queued = {
+        ...stalledTransfer,
+        stage: 'retrying',
+        transferStatus: 'retrying',
+        isStalled: false,
+        attempt: 2,
+        retryAt: Math.floor(Date.now() / 1000) + 30,
+      };
+
+      expect(retryingTransfer.transferStatus).toBe('retrying');
+      expect(retryingTransfer.attempt).toBe(2);
     });
 
     it('validates Komga library discovery selection and dual library ID targeting', () => {

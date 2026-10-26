@@ -4,7 +4,7 @@
   import Icon from '../lib/Icon.svelte';
   import Notice from '../lib/Notice.svelte';
   import { toast } from '../lib/toast.svelte';
-  import { ago } from '../lib/util';
+  import { ago, formatBytes } from '../lib/util';
 
   let data = $state<Queue | null>(null);
   let events = $state<PipelineEvent[]>([]);
@@ -212,9 +212,34 @@
 
   function describe(entry: Queued): string {
     if (entry.statusMessage) return entry.statusMessage;
+    if (entry.isStalled) return 'Transfer stalled — waiting for progress';
+    if (entry.stage === 'retrying' || entry.transferStatus === 'retrying') {
+      const wait = entry.retryAt ? Math.max(0, Math.ceil((entry.retryAt - Date.now() / 1000) / 60)) : 0;
+      const att = entry.attempt ?? entry.attempts;
+      const maxAtt = entry.maxAttempts ?? 5;
+      return `Retrying (Attempt ${att}/${maxAtt})${wait > 0 ? ` in ${wait} min` : ''}`;
+    }
     if (entry.state === 'verifying' || entry.stage === 'verifying') return 'Published — waiting for Komga';
-    if (entry.backendType === 'torbox' && entry.state === 'downloading') return 'Downloading via TorBox';
-    if (entry.state === 'downloading') return entry.total ? `Downloading, page ${entry.done} of ${entry.total}` : 'Downloading';
+    if (entry.backendType === 'torbox' && entry.state === 'downloading') {
+      if (entry.bytesDownloaded !== undefined && entry.bytesDownloaded !== null && entry.bytesDownloaded > 0) {
+        if (entry.totalBytes) {
+          const pct = Math.round((entry.bytesDownloaded / entry.totalBytes) * 100);
+          return `Downloading via TorBox: ${formatBytes(entry.bytesDownloaded)} / ${formatBytes(entry.totalBytes)} (${pct}%)`;
+        }
+        return `Downloading via TorBox: ${formatBytes(entry.bytesDownloaded)}`;
+      }
+      return 'Downloading via TorBox';
+    }
+    if (entry.state === 'downloading') {
+      if (entry.bytesDownloaded !== undefined && entry.bytesDownloaded !== null && entry.bytesDownloaded > 0) {
+        if (entry.totalBytes) {
+          const pct = Math.round((entry.bytesDownloaded / entry.totalBytes) * 100);
+          return `Downloading: ${formatBytes(entry.bytesDownloaded)} / ${formatBytes(entry.totalBytes)} (${pct}%)`;
+        }
+        return `Downloading: ${formatBytes(entry.bytesDownloaded)}`;
+      }
+      return entry.total ? `Downloading, page ${entry.done} of ${entry.total}` : 'Downloading';
+    }
     if (entry.state === 'identifying') return 'Identifying release semantics';
     if (entry.state === 'metadata') return 'Querying MangaBaka metadata';
     if (entry.state === 'optimizing') return 'Optimizing image compression';
@@ -230,6 +255,12 @@
   }
 
   function stageLabel(entry: Queued): string {
+    if (entry.isStalled || entry.stage === 'stalled') return 'Stalled';
+    if (entry.stage === 'retrying' || entry.transferStatus === 'retrying') {
+      const att = entry.attempt ?? entry.attempts;
+      const maxAtt = entry.maxAttempts ?? 5;
+      return `Retrying (${att}/${maxAtt})`;
+    }
     const s = entry.stage ?? entry.state;
     switch (s) {
       case 'torbox_submitting': return 'TorBox Submit';
@@ -342,7 +373,7 @@
                         <div class="main">
                           <div class="row-header">
                             <strong>{entry.chapterName}</strong>
-                            <span class="tag" class:spot={entry.stage !== 'queued' && entry.stage !== 'failed'} class:error={entry.stage === 'failed'}>
+                            <span class="tag" class:spot={entry.stage !== 'queued' && entry.stage !== 'failed' && !entry.isStalled} class:error={entry.stage === 'failed' || entry.isStalled}>
                               {stageLabel(entry)}
                             </span>
                             {#if entry.rawTitle}
@@ -350,8 +381,12 @@
                             {/if}
                           </div>
                           <span>{describe(entry)}</span>
-                          {#if entry.state === 'downloading' && entry.total}
-                            <span class="meter" aria-hidden="true"><span style:width="{Math.round((entry.done / entry.total) * 100)}%"></span></span>
+                          {#if entry.state === 'downloading' || entry.stage === 'downloading' || entry.stage === 'torbox_retrieving'}
+                            {#if entry.totalBytes && entry.bytesDownloaded}
+                              <span class="meter" aria-hidden="true"><span style:width="{Math.min(100, Math.round((entry.bytesDownloaded / entry.totalBytes) * 100))}%"></span></span>
+                            {:else if entry.total}
+                              <span class="meter" aria-hidden="true"><span style:width="{Math.round((entry.done / entry.total) * 100)}%"></span></span>
+                            {/if}
                           {/if}
                         </div>
                         <span class="tools">
@@ -397,7 +432,7 @@
                 <a class="main" href="#/title/{entry.mangaId}">
                   <div class="row-header">
                     <strong>{entry.title}</strong>
-                    <span class="tag" class:spot={entry.stage !== 'queued' && entry.stage !== 'failed'} class:error={entry.stage === 'failed'}>
+                    <span class="tag" class:spot={entry.stage !== 'queued' && entry.stage !== 'failed' && !entry.isStalled} class:error={entry.stage === 'failed' || entry.isStalled}>
                       {stageLabel(entry)}
                     </span>
                     {#if entry.sourceType === 'nyaa'}
@@ -411,8 +446,12 @@
                     {/if}
                   </div>
                   <span>{entry.chapterName} · {describe(entry)}</span>
-                  {#if entry.state === 'downloading' && entry.total}
-                    <span class="meter" aria-hidden="true"><span style:width="{Math.round((entry.done / entry.total) * 100)}%"></span></span>
+                  {#if entry.state === 'downloading' || entry.stage === 'downloading' || entry.stage === 'torbox_retrieving'}
+                    {#if entry.totalBytes && entry.bytesDownloaded}
+                      <span class="meter" aria-hidden="true"><span style:width="{Math.min(100, Math.round((entry.bytesDownloaded / entry.totalBytes) * 100))}%"></span></span>
+                    {:else if entry.total}
+                      <span class="meter" aria-hidden="true"><span style:width="{Math.round((entry.done / entry.total) * 100)}%"></span></span>
+                    {/if}
                   {/if}
                 </a>
                 <span class="tools">

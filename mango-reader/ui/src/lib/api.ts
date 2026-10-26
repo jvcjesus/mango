@@ -230,6 +230,12 @@ export type Queued = {
   releaseSize?: number | null;
   collectionId?: string | null;
   collectionName?: string | null;
+  bytesDownloaded?: number | null;
+  totalBytes?: number | null;
+  isStalled?: boolean;
+  attempt?: number | null;
+  maxAttempts?: number | null;
+  transferStatus?: string | null;
 };
 
 export type Queue = { paused: boolean; queue: Queued[] };

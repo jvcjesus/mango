@@ -148,6 +148,18 @@ export function volumeHeading(vol: number | null): string {
   return vol !== null ? `VOLUME ${vol}` : 'OTHER CHAPTERS';
 }
 
+/** Formats byte count into human-readable string (e.g. "357.1 MB", "1.24 GB"). */
+export function formatBytes(bytes?: number | null): string {
+  if (bytes === null || bytes === undefined || isNaN(bytes) || bytes < 0) return '0 B';
+  if (bytes < 1024) return `${bytes} B`;
+  const kb = bytes / 1024;
+  if (kb < 1024) return `${kb.toFixed(1)} KB`;
+  const mb = kb / 1024;
+  if (mb < 1024) return `${mb.toFixed(1)} MB`;
+  const gb = mb / 1024;
+  return `${gb.toFixed(2)} GB`;
+}
+
 /** Runs `run` each time the element comes near the viewport. For lists that load as they are scrolled. */
 export function whenVisible(node: HTMLElement, run: () => void) {
   let current = run;
