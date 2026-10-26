@@ -2103,21 +2103,36 @@ pub fn write_comic_info_to_cbz(
     let final_xml =
         generate_comic_info_xml(params, enrichment, existing_xml.as_deref(), image_count);
 
-    // Validate generated XML syntax
-    if !final_xml.starts_with("<?xml")
-        || !final_xml.contains("<ComicInfo>")
-        || !final_xml.ends_with("</ComicInfo>\n")
-    {
-        return Err(AppError::internal(
-            "Generated invalid ComicInfo.xml structure",
-        ));
-    }
     if params.is_volume && !final_xml.contains("<Volume>") {
         return Err(AppError::internal(
             "Generated ComicInfo.xml missing required Volume tag for volume release",
         ));
     }
+    write_prepared_comic_info_to_cbz(cbz_path, &final_xml)
+}
 
+/// Shared archive rewrite path for an already reviewed metadata document.
+pub fn write_prepared_comic_info_to_cbz(cbz_path: &Path, final_xml: &str) -> Result<usize> {
+    let parsed = roxmltree::Document::parse(final_xml)
+        .map_err(|_| AppError::bad_request("Invalid prepared ComicInfo XML"))?;
+    if parsed.root_element().tag_name().name() != "ComicInfo" {
+        return Err(AppError::bad_request("Invalid ComicInfo root"));
+    }
+    let mut source = zip::ZipArchive::new(File::open(cbz_path)?)?;
+    let image_count = source
+        .file_names()
+        .filter(|name| {
+            crate::local::is_image(name)
+                && !name.starts_with("__MACOSX")
+                && !name.rsplit('/').next().unwrap_or("").starts_with('.')
+        })
+        .count();
+    if image_count == 0 || !final_xml.starts_with("<?xml") || !final_xml.ends_with("</ComicInfo>\n")
+    {
+        return Err(AppError::bad_request(
+            "Invalid prepared ComicInfo or empty archive",
+        ));
+    }
     // Write to temporary staging file in same directory
     let parent = cbz_path.parent().unwrap_or_else(|| Path::new("."));
     let pid = std::process::id();
@@ -2211,7 +2226,7 @@ pub fn write_comic_info_to_cbz(
         "CBZ: successfully wrote ComicInfo.xml to {}",
         cbz_path.display()
     );
-    Ok(image_count as usize)
+    Ok(image_count)
 }
 
 pub fn enrich_comic_info_xml(xml: &str, enrichment: &MangaBakaEnrichment) -> Result<String> {

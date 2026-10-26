@@ -275,95 +275,75 @@ impl KomgaClient {
 
     /// Lists series in Komga, optionally filtered by library.
     pub async fn list_series(&self, library_id: Option<&str>) -> Result<Vec<KomgaSeries>> {
-        let mut endpoint = "/api/v1/series?size=1000".to_string();
-        if let Some(lib_id) = library_id.filter(|s| !s.trim().is_empty()) {
-            endpoint.push_str(&format!("&library_id={lib_id}"));
-        }
-        let resp = self
-            .request_builder(reqwest::Method::GET, &endpoint)
-            .send()
-            .await
-            .map_err(|e| {
-                AppError::new(
-                    502,
-                    "komga_offline",
-                    format!("Cannot fetch Komga series: {e}"),
-                )
-            })?;
-
-        let status = resp.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            return Err(AppError::new(
-                status.as_u16(),
-                "komga_unauthorized",
-                "Komga authentication failed",
-            ));
-        }
-
-        if !status.is_success() {
-            return Err(AppError::new(
-                status.as_u16(),
-                "komga_error",
-                format!("Komga series fetch returned HTTP {status}"),
-            ));
-        }
-
-        #[derive(Deserialize)]
-        struct Page {
-            #[serde(default)]
-            content: Vec<KomgaSeries>,
-        }
-
-        let page: Page = resp
-            .json()
-            .await
-            .map_err(|e| AppError::internal(e.to_string()))?;
-        Ok(page.content)
+        let filters: Vec<(&str, String)> = library_id
+            .map(|id| vec![("library_id", id.to_string())])
+            .unwrap_or_default();
+        self.all_pages("/api/v1/series", &filters).await
     }
 
-    /// Fetches all books for a specific series.
+    /// Fetch every page, so maintenance cannot silently report a truncated library.
     pub async fn get_books_in_series(&self, series_id: &str) -> Result<Vec<KomgaBook>> {
-        let endpoint = format!("/api/v1/series/{series_id}/books?size=500");
-        let resp = self
-            .request_builder(reqwest::Method::GET, &endpoint)
-            .send()
+        self.all_pages(&format!("/api/v1/series/{series_id}/books"), &[])
             .await
-            .map_err(|e| {
-                AppError::new(
-                    502,
-                    "komga_offline",
-                    format!("Cannot fetch Komga books: {e}"),
-                )
-            })?;
+    }
 
-        let status = resp.status();
-        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
-            return Err(AppError::new(
-                status.as_u16(),
-                "komga_unauthorized",
-                "Komga authentication failed",
-            ));
-        }
-
-        if !status.is_success() {
-            return Err(AppError::new(
-                status.as_u16(),
-                "komga_error",
-                format!("Komga books fetch returned HTTP {status}"),
-            ));
-        }
-
+    async fn all_pages<T: serde::de::DeserializeOwned>(
+        &self,
+        endpoint: &str,
+        filters: &[(&str, String)],
+    ) -> Result<Vec<T>> {
         #[derive(Deserialize)]
-        struct Page {
-            #[serde(default)]
-            content: Vec<KomgaBook>,
+        #[serde(rename_all = "camelCase")]
+        struct Page<T> {
+            content: Vec<T>,
+            total_pages: Option<usize>,
+            last: Option<bool>,
         }
-
-        let page: Page = resp
-            .json()
-            .await
-            .map_err(|e| AppError::internal(e.to_string()))?;
-        Ok(page.content)
+        let mut result = Vec::new();
+        for page in 0..10000usize {
+            let resp = self
+                .request_builder(reqwest::Method::GET, endpoint)
+                .query(filters)
+                .query(&[("size", 500), ("page", page)])
+                .send()
+                .await
+                .map_err(|_| {
+                    AppError::new(502, "komga_offline", "Cannot fetch Komga library page")
+                })?;
+            if matches!(
+                resp.status(),
+                reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+            ) {
+                return Err(AppError::new(
+                    resp.status().as_u16(),
+                    "komga_unauthorized",
+                    "Komga authentication failed",
+                ));
+            }
+            if !resp.status().is_success() {
+                return Err(AppError::new(
+                    resp.status().as_u16(),
+                    "komga_error",
+                    "Komga page fetch failed",
+                ));
+            }
+            let response: Page<T> = resp
+                .json()
+                .await
+                .map_err(|_| AppError::bad_request("Invalid Komga page response"))?;
+            let complete = response.last.unwrap_or_else(|| {
+                response
+                    .total_pages
+                    .map_or(response.content.len() < 500, |n| page + 1 >= n)
+            });
+            result.extend(response.content);
+            if complete {
+                return Ok(result);
+            }
+        }
+        Err(AppError::bad_request(
+            "Komga pagination exceeded safety bound; analysis incomplete",
+        ))
     }
 
     /// Triggers a library scan in Komga.
@@ -557,6 +537,27 @@ impl KomgaClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn maintenance_queries_follow_all_komga_pages() {
+        use axum::{extract::Query, routing::get, Json, Router};
+        use serde_json::json;
+        let app=Router::new().route("/api/v1/series",get(|Query(q): Query<std::collections::HashMap<String,String>>|async move {
+            let page=q.get("page").unwrap().parse::<usize>().unwrap();
+            Json(json!({"content":[{"id":format!("s{page}"),"name":"Title","libraryId":"en","booksCount":1}],"totalPages":2,"last":page==1}))
+        })).route("/api/v1/series/s0/books",get(|Query(q): Query<std::collections::HashMap<String,String>>|async move {
+            let page=q.get("page").unwrap().parse::<usize>().unwrap();
+            Json(json!({"content":[{"id":format!("b{page}"),"seriesId":"s0","name":"Book","number":1}],"totalPages":2,"last":page==1}))
+        }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = KomgaClient::new(Client::new(), Some(format!("http://{addr}")), None);
+        assert_eq!(client.list_series(Some("en")).await.unwrap().len(), 2);
+        assert_eq!(client.get_books_in_series("s0").await.unwrap().len(), 2);
+    }
 
     #[test]
     fn komga_client_url_formatting() {

@@ -221,6 +221,10 @@ pub fn router(state: Spaces) -> Router {
             get(get_maintenance_history),
         )
         .route(
+            "/pipeline/maintenance/refresh/{id}",
+            post(post_maintenance_refresh),
+        )
+        .route(
             "/pipeline/maintenance/rollback/{id}",
             post(post_maintenance_rollback),
         )
@@ -1590,11 +1594,7 @@ async fn post_maintenance_dry_run(
     Json(payload): Json<MaintenanceDryRunRequest>,
 ) -> Result<Json<crate::pipeline::normalization::LibraryAnalysisSummary>> {
     app.me.admin()?;
-    let (cfg, mb_token, komga_api_key) = app
-        .pipeline
-        .load_internal_config()
-        .await
-        .unwrap_or_default();
+    let (cfg, mb_token, komga_api_key) = app.pipeline.load_internal_config().await?;
 
     let komga_client = crate::pipeline::komga::KomgaClient::new(
         app.trackers.http().clone(),
@@ -1625,22 +1625,16 @@ async fn post_maintenance_dry_run(
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MaintenanceNormalizeRequest {
-    pub items: Vec<NormalizeItemRequest>,
-    #[allow(dead_code)]
-    pub dry_run: Option<bool>,
+    pub preview_id: String,
+    pub book_ids: Vec<String>,
+    #[serde(default)]
+    pub approved: bool,
+    #[serde(default = "maintenance_default_dry_run")]
+    pub dry_run: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct NormalizeItemRequest {
-    pub canonical_path: String,
-    pub series_title: String,
-    pub volume: Option<f64>,
-    pub komga_book_id: Option<String>,
-    pub komga_series_id: Option<String>,
-    pub mangabaka_id: Option<i64>,
-    pub mangabaka_release_id: Option<String>,
-    pub anilist_id: Option<i64>,
+fn maintenance_default_dry_run() -> bool {
+    true
 }
 
 async fn post_maintenance_normalize(
@@ -1648,104 +1642,20 @@ async fn post_maintenance_normalize(
     Json(payload): Json<MaintenanceNormalizeRequest>,
 ) -> Result<Json<crate::pipeline::normalization::NormalizationExecutionResult>> {
     app.me.admin()?;
-    let (cfg, mb_token, komga_api_key) = app
-        .pipeline
-        .load_internal_config()
-        .await
-        .unwrap_or_default();
-
-    let komga_client = crate::pipeline::komga::KomgaClient::new(
-        app.trackers.http().clone(),
-        cfg.komga_url,
-        komga_api_key,
-    );
-    let mb_client = crate::pipeline::mangabaka::MangaBakaClient::new(
-        app.trackers.http().clone(),
-        cfg.mangabaka_url,
-        mb_token,
-    );
-
-    let batch_id = format!("batch-{}", crate::db::now());
-    let mut items = Vec::new();
-    let mut normalized_count = 0;
-    let mut already_normalized_count = 0;
-    let mut failed_count = 0;
-    let mut skipped_count = 0;
-
-    for item in payload.items {
-        let path = std::path::PathBuf::from(&item.canonical_path);
-        let vol = item.volume.unwrap_or(1.0);
-        let mb_id = match item.mangabaka_id {
-            Some(id) => id,
-            None => {
-                failed_count += 1;
-                continue;
-            }
-        };
-
-        match app
-            .pipeline
-            .normalization
-            .normalize_book(
-                &batch_id,
-                &path,
-                &item.series_title,
-                vol,
-                mb_id,
-                item.anilist_id,
-                item.komga_series_id.as_deref(),
-                item.komga_book_id.as_deref(),
-                &mb_client,
-                Some(&komga_client),
-            )
-            .await
-        {
-            Ok(rec) => {
-                if rec.status == "normalized" {
-                    normalized_count += 1;
-                } else if rec.status == "already_normalized" {
-                    already_normalized_count += 1;
-                } else if rec.status == "skipped" {
-                    skipped_count += 1;
-                } else {
-                    failed_count += 1;
-                }
-                items.push(rec);
-            }
-            Err(e) => {
-                failed_count += 1;
-                items.push(crate::pipeline::normalization::NormalizationHistoryRecord {
-                    id: format!("err-{}", crate::db::now()),
-                    batch_id: batch_id.clone(),
-                    canonical_path: item.canonical_path,
-                    series_title: item.series_title,
-                    volume: vol,
-                    komga_series_id: item.komga_series_id,
-                    komga_book_id: item.komga_book_id,
-                    mangabaka_id: Some(mb_id),
-                    mangabaka_release_id: item.mangabaka_release_id,
-                    anilist_id: item.anilist_id,
-                    original_sha256: None,
-                    normalized_sha256: None,
-                    status: "error".to_string(),
-                    error_message: Some(e.to_string()),
-                    normalized_at: crate::db::now(),
-                    reverted_at: None,
-                });
-            }
-        }
-    }
-
+    let (cfg, _, key) = app.pipeline.load_internal_config().await?;
+    let komga =
+        crate::pipeline::komga::KomgaClient::new(app.trackers.http().clone(), cfg.komga_url, key);
     Ok(Json(
-        crate::pipeline::normalization::NormalizationExecutionResult {
-            batch_id,
-            total_processed: items.len(),
-            normalized_count,
-            already_normalized_count,
-            failed_count,
-            skipped_count,
-            items,
-        },
+        app.pipeline
+            .normalization
+            .execute_preview(
+                &payload.preview_id,
+                &payload.book_ids,
+                payload.approved,
+                payload.dry_run,
+                &komga,
+            )
+            .await?,
     ))
 }
 
@@ -1762,6 +1672,33 @@ async fn get_maintenance_history(
     let limit = query.limit.unwrap_or(50).clamp(1, 500);
     let records = app.pipeline.normalization.list_history(limit).await?;
     Ok(Json(records))
+}
+
+async fn post_maintenance_refresh(
+    Me(app): Me,
+    Path(id): Path<String>,
+) -> Result<Json<crate::pipeline::normalization::NormalizationHistoryRecord>> {
+    app.me.admin()?;
+    let (cfg, _, key) = app.pipeline.load_internal_config().await?;
+    let komga =
+        crate::pipeline::komga::KomgaClient::new(app.trackers.http().clone(), cfg.komga_url, key);
+    let rec = app
+        .pipeline
+        .normalization
+        .get_history_record(&id)
+        .await?
+        .ok_or_else(|| AppError::not_found("History record not found"))?;
+    app.pipeline
+        .normalization
+        .refresh_record(&rec, &komga)
+        .await?;
+    Ok(Json(
+        app.pipeline
+            .normalization
+            .get_history_record(&id)
+            .await?
+            .unwrap(),
+    ))
 }
 
 async fn post_maintenance_rollback(
@@ -2668,5 +2605,25 @@ mod tests {
         assert!(names("*", mark));
         assert!(!names("\"abd\"", mark));
         assert!(!names("", mark));
+    }
+}
+
+#[cfg(test)]
+mod maintenance_request_tests {
+    use super::*;
+    #[test]
+    fn mutation_requires_explicit_flags_and_saved_preview() {
+        let req: MaintenanceNormalizeRequest = serde_json::from_value(serde_json::json!({
+            "previewId":"preview", "bookIds":["book"]
+        }))
+        .unwrap();
+        assert!(req.dry_run);
+        assert!(!req.approved);
+        assert!(
+            serde_json::from_value::<MaintenanceNormalizeRequest>(serde_json::json!({
+                "items":[{"canonicalPath":"/arbitrary.cbz","mangabakaId":1}], "dryRun":false
+            }))
+            .is_err()
+        );
     }
 }
