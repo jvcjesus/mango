@@ -1953,10 +1953,16 @@ pub fn generate_comic_info_xml(
             field("Publisher", Some(pub_name));
         }
         if !e.genres.is_empty() {
-            field("Genre", Some(&e.genres.join(", ")));
+            let normalized_genres = crate::pipeline::metadata::normalize_genres(&e.genres);
+            if !normalized_genres.is_empty() {
+                field("Genre", Some(&normalized_genres.join(", ")));
+            }
         }
         if !e.tags.is_empty() {
-            field("Tags", Some(&e.tags.join(", ")));
+            let normalized_tags = crate::pipeline::metadata::normalize_tags(&e.tags, &e.genres);
+            if !normalized_tags.is_empty() {
+                field("Tags", Some(&normalized_tags.join(", ")));
+            }
         }
         if let Some(web) = &e.web_url {
             field("Web", Some(web));
