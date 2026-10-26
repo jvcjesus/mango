@@ -16,7 +16,7 @@
     type AcquisitionSourceOption,
   } from '../lib/api';
   import { onDestroy } from 'svelte';
-  import { PlanningSession, parseRequestedVolumes } from '../lib/planning';
+  import { PlanningSession, parseRequestedVolumes, SOURCE_OPTIONS_TIMEOUT_MS } from '../lib/planning';
   import { confirm } from '../lib/confirm.svelte';
   import type { InteractivePlan } from '../lib/api';
   import Cover from '../lib/Cover.svelte';
@@ -111,7 +111,7 @@
     planModalOpen = true;
 
     generateTitlePlan();
-    if (sources.length === 0) getAcquisitionSources(AbortSignal.timeout(10_000)).then(result => { if (planModalOpen) sources = result; }).catch(() => {});
+    if (sources.length === 0) getAcquisitionSources(AbortSignal.timeout(SOURCE_OPTIONS_TIMEOUT_MS)).then(result => { if (planModalOpen) sources = result; }).catch(() => {});
   }
   async function generateTitlePlan() {
     if (!planModalItem) return;
@@ -133,7 +133,7 @@
     const selectedAtConfirmation = selectedReleaseId;
     const titleAtConfirmation = planModalItem;
     const approved = await confirm({ title: 'Use Release Anyway', confirmText: 'Use Release Anyway',
-      message: `Mango cannot verify this release's exact edition against the catalog. Continue using the release's own edition/content and series-level metadata? Series: ${planModalItem.title}. Release: ${candidate.title}. Detected edition: ${candidate.edition ?? 'Unknown'}. Catalog edition: Unverified. Metadata: Series-level fallback. Existing files will not be replaced.` });
+      message: `Mango cannot verify this release's exact series/edition identity against the catalog. Continue using the release's own edition/content and series-level metadata? Series: ${planModalItem.title}. Release: ${candidate.title}. Detected edition: ${candidate.edition ?? 'Unknown'}. Catalog edition: Unverified. Metadata: Series-level fallback. Existing files will not be replaced.` });
     if (!approved || !planModalOpen || selectedReleaseId !== selectedAtConfirmation || planModalItem !== titleAtConfirmation) return;
     overrideConfirmed = true; generateTitlePlan();
   }
@@ -1038,7 +1038,7 @@
         {#if generatingPlan}
           <div class="loading-state">
             <Icon name="spinner" size={28} />
-            <p>Searching available releases… Discovery has a bounded timeout.</p>
+            <p>{selectedSourceId === 'nyaa' ? 'Searching Nyaa…' : 'Checking available sources…'}</p>
           </div>
         {:else if planError}
           <div class="plan-error-box">

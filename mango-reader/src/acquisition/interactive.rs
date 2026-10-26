@@ -84,6 +84,36 @@ fn bounded_coverage(unit: &super::AcquisitionReleaseUnit) -> bool {
     }
 }
 
+fn uncertain_source_candidate(
+    series: &str,
+    release: super::AcquisitionRelease,
+    profile: &AcquisitionProfile,
+) -> NormalizedAcquisitionCandidate {
+    let uncertain = super::AcquisitionCandidate {
+        is_variant: release.is_variant,
+        variant_name: release.variant_name.clone(),
+        release,
+        score: 0.0,
+        smart_score: None,
+        match_type: "ambiguous".into(),
+        ownership_status: "unknown".into(),
+        units_included: vec![],
+        units_owned: vec![],
+        units_missing: vec![],
+        coverage_summary: "Catalog identity unverified; explicit source review required".into(),
+        useful_efficiency_bytes: None,
+    };
+    let mut candidate = NormalizedAcquisitionCandidate::from_nyaa_candidate(
+        series,
+        &uncertain,
+        &profile.preferred_uploaders,
+        &profile.language,
+    );
+    candidate.confidence = "review_recommended".into();
+    candidate.provider_metadata["requiresIdentityOverride"] = serde_json::json!(true);
+    candidate
+}
+
 pub fn is_override(candidate: &NormalizedAcquisitionCandidate) -> bool {
     candidate.provider_metadata["identityOverride"] == true
 }
@@ -209,6 +239,9 @@ pub fn prepare_plan(
     let eligible = candidates
         .iter()
         .filter(|c| {
+            if c.provider_metadata["requiresIdentityOverride"] == true {
+                return false;
+            }
             let ed = c.edition.as_deref().unwrap_or("standard");
             edition.as_deref().is_none_or(|selected| {
                 selected == ed || (req.use_release_anyway && c.edition.is_none())
@@ -337,6 +370,7 @@ impl AcquisitionService {
             })
             .await?;
         let profile = self.get_manga_profile(manga_id).await?;
+        let (_, aliases) = self.get_title_and_aliases(manga_id).await?;
         let missing = bounded(provider_deadline, self.get_title_missing_content(manga_id)).await?;
         let (config, _) = self.load_internal_config().await?;
         let mut candidates = vec![];
@@ -358,10 +392,11 @@ impl AcquisitionService {
                         if releases.len() != count {
                             diagnostics.push("Nyaa: an oversized or invalid coverage range was rejected; select a supported release.".into());
                         }
+                        let unranked = releases.clone();
                         let ranked = super::nyaa::rank_candidates_smart(
                             releases,
                             &title,
-                            &[],
+                            &aliases,
                             None,
                             &missing.owned_volumes,
                             &missing.missing_volumes,
@@ -371,6 +406,14 @@ impl AcquisitionService {
                             None,
                             None,
                         );
+                        for release in unranked {
+                            if !ranked.iter().any(|candidate| {
+                                candidate.release.source_item_id == release.source_item_id
+                            }) {
+                                candidates
+                                    .push(uncertain_source_candidate(&title, release, &profile));
+                            }
+                        }
                         candidates.extend(ranked.iter().map(|c| {
                             NormalizedAcquisitionCandidate::from_nyaa_candidate(
                                 &title,
@@ -491,6 +534,60 @@ mod tests {
             content_mode: Some("specific".into()),
             ..Default::default()
         }
+    }
+    #[test]
+    fn unverified_provider_identity_is_review_only_until_override() {
+        let release = super::super::nyaa::parse_nyaa_rss(r#"<item><title>Unmapped Source Name v01-12 (Digital)</title><guid>source-other</guid><nyaa:categoryId>3_1</nyaa:categoryId><nyaa:seeders>10</nyaa:seeders></item>"#).remove(0);
+        let candidate =
+            uncertain_source_candidate("Series X", release, &AcquisitionProfile::default());
+        let automatic = PlanningRequest {
+            title: "Series X".into(),
+            ..Default::default()
+        };
+        assert!(prepare_plan(
+            1,
+            "Series X",
+            &AcquisitionProfile::default(),
+            &missing(),
+            vec![candidate.clone()],
+            &automatic,
+            vec![]
+        )
+        .unwrap()
+        .plan
+        .selected_items
+        .is_empty());
+        let mut explicit = request();
+        explicit.selected_release_id = Some(candidate.provider_release_id.clone());
+        assert!(prepare_plan(
+            1,
+            "Series X",
+            &AcquisitionProfile::default(),
+            &missing(),
+            vec![candidate.clone()],
+            &explicit,
+            vec![]
+        )
+        .unwrap()
+        .plan
+        .selected_items
+        .is_empty());
+        explicit.use_release_anyway = true;
+        assert!(is_override(
+            &prepare_plan(
+                1,
+                "Series X",
+                &AcquisitionProfile::default(),
+                &missing(),
+                vec![candidate],
+                &explicit,
+                vec![]
+            )
+            .unwrap()
+            .plan
+            .selected_items[0]
+                .candidate
+        ));
     }
     #[test]
     fn provider_ranges_are_bounded_before_ranking() {

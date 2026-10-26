@@ -354,6 +354,14 @@ pub fn validate_preflight_profile(
     );
     super::torbox::validate_edition_intent(&identity).map_err(|e| e.to_string())?;
 
+    if cand.provider_metadata["requiresIdentityOverride"] == true
+        && !super::interactive::is_override(cand)
+    {
+        return Err(
+            "Unverified source identity requires explicit Use Release Anyway approval".into(),
+        );
+    }
+
     if cand.mapping_provenance == UnitMappingProvenance::ChapterToVolumeInference {
         return Err(
             "Candidate volume mapping is inferred from chapter sequences; automated volume execution prohibited"

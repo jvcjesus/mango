@@ -1,4 +1,5 @@
 export const PLANNING_TIMEOUT_MS = 35_000;
+export const SOURCE_OPTIONS_TIMEOUT_MS = 10_000;
 export type PlanningResult<T> = { status: 'ready'; value: T } | { status: 'failed'; error: Error } | { status: 'stale' };
 export class PlanningSession {
   private generation = 0;
