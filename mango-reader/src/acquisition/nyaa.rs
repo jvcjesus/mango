@@ -329,11 +329,15 @@ fn extract_range_numbers(s: &str) -> Option<(f64, f64)> {
         while i < len && (bytes[i] == b' ' || bytes[i] == b'_') {
             i += 1;
         }
-        if i >= len || (bytes[i] != b'-' && bytes[i] != b'~' && !s[i..].starts_with("to")) {
+        if i >= len
+            || (bytes[i] != b'-'
+                && bytes[i] != b'~'
+                && !s.get(i..).is_some_and(|tail| tail.starts_with("to")))
+        {
             i += 1;
             continue;
         }
-        if s[i..].starts_with("to") {
+        if s.get(i..).is_some_and(|tail| tail.starts_with("to")) {
             i += 2;
         } else {
             i += 1;
@@ -365,15 +369,17 @@ fn extract_volume_range(s: &str) -> Option<(f64, f64)> {
 
     while i < len {
         // Match prefix "volumes", "volume", "vol.", "vol", "v"
-        let prefix_len = if s[i..].starts_with("volumes") {
+        let prefix_len = if s.get(i..).is_some_and(|tail| tail.starts_with("volumes")) {
             7
-        } else if s[i..].starts_with("volume") {
+        } else if s.get(i..).is_some_and(|tail| tail.starts_with("volume")) {
             6
-        } else if s[i..].starts_with("vol.") {
+        } else if s.get(i..).is_some_and(|tail| tail.starts_with("vol.")) {
             4
-        } else if s[i..].starts_with("vol") {
+        } else if s.get(i..).is_some_and(|tail| tail.starts_with("vol")) {
             3
-        } else if s[i..].starts_with('v') && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric()) {
+        } else if s.get(i..).is_some_and(|tail| tail.starts_with('v'))
+            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
+        {
             1
         } else {
             i += 1;
@@ -408,7 +414,7 @@ fn extract_volume_range(s: &str) -> Option<(f64, f64)> {
         let is_range_delim = if curr < len && (bytes[curr] == b'-' || bytes[curr] == b'~') {
             curr += 1;
             true
-        } else if s[curr..].starts_with("to ") {
+        } else if s.get(curr..).is_some_and(|tail| tail.starts_with("to ")) {
             curr += 3;
             true
         } else {
@@ -425,11 +431,11 @@ fn extract_volume_range(s: &str) -> Option<(f64, f64)> {
         }
 
         // Optional second 'v' or "vol"
-        if s[curr..].starts_with("vol.") {
+        if s.get(curr..).is_some_and(|tail| tail.starts_with("vol.")) {
             curr += 4;
-        } else if s[curr..].starts_with("vol") {
+        } else if s.get(curr..).is_some_and(|tail| tail.starts_with("vol")) {
             curr += 3;
-        } else if s[curr..].starts_with('v') {
+        } else if s.get(curr..).is_some_and(|tail| tail.starts_with('v')) {
             curr += 1;
         }
 
@@ -464,15 +470,17 @@ fn extract_single_volume(s: &str) -> Option<f64> {
     let mut i = 0;
 
     while i < len {
-        let prefix_len = if s[i..].starts_with("volumes") {
+        let prefix_len = if s.get(i..).is_some_and(|tail| tail.starts_with("volumes")) {
             7
-        } else if s[i..].starts_with("volume") {
+        } else if s.get(i..).is_some_and(|tail| tail.starts_with("volume")) {
             6
-        } else if s[i..].starts_with("vol.") {
+        } else if s.get(i..).is_some_and(|tail| tail.starts_with("vol.")) {
             4
-        } else if s[i..].starts_with("vol") {
+        } else if s.get(i..).is_some_and(|tail| tail.starts_with("vol")) {
             3
-        } else if s[i..].starts_with('v') && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric()) {
+        } else if s.get(i..).is_some_and(|tail| tail.starts_with('v'))
+            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
+        {
             1
         } else {
             i += 1;
@@ -522,15 +530,17 @@ fn extract_single_chapter(s: &str) -> Option<f64> {
     let mut i = 0;
 
     while i < len {
-        let prefix_len = if s[i..].starts_with("chapters") {
+        let prefix_len = if s.get(i..).is_some_and(|tail| tail.starts_with("chapters")) {
             8
-        } else if s[i..].starts_with("chapter") {
+        } else if s.get(i..).is_some_and(|tail| tail.starts_with("chapter")) {
             7
-        } else if s[i..].starts_with("ch.") {
+        } else if s.get(i..).is_some_and(|tail| tail.starts_with("ch.")) {
             3
-        } else if s[i..].starts_with("ch") {
+        } else if s.get(i..).is_some_and(|tail| tail.starts_with("ch")) {
             2
-        } else if s[i..].starts_with('c') && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric()) {
+        } else if s.get(i..).is_some_and(|tail| tail.starts_with('c'))
+            && (i == 0 || !bytes[i - 1].is_ascii_alphanumeric())
+        {
             1
         } else {
             i += 1;
@@ -1571,5 +1581,41 @@ mod tests {
         let (unit2, _, range2) = classify_release("Claymore Volumes 01-27 Complete");
         assert_eq!(unit2, AcquisitionReleaseUnit::Collection { start: 1.0, end: 27.0 });
         assert_eq!(range2, Some((1.0, 27.0)));
+    }
+}
+
+#[cfg(test)]
+mod unicode_regressions {
+    use super::*;
+
+    #[test]
+    fn provider_titles_are_utf8_safe() {
+        for prefix in [
+            "나",
+            "日本語",
+            "中文",
+            "éàñ",
+            "’",
+            "📚",
+            "나 日本 中文 café ’ 📚",
+        ] {
+            for suffix in [
+                " v04",
+                " v01-14",
+                " v01-14,082-095",
+                " c04",
+                " v01-14 + c082-095",
+                " v04’",
+                " unknown",
+            ] {
+                let title = format!("{prefix}{suffix}");
+                let _ = classify_release(&title);
+                let _ = detect_variant(&title, prefix);
+            }
+            assert_eq!(
+                classify_release(&format!("{prefix} v04")).0,
+                AcquisitionReleaseUnit::Volume(4.0)
+            );
+        }
     }
 }
