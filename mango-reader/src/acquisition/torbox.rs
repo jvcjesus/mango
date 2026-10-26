@@ -4,8 +4,9 @@
 //! status monitoring, conservative file selection, streaming CDN retrieval to staging,
 //! and remote job cancellation.
 
+pub use crate::acquisition::BackendFile;
 use crate::acquisition::{
-    AcquisitionRelease, AcquisitionReleaseUnit, BackendFile, BackendJobStatus, ExternalJobInfo,
+    AcquisitionRelease, AcquisitionReleaseUnit, BackendJobStatus, ExternalJobInfo,
 };
 use crate::error::AppError;
 use reqwest::{Client, StatusCode};
@@ -28,6 +29,7 @@ pub enum TorBoxError {
     RequestedUnitNotFound(String),
     UnsupportedFormat(String),
     InvalidCbz(String),
+    JobExpired(String),
     Io(String),
 }
 
@@ -41,15 +43,29 @@ impl fmt::Display for TorBoxError {
             Self::TorrentFailed(msg) => write!(f, "TorBox torrent failed: {msg}"),
             Self::AmbiguousFiles(msg) => write!(f, "TorBox file selection ambiguous: {msg}"),
             Self::NoArchiveFound(msg) => write!(f, "TorBox no manga archive found: {msg}"),
-            Self::RequestedUnitNotFound(msg) => write!(f, "Requested unit not found in TorBox torrent: {msg}"),
+            Self::RequestedUnitNotFound(msg) => {
+                write!(f, "Requested unit not found in TorBox torrent: {msg}")
+            }
             Self::UnsupportedFormat(msg) => write!(f, "Unsupported archive format: {msg}"),
             Self::InvalidCbz(msg) => write!(f, "Retrieved archive failed CBZ validation: {msg}"),
+            Self::JobExpired(msg) => write!(f, "TorBox job expired or missing: {msg}"),
             Self::Io(msg) => write!(f, "IO error during retrieval: {msg}"),
         }
     }
 }
 
 impl std::error::Error for TorBoxError {}
+
+impl TorBoxError {
+    pub fn is_job_expired(&self) -> bool {
+        match self {
+            Self::JobExpired(_) => true,
+            Self::RemoteError(404, _) => true,
+            Self::TorrentFailed(msg) if msg.to_lowercase().contains("not found") => true,
+            _ => false,
+        }
+    }
+}
 
 impl From<TorBoxError> for AppError {
     fn from(err: TorBoxError) -> Self {
@@ -61,9 +77,12 @@ impl From<TorBoxError> for AppError {
             TorBoxError::TorrentFailed(msg) => AppError::new(422, "torrent_failed", msg),
             TorBoxError::AmbiguousFiles(msg) => AppError::new(422, "ambiguous_files", msg),
             TorBoxError::NoArchiveFound(msg) => AppError::new(404, "no_archive_found", msg),
-            TorBoxError::RequestedUnitNotFound(msg) => AppError::new(404, "requested_unit_not_found", msg),
+            TorBoxError::RequestedUnitNotFound(msg) => {
+                AppError::new(404, "requested_unit_not_found", msg)
+            }
             TorBoxError::UnsupportedFormat(msg) => AppError::new(400, "unsupported_format", msg),
             TorBoxError::InvalidCbz(msg) => AppError::bad_request(msg),
+            TorBoxError::JobExpired(msg) => AppError::new(404, "external_job_expired", msg),
             TorBoxError::Io(msg) => AppError::internal(msg),
         }
     }
@@ -134,7 +153,9 @@ impl TorBoxClient {
             .map(|u| u.trim().trim_end_matches('/').to_string())
             .filter(|u| !u.is_empty())
             .unwrap_or_else(|| DEFAULT_TORBOX_URL.to_string());
-        let token = token.map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+        let token = token
+            .map(|t| t.trim().to_string())
+            .filter(|t| !t.is_empty());
         Self {
             http,
             base_url,
@@ -143,9 +164,9 @@ impl TorBoxClient {
     }
 
     fn auth_token(&self) -> std::result::Result<&str, TorBoxError> {
-        self.token
-            .as_deref()
-            .ok_or_else(|| TorBoxError::Unauthorized("TorBox API token is not configured".to_string()))
+        self.token.as_deref().ok_or_else(|| {
+            TorBoxError::Unauthorized("TorBox API token is not configured".to_string())
+        })
     }
 
     /// Tests the connection to TorBox by fetching the authenticated user profile (`/user/me`).
@@ -164,10 +185,14 @@ impl TorBoxClient {
 
         let status = resp.status();
         if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
-            return Err(TorBoxError::Unauthorized("Invalid or expired API token".to_string()));
+            return Err(TorBoxError::Unauthorized(
+                "Invalid or expired API token".to_string(),
+            ));
         }
         if status == StatusCode::TOO_MANY_REQUESTS {
-            return Err(TorBoxError::RateLimited("TorBox rate limit exceeded".to_string()));
+            return Err(TorBoxError::RateLimited(
+                "TorBox rate limit exceeded".to_string(),
+            ));
         }
         if !status.is_success() {
             return Err(TorBoxError::RemoteError(
@@ -182,7 +207,10 @@ impl TorBoxClient {
             .map_err(|e| TorBoxError::RemoteError(500, format!("Failed to parse response: {e}")))?;
 
         if !body.success {
-            let msg = body.detail.or(body.error).unwrap_or_else(|| "Unknown error".to_string());
+            let msg = body
+                .detail
+                .or(body.error)
+                .unwrap_or_else(|| "Unknown error".to_string());
             return Err(TorBoxError::RemoteError(status.as_u16(), msg));
         }
 
@@ -193,17 +221,24 @@ impl TorBoxClient {
         });
 
         let email = user.email.unwrap_or_else(|| "user".to_string());
-        let plan_str = user.plan.map(|p| p.to_string()).unwrap_or_else(|| "standard".to_string());
+        let plan_str = user
+            .plan
+            .map(|p| p.to_string())
+            .unwrap_or_else(|| "standard".to_string());
         Ok(format!("Connected to TorBox as {email} (Plan: {plan_str})"))
     }
 
     /// Submits a torrent to TorBox via magnet link.
-    pub async fn submit(&self, release: &AcquisitionRelease) -> std::result::Result<ExternalJobInfo, TorBoxError> {
+    pub async fn submit(
+        &self,
+        release: &AcquisitionRelease,
+    ) -> std::result::Result<ExternalJobInfo, TorBoxError> {
         let token = self.auth_token()?;
-        let magnet = release
-            .magnet_url
-            .as_deref()
-            .ok_or_else(|| TorBoxError::TorrentFailed("Release does not contain a magnet URL or infoHash".to_string()))?;
+        let magnet = release.magnet_url.as_deref().ok_or_else(|| {
+            TorBoxError::TorrentFailed(
+                "Release does not contain a magnet URL or infoHash".to_string(),
+            )
+        })?;
 
         let url = format!("{}/torrents/createtorrent", self.base_url);
         let form = reqwest::multipart::Form::new()
@@ -218,14 +253,20 @@ impl TorBoxClient {
             .multipart(form)
             .send()
             .await
-            .map_err(|e| TorBoxError::NetworkError(format!("Failed to submit torrent to TorBox: {e}")))?;
+            .map_err(|e| {
+                TorBoxError::NetworkError(format!("Failed to submit torrent to TorBox: {e}"))
+            })?;
 
         let status = resp.status();
         if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
-            return Err(TorBoxError::Unauthorized("Invalid or expired API token".to_string()));
+            return Err(TorBoxError::Unauthorized(
+                "Invalid or expired API token".to_string(),
+            ));
         }
         if status == StatusCode::TOO_MANY_REQUESTS {
-            return Err(TorBoxError::RateLimited("TorBox rate limit exceeded".to_string()));
+            return Err(TorBoxError::RateLimited(
+                "TorBox rate limit exceeded".to_string(),
+            ));
         }
         if !status.is_success() {
             return Err(TorBoxError::RemoteError(
@@ -234,21 +275,28 @@ impl TorBoxClient {
             ));
         }
 
-        let body: TorBoxApiResponse<CreateTorrentData> = resp
-            .json()
-            .await
-            .map_err(|e| TorBoxError::RemoteError(500, format!("Failed to parse submission response: {e}")))?;
+        let body: TorBoxApiResponse<CreateTorrentData> = resp.json().await.map_err(|e| {
+            TorBoxError::RemoteError(500, format!("Failed to parse submission response: {e}"))
+        })?;
 
         if !body.success {
-            let msg = body.detail.or(body.error).unwrap_or_else(|| "TorBox submission failed".to_string());
+            let msg = body
+                .detail
+                .or(body.error)
+                .unwrap_or_else(|| "TorBox submission failed".to_string());
             return Err(TorBoxError::TorrentFailed(msg));
         }
 
-        let data = body.data.ok_or_else(|| TorBoxError::TorrentFailed("No data returned from createtorrent".to_string()))?;
+        let data = body.data.ok_or_else(|| {
+            TorBoxError::TorrentFailed("No data returned from createtorrent".to_string())
+        })?;
         let job_id = match data.torrent_id {
             Some(serde_json::Value::Number(n)) => n.to_string(),
             Some(serde_json::Value::String(s)) => s,
-            _ => release.info_hash.clone().unwrap_or_else(|| "unknown".to_string()),
+            _ => release
+                .info_hash
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
         };
 
         Ok(ExternalJobInfo {
@@ -259,9 +307,15 @@ impl TorBoxClient {
     }
 
     /// Queries TorBox for the status and file list of a submitted torrent.
-    pub async fn get_torrent_data(&self, external_job_id: &str) -> std::result::Result<TorrentItemData, TorBoxError> {
+    pub async fn get_torrent_data(
+        &self,
+        external_job_id: &str,
+    ) -> std::result::Result<TorrentItemData, TorBoxError> {
         let token = self.auth_token()?;
-        let url = format!("{}/torrents/mylist?id={}&bypass_cache=true", self.base_url, external_job_id);
+        let url = format!(
+            "{}/torrents/mylist?id={}&bypass_cache=true",
+            self.base_url, external_job_id
+        );
 
         let resp = self
             .http
@@ -272,11 +326,20 @@ impl TorBoxClient {
             .map_err(|e| TorBoxError::NetworkError(e.to_string()))?;
 
         let status = resp.status();
+        if status == StatusCode::NOT_FOUND {
+            return Err(TorBoxError::JobExpired(format!(
+                "Failed to query torrent from TorBox (HTTP 404 Not Found for {external_job_id})"
+            )));
+        }
         if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
-            return Err(TorBoxError::Unauthorized("Invalid or expired API token".to_string()));
+            return Err(TorBoxError::Unauthorized(
+                "Invalid or expired API token".to_string(),
+            ));
         }
         if status == StatusCode::TOO_MANY_REQUESTS {
-            return Err(TorBoxError::RateLimited("TorBox rate limit exceeded".to_string()));
+            return Err(TorBoxError::RateLimited(
+                "TorBox rate limit exceeded".to_string(),
+            ));
         }
         if !status.is_success() {
             return Err(TorBoxError::RemoteError(
@@ -296,6 +359,12 @@ impl TorBoxClient {
                 if let Some(item) = single.data {
                     return Ok(item);
                 }
+            } else if let Some(ref detail) = single.detail {
+                if detail.to_lowercase().contains("not found") {
+                    return Err(TorBoxError::JobExpired(format!(
+                        "Torrent {external_job_id} expired: {detail}"
+                    )));
+                }
             }
         }
 
@@ -306,26 +375,45 @@ impl TorBoxClient {
                         return Ok(item);
                     }
                 }
+            } else if let Some(ref detail) = multi.detail {
+                if detail.to_lowercase().contains("not found") {
+                    return Err(TorBoxError::JobExpired(format!(
+                        "Torrent {external_job_id} expired: {detail}"
+                    )));
+                }
             }
         }
 
-        Err(TorBoxError::TorrentFailed(format!(
+        Err(TorBoxError::JobExpired(format!(
             "Torrent {external_job_id} not found in TorBox mylist response"
         )))
     }
 
     /// Checks the current backend status of a TorBox job.
-    pub async fn check_status(&self, external_job_id: &str) -> std::result::Result<BackendJobStatus, TorBoxError> {
+    pub async fn check_status(
+        &self,
+        external_job_id: &str,
+    ) -> std::result::Result<BackendJobStatus, TorBoxError> {
         let data = self.get_torrent_data(external_job_id).await?;
-        let state = data.download_state.as_deref().unwrap_or("downloading").to_lowercase();
+        let state = data
+            .download_state
+            .as_deref()
+            .unwrap_or("downloading")
+            .to_lowercase();
 
         if state == "cached" {
             return Ok(BackendJobStatus::Cached);
         }
-        if state == "completed" || state == "seeding" || (data.progress.unwrap_or(0.0) >= 0.999 && !data.files.as_ref().map(|f| f.is_empty()).unwrap_or(true)) {
+        if state == "completed"
+            || state == "seeding"
+            || (data.progress.unwrap_or(0.0) >= 0.999
+                && !data.files.as_ref().map(|f| f.is_empty()).unwrap_or(true))
+        {
             return Ok(BackendJobStatus::Completed);
         }
-        if state.contains("stalled") || (data.seeds.unwrap_or(1) == 0 && data.progress.unwrap_or(0.0) == 0.0) {
+        if state.contains("stalled")
+            || (data.seeds.unwrap_or(1) == 0 && data.progress.unwrap_or(0.0) == 0.0)
+        {
             return Ok(BackendJobStatus::Stalled {
                 reason: "Swarm has 0 seeders or torrent is stalled on TorBox".to_string(),
             });
@@ -345,7 +433,10 @@ impl TorBoxClient {
     }
 
     /// Lists files contained within a completed TorBox torrent.
-    pub async fn list_files(&self, external_job_id: &str) -> std::result::Result<Vec<BackendFile>, TorBoxError> {
+    pub async fn list_files(
+        &self,
+        external_job_id: &str,
+    ) -> std::result::Result<Vec<BackendFile>, TorBoxError> {
         let data = self.get_torrent_data(external_job_id).await?;
         let raw_files = data.files.unwrap_or_default();
 
@@ -383,11 +474,20 @@ impl TorBoxClient {
             .map_err(|e| TorBoxError::NetworkError(e.to_string()))?;
 
         let status = resp.status();
+        if status == StatusCode::NOT_FOUND {
+            return Err(TorBoxError::JobExpired(format!(
+                "Failed to request download link (HTTP 404 Not Found for torrent {external_job_id})"
+            )));
+        }
         if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
-            return Err(TorBoxError::Unauthorized("Invalid or expired API token".to_string()));
+            return Err(TorBoxError::Unauthorized(
+                "Invalid or expired API token".to_string(),
+            ));
         }
         if status == StatusCode::TOO_MANY_REQUESTS {
-            return Err(TorBoxError::RateLimited("TorBox rate limit exceeded".to_string()));
+            return Err(TorBoxError::RateLimited(
+                "TorBox rate limit exceeded".to_string(),
+            ));
         }
         if !status.is_success() {
             return Err(TorBoxError::RemoteError(
@@ -396,17 +496,24 @@ impl TorBoxClient {
             ));
         }
 
-        let body: TorBoxApiResponse<String> = resp
-            .json()
-            .await
-            .map_err(|e| TorBoxError::RemoteError(500, format!("Failed to parse requestdl response: {e}")))?;
+        let body: TorBoxApiResponse<String> = resp.json().await.map_err(|e| {
+            TorBoxError::RemoteError(500, format!("Failed to parse requestdl response: {e}"))
+        })?;
 
         if !body.success {
-            let msg = body.detail.or(body.error).unwrap_or_else(|| "Failed to get download URL".to_string());
+            let msg = body
+                .detail
+                .or(body.error)
+                .unwrap_or_else(|| "Failed to get download URL".to_string());
+            if msg.to_lowercase().contains("not found") {
+                return Err(TorBoxError::JobExpired(msg));
+            }
             return Err(TorBoxError::TorrentFailed(msg));
         }
 
-        let link = body.data.ok_or_else(|| TorBoxError::TorrentFailed("Empty download URL from TorBox".to_string()))?;
+        let link = body.data.ok_or_else(|| {
+            TorBoxError::TorrentFailed("Empty download URL from TorBox".to_string())
+        })?;
         Ok(link)
     }
 
@@ -516,7 +623,10 @@ impl TorBoxClient {
 
         if !resp.status().is_success() {
             // Cancellation is best-effort on delete
-            tracing::warn!("TorBox controltorrent delete returned HTTP {}", resp.status());
+            tracing::warn!(
+                "TorBox controltorrent delete returned HTTP {}",
+                resp.status()
+            );
         }
 
         Ok(())
@@ -577,7 +687,9 @@ pub fn select_artifact<'a>(
     target_unit: Option<&AcquisitionReleaseUnit>,
 ) -> std::result::Result<&'a BackendFile, TorBoxError> {
     if files.is_empty() {
-        return Err(TorBoxError::NoArchiveFound("Torrent contains 0 files".to_string()));
+        return Err(TorBoxError::NoArchiveFound(
+            "Torrent contains 0 files".to_string(),
+        ));
     }
 
     // 1. Scan for unsupported archive/document formats
@@ -752,7 +864,9 @@ pub fn map_torrent_files_to_volumes(
     files: &[BackendFile],
 ) -> std::result::Result<BTreeMap<i64, BackendFile>, TorBoxError> {
     if files.is_empty() {
-        return Err(TorBoxError::NoArchiveFound("Torrent contains 0 files".to_string()));
+        return Err(TorBoxError::NoArchiveFound(
+            "Torrent contains 0 files".to_string(),
+        ));
     }
 
     // 1. Scan for unsupported formats
@@ -842,7 +956,10 @@ pub fn validate_download_url(url_str: &str) -> std::result::Result<(), TorBoxErr
     let without_scheme = url_str
         .trim_start_matches("http://")
         .trim_start_matches("https://");
-    let host = without_scheme.split(&['/', ':', '?'][..]).next().unwrap_or("");
+    let host = without_scheme
+        .split(&['/', ':', '?'][..])
+        .next()
+        .unwrap_or("");
 
     if host.is_empty()
         || host.eq_ignore_ascii_case("localhost")
@@ -856,6 +973,138 @@ pub fn validate_download_url(url_str: &str) -> std::result::Result<(), TorBoxErr
     }
 
     Ok(())
+}
+
+/// Deterministic file resolution algorithm for TorBox torrents:
+/// 1. Filters out junk and unsupported formats using the conservative selection rules.
+/// 2. If exact normalized raw_title matches an archive in files, selects it.
+/// 3. If target_unit is specified, selects the archive matching the requested volume/chapter via `select_artifact`.
+///    If release_size is known (> 0), corroborates that the selected file size matches or is within reasonable range.
+/// 4. If persisted_file_id is specified and matches a supported archive in the current torrent that is consistent with unit/title, selects it.
+/// 5. If multiple files match without resolution or 0 files match, fails closed with explicit error.
+pub fn resolve_selected_file<'a>(
+    files: &'a [BackendFile],
+    raw_title: Option<&str>,
+    target_unit: Option<&AcquisitionReleaseUnit>,
+    release_size: Option<u64>,
+    persisted_file_id: Option<i64>,
+) -> std::result::Result<&'a BackendFile, TorBoxError> {
+    if files.is_empty() {
+        return Err(TorBoxError::NoArchiveFound(
+            "Torrent contains 0 files".to_string(),
+        ));
+    }
+
+    // 1. Scan and filter supported archives (.cbz / .zip)
+    let supported_archives: Vec<&BackendFile> = files
+        .iter()
+        .filter(|f| {
+            let lower = f.name.to_ascii_lowercase();
+            !is_junk_file(&lower) && (lower.ends_with(".cbz") || lower.ends_with(".zip"))
+        })
+        .collect();
+
+    if supported_archives.is_empty() {
+        // Run select_artifact to get the precise unsupported format error if applicable
+        return select_artifact(files, target_unit);
+    }
+
+    // 2. Exact normalized raw_title / file name matching
+    if let Some(raw) = raw_title.map(str::trim).filter(|s| !s.is_empty()) {
+        let clean_target = Path::new(raw)
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or(raw)
+            .trim();
+
+        let exact_matches: Vec<&BackendFile> = supported_archives
+            .iter()
+            .copied()
+            .filter(|f| {
+                let f_clean = Path::new(&f.name)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&f.name)
+                    .trim();
+                let f_path_clean = Path::new(&f.path)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(&f.path)
+                    .trim();
+                f_clean.eq_ignore_ascii_case(clean_target)
+                    || f_path_clean.eq_ignore_ascii_case(clean_target)
+            })
+            .collect();
+
+        if exact_matches.len() == 1 {
+            let selected = exact_matches[0];
+            if let Some(expected_sz) = release_size.filter(|&sz| sz > 0) {
+                if selected.size > 0 && selected.size != expected_sz {
+                    tracing::info!(
+                        "[TorBox] File '{}' matched raw title '{}' (size {} vs corroborated expected size {})",
+                        selected.name,
+                        clean_target,
+                        selected.size,
+                        expected_sz
+                    );
+                }
+            }
+            return Ok(selected);
+        }
+
+        if exact_matches.len() > 1 {
+            // If multiple exact name matches, attempt to disambiguate by release_size
+            if let Some(expected_sz) = release_size.filter(|&sz| sz > 0) {
+                let size_matches: Vec<&BackendFile> = exact_matches
+                    .iter()
+                    .copied()
+                    .filter(|f| f.size == expected_sz)
+                    .collect();
+                if size_matches.len() == 1 {
+                    return Ok(size_matches[0]);
+                }
+            }
+            return Err(TorBoxError::AmbiguousFiles(format!(
+                "Multiple files ({}) match exact raw title '{clean_target}'",
+                exact_matches.len()
+            )));
+        }
+    }
+
+    // 3. Requested unit semantics matching
+    if let Some(unit) = target_unit {
+        match select_artifact(files, Some(unit)) {
+            Ok(file) => {
+                if let Some(expected_sz) = release_size.filter(|&sz| sz > 0) {
+                    if file.size > 0 && file.size != expected_sz {
+                        tracing::info!(
+                            "[TorBox] File '{}' matched target unit {:?} (size {} vs corroborated expected size {})",
+                            file.name,
+                            unit,
+                            file.size,
+                            expected_sz
+                        );
+                    }
+                }
+                return Ok(file);
+            }
+            Err(e) => {
+                if target_unit.is_some() && raw_title.is_none() {
+                    return Err(e);
+                }
+            }
+        }
+    }
+
+    // 4. Corroborated persisted file ID (only if still matching and no other match found)
+    if let Some(fid) = persisted_file_id {
+        if let Some(file) = supported_archives.iter().copied().find(|f| f.id == fid) {
+            return Ok(file);
+        }
+    }
+
+    // 5. Fall back to select_artifact without unit (single archive in torrent)
+    select_artifact(files, None)
 }
 
 #[cfg(test)]
@@ -926,7 +1175,8 @@ mod tests {
         let err = select_artifact(&files3, None).unwrap_err();
         assert!(matches!(err, TorBoxError::AmbiguousFiles(_)));
 
-        let err2 = select_artifact(&files3, Some(&AcquisitionReleaseUnit::Volume(99.0))).unwrap_err();
+        let err2 =
+            select_artifact(&files3, Some(&AcquisitionReleaseUnit::Volume(99.0))).unwrap_err();
         assert!(matches!(err2, TorBoxError::RequestedUnitNotFound(_)));
 
         // Case 5: Unsupported formats rejected as UnsupportedFormat
@@ -981,7 +1231,8 @@ mod tests {
                 path: "Berserk v02.cbr".to_string(),
             },
         ];
-        let err_target_cbr = select_artifact(&files_mixed, Some(&AcquisitionReleaseUnit::Volume(2.0))).unwrap_err();
+        let err_target_cbr =
+            select_artifact(&files_mixed, Some(&AcquisitionReleaseUnit::Volume(2.0))).unwrap_err();
         assert!(matches!(err_target_cbr, TorBoxError::UnsupportedFormat(_)));
 
         // Case 7: Prefer native .cbz over .zip if both exist for the same target volume
@@ -999,7 +1250,11 @@ mod tests {
                 path: "Berserk v01.cbz".to_string(),
             },
         ];
-        let sel_pref = select_artifact(&files_cbz_and_zip, Some(&AcquisitionReleaseUnit::Volume(1.0))).unwrap();
+        let sel_pref = select_artifact(
+            &files_cbz_and_zip,
+            Some(&AcquisitionReleaseUnit::Volume(1.0)),
+        )
+        .unwrap();
         assert_eq!(sel_pref.id, 41); // Selected .cbz!
     }
 
@@ -1071,9 +1326,11 @@ mod tests {
             },
             BackendFile {
                 id: 106,
-                name: "BLAME! Master Edition v06 (2017) (F) (Digital) (danke-Empire).cbz".to_string(),
+                name: "BLAME! Master Edition v06 (2017) (F) (Digital) (danke-Empire).cbz"
+                    .to_string(),
                 size: 550_000_000,
-                path: "BLAME! Master Edition v06 (2017) (F) (Digital) (danke-Empire).cbz".to_string(),
+                path: "BLAME! Master Edition v06 (2017) (F) (Digital) (danke-Empire).cbz"
+                    .to_string(),
             },
         ];
 
@@ -1090,14 +1347,17 @@ mod tests {
         assert_eq!(parse_archive_volume(&blame_files[5].name), Some(6.0));
 
         // 3. Selection of individual volumes
-        let sel1 = select_artifact(&blame_files, Some(&AcquisitionReleaseUnit::Volume(1.0))).unwrap();
+        let sel1 =
+            select_artifact(&blame_files, Some(&AcquisitionReleaseUnit::Volume(1.0))).unwrap();
         assert_eq!(sel1.id, 101);
 
-        let sel6 = select_artifact(&blame_files, Some(&AcquisitionReleaseUnit::Volume(6.0))).unwrap();
+        let sel6 =
+            select_artifact(&blame_files, Some(&AcquisitionReleaseUnit::Volume(6.0))).unwrap();
         assert_eq!(sel6.id, 106);
 
         // Missing volume 7 fails with RequestedUnitNotFound
-        let err7 = select_artifact(&blame_files, Some(&AcquisitionReleaseUnit::Volume(7.0))).unwrap_err();
+        let err7 =
+            select_artifact(&blame_files, Some(&AcquisitionReleaseUnit::Volume(7.0))).unwrap_err();
         assert!(matches!(err7, TorBoxError::RequestedUnitNotFound(_)));
     }
 
@@ -1107,7 +1367,10 @@ mod tests {
         for i in 1..=39 {
             let year = 2021 + (i / 8);
             let f_marker = if i % 5 == 0 { " (f)" } else { "" };
-            let filename = format!("Blue Lock v{:02} ({year}){f_marker} (Digital) (Stick).cbz", i);
+            let filename = format!(
+                "Blue Lock v{:02} ({year}){f_marker} (Digital) (Stick).cbz",
+                i
+            );
             blue_lock_files.push(BackendFile {
                 id: 1000 + i as i64,
                 name: filename.clone(),
@@ -1117,16 +1380,28 @@ mod tests {
         }
 
         // 1. Requested Volume 39 -> exactly v39 selected (ID 1039)
-        let sel39 = select_artifact(&blue_lock_files, Some(&AcquisitionReleaseUnit::Volume(39.0))).unwrap();
+        let sel39 = select_artifact(
+            &blue_lock_files,
+            Some(&AcquisitionReleaseUnit::Volume(39.0)),
+        )
+        .unwrap();
         assert_eq!(sel39.id, 1039);
         assert_eq!(sel39.name, "Blue Lock v39 (2025) (Digital) (Stick).cbz");
 
         // 2. Requested Volume 26 -> exactly v26 selected (ID 1026)
-        let sel26 = select_artifact(&blue_lock_files, Some(&AcquisitionReleaseUnit::Volume(26.0))).unwrap();
+        let sel26 = select_artifact(
+            &blue_lock_files,
+            Some(&AcquisitionReleaseUnit::Volume(26.0)),
+        )
+        .unwrap();
         assert_eq!(sel26.id, 1026);
 
         // 3. Requested Volume 40 -> RequestedUnitNotFound
-        let err40 = select_artifact(&blue_lock_files, Some(&AcquisitionReleaseUnit::Volume(40.0))).unwrap_err();
+        let err40 = select_artifact(
+            &blue_lock_files,
+            Some(&AcquisitionReleaseUnit::Volume(40.0)),
+        )
+        .unwrap_err();
         assert!(matches!(err40, TorBoxError::RequestedUnitNotFound(_)));
         let err_msg = err40.to_string();
         assert!(err_msg.contains("Volume 40"));
@@ -1136,7 +1411,8 @@ mod tests {
         let selected_units = vec![31.0, 32.0, 35.0, 39.0];
         let mut chosen_ids = Vec::new();
         for u in selected_units {
-            let f = select_artifact(&blue_lock_files, Some(&AcquisitionReleaseUnit::Volume(u))).unwrap();
+            let f = select_artifact(&blue_lock_files, Some(&AcquisitionReleaseUnit::Volume(u)))
+                .unwrap();
             chosen_ids.push(f.id);
         }
         assert_eq!(chosen_ids, vec![1031, 1032, 1035, 1039]);
@@ -1159,7 +1435,8 @@ mod tests {
                 path: "Blue Lock v39 (Digital) (GroupB).cbz".to_string(),
             },
         ];
-        let err_dup = select_artifact(&dup_files, Some(&AcquisitionReleaseUnit::Volume(39.0))).unwrap_err();
+        let err_dup =
+            select_artifact(&dup_files, Some(&AcquisitionReleaseUnit::Volume(39.0))).unwrap_err();
         assert!(matches!(err_dup, TorBoxError::AmbiguousFiles(_)));
 
         // Case 2: Multiple archives with no target unit
