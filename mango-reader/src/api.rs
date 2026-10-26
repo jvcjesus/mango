@@ -208,6 +208,24 @@ pub fn router(state: Spaces) -> Router {
             post(retry_komga_download),
         )
         .route("/pipeline/repair-cbz", post(repair_pipeline_cbz))
+        .route(
+            "/pipeline/maintenance/dry-run",
+            post(post_maintenance_dry_run),
+        )
+        .route(
+            "/pipeline/maintenance/normalize",
+            post(post_maintenance_normalize),
+        )
+        .route(
+            "/pipeline/maintenance/history",
+            get(get_maintenance_history),
+        )
+        .route(
+            "/pipeline/maintenance/rollback/{id}",
+            post(post_maintenance_rollback),
+        )
+        .route("/acquisition/sources", get(get_acquisition_sources))
+        .route("/acquisition/plan-by-title", post(post_plan_by_title))
         .route("/pipeline/events", get(get_pipeline_events))
         .route(
             "/titles/{id}/acquisition-releases",
@@ -1558,6 +1576,336 @@ async fn repair_pipeline_cbz(
         .await?;
 
     Ok(Json(outcome))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaintenanceDryRunRequest {
+    pub library_id: String,
+    pub series_id: Option<String>,
+}
+
+async fn post_maintenance_dry_run(
+    Me(app): Me,
+    Json(payload): Json<MaintenanceDryRunRequest>,
+) -> Result<Json<crate::pipeline::normalization::LibraryAnalysisSummary>> {
+    app.me.admin()?;
+    let (cfg, mb_token, komga_api_key) = app
+        .pipeline
+        .load_internal_config()
+        .await
+        .unwrap_or_default();
+
+    let komga_client = crate::pipeline::komga::KomgaClient::new(
+        app.trackers.http().clone(),
+        cfg.komga_url,
+        komga_api_key,
+    );
+    let mb_client = crate::pipeline::mangabaka::MangaBakaClient::new(
+        app.trackers.http().clone(),
+        cfg.mangabaka_url,
+        mb_token,
+    );
+
+    let summary = app
+        .pipeline
+        .normalization
+        .analyze_library(
+            &komga_client,
+            &mb_client,
+            &payload.library_id,
+            payload.series_id.as_deref(),
+            None,
+        )
+        .await?;
+
+    Ok(Json(summary))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MaintenanceNormalizeRequest {
+    pub items: Vec<NormalizeItemRequest>,
+    #[allow(dead_code)]
+    pub dry_run: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NormalizeItemRequest {
+    pub canonical_path: String,
+    pub series_title: String,
+    pub volume: Option<f64>,
+    pub komga_book_id: Option<String>,
+    pub komga_series_id: Option<String>,
+    pub mangabaka_id: Option<i64>,
+    pub mangabaka_release_id: Option<String>,
+    pub anilist_id: Option<i64>,
+}
+
+async fn post_maintenance_normalize(
+    Me(app): Me,
+    Json(payload): Json<MaintenanceNormalizeRequest>,
+) -> Result<Json<crate::pipeline::normalization::NormalizationExecutionResult>> {
+    app.me.admin()?;
+    let (cfg, mb_token, komga_api_key) = app
+        .pipeline
+        .load_internal_config()
+        .await
+        .unwrap_or_default();
+
+    let komga_client = crate::pipeline::komga::KomgaClient::new(
+        app.trackers.http().clone(),
+        cfg.komga_url,
+        komga_api_key,
+    );
+    let mb_client = crate::pipeline::mangabaka::MangaBakaClient::new(
+        app.trackers.http().clone(),
+        cfg.mangabaka_url,
+        mb_token,
+    );
+
+    let batch_id = format!("batch-{}", crate::db::now());
+    let mut items = Vec::new();
+    let mut normalized_count = 0;
+    let mut already_normalized_count = 0;
+    let mut failed_count = 0;
+    let mut skipped_count = 0;
+
+    for item in payload.items {
+        let path = std::path::PathBuf::from(&item.canonical_path);
+        let vol = item.volume.unwrap_or(1.0);
+        let mb_id = match item.mangabaka_id {
+            Some(id) => id,
+            None => {
+                failed_count += 1;
+                continue;
+            }
+        };
+
+        match app
+            .pipeline
+            .normalization
+            .normalize_book(
+                &batch_id,
+                &path,
+                &item.series_title,
+                vol,
+                mb_id,
+                item.anilist_id,
+                item.komga_series_id.as_deref(),
+                item.komga_book_id.as_deref(),
+                &mb_client,
+                Some(&komga_client),
+            )
+            .await
+        {
+            Ok(rec) => {
+                if rec.status == "normalized" {
+                    normalized_count += 1;
+                } else if rec.status == "already_normalized" {
+                    already_normalized_count += 1;
+                } else if rec.status == "skipped" {
+                    skipped_count += 1;
+                } else {
+                    failed_count += 1;
+                }
+                items.push(rec);
+            }
+            Err(e) => {
+                failed_count += 1;
+                items.push(crate::pipeline::normalization::NormalizationHistoryRecord {
+                    id: format!("err-{}", crate::db::now()),
+                    batch_id: batch_id.clone(),
+                    canonical_path: item.canonical_path,
+                    series_title: item.series_title,
+                    volume: vol,
+                    komga_series_id: item.komga_series_id,
+                    komga_book_id: item.komga_book_id,
+                    mangabaka_id: Some(mb_id),
+                    mangabaka_release_id: item.mangabaka_release_id,
+                    anilist_id: item.anilist_id,
+                    original_sha256: None,
+                    normalized_sha256: None,
+                    status: "error".to_string(),
+                    error_message: Some(e.to_string()),
+                    normalized_at: crate::db::now(),
+                    reverted_at: None,
+                });
+            }
+        }
+    }
+
+    Ok(Json(
+        crate::pipeline::normalization::NormalizationExecutionResult {
+            batch_id,
+            total_processed: items.len(),
+            normalized_count,
+            already_normalized_count,
+            failed_count,
+            skipped_count,
+            items,
+        },
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct MaintenanceHistoryQuery {
+    limit: Option<usize>,
+}
+
+async fn get_maintenance_history(
+    Me(app): Me,
+    Query(query): Query<MaintenanceHistoryQuery>,
+) -> Result<Json<Vec<crate::pipeline::normalization::NormalizationHistoryRecord>>> {
+    app.me.admin()?;
+    let limit = query.limit.unwrap_or(50).clamp(1, 500);
+    let records = app.pipeline.normalization.list_history(limit).await?;
+    Ok(Json(records))
+}
+
+async fn post_maintenance_rollback(
+    Me(app): Me,
+    Path(id): Path<String>,
+) -> Result<Json<crate::pipeline::normalization::NormalizationHistoryRecord>> {
+    app.me.admin()?;
+    let (cfg, _, komga_api_key) = app
+        .pipeline
+        .load_internal_config()
+        .await
+        .unwrap_or_default();
+
+    let komga_client = crate::pipeline::komga::KomgaClient::new(
+        app.trackers.http().clone(),
+        cfg.komga_url,
+        komga_api_key,
+    );
+
+    let rec = app
+        .pipeline
+        .normalization
+        .rollback_normalization(&id, Some(&komga_client))
+        .await?;
+
+    Ok(Json(rec))
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcquisitionSourceOption {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub is_default: bool,
+    pub available: bool,
+    pub supports_volumes: bool,
+    pub supports_chapters: bool,
+}
+
+async fn get_acquisition_sources(Me(app): Me) -> Result<Json<Vec<AcquisitionSourceOption>>> {
+    let (cfg, _) = app.acquisition.load_internal_config().await?;
+    let sources = vec![
+        AcquisitionSourceOption {
+            id: "auto".to_string(),
+            name: "Auto (Recommended)".to_string(),
+            description:
+                "Automatically selects the best source based on quality, seeders, and profile rules"
+                    .to_string(),
+            is_default: true,
+            available: true,
+            supports_volumes: true,
+            supports_chapters: true,
+        },
+        AcquisitionSourceOption {
+            id: "nyaa".to_string(),
+            name: "Nyaa".to_string(),
+            description:
+                "Native BitTorrent release discovery via TorBox debrid acquisition backend"
+                    .to_string(),
+            is_default: false,
+            available: cfg.nyaa_enabled,
+            supports_volumes: true,
+            supports_chapters: true,
+        },
+        AcquisitionSourceOption {
+            id: "mangadot".to_string(),
+            name: "MangaDot".to_string(),
+            description: "Direct Tachiyomi/Mihon chapter source with inferred volume numbering"
+                .to_string(),
+            is_default: false,
+            available: true,
+            supports_volumes: false,
+            supports_chapters: true,
+        },
+        AcquisitionSourceOption {
+            id: "keiyoushi".to_string(),
+            name: "Keiyoushi Extensions".to_string(),
+            description: "Installed Keiyoushi extensions for chapter-level reader releases"
+                .to_string(),
+            is_default: false,
+            available: true,
+            supports_volumes: false,
+            supports_chapters: true,
+        },
+        AcquisitionSourceOption {
+            id: "madokami".to_string(),
+            name: "Madokami".to_string(),
+            description: "Digital manga provider (read-only archive index)".to_string(),
+            is_default: false,
+            available: false,
+            supports_volumes: true,
+            supports_chapters: false,
+        },
+    ];
+    Ok(Json(sources))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanByTitleRequest {
+    pub title: String,
+    pub komga_series_id: Option<String>,
+    #[allow(dead_code)]
+    pub source_id: Option<String>,
+    #[allow(dead_code)]
+    pub content_mode: Option<String>,
+    #[allow(dead_code)]
+    pub requested_volumes: Option<Vec<f64>>,
+    #[allow(dead_code)]
+    pub total_volumes: Option<i64>,
+}
+
+async fn post_plan_by_title(
+    Me(app): Me,
+    Json(payload): Json<PlanByTitleRequest>,
+) -> Result<Json<crate::acquisition::planner::AcquisitionPlan>> {
+    let title = payload.title.trim().to_string();
+    if title.is_empty() {
+        return Err(AppError::bad_request("Title cannot be empty"));
+    }
+    let komga_id = payload.komga_series_id.as_deref();
+
+    // 1. Ensure tracked_catalog has an entry for this title
+    let tracked_entry = app
+        .db
+        .call({
+            let t = title.clone();
+            let k = komga_id.map(str::to_string);
+            move |conn| {
+                crate::sync::catalog::add_or_update_tracked(conn, &t, "lists", k.as_deref(), None)
+            }
+        })
+        .await?;
+
+    let manga_id = tracked_entry.id;
+
+    // 2. Generate plan
+    let plan = app
+        .acquisition
+        .plan_title_missing_content(manga_id, true)
+        .await?;
+
+    Ok(Json(plan))
 }
 
 // ---------- acquisition (Nyaa + TorBox) ----------
