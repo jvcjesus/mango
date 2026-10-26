@@ -923,6 +923,7 @@ async fn test_scenario_ah_end_to_end_acquisition_workflow() {
         retrieved_path: Some(staging_rel),
         collection_id: None,
         collection_name: None,
+        magnet_url: None,
     };
 
     let outcome = pipeline.process_download(&staging_cbz, &job).await.unwrap();

@@ -264,6 +264,7 @@
     const s = entry.stage ?? entry.state;
     switch (s) {
       case 'torbox_submitting': return 'TorBox Submit';
+      case 'torbox_recreating': return 'TorBox Recreating';
       case 'torbox_checking': return 'TorBox Wait';
       case 'torbox_downloading': return 'TorBox Downloading';
       case 'torbox_stalled': return 'TorBox Stalled';
