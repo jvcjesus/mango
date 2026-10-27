@@ -589,7 +589,7 @@ impl TorBoxClient {
         })?;
 
         // Verify CBZ integrity on the temporary staging file
-        if let Err(e) = crate::pipeline::publisher::verify_cbz_integrity(destination_part) {
+        if let Err(e) = crate::acquisition::physical::validate_payload(destination_part) {
             let _ = std::fs::remove_file(destination_part);
             return Err(TorBoxError::InvalidCbz(format!(
                 "Downloaded file failed CBZ archive integrity: {e}"

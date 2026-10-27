@@ -794,6 +794,7 @@ impl Pipeline {
         let requested_edition_owned = retrieval_identity.requested_edition.clone();
         let requested_edition = requested_edition_owned.as_deref();
         let identity_override = retrieval_identity.selected_archive.is_some()
+            || retrieval_identity.import_candidate.is_some()
             || (retrieval_identity.identity_override
                 && retrieval_identity.override_approved_at.is_some());
         let mut metadata_scope = if config.mangabaka_enabled && is_volume {
@@ -1242,6 +1243,25 @@ impl Pipeline {
             "Publishing to canonical Komga library...",
             None,
         );
+        if let Some(candidate) = retrieval_identity.import_candidate {
+            let cancelled = self
+                .db
+                .call(move |c| {
+                    Ok(c.query_row(
+                        "SELECT cancel_requested FROM import_candidates WHERE id=?1",
+                        [candidate],
+                        |r| r.get::<_, bool>(0),
+                    )?)
+                })
+                .await?;
+            if cancelled {
+                return Err(AppError::new(
+                    409,
+                    "import_cancelled",
+                    "Import cancelled before publication",
+                ));
+            }
+        }
         let pub_res = publish_cbz(
             source_cbz,
             &dest_root,

@@ -45,6 +45,8 @@ pub struct PlanningRequest {
     pub selected_archives: Vec<super::edition::SelectedArchive>,
     #[serde(default)]
     pub use_release_anyway: bool,
+    #[serde(default)]
+    pub inspect_payload: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -140,6 +142,25 @@ pub fn prepare_plan(
     req: &PlanningRequest,
     diagnostics: Vec<String>,
 ) -> Result<InteractivePlan> {
+    if req.inspect_payload && req.selected_archives.is_empty() {
+        let mut discovery = req.clone();
+        discovery.inspect_payload = false;
+        let mut result = prepare_plan(
+            manga_id,
+            title,
+            profile,
+            missing,
+            candidates,
+            &discovery,
+            diagnostics,
+        )?;
+        result.plan.selected_items.clear();
+        result.plan.state = "draft".into();
+        result.plan.total_acquisitions_count = 0;
+        result.plan.missing_units_covered_count = 0;
+        result.plan.stale_reason=Some("Choose the physical payload files to acquire and inspect. Book assignments follow inspection.".into());
+        return Ok(result);
+    }
     if !req.selected_archives.is_empty() {
         if req.selected_archives.len() > 500 {
             return Err(AppError::bad_request("Select at most 500 files"));
@@ -169,7 +190,7 @@ pub fn prepare_plan(
             let unit = match source.unit {
                 super::AcquisitionReleaseUnit::Volume(_)
                 | super::AcquisitionReleaseUnit::Chapter(_) => source.unit.clone(),
-                _ if req.use_release_anyway => {
+                _ if req.use_release_anyway || req.inspect_payload => {
                     super::AcquisitionReleaseUnit::Volume((index + 1) as f64)
                 }
                 _ => {
@@ -216,6 +237,7 @@ pub fn prepare_plan(
                     id
                 ));
             }
+            c.provider_metadata["inspectPayload"] = serde_json::json!(req.inspect_payload);
             c.provider_metadata["metadataPolicy"] = serde_json::json!("best_available");
             c.provider_metadata["unitAssignment"] = serde_json::json!(if source.eligible {
                 "source"
@@ -224,6 +246,10 @@ pub fn prepare_plan(
             });
             if let Some(m) = c.provider_metadata.as_object_mut() {
                 m.remove("sourceUnits");
+            }
+            if req.inspect_payload {
+                c.title = archive.path.clone();
+                c.provider_metadata["unitAssignment"] = serde_json::json!("pending_import");
             }
             c.release_unit = unit;
             items.push(AcquisitionPlanItem {
@@ -811,7 +837,11 @@ impl AcquisitionService {
             .await?;
         let profile = self.get_manga_profile(manga_id).await?;
         let (_, aliases) = self.get_title_and_aliases(manga_id).await?;
-        let missing = bounded(provider_deadline, self.get_title_missing_content(manga_id)).await?;
+        let missing = if req.inspect_payload {
+            super::physical::discovery_context(manga_id, &title)
+        } else {
+            bounded(provider_deadline, self.get_title_missing_content(manga_id)).await?
+        };
         let (config, _) = self.load_internal_config().await?;
         let mut candidates = vec![];
         let mut diagnostics = vec![];
@@ -935,7 +965,7 @@ impl AcquisitionService {
                 .edition
                 .clone()
                 .or_else(|| req.requested_edition.clone());
-            if let Some(ed) = ed.filter(|ed| ed != "standard") {
+            if let Some(ed) = ed.filter(|ed| ed != "standard" && !req.inspect_payload) {
                 let (known, owned) = self.source_edition_ownership(manga_id, &title, &ed).await?;
                 candidate.provider_metadata["editionOwnershipKnown"] = serde_json::json!(known);
                 candidate.provider_metadata["editionOwnedUnits"] = serde_json::json!(owned);
@@ -2086,5 +2116,109 @@ mod source_local_tests {
             vec![]
         )
         .is_err());
+    }
+    #[tokio::test]
+    async fn physical_payloads_with_same_suggested_number_queue_independently() {
+        let mut files = source_units::tests::files("Master Edition");
+        files = vec![files.remove(3)];
+        let mut second = files[0].clone();
+        second.path = "Release/Alternative v04.cbz".into();
+        second.name = "Alternative v04.cbz".into();
+        files.push(second);
+        let dir = std::env::temp_dir().join(format!(
+            "physical-plan-{}-{}",
+            std::process::id(),
+            crate::db::now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = crate::db::Db::open(&dir.join("state.db")).unwrap();
+        let library = dir.to_string_lossy().to_string();
+        db.call(move|c|{c.execute("INSERT INTO manga(id,source_id,url,title) VALUES (1,0,'/physical-native','Series')",[])?;crate::settings::set(c,"pipeline.library_dir",&serde_json::json!(library))?;crate::db::set_state(c,"acquisition.torbox_enabled","true")?;crate::db::set_state(c,"acquisition.torbox_token","fixture")?;Ok(())}).await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = calls.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                axum::Router::new().fallback(axum::routing::get(move || {
+                    let calls = counted.clone();
+                    async move {
+                        calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        axum::http::StatusCode::BAD_GATEWAY
+                    }
+                })),
+            )
+            .await
+            .unwrap();
+        });
+        db.call(move |c| {
+            crate::settings::set(c, "pipeline.komga_enabled", &serde_json::json!(true))?;
+            crate::settings::set(
+                c,
+                "pipeline.komga_url",
+                &serde_json::json!(format!("http://{addr}")),
+            )?;
+            crate::db::set_state(c, "pipeline.komga_api_key", "fixture")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let pipeline = std::sync::Arc::new(crate::pipeline::Pipeline::new(db.clone()));
+        let service =
+            AcquisitionService::new(db.clone(), reqwest::Client::new(), Some(pipeline), None);
+        let profile = service.get_manga_profile(1).await.unwrap();
+        let mut req = request("complete");
+        req.inspect_payload = true;
+        req.selected_archives = files
+            .iter()
+            .map(|f| super::super::edition::SelectedArchive {
+                path: f.path.clone(),
+                size: f.size,
+            })
+            .collect();
+        let result = prepare_plan(
+            1,
+            "Series",
+            &profile,
+            &missing(),
+            vec![candidate(&files)],
+            &req,
+            vec![],
+        )
+        .unwrap();
+        assert_eq!(result.plan.selected_items.len(), 2);
+        let plan = result.plan.clone();
+        db.call(move |c| super::super::planner::save_plan(c, &plan))
+            .await
+            .unwrap();
+        let exec = service
+            .approve_and_create_execution(
+                1,
+                super::super::execution::ApprovePlanRequest {
+                    plan_id: result.plan.id,
+                    approved: true,
+                    override_confirmed: false,
+                },
+            )
+            .await
+            .unwrap();
+        let queued = service.start_execution(exec.id).await.unwrap();
+        assert_eq!(queued.items.len(), 2);
+        assert_ne!(
+            queued.items[0].download_job_id,
+            queued.items[1].download_job_id
+        );
+        let count=db.call(|c|Ok(c.query_row("SELECT count(*) FROM downloads WHERE json_extract(retrieval_identity_json,'$.inspectPayload')=1",[],|r|r.get::<_,i64>(0))?)).await.unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "Physical retrieval must not depend on ownership/catalog requests"
+        );
+        server.abort();
+        drop(service);
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

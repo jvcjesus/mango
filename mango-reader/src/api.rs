@@ -228,6 +228,13 @@ pub fn router(state: Spaces) -> Router {
             "/pipeline/maintenance/rollback/{id}",
             post(post_maintenance_rollback),
         )
+        .route(
+            "/imports/payload/{id}/cleanup",
+            post(cleanup_import_payload),
+        )
+        .route("/imports/payload/{id}/retry", post(retry_import_inspection))
+        .route("/imports", get(get_import_candidates))
+        .route("/imports/{id}/assignment", post(assign_import_candidate))
         .route("/acquisition/sources", get(get_acquisition_sources))
         .route("/acquisition/plan-by-title", post(post_plan_by_title))
         .route("/pipeline/events", get(get_pipeline_events))
@@ -1072,11 +1079,19 @@ async fn queue_downloads(Me(app): Me, Json(body): Json<ToQueue>) -> Result<Json<
 
 async fn clear_downloads(Me(app): Me) -> Result<Json<Value>> {
     app.downloads.cancel(None).await?;
+    app.db.call(|c|{c.execute("UPDATE import_payloads SET state='cancelled' WHERE state!='cleaned'",[])?;c.execute("UPDATE import_candidates SET cancel_requested=1,state=CASE WHEN state='processing' THEN state ELSE 'ignored' END WHERE state IN ('needs_review','queued','processing')",[])?;Ok(())}).await?;
     Ok(done())
 }
 
 async fn cancel_download(Me(app): Me, Path(chapter): Path<i64>) -> Result<Json<Value>> {
     app.downloads.cancel(Some(chapter)).await?;
+    app.db.call(move |conn| {
+        conn.execute("UPDATE import_payloads SET state='cancelled' WHERE chapter_id=?1",[chapter])?;
+        conn.execute("UPDATE import_candidates SET state='ignored' WHERE payload_chapter=?1 AND state='needs_review'",[chapter])?;
+        conn.execute("UPDATE import_candidates SET cancel_requested=1,state=CASE WHEN state='processing' THEN state ELSE 'ignored' END WHERE child_chapter=?1",[chapter])?;
+        Ok(())
+    }).await?;
+    let _ = crate::acquisition::physical::cleanup(&app.db, chapter, app.downloads.dir()).await;
     Ok(done())
 }
 
@@ -2591,4 +2606,30 @@ mod maintenance_request_tests {
             .is_err()
         );
     }
+}
+
+async fn get_import_candidates(
+    Me(app): Me,
+) -> Result<Json<Vec<crate::acquisition::physical::Candidate>>> {
+    Ok(Json(crate::acquisition::physical::list(&app.db).await?))
+}
+async fn assign_import_candidate(
+    Me(app): Me,
+    Path(id): Path<i64>,
+    Json(body): Json<crate::acquisition::physical::Assignment>,
+) -> Result<Json<Value>> {
+    crate::acquisition::physical::assign(&app.db, id, body, app.downloads.dir()).await?;
+    app.downloads.wake().notify_one();
+    Ok(Json(json!({"ok":true})))
+}
+
+async fn retry_import_inspection(Me(app): Me, Path(id): Path<i64>) -> Result<Json<Value>> {
+    crate::acquisition::physical::retry_inspection(&app.db, id).await?;
+    app.downloads.wake().notify_one();
+    Ok(Json(json!({"ok":true})))
+}
+
+async fn cleanup_import_payload(Me(app): Me, Path(id): Path<i64>) -> Result<Json<Value>> {
+    crate::acquisition::physical::cleanup(&app.db, id, app.downloads.dir()).await?;
+    Ok(Json(json!({"ok":true})))
 }

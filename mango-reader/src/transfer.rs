@@ -491,7 +491,7 @@ where
                         chapter_id,
                         existing_len
                     );
-                    if crate::pipeline::publisher::verify_cbz_integrity(destination_part).is_ok() {
+                    if crate::acquisition::physical::validate_payload(destination_part).is_ok() {
                         tracing::info!(
                             "[Transfer] Existing .part file is already complete and valid for chapter {}",
                             chapter_id
@@ -1253,7 +1253,10 @@ mod tests {
         std::fs::write(&corrupt_cbz, b"this is not a valid zip archive file").unwrap();
 
         let verify_res = crate::pipeline::publisher::verify_cbz_integrity(&corrupt_cbz);
-        assert!(verify_res.is_err(), "Corrupt candidate archive must fail verification");
+        assert!(
+            verify_res.is_err(),
+            "Corrupt candidate archive must fail verification"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1285,7 +1288,10 @@ mod tests {
         std::fs::write(&stale_part, b"PK\x03\x04incomplete_truncated_zip_data").unwrap();
 
         let res = crate::pipeline::publisher::verify_cbz_integrity(&stale_part);
-        assert!(res.is_err(), "Stale truncated .part must fail CBZ integrity");
+        assert!(
+            res.is_err(),
+            "Stale truncated .part must fail CBZ integrity"
+        );
 
         if res.is_err() {
             let _ = std::fs::remove_file(&stale_part);

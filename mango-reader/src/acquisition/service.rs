@@ -22,6 +22,7 @@ use crate::error::{AppError, Result};
 use reqwest::Client;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -1680,7 +1681,15 @@ impl AcquisitionService {
         }
 
         // Check plan staleness at approval time
-        let current_missing = self.get_title_missing_content(manga_id).await?;
+        let physical = plan
+            .selected_items
+            .iter()
+            .all(|item| item.candidate.provider_metadata["inspectPayload"] == true);
+        let current_missing = if physical {
+            super::physical::discovery_context(manga_id, &plan.series_title)
+        } else {
+            self.get_title_missing_content(manga_id).await?
+        };
         let mut plan_missing_sorted = plan.missing_units.clone();
         plan_missing_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -1725,6 +1734,8 @@ impl AcquisitionService {
             exec.status,
             ExecutionStatus::Queued
                 | ExecutionStatus::Downloading
+                | ExecutionStatus::NeedsReview
+                | ExecutionStatus::Importing
                 | ExecutionStatus::Verifying
                 | ExecutionStatus::Publishing
                 | ExecutionStatus::Reconciling
@@ -1823,9 +1834,19 @@ impl AcquisitionService {
         }
 
         // D. Existing Ownership reconciliation
-        let (owned_set, _) = self
-            .get_title_acquisition_state(exec.manga_id, &exec.title)
-            .await?;
+        let (owned_set, _) = if exec
+            .items
+            .iter()
+            .all(|item| !item.frozen_candidate.provider_metadata["selectedArchive"].is_null())
+        {
+            (
+                std::collections::HashSet::new(),
+                std::collections::HashSet::new(),
+            )
+        } else {
+            self.get_title_acquisition_state(exec.manga_id, &exec.title)
+                .await?
+        };
         let owned_vols: Vec<f64> = owned_set
             .iter()
             .filter_map(|s| s.strip_prefix('v').and_then(|v| v.parse::<f64>().ok()))
@@ -1833,17 +1854,20 @@ impl AcquisitionService {
 
         let mut all_skipped = true;
         for item in &mut exec.items {
-            let edition_owned = if let Some(edition) = item.frozen_candidate.provider_metadata
-                ["requestedEdition"]
-                .as_str()
-                .filter(|ed| *ed != "standard")
-            {
-                self.source_edition_ownership(exec.manga_id, &exec.title, edition)
-                    .await?
-                    .1
-            } else {
-                vec![]
-            };
+            let edition_owned =
+                if !item.frozen_candidate.provider_metadata["selectedArchive"].is_null() {
+                    vec![]
+                } else if let Some(edition) = item.frozen_candidate.provider_metadata
+                    ["requestedEdition"]
+                    .as_str()
+                    .filter(|ed| *ed != "standard")
+                {
+                    self.source_edition_ownership(exec.manga_id, &exec.title, edition)
+                        .await?
+                        .1
+                } else {
+                    vec![]
+                };
             let (still_needed, _) = crate::acquisition::execution::reconcile_preflight_ownership(
                 &item.expected_units,
                 if !item.frozen_candidate.provider_metadata["selectedArchive"].is_null()
@@ -2026,6 +2050,16 @@ impl AcquisitionService {
             } else {
                 ch_url
             };
+            let ch_url = if cand.provider_metadata["inspectPayload"] == true {
+                let physical = serde_json::to_vec(&cand.provider_metadata["selectedArchive"])?;
+                format!(
+                    "payload:{}:{}",
+                    cand.provider_release_id,
+                    hex::encode(Sha256::digest(physical))
+                )
+            } else {
+                ch_url
+            };
             let ch_name = format!(
                 "{} {}",
                 if matches!(requested_unit, AcquisitionReleaseUnit::Chapter(_)) {
@@ -2035,6 +2069,11 @@ impl AcquisitionService {
                 },
                 item.expected_units.first().copied().unwrap_or(1.0)
             );
+            let ch_name = if cand.provider_metadata["inspectPayload"] == true {
+                cand.title.clone()
+            } else {
+                ch_name
+            };
             let scanlator = cand.uploader.clone().unwrap_or_default();
             let release_size = cand.size.unwrap_or(0) as i64;
             let first_vol = item.expected_units.first().copied().unwrap_or(1.0);
@@ -2072,6 +2111,7 @@ impl AcquisitionService {
                         .map_err(|_| AppError::bad_request("Invalid frozen archive selection"))?,
                 );
             }
+            retrieval_identity.inspect_payload = cand.provider_metadata["inspectPayload"] == true;
             retrieval_identity.language = Some(cand.language.clone());
             retrieval_identity.identity_override = super::interactive::is_override(cand);
             retrieval_identity.override_approved_at = if retrieval_identity.identity_override {
@@ -2239,6 +2279,15 @@ impl AcquisitionService {
                                 item.error_message.as_deref(),
                             )?;
                         }
+                        "completed" => {
+                            item.status=ExecutionItemStatus::Completed;
+                            crate::acquisition::execution::update_item_status(conn,&item.id,item.status,item.download_job_id,None)?;
+                        }
+                        "needs_review" | "importing" => {
+                            item.status=if dl_state == "needs_review" {ExecutionItemStatus::NeedsReview} else {ExecutionItemStatus::Importing};
+                            any_active=true;active_state=if dl_state == "needs_review" {ExecutionStatus::NeedsReview} else {ExecutionStatus::Importing};
+                            crate::acquisition::execution::update_item_status(conn,&item.id,item.status,item.download_job_id,None)?;
+                        }
                         "downloading" => {
                             item.status = ExecutionItemStatus::Downloading;
                             any_active = true;
@@ -2382,12 +2431,17 @@ impl AcquisitionService {
             let eid = eid.clone();
             let r = r.clone();
             move |conn| {
-                crate::acquisition::execution::cancel_execution(conn, &eid, &r)?;
-                conn.execute(
+                let tx=conn.transaction()?;
+                crate::acquisition::execution::cancel_execution(&tx, &eid, &r)?;
+                tx.execute("UPDATE import_candidates SET cancel_requested=1,state=CASE WHEN state='processing' THEN state ELSE 'ignored' END WHERE payload_chapter IN (SELECT chapter_id FROM downloads WHERE execution_id=?1)",[&eid])?;
+                tx.execute("DELETE FROM downloads WHERE chapter_id IN (SELECT child_chapter FROM import_candidates WHERE cancel_requested=1 AND payload_chapter IN (SELECT chapter_id FROM downloads WHERE execution_id=?1))",[&eid])?;
+                tx.execute("UPDATE import_payloads SET state='cancelled' WHERE chapter_id IN (SELECT chapter_id FROM downloads WHERE execution_id=?1)",[&eid])?;
+                tx.execute("DELETE FROM downloads WHERE execution_id=?1 AND chapter_id IN (SELECT chapter_id FROM import_payloads)",[&eid])?;
+                tx.execute(
                     "DELETE FROM downloads WHERE execution_id = ?1 AND state IN ('queued', 'downloading')",
                     [&eid],
                 )?;
-                Ok(())
+                tx.commit()?;Ok(())
             }
         }).await
     }
@@ -2411,7 +2465,7 @@ impl AcquisitionService {
         let pending_ids = self.db.call(|conn| {
             let mut stmt = conn.prepare(
                 "SELECT id FROM acquisition_executions
-                 WHERE status IN ('PREFLIGHT', 'REVALIDATING', 'QUEUED', 'DOWNLOADING', 'VERIFYING', 'PUBLISHING', 'RECONCILING')",
+                 WHERE status IN ('PREFLIGHT', 'REVALIDATING', 'QUEUED', 'DOWNLOADING', 'NEEDS_REVIEW', 'IMPORTING', 'VERIFYING', 'PUBLISHING', 'RECONCILING')",
             )?;
             let ids = stmt.query_map([], |r| r.get::<_, String>(0))?.filter_map(std::result::Result::ok).collect::<Vec<_>>();
             Ok(ids)

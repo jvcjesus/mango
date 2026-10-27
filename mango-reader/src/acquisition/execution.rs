@@ -28,6 +28,8 @@ pub enum ExecutionStatus {
     Revalidating,
     Queued,
     Downloading,
+    NeedsReview,
+    Importing,
     Verifying,
     Publishing,
     Reconciling,
@@ -46,6 +48,8 @@ impl ExecutionStatus {
             Self::Revalidating => "REVALIDATING",
             Self::Queued => "QUEUED",
             Self::Downloading => "DOWNLOADING",
+            Self::NeedsReview => "NEEDS_REVIEW",
+            Self::Importing => "IMPORTING",
             Self::Verifying => "VERIFYING",
             Self::Publishing => "PUBLISHING",
             Self::Reconciling => "RECONCILING",
@@ -64,6 +68,8 @@ impl ExecutionStatus {
             "REVALIDATING" => Some(Self::Revalidating),
             "QUEUED" => Some(Self::Queued),
             "DOWNLOADING" => Some(Self::Downloading),
+            "NEEDS_REVIEW" => Some(Self::NeedsReview),
+            "IMPORTING" => Some(Self::Importing),
             "VERIFYING" => Some(Self::Verifying),
             "PUBLISHING" => Some(Self::Publishing),
             "RECONCILING" => Some(Self::Reconciling),
@@ -86,6 +92,18 @@ impl ExecutionStatus {
             (Self::Completed, _) => false,
             (Self::Cancelled, _) => false,
             (Self::Stale, _) => false,
+
+            // Aggregate stages can move back while independent payload siblings progress.
+            (Self::NeedsReview, Self::Queued | Self::Downloading) => true,
+            (Self::Importing, Self::Queued | Self::Downloading | Self::NeedsReview) => true,
+            (Self::Queued | Self::Downloading, Self::NeedsReview | Self::Importing) => true,
+            (
+                Self::NeedsReview,
+                Self::Importing | Self::Completed | Self::Cancelled | Self::Failed | Self::Partial,
+            ) => true,
+            (Self::Importing, Self::Completed | Self::Partial | Self::Failed | Self::Cancelled) => {
+                true
+            }
 
             // Approved can advance through phases or reach terminal/partial outcomes
             (Self::Approved, Self::Preflight | Self::Revalidating | Self::Queued | Self::Completed | Self::Partial | Self::Failed | Self::Cancelled | Self::Stale) => true,
@@ -130,6 +148,8 @@ pub enum ExecutionItemStatus {
     Revalidating,
     Queued,
     Downloading,
+    NeedsReview,
+    Importing,
     Verifying,
     Publishing,
     Reconciling,
@@ -148,6 +168,8 @@ impl ExecutionItemStatus {
             Self::Revalidating => "REVALIDATING",
             Self::Queued => "QUEUED",
             Self::Downloading => "DOWNLOADING",
+            Self::NeedsReview => "NEEDS_REVIEW",
+            Self::Importing => "IMPORTING",
             Self::Verifying => "VERIFYING",
             Self::Publishing => "PUBLISHING",
             Self::Reconciling => "RECONCILING",
@@ -166,6 +188,8 @@ impl ExecutionItemStatus {
             "REVALIDATING" => Some(Self::Revalidating),
             "QUEUED" => Some(Self::Queued),
             "DOWNLOADING" => Some(Self::Downloading),
+            "NEEDS_REVIEW" => Some(Self::NeedsReview),
+            "IMPORTING" => Some(Self::Importing),
             "VERIFYING" => Some(Self::Verifying),
             "PUBLISHING" => Some(Self::Publishing),
             "RECONCILING" => Some(Self::Reconciling),
@@ -1033,5 +1057,19 @@ fn dummy_cand() -> NormalizedAcquisitionCandidate {
         score: 0.0,
         mapping_provenance: UnitMappingProvenance::ExplicitVolumeMetadata,
         provider_metadata: serde_json::json!({}),
+    }
+}
+
+#[cfg(test)]
+mod physical_execution_states {
+    use super::ExecutionStatus as S;
+    #[test]
+    fn aggregate_physical_states_can_reflect_independent_sibling_progress() {
+        assert!(S::Queued.can_transition_to(S::Importing));
+        assert!(S::Downloading.can_transition_to(S::NeedsReview));
+        assert!(S::NeedsReview.can_transition_to(S::Downloading));
+        assert!(S::Importing.can_transition_to(S::NeedsReview));
+        assert!(S::Importing.can_transition_to(S::Completed));
+        assert!(!S::Completed.can_transition_to(S::Importing));
     }
 }

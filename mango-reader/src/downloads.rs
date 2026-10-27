@@ -629,6 +629,7 @@ impl Downloads {
         let _ = self
             .db
             .call(|conn| {
+                conn.execute("UPDATE import_candidates SET state=CASE WHEN cancel_requested=1 THEN 'ignored' ELSE 'queued' END WHERE state='processing'",[])?;
                 // 1. Verify any downloads marked with published_path
                 let mut stmt = conn.prepare("SELECT chapter_id, published_path FROM downloads WHERE published_path IS NOT NULL")?;
                 let published_items = stmt
@@ -873,6 +874,32 @@ impl Downloads {
             if let Ok(Some((relative_path, _page_count))) = &outcome {
                 if let Some(pipeline) = &self.pipeline {
                     let cbz_file = self.dir.join(relative_path);
+                    if crate::acquisition::physical::is_physical(&job) {
+                        *self.live_stage.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some(AcquisitionLiveState {
+                                chapter_id: job.chapter,
+                                stage: "inspection".into(),
+                                status_message: "Inspecting physical payload for candidate books"
+                                    .into(),
+                                destination: None,
+                            });
+                        match crate::acquisition::physical::capture(
+                            &self.db, &job, &cbz_file, &self.dir,
+                        )
+                        .await
+                        {
+                            Ok(()) => {
+                                *self.live_stage.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                                continue;
+                            }
+                            Err(error) => {
+                                let chapter = job.chapter;
+                                let message = error.to_string();
+                                let _=self.db.call(move |conn|{conn.execute("UPDATE downloads SET state='failed',error=?2 WHERE chapter_id=?1",rusqlite::params![chapter,format!("Inspection: {message}")])?;Ok(())}).await;
+                                continue;
+                            }
+                        }
+                    }
                     let live_stage = self.live_stage.clone();
                     let chapter_id = job.chapter;
 
@@ -887,10 +914,31 @@ impl Downloads {
                         }
                     };
 
-                    match pipeline
-                        .process_download_with_progress(&cbz_file, &job, update_stage)
+                    if crate::acquisition::physical::begin_candidate(&self.db, &job)
                         .await
+                        .is_err()
                     {
+                        continue;
+                    }
+                    let processing_result = pipeline
+                        .process_download_with_progress(&cbz_file, &job, update_stage)
+                        .await;
+                    let _ = crate::acquisition::physical::finish_candidate(&self.db, &job).await;
+                    match processing_result {
+                        Err(error) if error.code == "import_cancelled" => {
+                            let chapter = job.chapter;
+                            let _ = self
+                                .db
+                                .call(move |conn| {
+                                    conn.execute(
+                                        "DELETE FROM downloads WHERE chapter_id=?1",
+                                        [chapter],
+                                    )?;
+                                    Ok(())
+                                })
+                                .await;
+                            continue;
+                        }
                         Ok(crate::pipeline::AcquisitionOutcome::Complete(destination)) => {
                             if let Some(acq) = &self.acquisition {
                                 let _ = acq
@@ -1213,11 +1261,25 @@ impl Downloads {
         // 1. If already retrieved, verify staging CBZ
         if let Some(ref rel) = job.retrieved_path {
             let path = self.dir.join(rel);
-            if path.is_file() && crate::pipeline::publisher::verify_cbz_integrity(&path).is_ok() {
+            if path.is_file()
+                && (if crate::acquisition::physical::is_physical(job) {
+                    crate::acquisition::physical::validate_payload(&path)
+                } else {
+                    crate::pipeline::publisher::verify_cbz_integrity(&path)
+                })
+                .is_ok()
+            {
                 return Ok(Some((rel.clone(), 1)));
             }
         }
 
+        if job.source_type == "import" {
+            return Err(AppError::new(
+                422,
+                "import_staging_missing",
+                "Candidate staging is missing or corrupt; retry inspection from its payload",
+            ));
+        }
         let token = if let Some(acq) = &self.acquisition {
             acq.get_torbox_token().await.ok().flatten()
         } else {
@@ -1344,6 +1406,22 @@ impl Downloads {
             }
         }
 
+        if crate::acquisition::physical::is_physical(job) {
+            if let Some(expected) = job.torrent_hash.as_deref() {
+                let data = client.get_torrent_data(&external_job_id).await?;
+                if !data
+                    .hash
+                    .as_deref()
+                    .is_some_and(|actual| actual.eq_ignore_ascii_case(expected))
+                {
+                    return Err(AppError::new(
+                        409,
+                        "payload_source_changed",
+                        "The backend torrent no longer matches the approved source hash",
+                    ));
+                }
+            }
+        }
         // 4. File selection
         update_stage("torbox_selecting", "Selecting manga archive file...");
         let files = match client.list_files(&external_job_id).await {
@@ -1403,7 +1481,13 @@ impl Downloads {
             requested_edition = ?identity.requested_edition, requested_unit = ?identity.requested_unit,
             source_release = %crate::acquisition::torbox::diagnostic_text(&identity.source_release),
             job_id = %external_job_id, file_count = files.len(), "Resolving TorBox retrieval identity");
-        let selected_file = crate::acquisition::torbox::resolve_file_with_identity(
+        let selected_file = if identity.inspect_payload {
+            let selected = identity.selected_archive.as_ref().ok_or_else(|| {
+                AppError::bad_request("Choose a physical payload file before retrieval")
+            })?;
+            crate::acquisition::physical::resolve_payload(&files, selected)?
+        } else {
+            crate::acquisition::torbox::resolve_file_with_identity(
             &files,
             job.raw_title.as_deref(),
             target_unit.as_ref(),
@@ -1413,7 +1497,8 @@ impl Downloads {
         ).map_err(|error| {
             tracing::warn!(job_id = %external_job_id, reason = %error, "TorBox file resolution failed");
             AppError::from(error)
-        })?;
+        })?
+        };
         identity.selected_archive = Some(crate::acquisition::edition::SelectedArchive {
             path: selected_file.path.clone(),
             size: selected_file.size,
@@ -1495,7 +1580,7 @@ impl Downloads {
             .await?;
 
         // Double-check CBZ archive integrity & plausible manga images before atomic promotion
-        if let Err(e) = crate::pipeline::publisher::verify_cbz_integrity(&part_path) {
+        if let Err(e) = crate::acquisition::physical::validate_payload(&part_path) {
             let _ = std::fs::remove_file(&part_path);
             return Err(AppError::bad_request(format!(
                 "Retrieved archive failed integrity verification: {e}"
@@ -1866,12 +1951,17 @@ fn next_job(conn: &Connection) -> Result<Option<Job>> {
              ORDER BY d.position, d.chapter_id LIMIT 1",
             [now()],
             |r| {
-                let name: String = r.get(4)?;
-                let number: f64 = r.get(5)?;
+                let mut name: String = r.get(4)?;
+                let mut number: f64 = r.get(5)?;
+                let mut title:String=r.get(3)?;
                 let mut release_info = crate::release::parse_release(&name, number);
                 let identity_json: Option<String> = r.get(28)?;
                 let mut language: Option<String> = r.get(11)?;
                 if let Some(identity) = identity_json.as_deref().and_then(|json| serde_json::from_str::<crate::acquisition::edition::RetrievalIdentity>(json).ok()) {
+                    if identity.import_candidate.is_some() {
+                        title=identity.series.clone();
+                        match identity.requested_unit {crate::acquisition::AcquisitionReleaseUnit::Volume(n)=>{number=n;name=format!("Volume {n}");},crate::acquisition::AcquisitionReleaseUnit::Chapter(n)=>{number=n;name=format!("Chapter {n}");},_=>{}}
+                    }
                     if identity.language.is_some() { language = identity.language.clone(); }
                     match identity.requested_unit {
                         crate::acquisition::AcquisitionReleaseUnit::Volume(v) => {
@@ -1894,7 +1984,7 @@ fn next_job(conn: &Connection) -> Result<Option<Job>> {
                         manga_id: r.get(12)?,
                         attempts: r.get(1)?,
                         source: r.get(2)?,
-                        title: r.get(3)?,
+                        title,
                         name,
                         number,
                         scanlator: r.get(6)?,
@@ -3691,5 +3781,30 @@ mod retrieval_identity_persistence_tests {
             identity
         );
         fs::remove_dir_all(temp).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod import_assignment_recovery_tests {
+    use super::*;
+    #[test]
+    fn restart_uses_the_frozen_assignment_even_if_catalog_and_chapter_labels_change() {
+        let mut c = Connection::open_in_memory().unwrap();
+        crate::db::migrate(&mut c).unwrap();
+        c.execute("INSERT INTO manga(id,source_id,url,title) VALUES (1,0,'/frozen','Renamed catalog series')",[]).unwrap();
+        c.execute("INSERT INTO chapters(id,manga_id,url,name,chapter_number,source_order,fetched_at) VALUES (1,1,'/book','Volume 999',999,0,0)",[]).unwrap();
+        let mut identity = crate::acquisition::edition::RetrievalIdentity::new(
+            "Frozen Series",
+            "Unknown source",
+            crate::acquisition::AcquisitionReleaseUnit::Volume(5.),
+            Some("master"),
+        );
+        identity.import_candidate = Some(42);
+        c.execute("INSERT INTO downloads(chapter_id,state,position,attempts,added_at,retrieval_identity_json) VALUES (1,'queued',0,0,0,?1)",[serde_json::to_string(&identity).unwrap()]).unwrap();
+        let job = next_job(&c).unwrap().unwrap();
+        assert_eq!(job.title, "Frozen Series");
+        assert_eq!(job.number, 5.);
+        assert_eq!(job.volume, Some(5.));
+        assert_eq!(job.name, "Volume 5");
     }
 }
