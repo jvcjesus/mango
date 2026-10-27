@@ -206,3 +206,85 @@ atomic publication/collision, targeted Komga scan and exact ownership, restart
 at each stage, and cancellation during real processing. Use only disposable TEST
 storage and explicit operator authorization. Tracking a series still grants no
 automatic download authorization.
+
+## Exact-work MangaBaka covers
+
+Physical volume processing now propagates `MangaBakaEnrichment.work_cover_url`
+from the **same collection work** selected by the edition-aware exact-volume
+resolver. General series fallback leaves it unset. No series, first-volume,
+nearest-volume or neighbouring-volume artwork is substituted.
+
+Schema audit: the published [MangaBaka OpenAPI snapshot](https://github.com/AtiinLabs/mangabaka-sdk/blob/29e364dcaa03dea721d5df0a649ddbb9cd72c076/OpenAPI/openapi.json)
+models `/v1/collections/{id}/works` items as `V1_Work_Default`. Its optional
+`images` array defaults to empty and contains `V1_Series_Cover_Image` records;
+each record has `image: V1_Series_Image` and optional `work_id`. The shared image
+schema provides nullable absolute URI values at `raw.url` and
+`x150/x250/x350.{x1,x2,x3}`. Multiple image records and resolutions are possible.
+This is a published third-party snapshot of the API specification, not a live
+Punpun response. The parser visits only the matched work's image records in API
+order, rejects explicit foreign work IDs, and prefers raw, then x350/x250/x150
+at the highest available DPI. Existing image-size parsing also supports the
+string representation already used by Mango's series image integration. A work's
+absence of artwork does not change successful metadata resolution.
+
+Cover requests use the existing unauthenticated pipeline HTTP client, HTTP(S)
+URLs, normal bounded redirects, a 12-second request timeout and a 15-second
+retrieval/decode deadline. Bodies are limited to 16 MiB even without Content-Length.
+JPEG/PNG/WebP are decoded by the narrowly enabled `image` crate; MIME types and URL
+extensions are not trusted. Decode limits are 16 million pixels, 16,000 pixels per
+axis and 96 MiB decoder allocation. Unsupported formats, missing art, HTTP errors
+(including 429), timeouts and unsafe/invalid artwork log a warning and retain the
+valid source book. Artwork requests never carry MangaBaka's API token; logs omit
+artwork URLs and authorization headers.
+
+The additional page uses `000-cover.jpg`, `.png` or `.webp` according to actual
+content. Every original image filename and image byte is retained by the staged
+archive rewrite. Existing source covers remain reading pages. ComicInfo page
+indices shift once, the injected page is FrontCover index 0, and exactly one root
+ComicInfo remains. The reserved name must sort before source pages in both lexical
+and Mango's natural order; unusual source ordering or an unowned case-insensitive
+name collision causes optional cover enrichment to be skipped without renaming or
+overwriting source pages.
+
+`mango-volume-cover.json` stores the injected filename, version and SHA256. A retry
+replaces only a hash-verified Mango cover; an unmarked or changed source is never
+adopted as disposable. Exactly one injected cover remains, including format changes.
+Insertion runs **before the existing RustyLibraryShrinker step** with the configured
+normal book policy (defaults 2400/90/10). After that same processing run, ownership
+is refreshed if the optimizer changes the injected image's bytes or extension.
+An optimizer that strips provenance or changes identity ambiguously causes future
+replacement to fail closed. Final ComicInfo generation, ZIP validation, atomic
+publication/collision protection and Komga verification keep their existing order.
+No migration, acquisition authorization change or existing-library bulk mutation
+is introduced. Provider-not-applicable paths remain untouched.
+
+Cover milestone validation: 398 release tests passed (390 starting), including
+95 pipeline tests, 13 MangaBaka pipeline tests and six cover tests. The dedicated
+acquisition suite passed 108 tests. Eight added regressions cover exact work and
+edition selection, absent/foreign artwork and no series/neighbor substitution,
+source-page preservation, root/case-insensitive ComicInfo cleanup and page indices,
+idempotency/collisions, PNG/WebP/JPEG decoding, HTTP redirects/errors/429, declared
+and streamed size limits, timeout, optimizer format conversion and optional-art
+failure through the real local publisher. The optimizer-order integration test
+uses a recording stub, not the real RustyLibraryShrinker binary.
+
+Frontend: 86 tests passed; production build passed; the same 31 type-check errors
+and zero warnings remain. Cargo check passed with the existing 19 warnings;
+Clippy passed with the same diagnostic messages (86 binary / 124 test warnings).
+Formatting remains the existing 922 hunks across 55 files; diff whitespace checks
+pass. No frontend/API workflow or database migration was needed.
+
+TEST deployment and Punpun volumes 1–7 were not exercised from this environment:
+it exposes no server credentials, VPN or TCP grants. The guarded deploy helper,
+TEST container/image/health, retained Punpun payloads, live work IDs and covers,
+and production before/after fingerprints were therefore not inspected. No server
+was contacted and no canonical book was replaced. Required next acceptance is to
+inspect the existing deploy helper, fingerprint production, back up TEST, deploy
+the pushed commit to TEST only, verify health/8788 and the unchanged production
+fingerprint, then build and validate all seven volumes from retained payloads in
+staging. Confirm exact edition/work IDs, expected cover bytes before optimization,
+original pages (accounting for normal optimization), one ComicInfo, valid ZIPs,
+optimizer outcome, filenames and permissions. If retained source is absent, stop;
+do not reacquire automatically or overwrite canonical books. Any eventual
+canonical replacement needs the separately guarded backup/hash/atomic-replacement
+procedure described in the task.
