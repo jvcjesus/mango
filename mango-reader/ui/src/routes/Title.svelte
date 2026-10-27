@@ -1,23 +1,18 @@
 <script lang="ts">
+ import AcquisitionDialog from "../lib/AcquisitionDialog.svelte";
+ let unifiedAcquisition = $state<{release:string;mode: "missing"|"complete"|"specific"} | null>(null);
   import { onDestroy } from 'svelte';
   import {
     get,
     message,
     send,
     getTitleAcquisitionReleases,
-    acquireRelease,
-    acquireCollection,
-    inspectCollection,
     getTitleProfile,
     setTitleProfile,
     getAcquisitionProfiles,
     getTitleMissingContent,
-    planTitleMissingContent,
-    getTitlePlan,
-    createExecution,
     getTitleExecutions,
     getAcquisitionExecution,
-    startExecution,
     cancelExecution,
     retryExecution,
     type AcquisitionProfile,
@@ -221,15 +216,6 @@
   let missingContent = $state<MissingContentSummary | null>(null);
   let loadingMissing = $state(false);
 
-  // Plan Modal state
-  let planModalOpen = $state(false);
-  let currentPlan = $state<AcquisitionPlan | null>(null);
-  let planLoading = $state(false);
-  let planError = $state<string | null>(null);
-  let showAlternatives = $state(false);
-  let selectedPlanItemIds = $state<Record<string, boolean>>({});
-  let acquiringPlanLoading = $state(false);
-
   // Execution state
   let titleExecutions = $state<AcquisitionExecution[]>([]);
   let activeExecution = $state<AcquisitionExecution | null>(null);
@@ -267,48 +253,6 @@
       }
     } catch (e) {
       // ignore
-    }
-  }
-
-  async function handleApproveAndStartExecution() {
-    if (!currentPlan) return;
-    if (currentPlan.confidence !== 'high') {
-      const ok = await confirm({
-        title: 'Approve Plan With Warnings',
-        message: 'This plan is flagged as review recommended. Are you sure you want to approve and execute it?',
-        confirmText: 'Approve & Execute',
-        danger: false,
-      });
-      if (!ok) return;
-    }
-
-    executionActionLoading = true;
-    try {
-      let executablePlanId = currentPlan.id;
-      if (currentPlan.isDryRun) {
-        const persisted = await planTitleMissingContent(id, false);
-        currentPlan = persisted;
-        executablePlanId = persisted.id;
-      }
-
-      const execution = await createExecution(id, {
-        planId: executablePlanId,
-        approved: true,
-      });
-
-      const started = await startExecution(execution.id);
-      activeExecution = started;
-      planModalOpen = false;
-      executionModalOpen = true;
-      toast.success('Acquisition execution approved and started');
-      loadTitleExecutions();
-
-      if (executionPollTimer) clearInterval(executionPollTimer);
-      executionPollTimer = setInterval(refreshActiveExecution, 2000);
-    } catch (e) {
-      toast.error(message(e));
-    } finally {
-      executionActionLoading = false;
     }
   }
 
@@ -377,124 +321,7 @@
     }
   }
 
-  async function openPlanModal(dryRun: boolean = true) {
-    planModalOpen = true;
-    planLoading = true;
-    planError = null;
-    showAlternatives = false;
-    selectedPlanItemIds = {};
-    try {
-      const plan = await planTitleMissingContent(id, dryRun);
-      currentPlan = plan;
-      for (const item of plan.selectedItems) {
-        selectedPlanItemIds[item.candidate.providerReleaseId] = true;
-      }
-    } catch (e) {
-      planError = message(e);
-    } finally {
-      planLoading = false;
-    }
-  }
-
-  async function handleSavePlan() {
-    if (!currentPlan) return;
-    try {
-      const saved = await planTitleMissingContent(id, false);
-      currentPlan = saved;
-      toast.success('Acquisition plan saved');
-    } catch (e) {
-      toast.error(message(e));
-    }
-  }
-
-  async function handleAcquirePlanSelected() {
-    if (!currentPlan) return;
-    const selected = currentPlan.selectedItems.filter((i) => selectedPlanItemIds[i.candidate.providerReleaseId]);
-    if (selected.length === 0) {
-      toast.error('No plan releases selected for acquisition');
-      return;
-    }
-
-    acquiringPlanLoading = true;
-    try {
-      let count = 0;
-      for (const item of selected) {
-        const cand = item.candidate;
-        if (cand.releaseUnit.type === 'collection') {
-          await acquireCollection(id, {
-            release: {
-              source: cand.provider,
-              sourceItemId: cand.providerReleaseId,
-              title: cand.title,
-              rawTitle: cand.title,
-              uploader: cand.uploader ?? null,
-              sourceUrl: cand.providerMetadata?.sourceUrl ?? '',
-              torrentUrl: null,
-              magnetUrl: null,
-              infoHash: cand.providerMetadata?.torrentHash ?? null,
-              categoryId: null,
-              categoryName: null,
-              sizeBytes: cand.size ?? 0,
-              sizeFormatted: `${Math.round((cand.size ?? 0) / (1024 * 1024))} MiB`,
-              seeders: cand.health.seeders ?? 0,
-              leechers: cand.health.leechers ?? 0,
-              publishedAt: cand.publishedAt ?? null,
-              isTrusted: cand.qualitySignals.isTrusted,
-              isRemake: false,
-              isVariant: cand.qualitySignals.editionPenalty > 0,
-              variantName: cand.edition ?? null,
-              isMixed: false,
-              releaseUnit: cand.releaseUnit,
-              releaseNumber: cand.releaseNumber ?? null,
-              releaseRange: cand.releaseRange ?? null,
-              language: cand.language || 'en',
-            } as any,
-            selectedVolumes: item.unitsCovered,
-            mode: 'missing_only',
-          });
-          count += item.unitsCovered.length;
-        } else {
-          await acquireRelease(id, {
-            source: cand.provider,
-            sourceItemId: cand.providerReleaseId,
-            title: cand.title,
-            rawTitle: cand.title,
-            uploader: cand.uploader ?? null,
-            sourceUrl: cand.providerMetadata?.sourceUrl ?? '',
-            torrentUrl: null,
-            magnetUrl: null,
-            infoHash: cand.providerMetadata?.torrentHash ?? null,
-            categoryId: null,
-            categoryName: null,
-            sizeBytes: cand.size ?? 0,
-            sizeFormatted: `${Math.round((cand.size ?? 0) / (1024 * 1024))} MiB`,
-            seeders: cand.health.seeders ?? 0,
-            leechers: cand.health.leechers ?? 0,
-            publishedAt: cand.publishedAt ?? null,
-            isTrusted: cand.qualitySignals.isTrusted,
-            isRemake: false,
-            isVariant: cand.qualitySignals.editionPenalty > 0,
-            variantName: cand.edition ?? null,
-            isMixed: false,
-            releaseUnit: cand.releaseUnit,
-            releaseNumber: cand.releaseNumber ?? null,
-            releaseRange: cand.releaseRange ?? null,
-            language: cand.language || 'en',
-          } as any);
-          count += 1;
-        }
-      }
-      toast.success(`Queued ${count} releases/units for acquisition!`);
-      planModalOpen = false;
-      refreshOwnership();
-      loadMissingAndProfile();
-    } catch (e) {
-      toast.error(message(e));
-    } finally {
-      acquiringPlanLoading = false;
-    }
-  }
-
+  async function openPlanModal(_dryRun = true) { unifiedAcquisition = {release:'',mode:'missing'}; }
   const ownedVolumeNumbers = $derived.by<number[]>(() => {
     if (!ownership?.volumes) return [];
     return ownership.volumes.filter((v) => v.status === 'owned').map((v) => v.volume).sort((a, b) => a - b);
@@ -525,13 +352,6 @@
   let sortBy = $state('smart');
   let targetedUnit = $state<{ type: string; number: number } | null>(null);
   let expandedScoreBreakdown = $state<Record<string, boolean>>({});
-
-  // Collection Inspector state
-  let inspectingCollection = $state<CollectionInspection | null>(null);
-  let inspectingLoading = $state(false);
-  let collectionMode = $state<'missing_only' | 'entire' | 'manual'>('missing_only');
-  let manualSelectedVolumes = $state<Record<number, boolean>>({});
-  let acquiringCollectionLoading = $state(false);
 
   const discoveredUploaders = $derived.by(() => {
     const set = new Set<string>();
@@ -576,89 +396,7 @@
     searchNyaa();
   }
 
-  async function openCollectionInspector(release: AcquisitionRelease) {
-    inspectingLoading = true;
-    inspectingCollection = null;
-    manualSelectedVolumes = {};
-    collectionMode = 'missing_only';
-    try {
-      const inspection = await inspectCollection(id, release);
-      inspectingCollection = inspection;
-      collectionMode = inspection.recommendedMode;
-      for (const u of inspection.units) {
-        manualSelectedVolumes[u.volume] = !u.isOwned;
-      }
-    } catch (e) {
-      toast.error(message(e));
-    } finally {
-      inspectingLoading = false;
-    }
-  }
-
-  function closeCollectionInspector() {
-    inspectingCollection = null;
-  }
-
-  async function executeAcquireCollection() {
-    if (!inspectingCollection) return;
-    acquiringCollectionLoading = true;
-    try {
-      let selectedVolumes: number[] = [];
-      if (collectionMode === 'missing_only') {
-        selectedVolumes = inspectingCollection.units.filter((u) => !u.isOwned).map((u) => u.volume);
-      } else if (collectionMode === 'entire') {
-        selectedVolumes = inspectingCollection.units.map((u) => u.volume);
-      } else {
-        selectedVolumes = inspectingCollection.units.filter((u) => manualSelectedVolumes[u.volume]).map((u) => u.volume);
-      }
-
-      if (selectedVolumes.length === 0) {
-        toast.error('No volumes selected for acquisition');
-        return;
-      }
-
-      const res = await acquireCollection(id, {
-        release: inspectingCollection.release,
-        selectedVolumes,
-        mode: collectionMode,
-      });
-
-      toast.success(`Queued ${res.queuedCount} volumes for acquisition via TorBox!`);
-      closeCollectionInspector();
-      refreshOwnership();
-    } catch (e) {
-      toast.error(message(e));
-    } finally {
-      acquiringCollectionLoading = false;
-    }
-  }
-
-  function toggleManualVolume(vol: number) {
-    manualSelectedVolumes[vol] = !manualSelectedVolumes[vol];
-  }
-
-  function selectAllManual(select: boolean) {
-    if (!inspectingCollection) return;
-    for (const u of inspectingCollection.units) {
-      manualSelectedVolumes[u.volume] = select;
-    }
-  }
-
-  async function acquireCandidate(cand: AcquisitionCandidate) {
-    const key = cand.release.sourceItemId;
-    acquiringReleases[key] = true;
-    try {
-      await acquireRelease(id, cand.release, cand.release.releaseUnit);
-      toast.success(`Queued "${cand.release.title}" for download via TorBox!`);
-      cand.ownershipStatus = 'acquiring';
-      refreshOwnership();
-    } catch (e) {
-      toast.error(message(e));
-    } finally {
-      acquiringReleases[key] = false;
-    }
-  }
-
+  async function acquireCandidate(cand: AcquisitionCandidate) { unifiedAcquisition = {release:cand.release.sourceItemId,mode:'complete'}; }
   function formatVolumeRanges(nums: number[]): string {
     if (!nums.length) return 'None';
     const sorted = [...nums].sort((a, b) => a - b);
@@ -1205,7 +943,7 @@
 
                 <div class="planner-actions-row">
                   {#if missingContent.hasMissing}
-                    <button class="btn spot pill icon-text" onclick={() => openPlanModal(true)} disabled={planLoading}>
+                    <button class="btn spot pill icon-text" onclick={() => openPlanModal(true)}>
                       <Icon name="puzzle" size={14} /> Plan Missing Volumes
                     </button>
                   {/if}
@@ -1461,8 +1199,8 @@
                       {#if isCollection}
                         <button
                           class="btn spot pill"
-                          onclick={() => openCollectionInspector(cand.release)}
-                          disabled={inspectingLoading}
+                          onclick={() => unifiedAcquisition = {release:cand.release.sourceItemId,mode:'complete'}}
+
                         >
                           <Icon name="folder" size={14} /> View Collection ({cand.unitsIncluded.length} vols)
                         </button>
@@ -1777,310 +1515,6 @@
     </div>
   {/if}
 </div>
-
-{#if inspectingCollection}
-  <div class="modal-backdrop" onclick={closeCollectionInspector} role="presentation">
-    <div
-      class="modal-card collection-modal"
-      onclick={(e) => e.stopPropagation()}
-      onkeydown={(e) => { if (e.key === 'Escape') closeCollectionInspector(); }}
-      role="dialog"
-      aria-modal="true"
-      tabindex="-1"
-    >
-      <div class="modal-header">
-        <div>
-          <span class="tag spot">COLLECTION INSPECTOR</span>
-          <h2 class="display modal-title">{inspectingCollection.release.title}</h2>
-          <span class="modal-subtext">
-            {inspectingCollection.totalUnits} total volumes · 
-            <strong class="text-spot">{inspectingCollection.missingCount} missing</strong> · 
-            {inspectingCollection.ownedCount} owned in Komga
-          </span>
-        </div>
-        <button class="btn icon" onclick={closeCollectionInspector} aria-label="Close">
-          <Icon name="close" size={18} />
-        </button>
-      </div>
-
-      <div class="modal-body">
-        <div class="mode-selector-card">
-          <span class="selector-title">Acquisition Mode:</span>
-          <div class="mode-options">
-            <label class="mode-label" class:selected={collectionMode === 'missing_only'}>
-              <input type="radio" name="col_mode" value="missing_only" bind:group={collectionMode} />
-              <div>
-                <strong>Missing Only ({inspectingCollection.missingCount} volumes)</strong>
-                <span class="mode-desc">Only retrieves unowned volumes and skips {inspectingCollection.ownedCount} duplicates.</span>
-              </div>
-            </label>
-
-            <label class="mode-label" class:selected={collectionMode === 'entire'}>
-              <input type="radio" name="col_mode" value="entire" bind:group={collectionMode} />
-              <div>
-                <strong>Entire Collection ({inspectingCollection.totalUnits} volumes)</strong>
-                <span class="mode-desc">Retrieves all volumes in collection.</span>
-              </div>
-            </label>
-
-            <label class="mode-label" class:selected={collectionMode === 'manual'}>
-              <input type="radio" name="col_mode" value="manual" bind:group={collectionMode} />
-              <div>
-                <strong>Select Manually</strong>
-                <span class="mode-desc">Pick individual volumes below.</span>
-              </div>
-            </label>
-          </div>
-        </div>
-
-        <div class="collection-units-section">
-          <div class="units-header-row">
-            <h4>Included Volumes ({inspectingCollection.units.length})</h4>
-            {#if collectionMode === 'manual'}
-              <div class="quick-select">
-                <button class="btn-text" onclick={() => selectAllManual(true)}>Select All</button>
-                <span>·</span>
-                <button class="btn-text" onclick={() => selectAllManual(false)}>Deselect All</button>
-              </div>
-            {/if}
-          </div>
-
-          <div class="units-scroll-list">
-            {#each inspectingCollection.units as u (u.volume)}
-              <label class="unit-row" class:unit-owned={u.isOwned} class:unit-acquiring={u.isAcquiring}>
-                {#if collectionMode === 'manual'}
-                  <input
-                    type="checkbox"
-                    checked={manualSelectedVolumes[u.volume]}
-                    onchange={() => toggleManualVolume(u.volume)}
-                  />
-                {:else if collectionMode === 'missing_only'}
-                  <input type="checkbox" checked={!u.isOwned} disabled />
-                {:else}
-                  <input type="checkbox" checked={true} disabled />
-                {/if}
-
-                <div class="unit-row-info">
-                  <strong>Volume {u.volume}</strong>
-                  {#if u.filename}
-                    <span class="unit-filename">{u.filename}</span>
-                  {/if}
-                </div>
-
-                <div class="unit-row-status">
-                  {#if u.isOwned}
-                    <span class="tag spot"><Icon name="check" size={12} /> Owned</span>
-                  {:else if u.isAcquiring}
-                    <span class="tag"><span class="spin"><Icon name="spinner" size={12} stroke={3} /></span> Acquiring</span>
-                  {:else}
-                    <span class="tag warn">Missing</span>
-                  {/if}
-                </div>
-              </label>
-            {/each}
-          </div>
-        </div>
-      </div>
-
-      <div class="modal-footer">
-        <button class="btn" onclick={closeCollectionInspector} disabled={acquiringCollectionLoading}>
-          Cancel
-        </button>
-        <button
-          class="btn spot"
-          onclick={executeAcquireCollection}
-          disabled={acquiringCollectionLoading}
-        >
-          {#if acquiringCollectionLoading}
-            <span class="spin"><Icon name="spinner" size={16} stroke={3} /></span> Enqueuing Volumes…
-          {:else}
-            <Icon name="download" size={16} />
-            Acquire {
-              collectionMode === 'missing_only'
-                ? inspectingCollection.missingCount
-                : collectionMode === 'entire'
-                ? inspectingCollection.totalUnits
-                : Object.values(manualSelectedVolumes).filter(Boolean).length
-            } Volumes via TorBox
-          {/if}
-        </button>
-      </div>
-    </div>
-  </div>
-{/if}
-
-{#if planModalOpen}
-  <!-- svelte-ignore a11y_click_events_have_key_events -->
-  <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div class="modal-backdrop" onclick={() => (planModalOpen = false)}>
-    <div class="modal-content plan-modal" onclick={(e) => e.stopPropagation()}>
-      <div class="modal-header">
-        <div>
-          <h3>Plan Missing Content: {title.title}</h3>
-          <span class="muted">Profile: <strong>{currentPlan?.profileName ?? currentProfile?.name ?? 'Default Manga'}</strong></span>
-        </div>
-        <button class="btn icon close-btn" onclick={() => (planModalOpen = false)} aria-label="Close">
-          <Icon name="close" size={18} />
-        </button>
-      </div>
-
-      <div class="modal-body">
-        {#if planLoading}
-          <div class="nyaa-loading-box">
-            <span class="spin"><Icon name="spinner" size={24} stroke={3} /></span>
-            Evaluating candidates across providers & optimizing plan…
-          </div>
-        {:else if planError}
-          <Notice error={planError} retry={() => openPlanModal(true)} />
-        {:else if currentPlan}
-          <!-- Plan Confidence & Status Banner -->
-          <div class="plan-header-banner">
-            <div class="plan-status-badges">
-              <span class="tag {currentPlan.confidence === 'high' ? 'spot' : 'warn'}" style="font-weight: 700;">
-                {currentPlan.confidence === 'high' ? 'HIGH CONFIDENCE' : 'REVIEW RECOMMENDED'}
-              </span>
-              <span class="tag">
-                {currentPlan.missingUnitsCoveredCount} / {currentPlan.missingUnits.length} Missing Volumes Covered
-              </span>
-              {#if currentPlan.totalEstimatedSize > 0}
-                <span class="tag">
-                  Est. Retrieval: {(currentPlan.totalEstimatedSize / (1024 * 1024 * 1024)).toFixed(2)} GiB
-                </span>
-              {/if}
-              <span class="tag spot">DRY RUN PREVIEW</span>
-            </div>
-
-            {#if currentPlan.staleReason}
-              <div class="plan-stale-notice">
-                <Icon name="info" size={16} />
-                <span>{currentPlan.staleReason}</span>
-              </div>
-            {/if}
-          </div>
-
-          <!-- Recommended Acquisitions -->
-          <h4 style="margin-top: 1rem; margin-bottom: 0.5rem;">Recommended Plan</h4>
-          {#if currentPlan.selectedItems.length === 0}
-            <p class="muted">No viable releases found for the missing units with current profile preferences.</p>
-          {:else}
-            <div class="plan-items-list">
-              {#each currentPlan.selectedItems as item (item.candidate.providerReleaseId)}
-                <div class="plan-candidate-card recommended">
-                  <div class="plan-candidate-header">
-                    <label class="candidate-checkbox-label">
-                      <input
-                        type="checkbox"
-                        checked={selectedPlanItemIds[item.candidate.providerReleaseId]}
-                        onchange={(e) => {
-                          selectedPlanItemIds[item.candidate.providerReleaseId] = (e.target as HTMLInputElement).checked;
-                        }}
-                      />
-                      <strong class="candidate-title">{item.candidate.title}</strong>
-                    </label>
-                    <span class="tag spot">{item.candidate.provider.toUpperCase()}</span>
-                  </div>
-
-                  {#if item.candidate.provider === 'mangadot' || item.candidate.providerMetadata?.unitMappingProvenance === 'ChapterToVolumeInference' || item.candidate.providerMetadata?.volumeSupportMode === 'inferred'}
-                    <div class="inferred-badge-row">
-                      <span class="tag warn" title="Derived from chapter releases, not native volume package">
-                        Inferred volume mapping: requires manual review
-                      </span>
-                    </div>
-                  {/if}
-
-                  <div class="candidate-meta-row">
-                    {#if item.candidate.uploader}
-                      <span>Uploader: <strong>{item.candidate.uploader}</strong></span>
-                    {/if}
-                    {#if item.candidate.format}
-                      <span>Format: <strong>{item.candidate.format}</strong></span>
-                    {/if}
-                    {#if item.candidate.size}
-                      <span>Size: <strong>{Math.round(item.candidate.size / (1024 * 1024))} MiB</strong></span>
-                    {/if}
-                    {#if item.candidate.health.seeders !== null && item.candidate.health.seeders !== undefined}
-                      <span>Seeders: <strong>{item.candidate.health.seeders}</strong></span>
-                    {/if}
-                    <span>Smart Score: <strong>{item.candidate.score.toFixed(0)}</strong></span>
-                  </div>
-
-                  <!-- Explanations -->
-                  <div class="candidate-explanations-box">
-                    {#each item.explanation.whyRecommended as why}
-                      <div class="why-rec-line">{why}</div>
-                    {/each}
-                    {#each item.explanation.whyLower as why}
-                      <div class="why-low-line">{why}</div>
-                    {/each}
-                  </div>
-                </div>
-              {/each}
-            </div>
-          {/if}
-
-          <!-- Alternatives (Collapsible) -->
-          {#if currentPlan.alternatives.length > 0}
-            <div class="alternatives-toggle-row">
-              <button class="btn pill icon-text" onclick={() => (showAlternatives = !showAlternatives)}>
-                <Icon name={showAlternatives ? 'chevron-up' : 'chevron-down'} size={14} />
-                {showAlternatives ? 'Hide' : 'Show'} Alternative Candidates ({currentPlan.alternatives.length})
-              </button>
-            </div>
-
-            {#if showAlternatives}
-              <div class="alternatives-list">
-                {#each currentPlan.alternatives as alt (alt.providerReleaseId)}
-                  <div class="plan-candidate-card alternative">
-                    <div class="plan-candidate-header">
-                      <span class="candidate-title">{alt.title}</span>
-                      <span class="tag">{alt.provider.toUpperCase()}</span>
-                    </div>
-                    <div class="candidate-meta-row">
-                      {#if alt.uploader}<span>Uploader: <strong>{alt.uploader}</strong></span>{/if}
-                      {#if alt.size}<span>Size: <strong>{Math.round(alt.size / (1024 * 1024))} MiB</strong></span>{/if}
-                      {#if alt.health.seeders !== null && alt.health.seeders !== undefined}
-                        <span>Seeders: <strong>{alt.health.seeders}</strong></span>
-                      {/if}
-                      <span>Smart Score: <strong>{alt.score.toFixed(0)}</strong></span>
-                    </div>
-                  </div>
-                {/each}
-              </div>
-            {/if}
-          {/if}
-
-          <!-- Dry-run Safety Explainer -->
-          <div class="dry-run-safety-box">
-            <Icon name="check" size={16} />
-            <div>
-              <strong>Dry Run Mode:</strong>
-              <span>No external jobs created. No TorBox submission. No files modified. Execution remains explicitly manual.</span>
-            </div>
-          </div>
-        {/if}
-      </div>
-
-      <div class="modal-footer">
-        <button class="btn" onclick={() => (planModalOpen = false)}>Close</button>
-        {#if currentPlan && currentPlan.selectedItems.length > 0}
-          <button class="btn" onclick={handleSavePlan}>
-            <Icon name="bookmark" size={14} /> Save Plan
-          </button>
-          <button
-            class="btn spot approve-btn"
-            onclick={handleApproveAndStartExecution}
-            disabled={executionActionLoading}
-          >
-            <Icon name="check" size={14} />
-            {executionActionLoading
-              ? 'Approving…'
-              : `Approve & Acquire (${currentPlan.selectedItems.length} items${currentPlan.totalEstimatedSize > 0 ? `, ~${(currentPlan.totalEstimatedSize / (1024 * 1024 * 1024)).toFixed(1)} GB` : ''})`}
-          </button>
-        {/if}
-      </div>
-    </div>
-  </div>
-{/if}
 
 {#if executionModalOpen && activeExecution}
   <!-- svelte-ignore a11y_click_events_have_key_events -->
@@ -2951,12 +2385,7 @@
     justify-content: space-between;
   }
 
-  .units-header-row h4 {
-    margin: 0;
-    font-size: 13px;
-    text-transform: uppercase;
-    opacity: 0.8;
-  }
+
 
   .quick-select {
     display: flex;
@@ -3333,3 +2762,7 @@
     font-size: 0.8rem;
   }
 </style>
+
+{#if unifiedAcquisition && title}
+<AcquisitionDialog title={title.title} initialReleaseId={unifiedAcquisition.release} initialMode={unifiedAcquisition.mode} onclose={() => unifiedAcquisition = null} onacquired={() => { refreshOwnership(); loadTitleExecutions(); }} />
+{/if}

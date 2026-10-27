@@ -74,3 +74,9 @@ it('specific source archive and override remain explicit in regenerated requests
     expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toMatchObject({contentMode:'specific',requestedVolumes:[4],requestedEdition:'master',selectedReleaseId:'release',selectedArchive:{path:'Master/Alternative v04.cbz',size:400},useReleaseAnyway:true});
   } finally { vi.unstubAllGlobals(); }
 });
+
+it('the shared request carries a concrete multi-file selection independently of catalog units', async () => {
+ const {planByTitle}=await import('./api');
+ const fetchMock=vi.fn().mockResolvedValue(new Response('{}',{status:200}));vi.stubGlobal('fetch',fetchMock);
+ try {const selectedArchives=[{path:'release/book.zip',size:123},{path:'release/other.zip',size:456}];await planByTitle({title:'Unknown edition',selectedReleaseId:'source',selectedArchives,useReleaseAnyway:true});expect(JSON.parse(fetchMock.mock.calls[0][1].body).selectedArchives).toEqual(selectedArchives);}finally{vi.unstubAllGlobals();}
+});

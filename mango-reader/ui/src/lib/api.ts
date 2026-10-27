@@ -1227,6 +1227,7 @@ export interface PlanByTitleRequest {
   requestedEdition?: string | null;
   selectedReleaseId?: string | null;
   selectedArchive?: { path: string; size: number } | null;
+  selectedArchives?: {path:string;size:number}[];
   useReleaseAnyway?: boolean;
 }
 
