@@ -1845,6 +1845,7 @@ mod tests {
             web_url: Some("https://mangabaka.org/series/83".into()),
             language: Some("en".into()),
             work_id: None,
+            work_cover_url: None,
         };
 
         let (_status, _reason, diffs) = LibraryNormalizationService::evaluate_metadata_diff(
@@ -2228,6 +2229,7 @@ mod tests {
             web_url: None,
             language: Some("en".into()),
             work_id: None,
+            work_cover_url: None,
         }
     }
     #[test]

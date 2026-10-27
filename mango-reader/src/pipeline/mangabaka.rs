@@ -258,6 +258,46 @@ pub fn extract_mb_series_cover(series_node: &serde_json::Value) -> Option<String
     None
 }
 
+/// Artwork only from the already matched work, never its series or neighbours.
+/// V1_Work_Default.images -> V1_Series_Cover_Image.image (published OpenAPI).
+fn exact_work_cover(work: &serde_json::Value) -> Option<String> {
+    let work_id = work.get("id").and_then(|v| v.as_str());
+    work.get("images")?
+        .as_array()?
+        .iter()
+        .filter(|record| {
+            // Do not accept an explicitly different work's artwork.
+            record
+                .get("work_id")
+                .and_then(|v| v.as_str())
+                .is_none_or(|id| Some(id) == work_id)
+        })
+        .filter_map(|record| {
+            let image = record.get("image")?;
+            // Raw first for canonical books; scaled variants are only this same image.
+            ["raw", "x350", "x250", "x150"].iter().find_map(|key| {
+                let size = image.get(key)?;
+                // Reuse the existing documented image-size representations.
+                if *key == "raw" {
+                    extract_url_from_image_size(size).filter(|s| is_safe_cover_url(s))
+                } else {
+                    ["x3", "x2", "x1"]
+                        .iter()
+                        .find_map(|dpi| {
+                            size.get(dpi)
+                                .and_then(|v| v.as_str())
+                                .filter(|s| is_safe_cover_url(s))
+                                .map(|s| s.trim().to_owned())
+                        })
+                        .or_else(|| {
+                            extract_url_from_image_size(size).filter(|s| is_safe_cover_url(s))
+                        })
+                }
+            })
+        })
+        .next()
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct MangaBakaEnrichment {
     pub series_id: i64,
@@ -277,6 +317,9 @@ pub struct MangaBakaEnrichment {
     pub web_url: Option<String>,
     pub language: Option<String>,
     pub work_id: Option<String>,
+    /// Exact matched work artwork only. Series fallback deliberately leaves this unset.
+    #[serde(default)]
+    pub work_cover_url: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1815,6 +1858,7 @@ impl MangaBakaClient {
                             web_url,
                             language: Some("en".to_string()),
                             work_id,
+                            work_cover_url: exact_work_cover(&work),
                         }));
                     }
                 }
@@ -2194,6 +2238,16 @@ pub fn write_comic_info_to_cbz(
 
 /// Shared archive rewrite path for an already reviewed metadata document.
 pub fn write_prepared_comic_info_to_cbz(cbz_path: &Path, final_xml: &str) -> Result<usize> {
+    rewrite_comic_info_with_entries(cbz_path, final_xml, &[], &[])
+}
+
+/// Shared staged rewrite. Callers must validate ownership before removing entries.
+pub(super) fn rewrite_comic_info_with_entries(
+    cbz_path: &Path,
+    final_xml: &str,
+    remove: &[&str],
+    add: &[(&str, &[u8])],
+) -> Result<usize> {
     let parsed = roxmltree::Document::parse(final_xml)
         .map_err(|_| AppError::bad_request("Invalid prepared ComicInfo XML"))?;
     if parsed.root_element().tag_name().name() != "ComicInfo" {
@@ -2203,11 +2257,16 @@ pub fn write_prepared_comic_info_to_cbz(cbz_path: &Path, final_xml: &str) -> Res
     let image_count = source
         .file_names()
         .filter(|name| {
-            crate::local::is_image(name)
+            !remove.iter().any(|old| name.eq_ignore_ascii_case(old))
+                && crate::local::is_image(name)
                 && !name.starts_with("__MACOSX")
                 && !name.rsplit('/').next().unwrap_or("").starts_with('.')
         })
-        .count();
+        .count()
+        + add
+            .iter()
+            .filter(|(name, _)| crate::local::is_image(name))
+            .count();
     if image_count == 0 || !final_xml.starts_with("<?xml") || !final_xml.ends_with("</ComicInfo>\n")
     {
         return Err(AppError::bad_request(
@@ -2234,9 +2293,11 @@ pub fn write_prepared_comic_info_to_cbz(cbz_path: &Path, final_xml: &str) -> Res
             let _ = fs::remove_file(self.0);
         }
     }
+    let temp_file = File::options()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)?;
     let guard = CleanupGuard(&temp_path);
-
-    let temp_file = File::create(&temp_path)?;
     let mut dest_zip = zip::ZipWriter::new(temp_file);
 
     // Copy all non-ComicInfo entries with exact names and compression
@@ -2245,8 +2306,10 @@ pub fn write_prepared_comic_info_to_cbz(cbz_path: &Path, final_xml: &str) -> Res
         let name = entry.name().to_string();
         let basename = name.rsplit_once('/').map(|(_, b)| b).unwrap_or(&name);
 
-        if basename.eq_ignore_ascii_case("comicinfo.xml") {
-            continue; // Skip any existing case-insensitive ComicInfo variants
+        if basename.eq_ignore_ascii_case("comicinfo.xml")
+            || remove.iter().any(|old| name.eq_ignore_ascii_case(old))
+        {
+            continue; // Skip only managed metadata and caller-verified owned entries.
         }
 
         let options =
@@ -2255,15 +2318,22 @@ pub fn write_prepared_comic_info_to_cbz(cbz_path: &Path, final_xml: &str) -> Res
         std::io::copy(&mut entry, &mut dest_zip)?;
     }
 
+    for (name, bytes) in add {
+        dest_zip.start_file(*name, zip::write::SimpleFileOptions::default())?;
+        dest_zip.write_all(bytes)?;
+    }
     // Add exactly ONE ComicInfo.xml at root
     let xml_options = zip::write::SimpleFileOptions::default()
         .compression_method(zip::CompressionMethod::Deflated);
     dest_zip.start_file("ComicInfo.xml", xml_options)?;
     dest_zip.write_all(final_xml.as_bytes())?;
-    dest_zip.finish()?;
+    dest_zip.finish()?.sync_all()?;
 
     // Validate the temporary file
     crate::pipeline::publisher::verify_cbz_integrity(&temp_path)?;
+    if !add.is_empty() {
+        crate::acquisition::physical::validate_payload(&temp_path)?;
+    }
 
     // Assert exactly ONE ComicInfo.xml exists case-insensitively
     {
@@ -3248,5 +3318,77 @@ mod override_source_tests {
         assert!(xml.contains("<PageCount>2</PageCount>"));
         assert!(!xml.contains("MangaBaka Series 0"));
         std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod work_cover_tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn documented_work_images_prefer_raw_then_highest_scaled_variant() {
+        let work = json!({"id":"three","images":[{"work_id":"three","image":{"raw":{"url":"https://example.test/raw.jpg"},"x350":{"x3":"https://example.test/scaled.jpg"}}}]});
+        assert_eq!(
+            exact_work_cover(&work).as_deref(),
+            Some("https://example.test/raw.jpg")
+        );
+        let scaled = json!({"id":"three","images":[{"image":{"raw":{"url":null},"x350":{"x1":"https://example.test/small.jpg","x3":"https://example.test/large.jpg"}}}]});
+        assert_eq!(
+            exact_work_cover(&scaled).as_deref(),
+            Some("https://example.test/large.jpg")
+        );
+        assert!(exact_work_cover(&json!({"cover":"https://example.test/series.jpg"})).is_none());
+        assert!(exact_work_cover(&json!({"id":"three","images":[{"work_id":"other","image":{"raw":{"url":"https://example.test/other.jpg"}}}]})).is_none());
+    }
+    #[tokio::test]
+    async fn exact_work_and_edition_control_artwork_without_neighbour_or_series_fallback() {
+        use axum::{routing::get, Json, Router};
+        let app=Router::new()
+            .route("/series/83",get(||async{Json(json!({"data":{"title":"Fixture","cover":{"raw":{"url":"https://example.test/series.jpg"}}}}))}))
+            .route("/series/83/collections",get(||async{Json(json!({"data":[
+                {"id":"standard","language":"en","edition":{"name":"Standard Edition"},"medium":"digital"},
+                {"id":"master","language":"en","edition":{"name":"Master Edition"},"medium":"digital"}
+            ]}))}))
+            .route("/collections/{edition}/works",get(|axum::extract::Path(edition):axum::extract::Path<String>|async move {
+                let works=(1..=5).map(|n|json!({"id":format!("{edition}-{n}"),"sequence_numeric":n,"images":if n==4{json!([])}else{json!([{"work_id":format!("{edition}-{n}"),"image":{"raw":{"url":format!("https://example.test/{edition}-{n}.jpg")}}}])}})).collect::<Vec<_>>();
+                Json(json!({"data":works}))
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = MangaBakaClient::new(Client::new(), Some(format!("http://{addr}")), None);
+        for edition in ["standard", "master"] {
+            for number in [3., 4.] {
+                let MangaBakaOutcome::Success(e) = client
+                    .resolve_edition_volume_metadata(
+                        "Fixture",
+                        None,
+                        Some(83),
+                        number,
+                        Some(edition),
+                    )
+                    .await
+                    .unwrap()
+                else {
+                    panic!("Exact metadata should resolve")
+                };
+                assert_eq!(e.work_id, Some(format!("{edition}-{}", number as i32)));
+                assert_eq!(
+                    e.work_cover_url,
+                    if number == 4. {
+                        None
+                    } else {
+                        Some(format!("https://example.test/{edition}-3.jpg"))
+                    }
+                );
+            }
+        }
+        let fallback = client
+            .resolve_series_fallback("Fixture", Some(83), 3.)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(fallback.work_cover_url.is_none());
+        server.abort();
     }
 }

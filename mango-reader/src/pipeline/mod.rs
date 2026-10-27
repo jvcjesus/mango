@@ -7,6 +7,7 @@
 //! 4. Automatic Komga library scan triggers
 //! 5. Detailed in-memory audit trail of recent pipeline executions
 
+mod cover;
 pub mod komga;
 pub mod mangabaka;
 pub mod metadata;
@@ -1108,6 +1109,24 @@ impl Pipeline {
             mangabaka_status = format!("user_override:{metadata_scope}");
         }
 
+        // Optional exact-work artwork is additive and passes through the normal optimizer.
+        let mut injected_cover = None;
+        if let Some(enrichment) = resolved_enrichment.as_ref() {
+            tracing::info!(chapter_id=job.chapter, import_candidate=?retrieval_identity.import_candidate,
+                series_id=enrichment.series_id, collection_id=%enrichment.collection_id,
+                work_id=?enrichment.work_id, volume=release_num, edition=?requested_edition,
+                cover_found=enrichment.work_cover_url.is_some(), "Exact work cover resolution");
+            match cover::enrich(&self.http, source_cbz, enrichment.work_cover_url.as_deref()).await
+            {
+                Ok(filename) => {
+                    tracing::info!(chapter_id=job.chapter, filename=?filename, "Optional work cover enrichment complete");
+                    injected_cover = filename;
+                }
+                Err(error) => tracing::warn!(chapter_id=job.chapter, reason=%error,
+                    "Optional work cover skipped; source pages retained"),
+            }
+        }
+
         // 3. Non-destructive Image Optimization
         let mut optimizer_status = "skipped: disabled".to_string();
         if !config.optimize_enabled {
@@ -1170,6 +1189,16 @@ impl Pipeline {
                         }
                     }
                 }
+            }
+        }
+
+        if let Some(filename) = injected_cover {
+            let path = source_cbz.to_owned();
+            if let Err(error) =
+                crate::local::blocking(move || cover::refresh_after_optimization(&path, &filename))
+                    .await
+            {
+                tracing::warn!(chapter_id=job.chapter, reason=%error, "Could not refresh cover ownership after optimizer; future replacement will fail closed");
             }
         }
 
