@@ -77,11 +77,13 @@ pub struct TitleOwnership {
     pub last_refreshed: i64,
 }
 
+type OwnershipCache = HashMap<(i64, String), (Instant, TitleOwnership)>;
+
 #[derive(Clone)]
 pub struct OwnershipService {
     http: Client,
     db: crate::db::Db,
-    cache: Arc<RwLock<HashMap<i64, (Instant, TitleOwnership)>>>,
+    cache: Arc<RwLock<OwnershipCache>>,
 }
 
 impl OwnershipService {
@@ -96,7 +98,7 @@ impl OwnershipService {
     /// Invalidates cached ownership state for a manga title.
     pub fn invalidate(&self, manga_id: i64) {
         if let Ok(mut cache) = self.cache.write() {
-            cache.remove(&manga_id);
+            cache.retain(|(id, _), _| *id != manga_id);
         }
     }
 
@@ -112,7 +114,7 @@ impl OwnershipService {
     pub async fn get_title_ownership(&self, manga_id: i64, title: &str) -> TitleOwnership {
         // Check cache
         if let Ok(cache) = self.cache.read() {
-            if let Some((inserted, ownership)) = cache.get(&manga_id) {
+            if let Some((inserted, ownership)) = cache.get(&(manga_id, title.to_owned())) {
                 if inserted.elapsed() < OWNERSHIP_CACHE_TTL {
                     return ownership.clone();
                 }
@@ -122,7 +124,10 @@ impl OwnershipService {
         let ownership = self.query_komga_ownership(manga_id, title).await;
 
         if let Ok(mut cache) = self.cache.write() {
-            cache.insert(manga_id, (Instant::now(), ownership.clone()));
+            cache.insert(
+                (manga_id, title.to_owned()),
+                (Instant::now(), ownership.clone()),
+            );
         }
 
         ownership

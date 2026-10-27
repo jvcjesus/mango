@@ -53,6 +53,8 @@ pub struct InteractivePlan {
     pub editions: Vec<String>,
     pub candidates: Vec<NormalizedAcquisitionCandidate>,
     pub diagnostics: Vec<String>,
+    pub source_units: Vec<super::source_units::SourceUnit>,
+    pub edition_ownership_known: bool,
 }
 
 // Bound range expansion before ranking, which is synchronous and cannot be
@@ -180,8 +182,49 @@ pub fn prepare_plan(
     // Neither unknown nor known nonstandard editions inherit tracker numbering.
     let source_local_units =
         req.use_release_anyway || edition.as_deref().is_some_and(|ed| ed != "standard");
+    let source_units: Vec<super::source_units::SourceUnit> = selected
+        .as_ref()
+        .and_then(|c| serde_json::from_value(c.provider_metadata["sourceUnits"].clone()).ok())
+        .unwrap_or_default();
+    let inspected = selected
+        .as_ref()
+        .is_some_and(|c| c.provider_metadata["sourceFilesInspected"] == true);
+    let edition_owned: Vec<f64> = selected
+        .as_ref()
+        .and_then(|c| serde_json::from_value(c.provider_metadata["editionOwnedUnits"].clone()).ok())
+        .unwrap_or_default();
+    let edition_ownership_known = selected
+        .as_ref()
+        .is_some_and(|c| c.provider_metadata["editionOwnershipKnown"] == true);
+    let source_volumes = source_units
+        .iter()
+        .filter(|u| u.eligible)
+        .filter_map(|u| match u.unit {
+            super::AcquisitionReleaseUnit::Volume(n) => Some(n),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
     let mut units = if req.content_mode.as_deref() == Some("specific") {
         explicit_units
+    } else if source_local_units
+        && req.content_mode.as_deref().unwrap_or("missing") == "missing"
+        && !edition_ownership_known
+    {
+        vec![]
+    } else if source_local_units && inspected {
+        if req.content_mode.as_deref().unwrap_or("missing") == "missing" {
+            if edition_ownership_known {
+                source_volumes
+                    .iter()
+                    .copied()
+                    .filter(|n| !edition_owned.contains(n))
+                    .collect()
+            } else {
+                vec![]
+            }
+        } else {
+            source_volumes.clone()
+        }
     } else if source_local_units {
         selected
             .as_ref()
@@ -204,6 +247,12 @@ pub fn prepare_plan(
             !missing.owned_volumes.contains(unit) && !missing.acquiring_volumes.contains(unit)
         });
     }
+    if source_local_units
+        && req.content_mode.as_deref().unwrap_or("missing") == "missing"
+        && edition_ownership_known
+    {
+        units.retain(|n| !edition_owned.contains(n));
+    }
     units.sort_by(f64::total_cmp);
     units.dedup();
     if let Some(archive) = &req.selected_archive {
@@ -218,6 +267,10 @@ pub fn prepare_plan(
     }
     let mut context = missing.clone();
     context.missing_volumes = units.clone();
+    if source_local_units {
+        context.owned_volumes = edition_owned;
+        context.acquiring_volumes.clear();
+    }
     for candidate in &mut candidates {
         let detected = candidate.edition.clone();
         let compatible = edition.as_ref().is_none_or(|ed| {
@@ -274,14 +327,63 @@ pub fn prepare_plan(
             .unwrap()
             .clone();
         plan.selected_items.clear();
-        if !units.is_empty() && (confident_source_identity(&candidate) || req.use_release_anyway) {
-            // Explicit units express user intent, not inferred source coverage. Retrieval
-            // still requires labelled unit evidence (or a future explicit file mapping).
-            plan.selected_items = units.iter().map(|unit| AcquisitionPlanItem {
-                candidate: candidate.clone(), units_covered: vec![*unit], duplicate_units: vec![],
+        let selected_chapter = req
+            .selected_archive
+            .as_ref()
+            .and_then(|archive| {
+                source_units
+                    .iter()
+                    .find(|u| u.eligible && &u.archive == archive)
+            })
+            .is_some_and(|u| matches!(u.unit, super::AcquisitionReleaseUnit::Chapter(_)));
+        let mut selection_error = None;
+        let mut resolved_items = vec![];
+        for unit in &units {
+            let mut per_unit = candidate.clone();
+            if inspected {
+                let matches = source_units
+                    .iter()
+                    .filter(|u| {
+                        u.eligible
+                            && match u.unit {
+                                super::AcquisitionReleaseUnit::Volume(n) => {
+                                    !selected_chapter && n == *unit
+                                }
+                                super::AcquisitionReleaseUnit::Chapter(n) => {
+                                    selected_chapter && n == *unit
+                                }
+                                _ => false,
+                            }
+                    })
+                    .filter(|u| {
+                        req.selected_archive
+                            .as_ref()
+                            .is_none_or(|a| a == &u.archive)
+                    })
+                    .collect::<Vec<_>>();
+                if matches.len() != 1 {
+                    selection_error = Some(format!("Unit {unit}: {} matching source archives. Choose one numbered archive, or another release; file order cannot establish a unit.", matches.len()));
+                    break;
+                }
+                per_unit.provider_metadata["selectedArchive"] =
+                    serde_json::json!(matches[0].archive);
+                per_unit.release_unit = matches[0].unit.clone();
+                per_unit.provider_metadata["requestedUnit"] = serde_json::json!(matches[0].unit);
+            }
+            if let Some(metadata) = per_unit.provider_metadata.as_object_mut() {
+                metadata.remove("sourceUnits");
+            }
+            resolved_items.push(AcquisitionPlanItem {
+                candidate: per_unit, units_covered: vec![*unit], duplicate_units: vec![],
                 explanation: CandidateExplanation { candidate_id: id.clone(), candidate_title: candidate.title.clone(), provider: candidate.provider.clone(),
                     why_recommended: vec!["Explicit release and edition-local unit; archive must corroborate selection".into()], why_lower: vec![] },
-            }).collect();
+            });
+        }
+        if selection_error.is_none()
+            && !units.is_empty()
+            && (confident_source_identity(&candidate) || req.use_release_anyway)
+        {
+            plan.selected_items = resolved_items;
         }
         plan.state = if plan.selected_items.is_empty() {
             "draft"
@@ -289,8 +391,16 @@ pub fn prepare_plan(
             "ready"
         }
         .into();
-        plan.stale_reason = if units.is_empty() {
-            Some("Specify edition-local volumes; catalog totals cannot establish this release's numbering.".into())
+        plan.stale_reason = if selection_error.is_some() {
+            selection_error
+        } else if units.is_empty()
+            && source_local_units
+            && req.content_mode.as_deref().unwrap_or("missing") == "missing"
+            && !edition_ownership_known
+        {
+            Some("Missing-volume calculation is unavailable for this edition. Choose Complete Series or Specific Volumes using the source-local controls.".into())
+        } else if units.is_empty() {
+            Some("Choose source-local volumes or a numbered archive below; catalog totals cannot establish this release's numbering.".into())
         } else if plan.selected_items.is_empty() {
             Some("Exact catalog identity is uncertain. Review Use Release Anyway.".into())
         } else {
@@ -314,10 +424,200 @@ pub fn prepare_plan(
         editions,
         candidates,
         diagnostics,
+        source_units,
+        edition_ownership_known,
     })
 }
 
+pub fn edition_owned_units(
+    conn: &rusqlite::Connection,
+    manga_id: i64,
+    edition: &str,
+) -> Result<Vec<f64>> {
+    let mut stmt = conn.prepare("SELECT retrieval_identity_json, canonical_path FROM acquisition_history WHERE manga_id = ?1 AND canonical_path IS NOT NULL AND outcome IN ('published','completed','verification_pending','published_scan_failed')")?;
+    let rows = stmt.query_map([manga_id], |row| {
+        Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let mut owned = vec![];
+    for row in rows {
+        let (json, path) = row?;
+        let Some(identity) =
+            json.and_then(|s| serde_json::from_str::<super::edition::RetrievalIdentity>(&s).ok())
+        else {
+            continue;
+        };
+        if identity
+            .requested_edition
+            .as_deref()
+            .map(normalize_edition)
+            .as_deref()
+            == Some(edition)
+            && std::path::Path::new(&path).is_file()
+        {
+            if let super::AcquisitionReleaseUnit::Volume(n) = identity.requested_unit {
+                owned.push(n);
+            }
+        }
+    }
+    owned.sort_by(f64::total_cmp);
+    owned.dedup();
+    Ok(owned)
+}
+
 impl AcquisitionService {
+    pub(super) async fn source_edition_ownership(
+        &self,
+        manga_id: i64,
+        title: &str,
+        edition: &str,
+    ) -> Result<(bool, Vec<f64>)> {
+        let ed = normalize_edition(edition);
+        let query_ed = ed.clone();
+        let mut owned = self
+            .db
+            .call(move |conn| edition_owned_units(conn, manga_id, &query_ed))
+            .await?;
+        let mut known = !owned.is_empty();
+        if let Some(pipeline) = &self.pipeline {
+            // Reuse exactly the canonical/ComicInfo namespace used by publication.
+            let identity = super::edition::RetrievalIdentity::new(
+                title,
+                "",
+                super::AcquisitionReleaseUnit::Unknown,
+                Some(&ed),
+            );
+            let job = crate::downloads::Job {
+                title: title.into(),
+                retrieval_identity_json: Some(serde_json::to_string(&identity)?),
+                ..Default::default()
+            };
+            let qualified = job.publication_title();
+            if let Ok(ownership) = tokio::time::timeout(
+                PROVIDER_DEADLINE,
+                pipeline.ownership.get_title_ownership(manga_id, &qualified),
+            )
+            .await
+            {
+                if ownership.komga_connected
+                    && ownership.error.is_none()
+                    && ownership
+                        .series_name
+                        .as_deref()
+                        .and_then(super::edition::edition_from_title)
+                        .as_deref()
+                        == Some(ed.as_str())
+                {
+                    known = true;
+                    owned.extend(
+                        ownership
+                            .volumes
+                            .iter()
+                            .filter(|v| {
+                                v.status == crate::pipeline::ownership::OwnershipStatus::Owned
+                            })
+                            .map(|v| v.volume),
+                    );
+                }
+            }
+        }
+        owned.sort_by(f64::total_cmp);
+        owned.dedup();
+        Ok((known, owned))
+    }
+    async fn discover_source_files(
+        &self,
+        candidate: &NormalizedAcquisitionCandidate,
+        nyaa_url: Option<&str>,
+    ) -> Result<Vec<super::BackendFile>> {
+        // Reuse a matching known job read-only; never submit during a preview.
+        if let Some(hash) = candidate.provider_metadata["torrentHash"]
+            .as_str()
+            .filter(|h| !h.is_empty())
+        {
+            let hash = hash.to_owned();
+            let query_hash = hash.clone();
+            let job = self.db.call(move |conn| Ok(conn.query_row(
+                "SELECT external_job_id FROM downloads WHERE torrent_hash = ?1 AND backend_type='torbox' AND external_job_id IS NOT NULL ORDER BY added_at DESC LIMIT 1", [query_hash], |row| row.get::<_,String>(0)).optional()?)).await?;
+            if let Some(job) = job {
+                let (config, _) = self.load_internal_config().await?;
+                if config.torbox_enabled {
+                    let client = super::torbox::TorBoxClient::new(
+                        self.http.clone(),
+                        config.torbox_url,
+                        self.get_torbox_token().await?,
+                    );
+                    if let Ok(data) = client.get_torrent_data(&job).await {
+                        if data
+                            .hash
+                            .as_deref()
+                            .is_some_and(|actual| actual.eq_ignore_ascii_case(&hash))
+                        {
+                            if let Some(files) = data
+                                .files
+                                .filter(|files| !files.is_empty() && files.len() <= 500)
+                            {
+                                return Ok(files
+                                    .into_iter()
+                                    .map(|file| super::BackendFile {
+                                        id: file.id,
+                                        name: file.name.clone(),
+                                        path: file.absolute_path.unwrap_or(file.name),
+                                        size: file.size,
+                                    })
+                                    .collect());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let url = candidate.provider_metadata["torrentUrl"]
+            .as_str()
+            .ok_or_else(|| AppError::bad_request("No read-only torrent manifest is available"))?;
+        let url = reqwest::Url::parse(url)
+            .map_err(|_| AppError::bad_request("Invalid source manifest URL"))?;
+        let origin = reqwest::Url::parse(nyaa_url.unwrap_or(super::nyaa::DEFAULT_NYAA_URL))
+            .map_err(|_| AppError::bad_request("Invalid Nyaa URL"))?;
+        if url.origin() != origin.origin() {
+            return Err(AppError::bad_request(
+                "Manifest must belong to the configured source",
+            ));
+        }
+        let mut response = self
+            .http
+            .get(url)
+            .timeout(PROVIDER_DEADLINE)
+            .send()
+            .await
+            .map_err(|_| {
+                AppError::new(
+                    502,
+                    "source_files_failed",
+                    "Could not read source file manifest",
+                )
+            })?;
+        if !response.status().is_success() {
+            return Err(AppError::new(
+                502,
+                "source_files_failed",
+                "Source file manifest is unavailable",
+            ));
+        }
+        let mut bytes = vec![];
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|_| AppError::bad_request("Source manifest read failed"))?
+        {
+            if bytes.len() + chunk.len() > super::source_units::MAX_METAINFO_BYTES {
+                return Err(AppError::bad_request(
+                    "Source manifest exceeds planning limits",
+                ));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        super::source_units::metainfo_files(&bytes)
+    }
     pub async fn plan_interactive(&self, req: PlanningRequest) -> Result<InteractivePlan> {
         bounded(
             PLANNING_DEADLINE,
@@ -388,7 +688,8 @@ impl AcquisitionService {
             if config.nyaa_enabled {
                 // One bounded title query. Interactive planning does not wait on a
                 // sequential alias/source search chain or repeat ownership lookups.
-                let client = super::nyaa::NyaaClient::new(self.http.clone(), config.nyaa_url);
+                let client =
+                    super::nyaa::NyaaClient::new(self.http.clone(), config.nyaa_url.clone());
                 match bounded(
                     provider_deadline,
                     client.search(&title, config.nyaa_category.as_deref()),
@@ -484,6 +785,30 @@ impl AcquisitionService {
                 "discovery_failed",
                 diagnostics.join("; "),
             ));
+        }
+        if let Some(candidate) = candidates
+            .iter_mut()
+            .find(|c| req.selected_release_id.as_deref() == Some(&c.provider_release_id))
+        {
+            if candidate.provider == "nyaa" {
+                match bounded(provider_deadline, self.discover_source_files(candidate, config.nyaa_url.as_deref())).await {
+                    Ok(files) => {
+                        let units = super::source_units::discover(&files, candidate.provider_metadata["rawTitle"].as_str().unwrap_or(&candidate.title), candidate.edition.as_deref());
+                        candidate.provider_metadata["sourceUnits"] = serde_json::json!(units);
+                        candidate.provider_metadata["sourceFilesInspected"] = serde_json::json!(true);
+                    }
+                    Err(error) => diagnostics.push(format!("Source files: {}. Use Specific Volumes to express intent; retrieval must still corroborate the archive.", error.message)),
+                }
+            }
+            let ed = candidate
+                .edition
+                .clone()
+                .or_else(|| req.requested_edition.clone());
+            if let Some(ed) = ed.filter(|ed| ed != "standard") {
+                let (known, owned) = self.source_edition_ownership(manga_id, &title, &ed).await?;
+                candidate.provider_metadata["editionOwnershipKnown"] = serde_json::json!(known);
+                candidate.provider_metadata["editionOwnedUnits"] = serde_json::json!(owned);
+            }
         }
         let result = prepare_plan(
             manga_id,
@@ -1096,5 +1421,476 @@ mod discovery_tests {
             .any(|reason| reason.contains("timed out")));
         server.abort();
         std::fs::remove_file(path).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod source_local_tests {
+    use super::*;
+    use crate::acquisition::{source_units, AcquisitionReleaseUnit as Unit};
+    fn candidate(files: &[super::super::BackendFile]) -> NormalizedAcquisitionCandidate {
+        let mut c = NormalizedAcquisitionCandidate::from_mangadot_release(
+            "Series",
+            4.0,
+            "Series Master Edition (2016-2017)",
+            Some(2100),
+            "en",
+            super::super::candidates::UnitMappingProvenance::ParsedVolumeFromTitle,
+        );
+        c.provider = "nyaa".into();
+        c.provider_release_id = "source-master".into();
+        c.edition = Some("master".into());
+        c.release_unit = Unit::Unknown;
+        c.provider_metadata = serde_json::json!({"rawTitle": c.title, "sourceFilesInspected":true, "sourceUnits":source_units::discover(files, &c.title, Some("master"))});
+        c
+    }
+    fn request(mode: &str) -> PlanningRequest {
+        PlanningRequest {
+            title: "Series".into(),
+            content_mode: Some(mode.into()),
+            selected_release_id: Some("source-master".into()),
+            ..Default::default()
+        }
+    }
+    fn missing() -> MissingContentSummary {
+        super::super::missing::calculate_missing_content(
+            1,
+            "Series",
+            &[(4.0, None)],
+            &[],
+            Some(12),
+            &[],
+            &[],
+            &[],
+            &[],
+            None,
+            &[],
+        )
+    }
+    fn plan(c: NormalizedAcquisitionCandidate, req: &PlanningRequest) -> InteractivePlan {
+        prepare_plan(
+            1,
+            "Series",
+            &AcquisitionProfile::default(),
+            &missing(),
+            vec![c],
+            req,
+            vec![],
+        )
+        .unwrap()
+    }
+    #[test]
+    fn complete_selects_six_and_specific_four_ignores_standard_totals_ownership() {
+        let files = source_units::tests::files("Master Edition");
+        let complete = plan(candidate(&files), &request("complete"));
+        assert_eq!(complete.plan.selected_items.len(), 6);
+        assert_eq!(complete.plan.missing_units, vec![1., 2., 3., 4., 5., 6.]);
+        let mut req = request("specific");
+        req.requested_volumes = Some(vec![4.]);
+        let specific = plan(candidate(&files), &req);
+        assert_eq!(specific.plan.selected_items.len(), 1);
+        let item = &specific.plan.selected_items[0];
+        assert_eq!(item.units_covered, vec![4.]);
+        assert_eq!(item.candidate.release_unit, Unit::Volume(4.));
+        assert_eq!(
+            item.candidate.provider_metadata["requestedEdition"],
+            "master"
+        );
+        assert_eq!(
+            item.candidate.provider_metadata["selectedArchive"]["path"],
+            files[3].path
+        );
+    }
+    #[test]
+    fn missing_requires_edition_qualified_physical_ownership() {
+        let files = source_units::tests::files("Master Edition");
+        let unknown = plan(candidate(&files), &request("missing"));
+        assert!(unknown.plan.selected_items.is_empty());
+        assert!(unknown
+            .plan
+            .stale_reason
+            .unwrap()
+            .contains("Missing-volume calculation is unavailable"));
+        let mut known = candidate(&files);
+        known.provider_metadata["editionOwnershipKnown"] = serde_json::json!(true);
+        known.provider_metadata["editionOwnedUnits"] = serde_json::json!([4.]);
+        let result = plan(known, &request("missing"));
+        assert_eq!(result.plan.missing_units, vec![1., 2., 3., 5., 6.]);
+        assert_eq!(result.plan.selected_items.len(), 5);
+    }
+    #[test]
+    fn ambiguous_number_requires_exact_archive_even_under_override() {
+        let mut files = source_units::tests::files("Master Edition");
+        let mut alternate = files[3].clone();
+        alternate.path = "Series Master Edition/Alternative v04.cbz".into();
+        alternate.name = "Alternative v04.cbz".into();
+        files.push(alternate.clone());
+        let mut req = request("specific");
+        req.requested_volumes = Some(vec![4.]);
+        assert!(plan(candidate(&files), &req).plan.selected_items.is_empty());
+        req.use_release_anyway = true;
+        assert!(plan(candidate(&files), &req).plan.selected_items.is_empty());
+        req.selected_archive = Some(super::super::edition::SelectedArchive {
+            path: alternate.path,
+            size: alternate.size,
+        });
+        assert_eq!(plan(candidate(&files), &req).plan.selected_items.len(), 1);
+    }
+    #[test]
+    fn override_regenerates_real_units_but_cannot_invent_unlabelled_files() {
+        let files = source_units::tests::files("Master Edition");
+        let mut uncertain = candidate(&files);
+        uncertain.confidence = "review_recommended".into();
+        uncertain.provider_metadata["requiresIdentityOverride"] = serde_json::json!(true);
+        assert!(plan(uncertain.clone(), &request("complete"))
+            .plan
+            .selected_items
+            .is_empty());
+        let mut req = request("complete");
+        req.use_release_anyway = true;
+        let accepted = plan(uncertain, &req);
+        assert_eq!(accepted.plan.selected_items.len(), 6);
+        assert!(accepted
+            .plan
+            .selected_items
+            .iter()
+            .all(|i| is_override(&i.candidate)));
+        let files = vec![super::super::BackendFile {
+            id: 1,
+            name: "archive.cbz".into(),
+            path: "Series Master Edition/archive.cbz".into(),
+            size: 100,
+        }];
+        req.content_mode = Some("specific".into());
+        req.requested_volumes = Some(vec![4.]);
+        req.selected_archive = Some(super::super::edition::SelectedArchive {
+            path: files[0].path.clone(),
+            size: 100,
+        });
+        assert!(plan(candidate(&files), &req).plan.selected_items.is_empty());
+    }
+    #[test]
+    fn frozen_source_selection_survives_execution_restart_and_recreated_file_ids() {
+        let mut files = source_units::tests::files("Master Edition");
+        let planned = plan(candidate(&files), &request("complete"));
+        let dir = std::env::temp_dir().join(format!(
+            "source-unit-freeze-{}-{}",
+            std::process::id(),
+            crate::db::now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut conn = rusqlite::Connection::open(dir.join("test.db")).unwrap();
+        crate::db::migrate(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO manga (id,source_id,url,title) VALUES (1,0,'/source','Series')",
+            [],
+        )
+        .unwrap();
+        super::super::planner::save_plan(&conn, &planned.plan).unwrap();
+        let exec =
+            super::super::execution::create_execution(&conn, &planned.plan, &missing()).unwrap();
+        drop(conn);
+        let conn = rusqlite::Connection::open(dir.join("test.db")).unwrap();
+        let restored = super::super::execution::get_execution(&conn, &exec.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(restored.items.len(), 6);
+        let item = restored
+            .items
+            .iter()
+            .find(|i| i.expected_units == vec![4.])
+            .unwrap();
+        let frozen = &item.frozen_candidate;
+        let mut identity = super::super::edition::RetrievalIdentity::new(
+            "Series",
+            &frozen.title,
+            Unit::Volume(4.),
+            frozen.provider_metadata["requestedEdition"].as_str(),
+        );
+        identity.selected_archive = Some(
+            serde_json::from_value(frozen.provider_metadata["selectedArchive"].clone()).unwrap(),
+        );
+        files.reverse();
+        for file in &mut files {
+            file.id += 100;
+        }
+        let selected = super::super::torbox::resolve_file_with_identity(
+            &files,
+            None,
+            None,
+            None,
+            Some(4),
+            Some(&identity),
+        )
+        .unwrap();
+        assert_eq!(selected.size, 400);
+        for file in &mut files {
+            if file.size == 400 {
+                file.size += 1;
+            }
+        }
+        assert!(super::super::torbox::resolve_file_with_identity(
+            &files,
+            None,
+            None,
+            None,
+            None,
+            Some(&identity)
+        )
+        .is_err());
+        drop(conn);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn physical_history_ownership_requires_matching_edition_and_existing_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "source-owned-{}-{}",
+            std::process::id(),
+            crate::db::now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::migrate(&mut conn).unwrap();
+        conn.execute(
+            "INSERT INTO manga (id,source_id,url,title) VALUES (1,0,'/owned','Series')",
+            [],
+        )
+        .unwrap();
+        let path = dir.join("Master v04.cbz");
+        std::fs::write(&path, b"fixture").unwrap();
+        for edition in ["standard", "master"] {
+            let identity = super::super::edition::RetrievalIdentity::new(
+                "Series",
+                "Series",
+                Unit::Volume(4.),
+                Some(edition),
+            );
+            conn.execute("INSERT INTO acquisition_history (manga_id,series,release_name,outcome,canonical_path,completed_at,retrieval_identity_json) VALUES (1,'Series','Series','completed',?1,0,?2)", rusqlite::params![path.to_str().unwrap(),serde_json::to_string(&identity).unwrap()]).unwrap();
+            assert_eq!(
+                edition_owned_units(&conn, 1, "master").unwrap(),
+                if edition == "standard" {
+                    vec![]
+                } else {
+                    vec![4.]
+                }
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+        assert!(edition_owned_units(&conn, 1, "master").unwrap().is_empty());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn selected_rss_release_reads_manifest_without_submitting_downloads() {
+        use axum::{routing::get, Router};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let rss = format!(
+            r#"<rss><channel><item><title>Series Master Edition (2016-2017) (Digital)</title><guid>release-master</guid><nyaa:categoryId>3_1</nyaa:categoryId><nyaa:seeders>10</nyaa:seeders><enclosure url="http://{addr}/download/1.torrent" /></item></channel></rss>"#
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route(
+                        "/",
+                        get(move || {
+                            let rss = rss.clone();
+                            async move { rss }
+                        }),
+                    )
+                    .route(
+                        "/download/1.torrent",
+                        get(|| async { source_units::tests::manifest("Master Edition") }),
+                    ),
+            )
+            .await
+            .unwrap();
+        });
+        let dir = std::env::temp_dir().join(format!(
+            "source-manifest-http-{}-{}",
+            std::process::id(),
+            crate::db::now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = crate::db::Db::open(&dir.join("test.db")).unwrap();
+        let service = AcquisitionService::new(db.clone(), reqwest::Client::new(), None, None);
+        service
+            .save_config(super::super::service::AcquisitionConfigPatch {
+                nyaa_enabled: Some(true),
+                nyaa_url: Some(format!("http://{addr}")),
+                nyaa_category: None,
+                torbox_enabled: None,
+                torbox_url: None,
+                torbox_token: None,
+            })
+            .await
+            .unwrap();
+        let mut req = request("complete");
+        req.selected_release_id = Some("release-master".into());
+        let result = service.plan_interactive(req.clone()).await.unwrap();
+        assert_eq!(result.source_units.len(), 6);
+        assert_eq!(
+            result.plan.selected_items.len(),
+            6,
+            "{:?}",
+            result.plan.stale_reason
+        );
+        req.content_mode = Some("specific".into());
+        req.requested_volumes = Some(vec![4.]);
+        let result = service.plan_interactive(req).await.unwrap();
+        assert_eq!(result.plan.selected_items.len(), 1);
+        assert!(
+            result.plan.selected_items[0].candidate.provider_metadata["selectedArchive"]["path"]
+                .as_str()
+                .unwrap()
+                .ends_with("v04.cbz")
+        );
+        assert_eq!(
+            db.call(|conn| Ok(
+                conn.query_row("SELECT count(*) FROM downloads", [], |r| r.get::<_, i64>(0))?
+            ))
+            .await
+            .unwrap(),
+            0
+        );
+        server.abort();
+        drop(service);
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn explicitly_selected_chapter_keeps_its_kind() {
+        let files = vec![super::super::BackendFile {
+            id: 9,
+            name: "Series Master Edition ch. 4.cbz".into(),
+            path: "Series Master Edition/ch. 4.cbz".into(),
+            size: 400,
+        }];
+        let mut req = request("specific");
+        req.requested_volumes = Some(vec![4.]);
+        req.selected_archive = Some(super::super::edition::SelectedArchive {
+            path: files[0].path.clone(),
+            size: 400,
+        });
+        let result = plan(candidate(&files), &req);
+        assert_eq!(result.plan.selected_items.len(), 1);
+        assert_eq!(
+            result.plan.selected_items[0].candidate.provider_metadata["requestedUnit"],
+            serde_json::json!({"type":"chapter","value":4.0})
+        );
+    }
+    #[tokio::test]
+    async fn existing_matching_torbox_job_can_supply_read_only_file_evidence() {
+        use axum::{routing::get, Router};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, Router::new().route("/torrents/mylist",get(|| async { axum::Json(serde_json::json!({"success":true,"data":{"id":99,"hash":"fixture-hash","files":[{"id":400,"name":"Series Master Edition v04.cbz","absolute_path":"Series Master Edition/Series Master Edition v04.cbz","size":400}]}})) }))).await.unwrap();
+        });
+        let dir = std::env::temp_dir().join(format!(
+            "source-torbox-read-{}-{}",
+            std::process::id(),
+            crate::db::now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = crate::db::Db::open(&dir.join("test.db")).unwrap();
+        db.call(|conn| {
+            conn.execute("INSERT INTO manga (id,source_id,url,title) VALUES (1,0,'/known','Series')",[])?;
+            conn.execute("INSERT INTO chapters (id,manga_id,url,name,chapter_number,source_order,fetched_at) VALUES (1,1,'/v4','Volume 4',4,0,0)",[])?;
+            conn.execute("INSERT INTO downloads (chapter_id,state,position,attempts,added_at,torrent_hash,backend_type,external_job_id) VALUES (1,'failed',0,0,0,'fixture-hash','torbox','99')",[])?; Ok(())
+        }).await.unwrap();
+        let service = AcquisitionService::new(db.clone(), reqwest::Client::new(), None, None);
+        service
+            .save_config(super::super::service::AcquisitionConfigPatch {
+                nyaa_enabled: None,
+                nyaa_url: None,
+                nyaa_category: None,
+                torbox_enabled: Some(true),
+                torbox_url: Some(format!("http://{addr}")),
+                torbox_token: Some("fixture-token".into()),
+            })
+            .await
+            .unwrap();
+        let mut c = candidate(&source_units::tests::files("Master Edition"));
+        c.provider_metadata["torrentHash"] = serde_json::json!("fixture-hash");
+        let files = service.discover_source_files(&c, None).await.unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].id, 400);
+        assert!(source_units::discover(&files, &c.title, Some("master"))[0].eligible);
+        server.abort();
+        drop(service);
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[tokio::test]
+    async fn komga_edition_ownership_is_separate_from_cached_standard_ownership() {
+        use axum::{routing::get, Json, Router};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route("/api/v1/series",get(|axum::extract::Query(params): axum::extract::Query<HashMap<String,String>>| async move {
+            let master = params.get("search").is_some_and(|s| s.contains("master"));
+            Json(serde_json::json!({"content":[{"id":if master {"master"} else {"standard"},"name":if master {"Series (master Edition)"} else {"Series"},"libraryId":"test","booksCount":1}]}))
+        })).route("/api/v1/series/{id}/books",get(|axum::extract::Path(id):axum::extract::Path<String>| async move {
+            Json(serde_json::json!({"content":[{"id":"book","seriesId":id,"name":if id == "master" {"Series Master Edition v04"} else {"Series v01"},"number":if id == "master" {4.0} else {1.0},"metadata":{"numberSort":if id == "master" {4.0} else {1.0}}}]}))
+        }));
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let dir = std::env::temp_dir().join(format!(
+            "source-owned-komga-{}-{}",
+            std::process::id(),
+            crate::db::now()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = crate::db::Db::open(&dir.join("test.db")).unwrap();
+        db.call(move |conn| {
+            conn.execute(
+                "INSERT INTO manga (id,source_id,url,title) VALUES (1,0,'/komga','Series')",
+                [],
+            )?;
+            let mut settings = serde_json::Map::new();
+            settings.insert("pipeline.komga_enabled".into(), serde_json::json!(true));
+            settings.insert(
+                "pipeline.komga_url".into(),
+                serde_json::json!(format!("http://{addr}")),
+            );
+            settings.insert(
+                "pipeline.komga_library_id".into(),
+                serde_json::json!("test"),
+            );
+            crate::settings::put(conn, &settings)?;
+            crate::db::set_state(conn, "pipeline.komga_api_key", "fixture")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let pipeline = std::sync::Arc::new(crate::pipeline::Pipeline::new(db.clone()));
+        let standard = pipeline.ownership.get_title_ownership(1, "Series").await;
+        assert!(standard
+            .volumes
+            .iter()
+            .any(|v| v.volume == 1.0
+                && v.status == crate::pipeline::ownership::OwnershipStatus::Owned));
+        let service = AcquisitionService::new(
+            db.clone(),
+            reqwest::Client::new(),
+            Some(pipeline.clone()),
+            None,
+        );
+        assert_eq!(
+            service
+                .source_edition_ownership(1, "Series", "master")
+                .await
+                .unwrap(),
+            (true, vec![4.])
+        );
+        let standard = pipeline.ownership.get_title_ownership(1, "Series").await;
+        assert_eq!(standard.series_name.as_deref(), Some("Series"));
+        pipeline.ownership.invalidate(1);
+        server.abort();
+        drop(service);
+        drop(pipeline);
+        drop(db);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

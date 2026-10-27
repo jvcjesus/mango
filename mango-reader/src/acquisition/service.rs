@@ -1833,13 +1833,26 @@ impl AcquisitionService {
 
         let mut all_skipped = true;
         for item in &mut exec.items {
+            let edition_owned = if let Some(edition) = item.frozen_candidate.provider_metadata
+                ["requestedEdition"]
+                .as_str()
+                .filter(|ed| *ed != "standard")
+            {
+                self.source_edition_ownership(exec.manga_id, &exec.title, edition)
+                    .await?
+                    .1
+            } else {
+                vec![]
+            };
             let (still_needed, _) = crate::acquisition::execution::reconcile_preflight_ownership(
                 &item.expected_units,
-                if item.frozen_candidate.provider_metadata["requestedEdition"]
+                if item.frozen_candidate.provider_metadata["requestedUnit"]["type"] == "chapter" {
+                    &[]
+                } else if item.frozen_candidate.provider_metadata["requestedEdition"]
                     .as_str()
                     .is_some_and(|e| e != "standard")
                 {
-                    &[]
+                    &edition_owned
                 } else {
                     &owned_vols
                 },
@@ -1994,8 +2007,30 @@ impl AcquisitionService {
                 cand.provider_release_id,
                 item.expected_units.first().copied().unwrap_or(1.0)
             );
+            let requested_unit = cand
+                .provider_metadata
+                .get("requestedUnit")
+                .filter(|value| !value.is_null())
+                .map(|value| serde_json::from_value::<AcquisitionReleaseUnit>(value.clone()))
+                .transpose()
+                .map_err(|_| AppError::bad_request("Invalid frozen requested unit"))?
+                .unwrap_or_else(|| {
+                    AcquisitionReleaseUnit::Volume(
+                        item.expected_units.first().copied().unwrap_or(1.0),
+                    )
+                });
+            let ch_url = if matches!(requested_unit, AcquisitionReleaseUnit::Chapter(_)) {
+                format!("{ch_url}:chapter")
+            } else {
+                ch_url
+            };
             let ch_name = format!(
-                "Volume {}",
+                "{} {}",
+                if matches!(requested_unit, AcquisitionReleaseUnit::Chapter(_)) {
+                    "Chapter"
+                } else {
+                    "Volume"
+                },
                 item.expected_units.first().copied().unwrap_or(1.0)
             );
             let scanlator = cand.uploader.clone().unwrap_or_default();
@@ -2020,7 +2055,7 @@ impl AcquisitionService {
             let mut retrieval_identity = super::edition::RetrievalIdentity::new(
                 &exec.title,
                 &raw_t,
-                AcquisitionReleaseUnit::Volume(first_vol),
+                requested_unit,
                 cand.provider_metadata
                     .get("requestedEdition")
                     .and_then(|v| v.as_str()),

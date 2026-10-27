@@ -17,6 +17,7 @@ pub mod planner;
 pub mod profiles;
 pub mod providers;
 pub mod service;
+pub mod source_units;
 #[cfg(test)]
 pub mod tests;
 pub mod torbox;

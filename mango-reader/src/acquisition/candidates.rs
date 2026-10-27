@@ -134,6 +134,7 @@ impl NormalizedAcquisitionCandidate {
             provider_metadata: serde_json::json!({
                 "sourceUrl": r.source_url,
                 "torrentHash": r.info_hash,
+                "torrentUrl": r.torrent_url,
                 "rawTitle": r.raw_title,
                 "requestedEdition": super::edition::edition_from_title(series),
                 "smartScore": cand.smart_score,

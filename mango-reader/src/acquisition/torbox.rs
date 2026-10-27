@@ -1080,13 +1080,7 @@ pub fn resolve_file_with_identity<'a>(
         let file_edition = edition_from_title(&file.path)
             .or_else(|| edition_from_title(&file.name))
             .or_else(|| release_edition.clone());
-        let (parsed, _, _) = crate::acquisition::nyaa::classify_release(&file.name);
-        let parsed = match parsed {
-            AcquisitionReleaseUnit::Unknown => {
-                crate::acquisition::nyaa::classify_release(&file.path).0
-            }
-            other => other,
-        };
+        let parsed = super::source_units::archive_unit(file);
         let edition_ok = match (&requested_edition, &file_edition) {
             (Some(req), Some(actual)) => {
                 req == actual
