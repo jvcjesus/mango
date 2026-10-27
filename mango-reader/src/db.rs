@@ -37,6 +37,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/024_torbox_provenance_and_recovery.sql"),
     include_str!("../migrations/025_normalization_safety.sql"),
     include_str!("../migrations/026_retrieval_identity.sql"),
+    include_str!("../migrations/027_physical_import.sql"),
 ];
 
 /// Now, in epoch seconds: the unit of every time the database stores.
@@ -177,6 +178,28 @@ pub(crate) fn migrate(conn: &mut Connection) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn physical_import_upgrade_preserves_026_data() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        for sql in &MIGRATIONS[..26] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.execute_batch("PRAGMA user_version=26; INSERT INTO manga(id,source_id,url,title) VALUES (99,0,'/preserve','Preserved');").unwrap();
+        migrate(&mut conn).unwrap();
+        migrate(&mut conn).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT title FROM manga WHERE id=99", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "Preserved"
+        );
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM import_candidates", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
     #[test]
     fn migrations_apply_once() {
         let mut conn = Connection::open_in_memory().unwrap();

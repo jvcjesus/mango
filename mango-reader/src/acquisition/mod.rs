@@ -13,6 +13,7 @@ pub mod intelligence;
 pub mod interactive;
 pub mod missing;
 pub mod nyaa;
+pub mod physical;
 pub mod planner;
 pub mod profiles;
 pub mod providers;

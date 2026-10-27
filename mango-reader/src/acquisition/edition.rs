@@ -90,11 +90,24 @@ pub struct RetrievalIdentity {
     pub metadata_confidence: Option<String>,
     #[serde(default)]
     pub language: Option<String>,
+    #[serde(default)]
+    pub inspect_payload: bool,
+    #[serde(default)]
+    pub import_candidate: Option<i64>,
 }
 
 impl RetrievalIdentity {
     /// Requeueing must not mix an existing partial transfer with a new archive.
     pub fn preserve_selection_from(&mut self, previous: &Self) -> Result<(), String> {
+        if self.inspect_payload && previous.inspect_payload {
+            if let (Some(old), Some(new)) = (&previous.selected_archive, &self.selected_archive) {
+                if old.size != new.size || !super::physical::same_path(&old.path, &new.path) {
+                    return Err("Approved physical payload changed".into());
+                }
+            }
+            self.selected_archive = previous.selected_archive.clone();
+            return Ok(());
+        }
         if previous.selected_archive.is_none() {
             return Ok(());
         }
@@ -134,6 +147,8 @@ impl RetrievalIdentity {
             override_approved_at: None,
             metadata_confidence: None,
             language: None,
+            inspect_payload: false,
+            import_candidate: None,
         }
     }
 }
