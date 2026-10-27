@@ -1,5 +1,8 @@
 # Edition-aware acquisition and file resolution
 
+The interactive planner and override limitations recorded here describe milestone
+52641b0; see [interactive planning and identity override](18-interactive-planning-and-identity-override.md) for the subsequent implementation.
+
 Acquisition numbering is edition-local. A request for Standard Volume 4 never
 implicitly becomes Master/Omnibus Volume 2 or 4. No conversion table is inferred
 from archive count, ordering, release size, or tracker totals.
