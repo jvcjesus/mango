@@ -1846,7 +1846,9 @@ impl AcquisitionService {
             };
             let (still_needed, _) = crate::acquisition::execution::reconcile_preflight_ownership(
                 &item.expected_units,
-                if item.frozen_candidate.provider_metadata["requestedUnit"]["type"] == "chapter" {
+                if !item.frozen_candidate.provider_metadata["selectedArchive"].is_null()
+                    || item.frozen_candidate.provider_metadata["requestedUnit"]["type"] == "chapter"
+                {
                     &[]
                 } else if item.frozen_candidate.provider_metadata["requestedEdition"]
                     .as_str()

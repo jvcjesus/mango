@@ -346,7 +346,7 @@ pub fn validate_preflight_profile(
         }
     }
 
-    let identity = super::edition::RetrievalIdentity::new(
+    let mut identity = super::edition::RetrievalIdentity::new(
         &cand.series_identity,
         cand.provider_metadata
             .get("rawTitle")
@@ -357,9 +357,17 @@ pub fn validate_preflight_profile(
             .get("requestedEdition")
             .and_then(|v| v.as_str()),
     );
+    identity.selected_archive = cand
+        .provider_metadata
+        .get("selectedArchive")
+        .filter(|v| !v.is_null())
+        .map(|v| serde_json::from_value(v.clone()))
+        .transpose()
+        .map_err(|_| "Invalid approved file selection".to_string())?;
     super::torbox::validate_edition_intent(&identity).map_err(|e| e.to_string())?;
 
     if cand.provider_metadata["requiresIdentityOverride"] == true
+        && cand.provider_metadata["selectedArchive"].is_null()
         && !super::interactive::is_override(cand)
     {
         return Err(
@@ -376,6 +384,7 @@ pub fn validate_preflight_profile(
 
     if !profile.allow_unsupported_editions
         && cand.quality_signals.edition_recognized
+        && cand.provider_metadata["selectedArchive"].is_null()
         && !super::interactive::is_override(cand)
     {
         return Err("Candidate has unrecognized edition variant forbidden by profile".to_string());

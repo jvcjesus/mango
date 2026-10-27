@@ -42,6 +42,8 @@ pub struct PlanningRequest {
     pub selected_release_id: Option<String>,
     pub selected_archive: Option<super::edition::SelectedArchive>,
     #[serde(default)]
+    pub selected_archives: Vec<super::edition::SelectedArchive>,
+    #[serde(default)]
     pub use_release_anyway: bool,
 }
 
@@ -138,6 +140,135 @@ pub fn prepare_plan(
     req: &PlanningRequest,
     diagnostics: Vec<String>,
 ) -> Result<InteractivePlan> {
+    if !req.selected_archives.is_empty() {
+        if req.selected_archives.len() > 500 {
+            return Err(AppError::bad_request("Select at most 500 files"));
+        }
+        let id = req
+            .selected_release_id
+            .as_ref()
+            .ok_or_else(|| AppError::bad_request("Choose a source release"))?;
+        let candidate = candidates
+            .iter()
+            .find(|c| &c.provider_release_id == id)
+            .ok_or_else(|| AppError::bad_request("Release no longer available"))?;
+        let sources: Vec<super::source_units::SourceUnit> =
+            serde_json::from_value(candidate.provider_metadata["sourceUnits"].clone())
+                .unwrap_or_default();
+        let mut items = vec![];
+        let mut seen = std::collections::HashSet::new();
+        for (index, archive) in req.selected_archives.iter().enumerate() {
+            if !seen.insert(archive.path.clone()) {
+                return Err(AppError::bad_request("Duplicate file selection"));
+            }
+            let source = sources
+                .iter()
+                .find(|u| &u.archive == archive)
+                .ok_or_else(|| AppError::bad_request("Selected file changed; discover again"))?;
+            let mut c = candidate.clone();
+            let unit = match source.unit {
+                super::AcquisitionReleaseUnit::Volume(_)
+                | super::AcquisitionReleaseUnit::Chapter(_) => source.unit.clone(),
+                _ if req.use_release_anyway => {
+                    super::AcquisitionReleaseUnit::Volume((index + 1) as f64)
+                }
+                _ => {
+                    let mut review_req = req.clone();
+                    review_req.selected_archives.clear();
+                    let mut review = prepare_plan(
+                        manga_id,
+                        title,
+                        profile,
+                        missing,
+                        candidates,
+                        &review_req,
+                        diagnostics,
+                    )?;
+                    review.plan.selected_items.clear();
+                    review.plan.state = "draft".into();
+                    review.plan.total_acquisitions_count = 0;
+                    review.plan.missing_units_covered_count = 0;
+                    review.plan.stale_reason=Some("These files have no reliable numbering. Confirm Use Release Anyway to approve their displayed library assignments.".into());
+                    return Ok(review);
+                }
+            };
+            let number = match unit {
+                super::AcquisitionReleaseUnit::Volume(n)
+                | super::AcquisitionReleaseUnit::Chapter(n) => n,
+                _ => unreachable!(),
+            };
+            c.provider_metadata["selectedArchive"] = serde_json::json!(archive);
+            c.provider_metadata["requestedUnit"] = serde_json::json!(unit);
+            c.provider_metadata["requestedEdition"] = serde_json::json!(candidate
+                .edition
+                .clone()
+                .unwrap_or_else(|| format!("source {}", id)));
+            c.provider_metadata["identityOverride"] = serde_json::json!(req.use_release_anyway);
+            c.provider_metadata["interactive"] = serde_json::json!(true);
+            if !matches!(
+                source.unit,
+                super::AcquisitionReleaseUnit::Volume(_)
+                    | super::AcquisitionReleaseUnit::Chapter(_)
+            ) {
+                c.provider_metadata["requestedEdition"] = serde_json::json!(format!(
+                    "{} source {}",
+                    candidate.edition.as_deref().unwrap_or("unknown"),
+                    id
+                ));
+            }
+            c.provider_metadata["metadataPolicy"] = serde_json::json!("best_available");
+            c.provider_metadata["unitAssignment"] = serde_json::json!(if source.eligible {
+                "source"
+            } else {
+                "user_confirmed_file_order"
+            });
+            if let Some(m) = c.provider_metadata.as_object_mut() {
+                m.remove("sourceUnits");
+            }
+            c.release_unit = unit;
+            items.push(AcquisitionPlanItem {
+                candidate: c,
+                units_covered: vec![number],
+                duplicate_units: vec![],
+                explanation: CandidateExplanation {
+                    candidate_id: id.clone(),
+                    candidate_title: archive.path.clone(),
+                    provider: candidate.provider.clone(),
+                    why_recommended: vec![
+                        "Explicit source file selection; metadata may fall back".into()
+                    ],
+                    why_lower: vec![],
+                },
+            });
+        }
+        let mut plan = super::planner::generate_plan(
+            manga_id,
+            title,
+            profile,
+            missing,
+            &[],
+            &HashMap::new(),
+            true,
+        );
+        plan.missing_units = items.iter().flat_map(|i| i.units_covered.clone()).collect();
+        plan.missing_units_covered_count = items.len();
+        plan.total_acquisitions_count = items.len();
+        plan.total_estimated_size = req.selected_archives.iter().map(|a| a.size).sum();
+        plan.selected_items = items;
+        plan.state = "ready".into();
+        plan.stale_reason = None;
+        return Ok(InteractivePlan {
+            plan,
+            editions: candidates
+                .iter()
+                .filter_map(|c| c.edition.clone())
+                .collect(),
+            candidates,
+            diagnostics,
+            source_units: sources,
+            edition_ownership_known: false,
+        });
+    }
     let mut editions = candidates
         .iter()
         .filter_map(|c| c.edition.clone())
@@ -1892,5 +2023,68 @@ mod source_local_tests {
         drop(pipeline);
         drop(db);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    fn explicit_file_collection_and_single_selection_freeze_exact_archives() {
+        let files = source_units::tests::files("Master Edition");
+        let mut req = request("complete");
+        req.selected_archives = files
+            .iter()
+            .map(|f| super::super::edition::SelectedArchive {
+                path: f.path.clone(),
+                size: f.size,
+            })
+            .collect();
+        let result = plan(candidate(&files), &req);
+        assert_eq!(result.plan.selected_items.len(), 6);
+        req.selected_archives = vec![req.selected_archives[3].clone()];
+        let result = plan(candidate(&files), &req);
+        assert_eq!(result.plan.selected_items.len(), 1);
+        assert_eq!(
+            result.plan.selected_items[0].candidate.provider_metadata["selectedArchive"]["path"],
+            files[3].path
+        );
+    }
+    #[test]
+    fn unnumbered_files_require_consent_and_receive_isolated_library_assignments() {
+        let files = vec![super::super::BackendFile {
+            id: 1,
+            name: "book.cbz".into(),
+            path: "release/book.cbz".into(),
+            size: 100,
+        }];
+        let mut req = request("complete");
+        req.use_release_anyway = true;
+        req.selected_archives = vec![super::super::edition::SelectedArchive {
+            path: files[0].path.clone(),
+            size: 100,
+        }];
+        req.use_release_anyway = false;
+        assert!(plan(candidate(&files), &req).plan.selected_items.is_empty());
+        req.use_release_anyway = true;
+        let result = plan(candidate(&files), &req);
+        assert!(super::super::execution::validate_preflight_profile(
+            &AcquisitionProfile::default(),
+            &result.plan.selected_items[0].candidate
+        )
+        .is_ok());
+        assert_eq!(result.plan.selected_items.len(), 1);
+        assert!(
+            result.plan.selected_items[0].candidate.provider_metadata["requestedEdition"]
+                .as_str()
+                .unwrap()
+                .contains("source")
+        );
+        req.selected_archives[0].size = 101;
+        assert!(prepare_plan(
+            1,
+            "Series",
+            &AcquisitionProfile::default(),
+            &missing(),
+            vec![candidate(&files)],
+            &req,
+            vec![]
+        )
+        .is_err());
     }
 }

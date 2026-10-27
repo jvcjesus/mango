@@ -1021,6 +1021,9 @@ pub fn validate_edition_intent(
     identity: &super::edition::RetrievalIdentity,
 ) -> std::result::Result<(), TorBoxError> {
     use super::edition::{edition_from_title, normalize_edition};
+    if identity.selected_archive.is_some() {
+        return Ok(());
+    }
     let requested = identity.requested_edition.as_deref().map(normalize_edition);
     if let Some(release) = edition_from_title(&identity.source_release) {
         if requested.as_ref().is_some_and(|ed| ed != &release)
@@ -1044,6 +1047,36 @@ pub fn resolve_file_with_identity<'a>(
     identity: Option<&super::edition::RetrievalIdentity>,
 ) -> std::result::Result<&'a BackendFile, TorBoxError> {
     use super::edition::{edition_from_title, normalize_edition};
+    // Approval freezes source identity. Disposable backend IDs and later catalog
+    // parsing cannot override an exact, unique path/size selection.
+    if let Some(selection) = identity.and_then(|i| i.selected_archive.as_ref()) {
+        if !super::source_units::safe_path(
+            selection.path.strip_prefix('/').unwrap_or(&selection.path),
+        ) || selection.size == 0
+        {
+            return Err(TorBoxError::AmbiguousFiles(
+                "Unsafe approved archive path/size".into(),
+            ));
+        }
+        let matched = files
+            .iter()
+            .filter(|f| f.path == selection.path && f.size == selection.size)
+            .collect::<Vec<_>>();
+        if matched.len() != 1 {
+            return Err(TorBoxError::AmbiguousFiles(
+                "The approved file changed or is no longer uniquely available. Select it again."
+                    .into(),
+            ));
+        }
+        let file = matched[0];
+        let name = file.name.to_ascii_lowercase();
+        if !(name.ends_with(".cbz") || name.ends_with(".zip")) || is_junk_file(&name) {
+            return Err(TorBoxError::UnsupportedFormat(
+                "Approved file is not a supported archive".into(),
+            ));
+        }
+        return Ok(file);
+    }
     let target = identity.map(|i| &i.requested_unit).or(target_unit);
     let source = identity
         .map(|i| i.source_release.as_str())
@@ -1876,5 +1909,43 @@ mod override_identity_tests {
             resolve_file_with_identity(&files, None, None, None, None, Some(&identity)),
             Err(TorBoxError::UnsupportedFormat(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod approved_source_tests {
+    use super::*;
+    #[test]
+    fn exact_approval_survives_metadata_disagreement_and_changed_ids_but_not_changed_files() {
+        let mut identity = crate::acquisition::edition::RetrievalIdentity::new(
+            "Series",
+            "Master Edition",
+            AcquisitionReleaseUnit::Volume(4.),
+            Some("master"),
+        );
+        identity.selected_archive = Some(crate::acquisition::edition::SelectedArchive {
+            path: "release/unknown.zip".into(),
+            size: 100,
+        });
+        let mut files = vec![BackendFile {
+            id: 900,
+            name: "unknown.zip".into(),
+            path: "release/unknown.zip".into(),
+            size: 100,
+        }];
+        assert_eq!(
+            resolve_file_with_identity(&files, None, None, None, Some(1), Some(&identity))
+                .unwrap()
+                .id,
+            900
+        );
+        files[0].id = 901;
+        assert!(
+            resolve_file_with_identity(&files, None, None, None, None, Some(&identity)).is_ok()
+        );
+        files[0].size = 101;
+        assert!(
+            resolve_file_with_identity(&files, None, None, None, None, Some(&identity)).is_err()
+        );
     }
 }

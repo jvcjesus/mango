@@ -793,8 +793,9 @@ impl Pipeline {
             });
         let requested_edition_owned = retrieval_identity.requested_edition.clone();
         let requested_edition = requested_edition_owned.as_deref();
-        let identity_override = retrieval_identity.identity_override
-            && retrieval_identity.override_approved_at.is_some();
+        let identity_override = retrieval_identity.selected_archive.is_some()
+            || (retrieval_identity.identity_override
+                && retrieval_identity.override_approved_at.is_some());
         let mut metadata_scope = if config.mangabaka_enabled && is_volume {
             "exact_edition"
         } else {

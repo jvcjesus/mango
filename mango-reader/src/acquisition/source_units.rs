@@ -28,7 +28,8 @@ pub fn discover(files: &[BackendFile], release: &str, edition: Option<&str>) -> 
         let mut identity = RetrievalIdentity::new("", release, unit.clone(), edition.or(detected.as_deref()));
         identity.selected_archive = Some(archive.clone());
         let numbered = matches!(unit, AcquisitionReleaseUnit::Volume(n) | AcquisitionReleaseUnit::Chapter(n) if n.is_finite() && n >= 0.0);
-        let eligible = numbered && super::torbox::resolve_file_with_identity(files, None, None, None, None, Some(&identity)).is_ok();
+        let compatible = edition.is_none_or(|ed| detected.as_deref().is_none_or(|actual| actual == ed));
+        let eligible = numbered && compatible && super::torbox::resolve_file_with_identity(files, None, None, None, None, Some(&identity)).is_ok();
         SourceUnit { unit, edition: edition_from_title(&file.path).or_else(|| edition_from_title(release)), archive, eligible,
             evidence: if eligible { "Filename/path and release edition corroborate this unit" } else { "Unverified unit or conflicting edition; cannot infer from file order" }.into() }
     }).collect()
