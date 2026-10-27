@@ -1134,7 +1134,7 @@ export type ExecutionStatus =
   | 'PREFLIGHT'
   | 'REVALIDATING'
   | 'QUEUED'
-  | 'DOWNLOADING'
+  | 'DOWNLOADING' | 'NEEDS_REVIEW' | 'IMPORTING'
   | 'VERIFYING'
   | 'PUBLISHING'
   | 'RECONCILING'
@@ -1147,7 +1147,7 @@ export type ExecutionStatus =
 export type ExecutionItemStatus =
   | 'PENDING'
   | 'QUEUED'
-  | 'DOWNLOADING'
+  | 'DOWNLOADING' | 'NEEDS_REVIEW' | 'IMPORTING'
   | 'VERIFYING'
   | 'PUBLISHING'
   | 'RECONCILING'
@@ -1227,6 +1227,7 @@ export interface PlanByTitleRequest {
   requestedEdition?: string | null;
   selectedReleaseId?: string | null;
   selectedArchive?: { path: string; size: number } | null;
+  inspectPayload?: boolean;
   selectedArchives?: {path:string;size:number}[];
   useReleaseAnyway?: boolean;
 }

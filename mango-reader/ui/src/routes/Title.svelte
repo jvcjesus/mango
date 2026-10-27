@@ -983,10 +983,10 @@
                       <!-- svelte-ignore a11y_no_static_element_interactions -->
                       <div class="execution-history-row" onclick={() => { activeExecution = exec; executionModalOpen = true; }}>
                         <span class="tag {exec.status === 'COMPLETED' ? 'spot' : ['PARTIAL', 'FAILED', 'CANCELLED'].includes(exec.status) ? 'warn' : ''}">
-                          {exec.status}
+                          {exec.status === 'NEEDS_REVIEW' ? 'Needs Review' : exec.status === 'IMPORTING' ? 'Importing books' : exec.status}
                         </span>
                         <span class="muted">{new Date(exec.approvedAt * 1000).toLocaleString()}</span>
-                        <span>{exec.items.length} units ({Math.round(exec.expectedTotalBytes / (1024 * 1024))} MiB)</span>
+                        <span>{exec.items.length} acquisitions ({Math.round(exec.expectedTotalBytes / (1024 * 1024))} MiB)</span>
                         <span class="view-details-arrow">View Details →</span>
                       </div>
                     {/each}
@@ -1536,7 +1536,7 @@
         <div class="execution-status-banner">
           <div class="execution-status-row">
             <span class="tag {activeExecution.status === 'COMPLETED' ? 'spot' : ['PARTIAL', 'FAILED', 'CANCELLED', 'STALE'].includes(activeExecution.status) ? 'warn' : 'spot'}" style="font-weight: 700; font-size: 0.9rem;">
-              {activeExecution.status}
+              {activeExecution.status === 'NEEDS_REVIEW' ? 'Needs Review' : activeExecution.status === 'IMPORTING' ? 'Importing books' : activeExecution.status}
             </span>
             {#if activeExecution.statusMessage}
               <span class="muted">{activeExecution.statusMessage}</span>
@@ -1574,13 +1574,13 @@
             <div class="execution-item-card {item.status.toLowerCase()}">
               <div class="execution-item-header">
                 <span class="tag {item.status === 'COMPLETED' ? 'spot' : item.status === 'FAILED' ? 'warn' : ''}">
-                  {item.status}
+                  {item.status === 'NEEDS_REVIEW' ? 'Needs Review' : item.status === 'IMPORTING' ? 'Importing books' : item.status}
                 </span>
                 <strong class="item-candidate-title">{item.frozenCandidate.title}</strong>
                 <span class="tag">{item.frozenCandidate.provider.toUpperCase()}</span>
               </div>
               <div class="item-meta-row">
-                <span>Targets: <strong>Volumes {item.expectedUnits.join(', ')}</strong></span>
+                <span>Targets: <strong>{item.frozenCandidate.providerMetadata.inspectPayload ? 'Physical payload · review books in Downloads' : `Volumes ${item.expectedUnits.join(', ')}`}</strong></span>
                 {#if item.frozenCandidate.size}
                   <span>Size: <strong>{Math.round(item.frozenCandidate.size / (1024 * 1024))} MiB</strong></span>
                 {/if}

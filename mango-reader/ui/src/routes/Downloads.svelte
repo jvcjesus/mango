@@ -6,6 +6,15 @@
   import { toast } from '../lib/toast.svelte';
   import { ago, formatBytes } from '../lib/util';
 
+  import {assignmentFor,unambiguousSuggestions,type ImportBook} from '../lib/importReview';
+  let importBooks = $state<ImportBook[]>([]);
+  let importSeries = $state<Record<number,string>>({});
+  let importNumbers = $state<Record<number,string>>({});
+  let importKinds = $state<Record<number,string>>({});
+  let importEditions = $state<Record<number,string>>({});
+  async function assignBook(book:ImportBook,ignore=false) {try {
+    await send('POST',`/imports/${book.id}/assignment`,assignmentFor(book,{series:importSeries[book.id],kind:importKinds[book.id],number:importNumbers[book.id],edition:importEditions[book.id]},ignore));await load(true);
+  } catch(e){toast.error(message(e));}}
   let data = $state<Queue | null>(null);
   let events = $state<PipelineEvent[]>([]);
   let loading = $state(true);
@@ -71,6 +80,7 @@
         get<Queue>('/downloads'),
         get<PipelineEvent[]>('/pipeline/events').catch(() => []),
       ]);
+      importBooks = await get<ImportBook[]>('/imports');
       data = freshQueue;
       events = freshEvents;
       if (!isBackground) error = null;
@@ -246,6 +256,10 @@
     if (entry.state === 'validating') return 'Validating archive integrity';
     if (entry.state === 'publishing') return 'Publishing to library';
     if (entry.state === 'komga') return 'Triggering Komga scan';
+    if (entry.state === 'importing') return 'Inspection complete · assigned books importing independently';
+    if (entry.state === 'needs_review' && entry.error) return entry.error;
+    if (entry.state === 'needs_review') return 'Downloaded · inspection complete · book assignments await review';
+    if (entry.state === 'failed' && entry.attempts === 0) return `Stopped: ${entry.error ?? 'Source or inspection could not continue'}`;
     if (entry.state === 'failed') return `Gave up after ${entry.attempts} tries: ${entry.error ?? 'unknown error'}`;
     if (entry.error) {
       const wait = entry.retryAt ? Math.max(0, Math.ceil((entry.retryAt - Date.now() / 1000) / 60)) : 0;
@@ -326,6 +340,31 @@
     {/if}
   </div>
 
+  {#if importBooks.length}
+    <section aria-label="Import assignments" class="import-review">
+      <h2>Inspected books</h2>
+      <p>{importBooks.length} books found · {importBooks.filter(b=>b.state==='needs_review').length} need review · {importBooks.filter(b=>b.assignedNumber !== null).length} assigned · {importBooks.filter(b=>b.state==='ignored').length} ignored</p>
+      {#if unambiguousSuggestions(importBooks).length}
+        <button class="btn" onclick={async()=>{const books=unambiguousSuggestions(importBooks);if(await confirm({title:'Approve book assignments',message:`Import ${books.length} books using the displayed series, edition and unit suggestions? Duplicate alternatives and unknown books stay in review.`,confirmText:'Assign & Import'})){for(const book of books) await assignBook(book);}}}>Import numbered suggestions</button>
+      {/if}
+      {#each [...new Set(importBooks.map(b=>b.payloadChapter))] as payload}
+        <button class="btn" onclick={()=>act('POST',`/imports/payload/${payload}/cleanup`)}>Clean completed payload staging</button>
+      {/each}<p>Assignments control how books enter your library. Filename numbers are suggestions. Metadata is enriched after approval.</p>
+      {#each importBooks as book (book.id)}
+        <div class="import-book">
+          <strong>{book.series} · {book.innerPath}</strong><span class="tag">{book.state === 'needs_review' ? 'Needs Review' : book.state}</span>
+          {#if book.assignedNumber !== null}<span>{book.assignedKind === 'chapter' ? 'Chapter' : 'Volume'} {book.assignedNumber}{book.assignedEdition ? ` · ${book.assignedEdition} Edition` : ''}</span>{/if}
+          {#if book.state === 'needs_review'}
+            <label>Series <input aria-label="Assigned series" placeholder={book.series} bind:value={importSeries[book.id]} /></label>
+            <label>Unit <select aria-label="Unit kind" bind:value={importKinds[book.id]}><option value="volume">Volume</option><option value="chapter">Chapter</option></select></label>
+            <label>Number <input type="number" min="0" step="any" aria-label="Assigned number" placeholder={String(book.suggestedNumber ?? 'Required')} bind:value={importNumbers[book.id]} /></label>
+            <label>Edition (optional) <input aria-label="Edition label" placeholder={book.suggestedEdition ?? 'Optional'} bind:value={importEditions[book.id]} /></label>
+            <button class="btn" onclick={()=>assignBook(book)}>Assign & Import</button><button class="btn" onclick={()=>assignBook(book,true)}>Ignore</button>
+          {/if}
+        </div>
+      {/each}
+    </section>
+  {/if}
   <Notice {loading} {error} retry={() => load(false)} />
 
   {#if data}
@@ -396,6 +435,7 @@
                               <Icon name="refresh" size={16} />Retry Komga
                             </button>
                           {/if}
+                          {#if entry.state === 'needs_review'}<button class="btn" onclick={()=>act('POST',`/imports/payload/${entry.chapterId}/retry`)}>Retry inspection</button>{/if}
                           {#if entry.state === 'failed'}
                             <button class="btn" disabled={busyItems[entry.chapterId]} onclick={() => act('POST', `/downloads/${entry.chapterId}/retry`)}>
                               <Icon name="refresh" size={18} />Try again
@@ -461,7 +501,8 @@
                       <Icon name="refresh" size={16} />Retry Komga Scan
                     </button>
                   {/if}
-                  {#if entry.state === 'failed'}
+                  {#if entry.state === 'needs_review'}<button class="btn" onclick={()=>act('POST',`/imports/payload/${entry.chapterId}/retry`)}>Retry inspection</button>{/if}
+                          {#if entry.state === 'failed'}
                     <button class="btn" disabled={busyItems[entry.chapterId]} onclick={() => act('POST', `/downloads/${entry.chapterId}/retry`)}>
                       <Icon name="refresh" size={18} />Try again
                     </button>
@@ -673,4 +714,5 @@
     overflow: hidden;
     text-overflow: ellipsis;
   }
+.import-review {padding:16px;border:1px solid var(--ink);margin-bottom:24px;} .import-book {display:flex;flex-wrap:wrap;gap:12px;padding:16px 0;align-items:center;border-bottom:1px solid var(--muted);} .import-book strong {width:100%;overflow-wrap:anywhere;} .import-book input {max-width:100%;} .import-book label {display:flex;flex-direction:column;gap:4px;}
 </style>
