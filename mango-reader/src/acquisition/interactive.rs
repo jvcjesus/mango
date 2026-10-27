@@ -176,10 +176,13 @@ pub fn prepare_plan(
             "Choose at most 500 valid edition-local volumes",
         ));
     }
-    // Nonstandard editions never inherit standard tracker numbering/totals.
+    // Override means source-owned content, including when its edition is unknown.
+    // Neither unknown nor known nonstandard editions inherit tracker numbering.
+    let source_local_units =
+        req.use_release_anyway || edition.as_deref().is_some_and(|ed| ed != "standard");
     let mut units = if req.content_mode.as_deref() == Some("specific") {
         explicit_units
-    } else if edition.as_deref().is_some_and(|ed| ed != "standard") {
+    } else if source_local_units {
         selected
             .as_ref()
             .map(|c| c.release_unit.included_volumes())
@@ -187,10 +190,7 @@ pub fn prepare_plan(
     } else {
         missing.missing_volumes.clone()
     };
-    if units.is_empty()
-        && !edition.as_deref().is_some_and(|ed| ed != "standard")
-        && req.content_mode.as_deref() != Some("specific")
-    {
+    if units.is_empty() && !source_local_units && req.content_mode.as_deref() != Some("specific") {
         units = selected
             .as_ref()
             .map(|c| c.release_unit.included_volumes())
@@ -471,7 +471,7 @@ impl AcquisitionService {
                                     &language,
                                     super::candidates::UnitMappingProvenance::ParsedVolumeFromTitle,
                                 )
-                            })
+                                })
                         })
                         .collect::<Vec<_>>())
                 })
@@ -663,8 +663,10 @@ mod tests {
         let mut cached_source = result.plan.selected_items[0].candidate.clone();
         cached_source.confidence = "review_recommended".into();
         cached_source.health.seeders = Some(0);
-        let mut cache_profile = AcquisitionProfile::default();
-        cache_profile.min_seeders = 0;
+        let cache_profile = AcquisitionProfile {
+            min_seeders: 0,
+            ..Default::default()
+        };
         let cached = prepare_plan(
             1,
             "Series X",
@@ -698,6 +700,22 @@ mod tests {
         .unwrap();
         assert!(result.plan.selected_items.is_empty());
         assert!(result.plan.missing_units.is_empty());
+        req.use_release_anyway = true;
+        let unknown = prepare_plan(
+            1,
+            "Series X",
+            &AcquisitionProfile::default(),
+            &missing(),
+            vec![candidate(None)],
+            &req,
+            vec![],
+        )
+        .unwrap();
+        assert!(
+            unknown.plan.missing_units.is_empty(),
+            "Unknown overridden editions must not inherit standard catalog totals"
+        );
+        assert!(unknown.plan.selected_items.is_empty());
     }
     #[test]
     fn genuine_mismatch_rejects_even_override() {
@@ -750,8 +768,10 @@ mod tests {
         .unwrap()
         .plan;
         assert!(is_override(&p.selected_items[0].candidate));
-        let mut limited_profile = AcquisitionProfile::default();
-        limited_profile.max_acquisition_size_bytes = Some(50);
+        let limited_profile = AcquisitionProfile {
+            max_acquisition_size_bytes: Some(50),
+            ..Default::default()
+        };
         assert!(super::super::execution::validate_preflight_profile(
             &limited_profile,
             &p.selected_items[0].candidate
