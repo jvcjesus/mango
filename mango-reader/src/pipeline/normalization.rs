@@ -412,9 +412,21 @@ fn unique_id(prefix: &str) -> String {
     format!("{prefix}-{}", hex::encode(random))
 }
 
-fn book_path(root: &Path, url: Option<&str>) -> Result<PathBuf> {
+// Komga and Mango may mount the same library under different absolute roots.
+// Translate only a selected-library-relative path; never search or guess a basename.
+fn book_path(komga_root: &Path, local_root: &Path, url: Option<&str>) -> Result<PathBuf> {
+    use std::path::Component;
     let raw = url.ok_or_else(|| AppError::bad_request("Komga did not provide a filesystem URL"))?;
-    let local = if raw.starts_with("file:") {
+    // URL parsing normalizes dot segments. Reject them before parsing, including
+    // encoded dots; encoded separators are checked again after to_file_path().
+    if raw.contains('\\')
+        || raw
+            .split('/')
+            .any(|part| part.to_ascii_lowercase().replace("%2e", ".") == "..")
+    {
+        return Err(AppError::bad_request("Traversal in Komga book path"));
+    }
+    let reported = if raw.starts_with("file:") {
         reqwest::Url::parse(raw)
             .map_err(|_| AppError::bad_request("Invalid Komga file URL"))?
             .to_file_path()
@@ -422,18 +434,35 @@ fn book_path(root: &Path, url: Option<&str>) -> Result<PathBuf> {
     } else {
         PathBuf::from(raw)
     };
-    if !local.is_absolute() {
-        return Err(AppError::bad_request("Komga book path must be absolute"));
+    if [reported.as_path(), komga_root, local_root]
+        .iter()
+        .any(|path| {
+            !path.is_absolute() || path.components().any(|c| matches!(c, Component::ParentDir))
+        })
+    {
+        return Err(AppError::bad_request(
+            "Book and library paths must be absolute without traversal",
+        ));
     }
-    let path = fs::canonicalize(local)?;
-    let root = fs::canonicalize(root)?;
-    if !path.starts_with(root)
+    let root = fs::canonicalize(local_root)?;
+    let candidate = if let Ok(relative) = reported.strip_prefix(komga_root) {
+        root.join(relative)
+    } else if reported.starts_with(local_root) || reported.starts_with(&root) {
+        // Komga may already report the Mango-visible namespace.
+        reported
+    } else {
+        return Err(AppError::bad_request(
+            "Book is outside the selected library roots",
+        ));
+    };
+    let path = fs::canonicalize(candidate)?;
+    if !path.starts_with(&root)
         || path
             .extension()
             .is_none_or(|e| !e.eq_ignore_ascii_case("cbz"))
     {
         return Err(AppError::bad_request(
-            "Book must be a CBZ inside the applicable library root",
+            "Book must be a CBZ inside the configured canonical library root",
         ));
     }
     Ok(path)
@@ -670,6 +699,27 @@ impl LibraryNormalizationService {
         } else {
             "Skipped — provider not applicable or library unavailable; English Manga only".into()
         }
+    }
+
+    // Reuse the English publication destination. The override/Komga fallback
+    // preserves callers/installations without a configured pipeline destination.
+    async fn canonical_library_root(
+        &self,
+        library: &KomgaLibrary,
+        fallback: Option<&Path>,
+    ) -> Result<PathBuf> {
+        let configured = self
+            .db
+            .call(|conn| Ok(crate::settings::get::<String>(conn, "pipeline.library_dir")))
+            .await?;
+        Ok(configured
+            .filter(|root| !root.trim().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                fallback
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(&library.root))
+            }))
     }
 
     async fn library_policy_reason(&self, library: &KomgaLibrary) -> Result<Option<String>> {
@@ -1033,9 +1083,9 @@ impl LibraryNormalizationService {
         }
 
         // Analyze eligible manga series
-        let base_dir = library_dir_override
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(&lib.root));
+        let base_dir = self
+            .canonical_library_root(&lib, library_dir_override)
+            .await?;
 
         for s in target_series {
             let books = komga_client.get_books_in_series(&s.id).await?;
@@ -1043,7 +1093,7 @@ impl LibraryNormalizationService {
 
             let sample_path = books
                 .first()
-                .and_then(|b| book_path(&base_dir, b.url.as_deref()).ok());
+                .and_then(|b| book_path(Path::new(&lib.root), &base_dir, b.url.as_deref()).ok());
 
             // Identity resolution
             let (mangabaka_id, anilist_id, id_reason) = self
@@ -1103,7 +1153,9 @@ impl LibraryNormalizationService {
 
             // Inspect each book
             for b in books {
-                let canonical_path = book_path(&base_dir, b.url.as_deref()).unwrap_or_default();
+                let resolved_path = book_path(Path::new(&lib.root), &base_dir, b.url.as_deref());
+                let path_error = resolved_path.as_ref().err().map(|error| error.to_string());
+                let canonical_path = resolved_path.unwrap_or_default();
                 let path_str = canonical_path.to_string_lossy().to_string();
 
                 if !canonical_path.is_file() {
@@ -1116,7 +1168,9 @@ impl LibraryNormalizationService {
                         canonical_path: path_str,
                         volume: Some(b.number),
                         status: NormalizationStatus::Error,
-                        reason: "File not found on local canonical filesystem".to_string(),
+                        reason: path_error.unwrap_or_else(|| {
+                            "File not found on local canonical filesystem".to_string()
+                        }),
                         mangabaka_id: Some(mb_id),
                         mangabaka_release_id: None,
                         anilist_id,
@@ -1829,7 +1883,15 @@ impl LibraryNormalizationService {
                     .iter()
                     .find(|b| b.id == item.komga_book_id)
                     .ok_or_else(|| AppError::bad_request("Book no longer in series"))?;
-                let path = book_path(Path::new(&root), live.url.as_deref())?;
+                let local_root = self
+                    .canonical_library_root(
+                        library.ok_or_else(|| {
+                            AppError::bad_request("Preview library is no longer available")
+                        })?,
+                        None,
+                    )
+                    .await?;
+                let path = book_path(Path::new(&root), &local_root, live.url.as_deref())?;
                 if path.to_string_lossy() != item.canonical_path {
                     return Err(AppError::bad_request(
                         "Canonical path changed; repeat dry run",
@@ -2739,11 +2801,11 @@ mod tests {
         fixture(&path, &[]);
         let url = reqwest::Url::from_file_path(&path).unwrap();
         assert_eq!(
-            book_path(&dir, Some(url.as_str())).unwrap(),
+            book_path(&dir, &dir, Some(url.as_str())).unwrap(),
             fs::canonicalize(&path).unwrap()
         );
-        assert!(book_path(&dir.join("other"), Some(url.as_str())).is_err());
-        assert!(book_path(&dir, Some("https://example.invalid/book.cbz")).is_err());
+        assert!(book_path(&dir.join("other"), &dir.join("other"), Some(url.as_str())).is_err());
+        assert!(book_path(&dir, &dir, Some("https://example.invalid/book.cbz")).is_err());
         fs::remove_dir_all(dir).unwrap();
     }
     #[test]
@@ -2823,9 +2885,18 @@ mod canonical_cover_tests {
     }
     impl Fixture {
         async fn new(collision: Option<&str>, edition: &str) -> Self {
+            Self::with_mapping(collision, edition, false).await
+        }
+        async fn with_mapping(collision: Option<&str>, edition: &str, mapped: bool) -> Self {
             let dir = std::env::temp_dir().join(unique_id("manga-canonical-cover"));
             fs::create_dir_all(&dir).unwrap();
-            let path = dir.join("Fixture v03.cbz");
+            let relative = if mapped {
+                Path::new("Publisher (EN)/Stories & Series/Fixture v03 [Official!].cbz")
+            } else {
+                Path::new("Fixture v03.cbz")
+            };
+            let path = dir.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
             make_book(&path, collision);
             let db = Db::open(&dir.join("state.db")).unwrap();
             db.call(|c|{c.execute("INSERT INTO tracker_mappings(komga_series_id,tracker,tracker_id,updated_at,confidence)VALUES('s','mangabaka','83',0,'resolved')",[])?;Ok(())}).await.unwrap();
@@ -2834,8 +2905,22 @@ mod canonical_cover_tests {
             let art = Arc::new(AtomicUsize::new(100));
             let artwork = art.clone();
             let work_art = art.clone();
-            let root = dir.to_string_lossy().to_string();
-            let book = path.to_string_lossy().to_string();
+            let remote = if mapped {
+                PathBuf::from(format!("/komga-visible-only/{}", unique_id("manga")))
+            } else {
+                dir.clone()
+            };
+            if mapped {
+                let local = dir.to_string_lossy().to_string();
+                db.call(move |c| {
+                    crate::settings::set(c, "pipeline.library_dir", &json!(local))?;
+                    Ok(())
+                })
+                .await
+                .unwrap();
+            }
+            let root = remote.to_string_lossy().to_string();
+            let book = remote.join(relative).to_string_lossy().to_string();
             let title = if edition == "master" {
                 "Fixture Master Edition"
             } else {
@@ -3121,5 +3206,137 @@ mod canonical_cover_tests {
             .as_deref(),
             Some("master")
         );
+    }
+    #[tokio::test]
+    async fn mapped_roots_reach_cover_analysis_without_dry_run_mutation_and_execute_safely() {
+        let f = Fixture::with_mapping(None, "standard", true).await;
+        f.metadata_only("standard").await;
+        let original = calculate_file_sha256(&f.path).unwrap();
+        let source = entry(&f.path, "001.jpg");
+        let preview = f.analyze().await;
+        assert_eq!(preview.total_books, 1);
+        assert_eq!(preview.error_count, 0);
+        assert_eq!(preview.needs_update_count, 1);
+        let book = &preview.series[0].books[0];
+        assert_eq!(
+            book.canonical_path,
+            fs::canonicalize(&f.path).unwrap().to_string_lossy()
+        );
+        assert_eq!(book.mangabaka_release_id.as_deref(), Some("standard-3"));
+        assert!(book.diffs.iter().any(|d| d.field == "Exact work cover"));
+        assert!(!Path::new(&preview.library_root).exists());
+        assert_eq!(calculate_file_sha256(&f.path).unwrap(), original);
+        let dry = f
+            .service
+            .execute_preview(&preview.preview_id, &["b".into()], false, true, &f.komga)
+            .await
+            .unwrap();
+        assert_eq!(dry.failed_count, 0);
+        assert_eq!(dry.items[0].status, "would_change");
+        assert_eq!(calculate_file_sha256(&f.path).unwrap(), original);
+        assert!(f.service.list_history(10).await.unwrap().is_empty());
+        let result = f.execute(&preview).await;
+        assert_eq!(result.failed_count, 0);
+        assert_eq!(result.normalized_count, 1);
+        assert_eq!(entry(&f.path, "001.jpg"), source);
+        f.service
+            .rollback_normalization(&result.items[0].id, None)
+            .await
+            .unwrap();
+        assert_eq!(calculate_file_sha256(&f.path).unwrap(), original);
+    }
+    #[tokio::test]
+    async fn changed_configured_mapping_refuses_even_identical_book_at_another_root() {
+        let f = Fixture::with_mapping(None, "standard", true).await;
+        f.metadata_only("standard").await;
+        let original = calculate_file_sha256(&f.path).unwrap();
+        let preview = f.analyze().await;
+        let other_root = f.dir.join("different-local-root");
+        let other_book = other_root.join(f.path.strip_prefix(&f.dir).unwrap());
+        fs::create_dir_all(other_book.parent().unwrap()).unwrap();
+        fs::copy(&f.path, &other_book).unwrap();
+        let root = other_root.to_string_lossy().to_string();
+        f.service
+            .db
+            .call(move |c| {
+                crate::settings::set(c, "pipeline.library_dir", &json!(root))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let result = f.execute(&preview).await;
+        assert_eq!(result.failed_count, 1);
+        assert!(result.items[0]
+            .error_message
+            .as_deref()
+            .unwrap()
+            .contains("Canonical path changed"));
+        assert_eq!(calculate_file_sha256(&f.path).unwrap(), original);
+        assert_eq!(calculate_file_sha256(&other_book).unwrap(), original);
+    }
+    #[test]
+    fn mapped_book_paths_support_nested_names_file_urls_and_reject_traversal() {
+        let dir = std::env::temp_dir().join(unique_id("manga-path-mapping"));
+        fs::create_dir_all(&dir).unwrap();
+        let remote = dir.join("unmounted-provider-root");
+        let local = dir.join("local-canonical");
+        let relative = Path::new("Publisher (EN)/Series & Stories/Book v03 [Official!].cbz");
+        let path = local.join(relative);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        make_book(&path, None);
+        let reported = remote.join(relative);
+        let expected = fs::canonicalize(&path).unwrap();
+        assert!(!remote.exists());
+        assert_eq!(
+            book_path(&remote, &local, reported.to_str()).unwrap(),
+            expected
+        );
+        let url = reqwest::Url::from_file_path(&reported).unwrap();
+        assert_eq!(
+            book_path(&remote, &local, Some(url.as_str())).unwrap(),
+            expected
+        );
+        assert_eq!(book_path(&remote, &local, path.to_str()).unwrap(), expected);
+        for invalid in [
+            format!(
+                "{}/../local-canonical/{}",
+                remote.display(),
+                relative.display()
+            ),
+            format!(
+                "file://{}/nested/%2e%2e/{}",
+                remote.display(),
+                relative.display()
+            ),
+            format!("{}/nested/../{}", remote.display(), relative.display()),
+            format!("{}-other/{}", remote.display(), relative.display()),
+            "relative/Book.cbz".into(),
+            "https://example.invalid/Book.cbz".into(),
+        ] {
+            assert!(
+                book_path(&remote, &local, Some(&invalid)).is_err(),
+                "{invalid}"
+            );
+        }
+        assert!(book_path(&remote, &local, remote.join("missing.cbz").to_str()).is_err());
+        let non_book = local.join("not-a-book.txt");
+        fs::write(&non_book, "text").unwrap();
+        assert!(book_path(&remote, &local, remote.join("not-a-book.txt").to_str()).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn mapped_book_path_rejects_symlink_escape_from_selected_local_root() {
+        let dir = std::env::temp_dir().join(unique_id("manga-symlink-mapping"));
+        let local = dir.join("canonical");
+        let outside = dir.join("outside");
+        fs::create_dir_all(&local).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        make_book(&outside.join("Book.cbz"), None);
+        std::os::unix::fs::symlink(&outside, local.join("escaped")).unwrap();
+        let remote = dir.join("unmounted-provider-root");
+        assert!(book_path(&remote, &local, remote.join("escaped/Book.cbz").to_str()).is_err());
+        assert!(book_path(&remote, &local, local.join("escaped/Book.cbz").to_str()).is_err());
+        fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -214,3 +214,37 @@ Frontend tests/build were not rerun because no frontend code or public response
 shape changed. All integration calls used local fixtures. No server was accessed
 or deployed; Goodnight Punpun volumes 1–7 still require later operator acceptance
 through the saved-preview normalization workflow, without reacquisition.
+
+### Komga and Mango filesystem namespaces
+
+Normalization uses the selected Komga library root as the source namespace and
+Mango's existing `pipeline.library_dir` as the local English canonical root (the
+same destination used by acquisition/publication). The existing `book_path`
+resolver strips the selected Komga root by path components, joins the relative
+book path onto the configured local root, then resolves and checks the local path.
+The Komga root itself need not exist inside Mango's container. Nested directories,
+spaces/punctuation and encoded `file:` URLs are preserved; already-local paths
+inside the configured root are also accepted. No mount discovery, basename search,
+new mapping registry, configuration key or compose change is introduced.
+
+The same resolver handles identity samples, dry-run analysis and execution's live
+book revalidation. Traversal (including encoded URI dot segments), unrelated root
+prefixes and symlink escapes are rejected; the final target must be a CBZ confined
+to the configured root. Execution reloads that root and compares the resolved path
+to the frozen preview, so changing a mapping requires a new preview even if an
+identical book exists at the new destination. Hash, staging, journal, backup,
+rollback and atomic replacement checks remain unchanged. Dry runs do not modify
+canonical files. Chinese/Comics provider exclusions still run before local-root
+resolution. Installations without a configured publication destination retain the
+legacy same-namespace Komga-root fallback; different mounts require the correct
+Mango-visible `pipeline.library_dir`. Re-run analysis after changing configuration.
+
+Local namespace-fix validation: 22 focused normalization tests and all 409 release
+tests pass. Four new regressions cover mapped-root dry-run/diff/execution/rollback,
+changed-root refusal despite identical book contents, nested spaces/punctuation
+and `file:` URLs, traversal/unrelated-prefix rejection, and symlink escape refusal.
+Cargo check and Clippy pass with unchanged warnings; existing formatting debt
+remains 921 hunks across 55 files, and diff whitespace checks pass. No server was
+accessed or deployed. Live acceptance should deploy this fix, verify the English
+canonical destination setting, and repeat the Manga/Punpun dry-run; verify all
+seven books reach exact-work metadata/cover analysis without canonical changes.
