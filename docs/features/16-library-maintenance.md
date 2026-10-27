@@ -156,3 +156,61 @@ Mango/Komga instance using disposable **copies**, never production media or data
     expected/actual Komga fields, restart/refresh evidence and failures. Stop on any
     ambiguity, unexpected mutation or mismatch. Approve broader test batches only
     after this evidence passes. Production migration is a separate authorized phase.
+
+### Exact-work covers for existing books
+
+Canonical normalization now reviews optional exact-work MangaBaka artwork alongside
+metadata. A book whose ComicInfo is already correct can have an `Exact work cover`
+diff. Analysis downloads and validates the matched work's image without modifying
+the canonical CBZ. Validated bytes and their hash are frozen server-side in the
+existing saved preview JSON; they are not returned in the UI response. Preview
+execution survives restart/provider outages and cannot fetch different artwork
+than the operator reviewed. Expiry remains 24 hours; artwork is bounded to 16 MiB
+per book (base64 in SQLite), and previews are saved one book at a time to bound
+memory. No migration is required; old metadata-only previews remain readable.
+
+Execution uses the same normalization staging, full-file backup, original hash
+check, durable journal, atomic replacement and rollback. Every non-managed entry
+must retain its original hash: only ComicInfo and provably Mango-owned injected
+cover/marker entries may change. Cover insertion uses the existing atomic cover
+writer. The normal acquisition publisher and its collision policy are not used.
+There is **no optimizer pass over canonical pages**. A rollback restores the exact
+original archive, including its original metadata and cover state.
+
+`Pipeline::repair_canonical_cbz()` now delegates to this same normalization engine
+instead of maintaining a separate rewrite path. It records backup/history and
+retains the existing library scan behavior; batch normalization performs the normal
+targeted Komga refresh. Repair also checks the canonical hash across metadata
+resolution and before replacement.
+
+Known edition labels from the canonical series/ComicInfo select the edition-aware
+collection resolver; conflicting labels fail closed. Edition namespaces are
+retained. There is no cover substitution from a series, another volume or another
+edition. Missing artwork and temporary download/validation errors do not by
+themselves produce `NeedsUpdate`; valid owned artwork is `AlreadyNormalized`.
+Unowned reserved filenames or invalid ownership markers require review and leave
+the canonical file unchanged.
+
+The existing version-1 ownership marker gains an optional `source_sha256` field.
+Its original `sha256` still proves ownership of the current injected image; the
+source hash identifies the upstream image before optimization. New acquisitions
+retain that source hash across optimization. A changed upstream hash can update
+only a current hash-verified owned cover. Legacy valid markers lacking an upstream
+hash are conservatively retained: their optimized bytes cannot establish whether
+upstream art changed. Such books need a future explicit cover-replacement review
+if an upstream update is desired. No alternate provenance mechanism is added.
+
+Local validation for this extension: 405 release tests passed, including 102
+pipeline tests (18 normalization, six cover and 13 MangaBaka tests) and 108
+acquisition tests. Seven new regressions exercise non-destructive cover-only
+preview/execution, source-page and ComicInfo preservation, exact rollback,
+frozen artwork across restart/outage, stale-file refusal, edition/volume selection,
+changed upstream artwork, absent/invalid/unavailable artwork, collision/ownership
+refusal, legacy previews/markers, and the canonical repair entry point itself.
+Cargo check and Clippy pass with existing warning counts (19 check; 86 binary /
+124 test Clippy warnings). Formatting retains existing repository debt: 921 hunks
+across 55 files versus 922 at the starting commit. Diff whitespace checks pass.
+Frontend tests/build were not rerun because no frontend code or public response
+shape changed. All integration calls used local fixtures. No server was accessed
+or deployed; Goodnight Punpun volumes 1–7 still require later operator acceptance
+through the saved-preview normalization workflow, without reacquisition.

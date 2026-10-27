@@ -288,3 +288,11 @@ optimizer outcome, filenames and permissions. If retained source is absent, stop
 do not reacquire automatically or overwrite canonical books. Any eventual
 canonical replacement needs the separately guarded backup/hash/atomic-replacement
 procedure described in the task.
+
+Existing canonical books now share exact-work cover enrichment through the
+[normalization workflow](16-library-maintenance.md#exact-work-covers-for-existing-books).
+That workflow freezes reviewed artwork, preserves source-entry hashes and full
+rollback backups, and never sends canonical books through acquisition publication
+or a whole-book optimizer. The existing ownership marker optionally retains the
+upstream image hash so later maintenance can distinguish new artwork from
+optimization changes. Legacy markers remain readable and conservative.
