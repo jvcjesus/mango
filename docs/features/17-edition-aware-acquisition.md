@@ -1,5 +1,9 @@
 # Edition-aware acquisition and file resolution
 
+For current approved-file semantics and the shared Lists/Library workflow, see
+[approved source acquisition](20-approved-source-acquisition.md). Strict metadata
+prerequisites below describe historical behavior superseded for approved files.
+
 The interactive planner and override limitations recorded here describe milestone
 52641b0; see [interactive planning and identity override](18-interactive-planning-and-identity-override.md) for the subsequent implementation.
 

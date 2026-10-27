@@ -1,5 +1,9 @@
 # Source-local acquisition units
 
+For current approved-file semantics and the shared Lists/Library workflow, see
+[approved source acquisition](20-approved-source-acquisition.md). Strict metadata
+prerequisites below describe historical behavior superseded for approved files.
+
 This focused follow-up to [interactive planning](18-interactive-planning-and-identity-override.md)
 addresses the isolated TEST zero-unit report. Implementation does not constitute
 live acceptance. No deployment, production access, real media or tracker mutation

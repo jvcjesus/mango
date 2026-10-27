@@ -1,5 +1,9 @@
 # Interactive planning, edition intent and identity override
 
+For current approved-file semantics and the shared Lists/Library workflow, see
+[approved source acquisition](20-approved-source-acquisition.md). Strict metadata
+prerequisites below describe historical behavior superseded for approved files.
+
 This milestone extends the frozen plan/execution and retrieval JSON from migration
 026. It does not deploy Mango, access production or authorize filesystem replacement.
 See [edition-aware retrieval](17-edition-aware-acquisition.md) for the underlying
