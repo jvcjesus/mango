@@ -1231,7 +1231,8 @@ export interface PlanByTitleRequest {
 }
 
 export const getAcquisitionSources = (signal?: AbortSignal) => get<AcquisitionSourceOption[]>('/acquisition/sources', signal);
-export interface InteractivePlan extends AcquisitionPlan { editions: string[]; candidates: NormalizedAcquisitionCandidate[]; diagnostics: string[]; }
+export interface SourceLocalUnit { unit: AcquisitionReleaseUnit; edition: string | null; archive: { path: string; size: number }; eligible: boolean; evidence: string; }
+export interface InteractivePlan extends AcquisitionPlan { editions: string[]; candidates: NormalizedAcquisitionCandidate[]; diagnostics: string[]; sourceUnits: SourceLocalUnit[]; editionOwnershipKnown: boolean; }
 export const planByTitle = (req: PlanByTitleRequest, signal?: AbortSignal) => send<InteractivePlan>('POST', '/acquisition/plan-by-title', req, signal);
 
 // ---------- Library Normalization & Maintenance ----------

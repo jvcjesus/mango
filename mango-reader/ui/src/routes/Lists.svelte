@@ -16,7 +16,7 @@
     type AcquisitionSourceOption,
   } from '../lib/api';
   import { onDestroy } from 'svelte';
-  import { PlanningSession, parseRequestedVolumes, SOURCE_OPTIONS_TIMEOUT_MS } from '../lib/planning';
+  import { PlanningSession, parseRequestedVolumes, discoveredVolumes, SOURCE_OPTIONS_TIMEOUT_MS } from '../lib/planning';
   import { confirm } from '../lib/confirm.svelte';
   import type { InteractivePlan } from '../lib/api';
   import Cover from '../lib/Cover.svelte';
@@ -59,6 +59,7 @@
   let requestedEdition = $state('');
   let selectedReleaseId = $state('');
   let overrideConfirmed = $state(false);
+  let selectedArchive = $state<{ path: string; size: number } | null>(null);
   function closePlanningModal() { planningSession.cancel(); generatingPlan = false; planModalOpen = false; }
   $effect(() => { if (!planModalOpen) { planningSession.cancel(); generatingPlan = false; } });
   let generatingPlan = $state<boolean>(false);
@@ -104,7 +105,7 @@
     planModalItem = item;
     contentMode = mode ?? (item.ownershipStatus === 'Partially Owned' ? 'missing' : 'complete');
     selectedSourceId = 'auto';
-    requestedEdition = ''; selectedReleaseId = ''; overrideConfirmed = false;
+    requestedEdition = ''; selectedReleaseId = ''; overrideConfirmed = false; selectedArchive = null;
     specificVolumesInput = '';
     titlePlan = null;
     planError = null;
@@ -117,10 +118,10 @@
     if (!planModalItem) return;
     planningSession.cancel(); generatingPlan = true; planError = null;
     const request = { title: planModalItem.title, komgaSeriesId: planModalItem.komgaSeriesId,
-      sourceId: selectedSourceId, contentMode, requestedVolumes: null as number[] | null,
+      sourceId: selectedSourceId, contentMode, selectedArchive, requestedVolumes: null as number[] | null,
       requestedEdition: requestedEdition || null, selectedReleaseId: selectedReleaseId || null, useReleaseAnyway: overrideConfirmed };
     titlePlan = null;
-    try { if (contentMode === 'specific') request.requestedVolumes = parseRequestedVolumes(specificVolumesInput); }
+    try { if (contentMode === 'specific') request.requestedVolumes = specificVolumesInput.trim() ? parseRequestedVolumes(specificVolumesInput) : []; }
     catch (error) { planError = message(error); generatingPlan = false; return; }
     const result = await planningSession.run(signal => planByTitle(request, signal));
     if (result.status === 'stale') return;
@@ -970,7 +971,7 @@
                 class="segment-btn"
                 class:active={contentMode === 'missing'}
                 onclick={() => {
-                  overrideConfirmed = false; contentMode = 'missing';
+                  selectedArchive = null; contentMode = 'missing';
                   generateTitlePlan();
                 }}
               >
@@ -980,7 +981,7 @@
                 class="segment-btn"
                 class:active={contentMode === 'complete'}
                 onclick={() => {
-                  overrideConfirmed = false; contentMode = 'complete';
+                  selectedArchive = null; contentMode = 'complete';
                   generateTitlePlan();
                 }}
               >
@@ -990,7 +991,7 @@
                 class="segment-btn"
                 class:active={contentMode === 'specific'}
                 onclick={() => {
-                  planningSession.cancel(); generatingPlan = false; titlePlan = null; overrideConfirmed = false; contentMode = 'specific';
+                  selectedArchive = null; contentMode = 'specific'; generateTitlePlan();
                 }}
               >
                 Specific Volumes
@@ -1002,6 +1003,8 @@
                   type="text"
                   class="specific-input"
                   bind:value={specificVolumesInput}
+                  aria-label="Edition-local volumes"
+                  oninput={() => { selectedArchive = null; planningSession.cancel(); generatingPlan = false; titlePlan = null; }}
                   placeholder="e.g. 1, 2, 5-8, 39"
                 />
                 <button class="btn small" onclick={generateTitlePlan} disabled={generatingPlan}>
@@ -1018,7 +1021,7 @@
               id="plan-source-select"
               class="source-select"
               bind:value={selectedSourceId}
-              onchange={() => { overrideConfirmed = false; selectedReleaseId = ''; generateTitlePlan(); }}
+              onchange={() => { overrideConfirmed = false; selectedArchive = null; selectedReleaseId = ''; generateTitlePlan(); }}
             >
               {#if sources.length === 0}
                 <option value="auto">Auto (Recommended)</option>
@@ -1051,7 +1054,7 @@
         {:else if titlePlan}
           {#if titlePlan.editions.some(ed => ed !== 'standard') || titlePlan.editions.length > 1}
             <label for="plan-edition">Edition (numbering is edition-local)</label>
-            <select class="source-select" id="plan-edition" bind:value={requestedEdition} onchange={() => { overrideConfirmed = false; selectedReleaseId = ''; generateTitlePlan(); }}>
+            <select class="source-select" id="plan-edition" bind:value={requestedEdition} onchange={() => { overrideConfirmed = false; selectedArchive = null; selectedReleaseId = ''; generateTitlePlan(); }}>
               <option value="">Choose a discovered edition</option>
               {#each titlePlan.editions as edition}<option value={edition}>{edition} Edition</option>{/each}
             </select>
@@ -1061,9 +1064,9 @@
           {#if titlePlan.candidates.length > 0}
             <label for="plan-release">Source release</label>
             <select class="source-select" id="plan-release" bind:value={selectedReleaseId} onchange={() => {
-              overrideConfirmed = false;
+              overrideConfirmed = false; selectedArchive = null;
               const release = titlePlan?.candidates.find(candidate => candidate.providerReleaseId === selectedReleaseId);
-              if (release?.edition) requestedEdition = release.edition;
+              requestedEdition = release?.edition ?? '';
               generateTitlePlan();
             }}>
               <option value="">Automatic strict selection</option>
@@ -1071,10 +1074,40 @@
             </select>
           {/if}
           {#if selectedReleaseId}
-            <p>Catalog edition: Unverified until metadata resolution. {overrideConfirmed ? 'User override confirmed; series-level fallback is allowed.' : 'Strict metadata checks apply.'}</p>
-            <button class="btn small" onclick={useReleaseAnyway}>Use Release Anyway</button>
+            <p>Catalog edition: Unverified until metadata resolution. {overrideConfirmed ? 'Using source release identity · Series metadata fallback' : 'Strict metadata checks apply.'}</p>
+            <button class="btn small" onclick={useReleaseAnyway} disabled={overrideConfirmed}>{overrideConfirmed ? 'Source identity confirmed' : 'Use Release Anyway'}</button>
           {/if}
           </details>
+          {#if selectedReleaseId}
+            <div class="control-group">
+              <strong>Source-local {requestedEdition ? `${requestedEdition} Edition` : 'release'} units</strong>
+              <p role="status">{discoveredVolumes(titlePlan.sourceUnits).length} numbered source-local volumes discovered. These numbers belong to this release's edition.</p>
+              {#if titlePlan.sourceUnits.length > 0}
+                <div class="segmented-control" role="group" aria-label="Discovered edition-local volumes">
+                  {#each discoveredVolumes(titlePlan.sourceUnits) as volume}
+                    <button class="segment-btn" onclick={() => { contentMode = 'specific'; specificVolumesInput = String(volume); selectedArchive = null; generateTitlePlan(); }}>Volume {volume}</button>
+                  {/each}
+                </div>
+                <label for="source-archive">Exact source archive (resolves duplicate numbered alternatives)</label>
+                <select id="source-archive" class="source-select" value={selectedArchive?.path ?? ''} onchange={(event) => {
+                  const choice = titlePlan?.sourceUnits.find(u => u.archive.path === event.currentTarget.value);
+                  if (choice?.eligible && (choice.unit.type === 'volume' || choice.unit.type === 'chapter')) { selectedArchive = choice.archive; specificVolumesInput = String(choice.unit.value); contentMode = 'specific'; }
+                  else selectedArchive = null;
+                  generateTitlePlan();
+                }}>
+                  <option value="">Automatic unambiguous file selection</option>
+                  {#each titlePlan.sourceUnits as unit}
+                    <option value={unit.archive.path} disabled={!unit.eligible}>{unit.archive.path} ({unit.archive.size} bytes){unit.eligible ? '' : ' — unverified unit/edition'}</option>
+                  {/each}
+                </select>
+              {:else}
+                <p>No numbered source archives are available. Choose Specific Volumes above to enter edition-local intent, or try another release. Mango will still require archive evidence before retrieval.</p>
+              {/if}
+              {#if contentMode === 'missing' && requestedEdition && requestedEdition !== 'standard' && !titlePlan.editionOwnershipKnown}
+                <p>Edition-qualified ownership is unavailable. Standard-edition ownership is not used; choose Complete Series or Specific Volumes.</p>
+              {/if}
+            </div>
+          {/if}
           {#if titlePlan.staleReason}<p role="status">{titlePlan.staleReason}</p>{/if}
           <!-- Plan Summary Cards -->
           <div class="plan-summary-metrics">

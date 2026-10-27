@@ -40,3 +40,8 @@ export function parseRequestedVolumes(value: string): number[] {
   if (!volumes.size) throw new Error('Specify the edition-local volumes to acquire.');
   return [...volumes].sort((a,b) => a-b);
 }
+
+// Keep the displayed choices tied to backend filename evidence, not catalog totals.
+export function discoveredVolumes(units: import('./api').SourceLocalUnit[]): number[] {
+  return [...new Set(units.flatMap(u => u.eligible && u.unit.type === 'volume' ? [u.unit.value] : []))].sort((a,b) => a-b);
+}

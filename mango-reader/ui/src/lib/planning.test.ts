@@ -55,3 +55,22 @@ it('planning API carries edition intent and cancellation', async () => {
     expect(JSON.parse(options.body)).toMatchObject({requestedEdition:'master', selectedReleaseId:'release4', useReleaseAnyway:true});
   } finally { vi.unstubAllGlobals(); }
 });
+
+it('source-local volume choices come only from eligible filename evidence', async () => {
+  const { discoveredVolumes } = await import('./planning');
+  const units: import('./api').SourceLocalUnit[] = [6,1,4,4,2,3,5].map(n => ({unit:{type:'volume',value:n},edition:'master',archive:{path:`Master v${n}.cbz`,size:100},eligible:true,evidence:'Filename'}));
+  units.push({unit:{type:'unknown'},edition:'master',archive:{path:'file12.cbz',size:100},eligible:false,evidence:'Unknown'});
+  units.push({unit:{type:'chapter',value:39},edition:'master',archive:{path:'ch39.cbz',size:100},eligible:true,evidence:'Chapter'});
+  expect(discoveredVolumes(units)).toEqual([1,2,3,4,5,6]);
+  expect(discoveredVolumes([])).toEqual([]);
+});
+
+it('specific source archive and override remain explicit in regenerated requests', async () => {
+  const { planByTitle } = await import('./api');
+  const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({selectedItems:[]}), {status:200}));
+  vi.stubGlobal('fetch', fetchMock);
+  try {
+    await planByTitle({title:'Series',contentMode:'specific',requestedVolumes:[4],requestedEdition:'master',selectedReleaseId:'release',selectedArchive:{path:'Master/Alternative v04.cbz',size:400},useReleaseAnyway:true});
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toMatchObject({contentMode:'specific',requestedVolumes:[4],requestedEdition:'master',selectedReleaseId:'release',selectedArchive:{path:'Master/Alternative v04.cbz',size:400},useReleaseAnyway:true});
+  } finally { vi.unstubAllGlobals(); }
+});
