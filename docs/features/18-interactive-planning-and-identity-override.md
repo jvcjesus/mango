@@ -173,6 +173,10 @@ migration 026's JSON and existing history/provider fields. Old JSON defaults to
 strict behavior. A later accepted attempt does not rewrite the metadata/provenance
 of an earlier rejected attempt.
 
+For the follow-up source-local unit discovery and graphical archive chooser, see
+[source-local acquisition units](19-source-local-acquisition-units.md). The archive
+chooser limitations below describe this milestone's historical state.
+
 ## Archive choice and collision behavior
 
 Ambiguous multi-file releases still fail with an actionable request for exact file
