@@ -1,5 +1,9 @@
 # Source-local acquisition units
 
+The native acquisition architecture is superseded by
+[physical acquisition and import](21-physical-import.md). This document retains
+historical implementation/acceptance evidence and compatibility behavior.
+
 For current approved-file semantics and the shared Lists/Library workflow, see
 [approved source acquisition](20-approved-source-acquisition.md). Strict metadata
 prerequisites below describe historical behavior superseded for approved files.

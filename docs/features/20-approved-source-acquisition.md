@@ -1,5 +1,9 @@
 # Approved source acquisition and a shared title workflow
 
+The native acquisition architecture is superseded by
+[physical acquisition and import](21-physical-import.md). This document retains
+historical implementation/acceptance evidence and compatibility behavior.
+
 Source acquisition certainty and metadata certainty are separate. This follow-up
 supersedes the strict bibliographic prerequisites in feature documents 17–19 for
 explicitly approved source files. It does not authorize deployment or external
