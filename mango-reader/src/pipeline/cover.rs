@@ -23,6 +23,8 @@ struct Ownership {
     version: u8,
     filename: String,
     sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source_sha256: Option<String>,
 }
 fn failure(message: &str) -> AppError {
     AppError::new(422, "optional_cover", message)
@@ -191,7 +193,14 @@ fn page_metadata(existing: Option<&str>, added: bool, page_count: usize) -> Resu
     Ok(result)
 }
 
-fn inject(path: &Path, cover: &Cover) -> Result<String> {
+struct Injection {
+    filename: String,
+    xml: String,
+    remove: Vec<String>,
+    marker: Vec<u8>,
+    previous: Option<Ownership>,
+}
+fn prepare_injection(path: &Path, cover: &Cover) -> Result<Injection> {
     // Reuse the importer limits, CRC/path/symlink/collision checks before any rewrite.
     crate::acquisition::physical::validate_payload(path)?;
     let mut zip = zip::ZipArchive::new(std::fs::File::open(path)?)?;
@@ -202,6 +211,7 @@ fn inject(path: &Path, cover: &Cover) -> Result<String> {
         .collect::<Vec<_>>();
     let managed = names.iter().filter(|n| reserved(n)).collect::<Vec<_>>();
     let mut old_cover = None;
+    let mut previous = None;
     if !markers.is_empty() {
         if markers.len() != 1 || managed.len() != 1 {
             return Err(failure("Ambiguous cover ownership; source retained"));
@@ -227,7 +237,8 @@ fn inject(path: &Path, cover: &Cover) -> Result<String> {
                 "Cover ownership hash changed; existing artwork retained",
             ));
         }
-        old_cover = Some(owned.filename);
+        old_cover = Some(owned.filename.clone());
+        previous = Some(owned);
     } else if !managed.is_empty() {
         return Err(failure(
             "Reserved cover filename belongs to source; source retained",
@@ -282,19 +293,96 @@ fn inject(path: &Path, cover: &Cover) -> Result<String> {
         version: 1,
         filename: filename.clone(),
         sha256: digest(&cover.bytes),
+        source_sha256: Some(digest(&cover.bytes)),
     })?;
     let mut remove = markers.iter().map(|s| s.as_str()).collect::<Vec<_>>();
     if let Some(old) = old_cover.as_deref() {
         remove.push(old);
     }
-    drop(zip);
+    Ok(Injection {
+        filename,
+        xml,
+        remove: remove.iter().map(|s| s.to_string()).collect(),
+        marker,
+        previous,
+    })
+}
+fn inject(path: &Path, cover: &Cover) -> Result<String> {
+    let plan = prepare_injection(path, cover)?;
+    write_injection(path, cover, plan)
+}
+fn write_injection(path: &Path, cover: &Cover, plan: Injection) -> Result<String> {
     rewrite_comic_info_with_entries(
         path,
-        &xml,
-        &remove,
-        &[(filename.as_str(), &cover.bytes), (MARKER, &marker)],
+        &plan.xml,
+        &plan.remove.iter().map(String::as_str).collect::<Vec<_>>(),
+        &[
+            (plan.filename.as_str(), &cover.bytes),
+            (MARKER, &plan.marker),
+        ],
     )?;
-    Ok(filename)
+    Ok(plan.filename)
+}
+
+/// Internal persisted preview payload. Never exposed in the library analysis response.
+#[derive(Clone, Serialize, Deserialize)]
+pub(super) struct PreparedCover {
+    data: String,
+    pub sha256: String,
+}
+
+pub(super) async fn preview(
+    client: &reqwest::Client,
+    path: &Path,
+    url: Option<&str>,
+) -> Result<Option<PreparedCover>> {
+    let Some(url) = url else {
+        return Ok(None);
+    };
+    let cover = tokio::time::timeout(Duration::from_secs(15), download(client, url))
+        .await
+        .map_err(|_| failure("Cover preview deadline exceeded"))??;
+    let path = path.to_owned();
+    crate::local::blocking(move || {
+        let plan = prepare_injection(&path, &cover)
+            .map_err(|e| AppError::new(e.status.as_u16(), "cover_conflict", e.message))?;
+        let hash = digest(&cover.bytes);
+        if let Some(owned) = plan.previous {
+            // Old optimized covers have no upstream fingerprint. Retain those safely.
+            if owned.source_sha256.as_ref().is_none_or(|old| old == &hash) || owned.sha256 == hash {
+                return Ok(None);
+            }
+        }
+        use base64::Engine;
+        Ok(Some(PreparedCover {
+            data: base64::engine::general_purpose::STANDARD.encode(&cover.bytes),
+            sha256: hash,
+        }))
+    })
+    .await
+}
+
+/// Apply only server-frozen, validated artwork to a normalization staging copy.
+/// Return precisely the old and new managed entries allowed to change.
+pub(super) fn apply_prepared(
+    path: &Path,
+    frozen: &PreparedCover,
+) -> Result<(Vec<String>, Vec<String>)> {
+    use base64::Engine;
+    if frozen.data.len() > MAX_BYTES.div_ceil(3) * 4 {
+        return Err(failure("Oversized saved cover"));
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(&frozen.data)
+        .map_err(|_| failure("Invalid saved cover"))?;
+    if bytes.len() > MAX_BYTES || digest(&bytes) != frozen.sha256 {
+        return Err(failure("Saved cover hash mismatch"));
+    }
+    let cover = checked_image(bytes)?;
+    let plan = prepare_injection(path, &cover)?;
+    let old = plan.remove.clone();
+    let filename = write_injection(path, &cover, plan)?;
+    Ok((old, vec![filename, MARKER.into()]))
 }
 
 /// Only this processing run may refresh ownership of the image handed to its optimizer.

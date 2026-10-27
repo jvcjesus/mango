@@ -1664,6 +1664,7 @@ impl Pipeline {
             )));
         }
         publisher::verify_cbz_integrity(canonical_path)?;
+        let original_sha = normalization::calculate_file_sha256(canonical_path)?;
 
         let file_stem = canonical_path
             .file_stem()
@@ -1698,7 +1699,17 @@ impl Pipeline {
         let mb_client =
             mangabaka::MangaBakaClient::new(self.http.clone(), cfg.mangabaka_url.clone(), mb_token);
         let outcome = mb_client
-            .resolve_volume_metadata(&series, anilist_id, mangabaka_id, volume)
+            .resolve_edition_volume_metadata(
+                &series,
+                anilist_id,
+                mangabaka_id,
+                volume,
+                normalization::maintenance_edition(
+                    &series,
+                    normalization::read_comic_info_xml_from_cbz(canonical_path)?.as_deref(),
+                )?
+                .as_deref(),
+            )
             .await?;
 
         let enrichment = match outcome {
@@ -1711,58 +1722,39 @@ impl Pipeline {
             }
         };
 
-        let parent = canonical_path.parent().unwrap_or_else(|| Path::new("."));
-        let pid = std::process::id();
-        let temp_path = parent.join(format!(
-            ".{}.repair-{pid}-{}.tmp",
-            canonical_path
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .subsec_nanos()
-        ));
-
-        struct CleanupGuard<'a>(&'a Path);
-        impl<'a> Drop for CleanupGuard<'a> {
-            fn drop(&mut self) {
-                let _ = fs::remove_file(self.0);
-            }
-        }
-        let guard = CleanupGuard(&temp_path);
-
-        fs::copy(canonical_path, &temp_path).map_err(|e| {
-            AppError::internal(format!("Failed to stage temporary copy for repair: {e}"))
-        })?;
-
-        let params = mangabaka::ComicInfoParams {
-            series: &series,
-            volume: Some(volume),
-            number: None,
-            is_volume: true,
-            title: enrichment.work_title.as_deref(),
-            scanlator: None,
-            notes: None,
-        };
-        let page_count =
-            mangabaka::write_comic_info_to_cbz(&temp_path, &params, Some(&enrichment))?;
-
-        publisher::verify_cbz_integrity(&temp_path)?;
-
-        fs::rename(&temp_path, canonical_path).map_err(|e| {
-            AppError::internal(format!("Failed to atomically replace canonical CBZ: {e}"))
-        })?;
-        std::mem::forget(guard);
+        let resolved_mangabaka_id = enrichment.series_id;
+        let record = self
+            .normalization
+            .normalize_canonical(
+                normalization::CanonicalTarget {
+                    batch_id: "canonical-repair",
+                    canonical_path,
+                    series_title: &series,
+                    volume,
+                    anilist_id,
+                    komga_series_id: None,
+                    komga_book_id: None,
+                    expected_sha: Some(&original_sha),
+                },
+                enrichment,
+                None,
+            )
+            .await?;
+        let page_count = optimizer::count_cbz_pages(canonical_path)?;
 
         self.ownership.clear_cache();
         if cfg.komga_enabled && cfg.komga_scan_enabled {
             let komga_client =
                 komga::KomgaClient::new(self.http.clone(), cfg.komga_url.clone(), komga_key);
-            let _ = komga_client
+            if komga_client
                 .trigger_scan(cfg.komga_library_id.as_deref())
-                .await;
+                .await
+                .is_ok()
+            {
+                self.normalization
+                    .acknowledge_library_scan(record.id.clone())
+                    .await?;
+            }
         }
 
         let fields_populated = vec![
@@ -1792,11 +1784,16 @@ impl Pipeline {
         );
 
         Ok(RepairOutcome {
-            status: "repaired".to_string(),
+            status: if record.status == "already_normalized" {
+                "already_normalized"
+            } else {
+                "repaired"
+            }
+            .into(),
             canonical_path: canonical_path.to_string_lossy().to_string(),
             series,
             volume,
-            mangabaka_id: enrichment.series_id,
+            mangabaka_id: resolved_mangabaka_id,
             fields_populated,
             page_count: page_count as i64,
         })
@@ -2975,7 +2972,7 @@ exit 0
 
     #[tokio::test]
     async fn test_pipeline_repair_canonical_cbz() {
-        use axum::{Json, Router, routing::get};
+        use axum::{routing::get, Json, Router};
         use serde_json::json;
 
         let app = Router::new()
@@ -3078,6 +3075,7 @@ exit 0
         .await
         .unwrap();
 
+        let original_sha = normalization::calculate_file_sha256(&cbz_path).unwrap();
         let pipeline = Pipeline::new(db.clone());
         let outcome = pipeline
             .repair_canonical_cbz(
@@ -3120,13 +3118,28 @@ exit 0
         assert!(xml_content.contains("<Manga>YesAndRightToLeft</Manga>"));
         assert!(xml_content.contains("<PageCount>2</PageCount>"));
 
-        // Verify no temporary files remain
+        // Repair now retains a verified full-file rollback backup; no staging remains.
         let dir_entries: Vec<_> = fs::read_dir(&series_dir)
             .unwrap()
             .map(|e| e.unwrap().file_name())
             .collect();
-        assert_eq!(dir_entries.len(), 1);
-        assert_eq!(dir_entries[0].to_str().unwrap(), "Blue Lock v39.cbz");
+        assert_eq!(dir_entries.len(), 2);
+        assert!(dir_entries.iter().any(|name| name == "Blue Lock v39.cbz"));
+        let backup = dir_entries
+            .iter()
+            .find(|name| name.to_string_lossy().ends_with(".original.backup"))
+            .unwrap();
+        assert_eq!(
+            normalization::calculate_file_sha256(&series_dir.join(backup)).unwrap(),
+            original_sha
+        );
+        let history = pipeline.normalization.list_history(10).await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            history[0].original_sha256.as_deref(),
+            Some(original_sha.as_str())
+        );
+        assert!(history[0].rollback_available);
     }
 }
 

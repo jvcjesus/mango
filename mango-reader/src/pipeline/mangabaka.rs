@@ -1438,6 +1438,7 @@ impl MangaBakaClient {
     /// - VolumeNotFound(volume) / SeriesNotFound / CollectionNotFound
     /// - AmbiguousSeries / AmbiguousCollection
     /// - AuthError / NetworkError
+    #[cfg(test)]
     pub async fn resolve_volume_metadata(
         &self,
         series: &str,
@@ -1877,6 +1878,7 @@ impl MangaBakaClient {
     }
 
     /// Fetches volume enrichment data for a series and volume number with fail-closed precision.
+    #[cfg(test)]
     pub async fn fetch_volume_enrichment(
         &self,
         series: &str,

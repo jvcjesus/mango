@@ -83,6 +83,66 @@ pub struct BookNormalizationItem {
     pub current_sha256: Option<String>,
 }
 
+pub(super) struct CanonicalTarget<'a> {
+    pub batch_id: &'a str,
+    pub canonical_path: &'a Path,
+    pub series_title: &'a str,
+    pub volume: f64,
+    pub anilist_id: Option<i64>,
+    pub komga_series_id: Option<&'a str>,
+    pub komga_book_id: Option<&'a str>,
+    pub expected_sha: Option<&'a str>,
+}
+
+// Existing item_json remains backward compatible; legacy previews omit mangoCover.
+#[derive(Serialize, Deserialize)]
+struct FrozenItem {
+    #[serde(flatten)]
+    item: BookNormalizationItem,
+    #[serde(default)]
+    mango_cover: Option<super::cover::PreparedCover>,
+}
+fn cover_diff(cover: &super::cover::PreparedCover) -> BookMetadataDiff {
+    BookMetadataDiff {
+        field: "Exact work cover".into(),
+        current: Some("Missing or changed upstream artwork".into()),
+        proposed: Some(format!("Validated artwork SHA256 {}", cover.sha256)),
+    }
+}
+pub(super) fn maintenance_edition(title: &str, xml: Option<&str>) -> Result<Option<String>> {
+    let named = crate::acquisition::edition::edition_from_title(title);
+    let recorded = xml.map(comic_fields).transpose()?.and_then(|f| {
+        f.get("Series")
+            .and_then(|s| crate::acquisition::edition::edition_from_title(s))
+    });
+    if named
+        .as_ref()
+        .zip(recorded.as_ref())
+        .is_some_and(|(a, b)| a != b)
+    {
+        return Err(AppError::bad_request(
+            "Conflicting canonical edition; manual review required",
+        ));
+    }
+    Ok(named.or(recorded))
+}
+
+fn retain_edition_namespace(
+    enrichment: &mut MangaBakaEnrichment,
+    title: &str,
+    xml: Option<&str>,
+) -> Result<()> {
+    if maintenance_edition(title, xml)?.is_some_and(|ed| ed != "standard") {
+        let recorded = xml.map(comic_fields).transpose()?.and_then(|f| {
+            f.get("Series")
+                .filter(|s| crate::acquisition::edition::edition_from_title(s).is_some())
+                .cloned()
+        });
+        enrichment.series_title = Some(recorded.unwrap_or_else(|| title.to_string()));
+    }
+    Ok(())
+}
+
 /// Normalization item for a series in a Komga library.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -542,8 +602,8 @@ fn history_item(
         canonical_path: item.canonical_path.clone(),
         series_title: item.series_title.clone(),
         volume: item.volume.unwrap_or(0.0),
-        komga_series_id: Some(item.komga_series_id.clone()),
-        komga_book_id: Some(item.komga_book_id.clone()),
+        komga_series_id: (!item.komga_series_id.is_empty()).then(|| item.komga_series_id.clone()),
+        komga_book_id: (!item.komga_book_id.is_empty()).then(|| item.komga_book_id.clone()),
         mangabaka_id: item.mangabaka_id,
         mangabaka_release_id: item.mangabaka_release_id.clone(),
         anilist_id: item.anilist_id,
@@ -1120,17 +1180,58 @@ impl LibraryNormalizationService {
 
                 // Resolve MangaBaka metadata for this specific volume
                 match mb_client
-                    .resolve_volume_metadata(&s.name, anilist_id, Some(mb_id), vol)
+                    .resolve_edition_volume_metadata(
+                        &s.name,
+                        anilist_id,
+                        Some(mb_id),
+                        vol,
+                        maintenance_edition(&s.name, existing_xml.as_deref())?.as_deref(),
+                    )
                     .await
                 {
-                    Ok(MangaBakaOutcome::Success(enrichment)) => {
-                        let (mut b_status, mut b_reason, diffs) = Self::evaluate_metadata_diff(
+                    Ok(MangaBakaOutcome::Success(mut enrichment)) => {
+                        retain_edition_namespace(
+                            &mut enrichment,
+                            &s.name,
+                            existing_xml.as_deref(),
+                        )?;
+                        let (mut b_status, mut b_reason, mut diffs) = Self::evaluate_metadata_diff(
                             existing_xml.as_deref(),
                             &enrichment,
                             vol,
                             page_count,
                         );
 
+                        let mut frozen_cover = None;
+                        if b_status != NormalizationStatus::Error {
+                            match super::cover::preview(
+                                &self.http,
+                                &canonical_path,
+                                enrichment.work_cover_url.as_deref(),
+                            )
+                            .await
+                            {
+                                Ok(Some(cover)) => {
+                                    diffs.push(cover_diff(&cover));
+                                    frozen_cover = Some(cover);
+                                    b_status = NormalizationStatus::NeedsUpdate;
+                                    b_reason =
+                                        "Reviewed metadata and exact-work cover enrichment".into();
+                                }
+                                Ok(None) => {}
+                                Err(error) if error.code == "cover_conflict" => {
+                                    b_status = NormalizationStatus::Error;
+                                    b_reason = format!(
+                                        "Cover conflict; canonical book unchanged: {error}"
+                                    );
+                                }
+                                Err(error) => {
+                                    b_reason =
+                                        format!("{b_reason}; optional cover skipped: {error}");
+                                    tracing::warn!(reason=%error, "Optional maintenance cover unavailable");
+                                }
+                            }
+                        }
                         if b_status == NormalizationStatus::AlreadyNormalized
                             && !canonical_comic_info_layout(&canonical_path)?
                         {
@@ -1151,7 +1252,7 @@ impl LibraryNormalizationService {
                         }
                         summary.matched_count += 1;
 
-                        series_item.books.push(BookNormalizationItem {
+                        let item = BookNormalizationItem {
                             komga_book_id: b.id,
                             komga_series_id: s.id.clone(),
                             series_title: s.name.clone(),
@@ -1161,11 +1262,36 @@ impl LibraryNormalizationService {
                             status: b_status,
                             reason: b_reason,
                             mangabaka_id: Some(mb_id),
-                            mangabaka_release_id: enrichment.work_id,
+                            mangabaka_release_id: enrichment.work_id.clone(),
                             anilist_id,
                             diffs,
                             current_sha256: current_sha,
-                        });
+                        };
+                        if item.status == NormalizationStatus::NeedsUpdate {
+                            let (xml, _) = proposed_metadata(
+                                existing_xml.as_deref(),
+                                &enrichment,
+                                vol,
+                                page_count,
+                            )?;
+                            if Some(calculate_file_sha256(&canonical_path)?) != item.current_sha256
+                            {
+                                return Err(AppError::bad_request(
+                                    "Book changed during preview; repeat analysis",
+                                ));
+                            }
+                            let json = serde_json::to_string(&FrozenItem {
+                                item: item.clone(),
+                                mango_cover: frozen_cover,
+                            })?;
+                            let preview = summary.preview_id.clone();
+                            let book = item.komga_book_id.clone();
+                            let library = lib.clone();
+                            self.db.call(move |conn| {
+                                conn.execute("INSERT INTO normalization_previews (preview_id,book_id,library_id,library_root,item_json,proposed_xml,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",params![preview,book,library.id,library.root,json,xml,now()])?;Ok(())
+                            }).await?;
+                        }
+                        series_item.books.push(item);
                     }
                     Ok(other) => {
                         let status = match &other {
@@ -1225,53 +1351,8 @@ impl LibraryNormalizationService {
             summary.series.push(series_item);
         }
 
-        // Freeze exact proposed XML with the server-resolved path, identity and original hash.
-        for series in &summary.series {
-            for item in &series.books {
-                if item.status != NormalizationStatus::NeedsUpdate {
-                    continue;
-                }
-                let outcome = mb_client
-                    .resolve_volume_metadata(
-                        &item.series_title,
-                        item.anilist_id,
-                        item.mangabaka_id,
-                        item.volume.unwrap(),
-                    )
-                    .await?;
-                let MangaBakaOutcome::Success(enrichment) = outcome else {
-                    return Err(AppError::bad_request(
-                        "Metadata changed during preview; repeat analysis",
-                    ));
-                };
-                let path = Path::new(&item.canonical_path);
-                let existing = read_comic_info_xml_from_cbz(path)?;
-                let (xml, diffs) = proposed_metadata(
-                    existing.as_deref(),
-                    &enrichment,
-                    item.volume.unwrap(),
-                    image_count(path)?,
-                )?;
-                if enrichment.work_id != item.mangabaka_release_id
-                    || diffs != item.diffs
-                    || Some(calculate_file_sha256(path)?) != item.current_sha256
-                {
-                    return Err(AppError::bad_request(
-                        "Book or metadata changed during preview; repeat analysis",
-                    ));
-                }
-                let preview = summary.preview_id.clone();
-                let book = item.komga_book_id.clone();
-                let json =
-                    serde_json::to_string(item).map_err(|e| AppError::internal(e.to_string()))?;
-                let library = lib.clone();
-                self.db.call(move |conn| {
-                    conn.execute("INSERT INTO normalization_previews (preview_id, book_id, library_id, library_root, item_json, proposed_xml, created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-                        params![preview, book, library.id, library.root, json, xml, now()])?;
-                    Ok(())
-                }).await?;
-            }
-        }
+        // Proposals are frozen per book to bound artwork memory. Execution rechecks
+        // each canonical hash and uses the exact approved bytes without another fetch.
         Ok(summary)
     }
 
@@ -1297,14 +1378,65 @@ impl LibraryNormalizationService {
         mb_client: &MangaBakaClient,
         komga_client: Option<&KomgaClient>,
     ) -> Result<NormalizationHistoryRecord> {
+        let path = fs::canonicalize(canonical_path)?;
+        let expected_sha = calculate_file_sha256(&path)?;
+        let existing = read_comic_info_xml_from_cbz(&path)?;
         let outcome = mb_client
-            .resolve_volume_metadata(series_title, anilist_id, Some(mangabaka_id), volume)
+            .resolve_edition_volume_metadata(
+                series_title,
+                anilist_id,
+                Some(mangabaka_id),
+                volume,
+                maintenance_edition(series_title, existing.as_deref())?.as_deref(),
+            )
             .await?;
         let MangaBakaOutcome::Success(enrichment) = outcome else {
             return Err(AppError::bad_request("Authoritative metadata unavailable"));
         };
+        self.normalize_canonical(
+            CanonicalTarget {
+                batch_id,
+                canonical_path,
+                series_title,
+                volume,
+                anilist_id,
+                komga_series_id,
+                komga_book_id,
+                expected_sha: Some(&expected_sha),
+            },
+            enrichment,
+            komga_client,
+        )
+        .await
+    }
+
+    pub(super) async fn normalize_canonical(
+        &self,
+        target: CanonicalTarget<'_>,
+        mut enrichment: MangaBakaEnrichment,
+        komga_client: Option<&KomgaClient>,
+    ) -> Result<NormalizationHistoryRecord> {
+        let CanonicalTarget {
+            batch_id,
+            canonical_path,
+            series_title,
+            volume,
+            anilist_id,
+            komga_series_id,
+            komga_book_id,
+            expected_sha,
+        } = target;
         let path = fs::canonicalize(canonical_path)?;
+        let current_sha = calculate_file_sha256(&path)?;
+        if expected_sha.is_some_and(|sha| sha != current_sha) {
+            return Err(AppError::new(
+                409,
+                "stale_preview",
+                "Canonical book changed during repair resolution",
+            ));
+        }
         let existing = read_comic_info_xml_from_cbz(&path)?;
+        retain_edition_namespace(&mut enrichment, series_title, existing.as_deref())?;
         let (xml, _) = proposed_metadata(
             existing.as_deref(),
             &enrichment,
@@ -1320,22 +1452,46 @@ impl LibraryNormalizationService {
             volume: Some(volume),
             status: NormalizationStatus::NeedsUpdate,
             reason: String::new(),
-            mangabaka_id: Some(mangabaka_id),
+            mangabaka_id: Some(enrichment.series_id),
             mangabaka_release_id: enrichment.work_id,
             anilist_id,
             diffs: Vec::new(),
-            current_sha256: Some(calculate_file_sha256(&path)?),
+            current_sha256: Some(current_sha),
         };
-        self.apply_preview(batch_id, &item, &xml, komga_client)
+        let cover =
+            match super::cover::preview(&self.http, &path, enrichment.work_cover_url.as_deref())
+                .await
+            {
+                Ok(cover) => cover,
+                Err(error) if error.code == "cover_conflict" => return Err(error),
+                Err(error) => {
+                    tracing::warn!(reason=%error, "Optional repair cover skipped");
+                    None
+                }
+            };
+        self.apply_preview_with_cover(batch_id, &item, &xml, komga_client, cover.as_ref())
             .await
     }
 
+    #[cfg(test)]
     async fn apply_preview(
         &self,
         batch: &str,
         item: &BookNormalizationItem,
         xml: &str,
         komga: Option<&KomgaClient>,
+    ) -> Result<NormalizationHistoryRecord> {
+        self.apply_preview_with_cover(batch, item, xml, komga, None)
+            .await
+    }
+
+    async fn apply_preview_with_cover(
+        &self,
+        batch: &str,
+        item: &BookNormalizationItem,
+        xml: &str,
+        komga: Option<&KomgaClient>,
+        cover: Option<&super::cover::PreparedCover>,
     ) -> Result<NormalizationHistoryRecord> {
         comic_fields(xml)?;
         let path = fs::canonicalize(&item.canonical_path)?;
@@ -1350,7 +1506,12 @@ impl LibraryNormalizationService {
         }
         let manifest = archive_manifest(&path)?;
         let original_xml = read_comic_info_xml_from_cbz(&path)?;
-        if original_xml.as_deref() == Some(xml) && canonical_comic_info_layout(&path)? {
+        if cover.is_none()
+            && original_xml
+                .as_deref()
+                .is_some_and(|old| comic_fields(old).ok() == comic_fields(xml).ok())
+            && canonical_comic_info_layout(&path)?
+        {
             // No rewrite or new rollback record for an unchanged book.
             return Ok(history_item(
                 unique_id("noop"),
@@ -1379,9 +1540,50 @@ impl LibraryNormalizationService {
         let _cleanup = Cleanup(stage.clone());
         copy_new_synced(&path, &stage)?;
         mangabaka::write_prepared_comic_info_to_cbz(&stage, xml)?;
-        if archive_manifest(&stage)? != manifest || comic_info_count(&stage)? != 1 {
+        let mut final_manifest = archive_manifest(&stage)?;
+        let mut artwork_applied = false;
+        if let Some(cover) = cover {
+            // The shared cover writer is atomic: failure leaves metadata-only staging intact.
+            match super::cover::apply_prepared(&stage, cover) {
+                Ok((old, new)) => {
+                    let artwork_manifest = archive_manifest(&stage)?;
+                    let retained = |entries: &[(String, String)], removed: &[String]| {
+                        entries
+                            .iter()
+                            .filter(|(n, _)| !removed.contains(n))
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    };
+                    if retained(&manifest, &old) != retained(&artwork_manifest, &new) {
+                        return Err(AppError::internal("Cover rewrite changed source entries"));
+                    }
+                    final_manifest = artwork_manifest;
+                    artwork_applied = true;
+                }
+                Err(error) => {
+                    tracing::warn!(reason=%error, "Optional frozen cover skipped; metadata-only staging retained")
+                }
+            }
+        }
+        if (!artwork_applied && final_manifest != manifest) || comic_info_count(&stage)? != 1 {
             return Err(AppError::internal(
                 "Staged archive changed non-metadata contents",
+            ));
+        }
+        if !artwork_applied
+            && original_xml
+                .as_deref()
+                .is_some_and(|old| comic_fields(old).ok() == comic_fields(xml).ok())
+            && canonical_comic_info_layout(&path)?
+        {
+            fs::remove_file(&backup)?;
+            return Ok(history_item(
+                unique_id("noop"),
+                batch,
+                item,
+                &sha,
+                &sha,
+                "already_normalized",
             ));
         }
         fs::set_permissions(&stage, fs::metadata(&path)?.permissions())?;
@@ -1397,7 +1599,7 @@ impl LibraryNormalizationService {
             Ok(())
         }).await?;
         // Revalidate staged contents after journal persistence, immediately before replacement.
-        publish_normalized(&path, &stage, &sha, &new_sha, &manifest)?;
+        publish_normalized(&path, &stage, &sha, &new_sha, &final_manifest)?;
         self.set_status(&record.id, "normalized").await?;
         record.status = "normalized".into();
         record.refresh_pending = true;
@@ -1405,6 +1607,10 @@ impl LibraryNormalizationService {
             self.refresh_record(&record, kc).await?;
         }
         Ok(self.get_history_record(&record.id).await?.unwrap())
+    }
+
+    pub(super) async fn acknowledge_library_scan(&self, id: String) -> Result<()> {
+        self.db.call(move |c| { c.execute("UPDATE normalization_history SET refresh_pending=0,error_message=NULL WHERE id=?1",[id])?; Ok(()) }).await
     }
 
     async fn set_status(&self, id: &str, status: &str) -> Result<()> {
@@ -1592,8 +1798,9 @@ impl LibraryNormalizationService {
             let Some((lib_id, root, json, xml)) = saved else {
                 return Err(AppError::bad_request("Missing or expired dry-run preview"));
             };
-            let item: BookNormalizationItem =
+            let frozen: FrozenItem =
                 serde_json::from_str(&json).map_err(|e| AppError::internal(e.to_string()))?;
+            let item = frozen.item;
             let library = libraries.iter().find(|l| l.id == lib_id && l.root == root);
             let policy = match library {
                 Some(l) => self.library_policy_reason(l).await?,
@@ -1641,7 +1848,14 @@ impl LibraryNormalizationService {
                         "would_change",
                     ));
                 }
-                self.apply_preview(&batch, &item, &xml, Some(komga)).await
+                self.apply_preview_with_cover(
+                    &batch,
+                    &item,
+                    &xml,
+                    Some(komga),
+                    frozen.mango_cover.as_ref(),
+                )
+                .await
             }
             .await;
             match outcome {
@@ -2548,5 +2762,364 @@ mod tests {
         assert!(FileLock::acquire(&second.file_locks, &path).is_err());
         drop(guard);
         assert!(FileLock::acquire(&second.file_locks, &path).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod canonical_cover_tests {
+    use super::*;
+    use axum::{
+        response::IntoResponse,
+        routing::{get, post},
+        Json, Router,
+    };
+    use serde_json::json;
+    use std::{
+        io::Write,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+    struct Fixture {
+        dir: PathBuf,
+        path: PathBuf,
+        base: String,
+        service: LibraryNormalizationService,
+        mb: MangaBakaClient,
+        komga: KomgaClient,
+        art: Arc<AtomicUsize>,
+        server: tokio::task::JoinHandle<()>,
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            self.server.abort();
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+    fn jpeg(value: u8) -> Vec<u8> {
+        let mut bytes = vec![];
+        jpeg_encoder::Encoder::new(&mut bytes, 80)
+            .encode(&[value; 12], 2, 2, jpeg_encoder::ColorType::Rgb)
+            .unwrap();
+        bytes
+    }
+    fn entry(path: &Path, name: &str) -> Vec<u8> {
+        let mut zip = zip::ZipArchive::new(File::open(path).unwrap()).unwrap();
+        let mut b = vec![];
+        zip.by_name(name).unwrap().read_to_end(&mut b).unwrap();
+        b
+    }
+    fn make_book(path: &Path, collision: Option<&str>) {
+        let mut zip = zip::ZipWriter::new(File::create(path).unwrap());
+        for (n, b) in [("001.jpg", jpeg(10)), ("002.jpg", jpeg(20))] {
+            zip.start_file(n, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(&b).unwrap();
+        }
+        if let Some(name) = collision {
+            zip.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(&jpeg(30)).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+    impl Fixture {
+        async fn new(collision: Option<&str>, edition: &str) -> Self {
+            let dir = std::env::temp_dir().join(unique_id("manga-canonical-cover"));
+            fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("Fixture v03.cbz");
+            make_book(&path, collision);
+            let db = Db::open(&dir.join("state.db")).unwrap();
+            db.call(|c|{c.execute("INSERT INTO tracker_mappings(komga_series_id,tracker,tracker_id,updated_at,confidence)VALUES('s','mangabaka','83',0,'resolved')",[])?;Ok(())}).await.unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let art = Arc::new(AtomicUsize::new(100));
+            let artwork = art.clone();
+            let work_art = art.clone();
+            let root = dir.to_string_lossy().to_string();
+            let book = path.to_string_lossy().to_string();
+            let title = if edition == "master" {
+                "Fixture Master Edition"
+            } else {
+                "Fixture"
+            }
+            .to_string();
+            let app=Router::new()
+                .route("/api/v1/libraries",get(move||{let root=root.clone();async move{Json(json!([{"id":"en","name":"Manga","root":root,"unavailable":false}]))}}))
+                .route("/api/v1/series",get(move||{let title=title.clone();async move{Json(json!({"content":[{"id":"s","name":title,"libraryId":"en","booksCount":1}],"last":true}))}}))
+                .route("/api/v1/series/s/books",get(move||{let book=book.clone();async move{Json(json!({"content":[{"id":"b","seriesId":"s","name":"Fixture v03","number":3,"url":book}],"last":true}))}}))
+                .route("/api/v1/books/b/analyze",post(||async{axum::http::StatusCode::NO_CONTENT}))
+                .route("/series/83",get(||async{Json(json!({"data":{"id":83,"title":"Fixture"}}))}))
+                .route("/series/83/collections",get(||async{Json(json!({"data":[
+                    {"id":"standard","language":"en","edition":{"name":"Standard Edition"},"medium":"digital"},
+                    {"id":"master","language":"en","edition":{"name":"Master Edition"},"medium":"digital"}
+                ]}))}))
+                .route("/collections/{edition}/works",get(move |axum::extract::Path(edition): axum::extract::Path<String>| {
+                    let art = work_art.clone();
+                    async move {
+                        let works = (2..=4).map(|n| {
+                            let images = if art.load(Ordering::SeqCst) == 2 { json!([]) } else {
+                                json!([{"image":{"raw":{"url":format!("http://{addr}/art/{edition}/{n}")}}}])
+                            };
+                            json!({"id":format!("{edition}-{n}"),"sequence_numeric":n,"images":images})
+                        }).collect::<Vec<_>>();
+                        Json(json!({"data":works}))
+                    }
+                }))
+                .route("/art/{edition}/{volume}",get(move|axum::extract::Path((edition,volume)):axum::extract::Path<(String,u8)>|{let art=artwork.clone();async move{
+                    match art.load(Ordering::SeqCst) {0=>axum::http::StatusCode::NOT_FOUND.into_response(),1=>([(axum::http::header::CONTENT_TYPE,"image/jpeg")],"invalid").into_response(),v=>jpeg((v as u8).wrapping_add(volume).wrapping_add(if edition=="master"{20}else{0})).into_response()}
+                }}));
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let http = reqwest::Client::new();
+            let mb = MangaBakaClient::new(http.clone(), Some(format!("http://{addr}")), None);
+            let komga = KomgaClient::new(http.clone(), Some(format!("http://{addr}")), None);
+            Self {
+                dir,
+                path,
+                base: format!("http://{addr}"),
+                service: LibraryNormalizationService::new(db, http),
+                mb,
+                komga,
+                art,
+                server,
+            }
+        }
+        async fn analyze(&self) -> LibraryAnalysisSummary {
+            self.service
+                .analyze_library(&self.komga, &self.mb, "en", None, None)
+                .await
+                .unwrap()
+        }
+        async fn execute(&self, preview: &LibraryAnalysisSummary) -> NormalizationExecutionResult {
+            self.service
+                .execute_preview(&preview.preview_id, &["b".into()], true, false, &self.komga)
+                .await
+                .unwrap()
+        }
+        async fn metadata_only(&self, edition: &str) {
+            let MangaBakaOutcome::Success(mut e) = self
+                .mb
+                .resolve_edition_volume_metadata("Fixture", None, Some(83), 3., Some(edition))
+                .await
+                .unwrap()
+            else {
+                panic!()
+            };
+            if edition == "master" {
+                e.series_title = Some("Fixture Master Edition".into());
+            }
+            let xml = proposed_metadata(None, &e, 3., image_count(&self.path).unwrap())
+                .unwrap()
+                .0;
+            mangabaka::write_prepared_comic_info_to_cbz(&self.path, &xml).unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn canonical_cover_preview_execution_idempotency_and_exact_rollback() {
+        let f = Fixture::new(None, "standard").await;
+        f.metadata_only("standard").await;
+        let sha = calculate_file_sha256(&f.path).unwrap();
+        let images = [entry(&f.path, "001.jpg"), entry(&f.path, "002.jpg")];
+        let preview = f.analyze().await;
+        assert_eq!(preview.needs_update_count, 1);
+        assert_eq!(preview.series[0].books[0].diffs.len(), 1);
+        assert_eq!(
+            preview.series[0].books[0].diffs[0].field,
+            "Exact work cover"
+        );
+        assert_eq!(calculate_file_sha256(&f.path).unwrap(), sha);
+        let result = f.execute(&preview).await;
+        assert_eq!(result.normalized_count, 1);
+        assert_eq!(result.failed_count, 0);
+        assert!(!result.items[0].refresh_pending);
+        assert_eq!(entry(&f.path, "000-cover.jpg"), jpeg(103));
+        for (i, name) in ["001.jpg", "002.jpg"].iter().enumerate() {
+            assert_eq!(entry(&f.path, name), images[i]);
+        }
+        let xml = read_comic_info_xml_from_cbz(&f.path).unwrap().unwrap();
+        let fields = comic_fields(&xml).unwrap();
+        assert_eq!(fields["PageCount"], "3");
+        assert!(fields["Pages"].contains("Image=\"0\" Type=\"FrontCover\""));
+        assert_eq!(comic_info_count(&f.path).unwrap(), 1);
+        verify_cbz_integrity(&f.path).unwrap();
+        assert_eq!(f.analyze().await.already_normalized_count, 1);
+        f.service
+            .rollback_normalization(&result.items[0].id, None)
+            .await
+            .unwrap();
+        assert_eq!(calculate_file_sha256(&f.path).unwrap(), sha);
+    }
+    #[tokio::test]
+    async fn frozen_artwork_survives_restart_outage_and_stale_canonical_is_refused() {
+        let f = Fixture::new(None, "standard").await;
+        f.metadata_only("standard").await;
+        let preview = f.analyze().await;
+        f.art.store(0, Ordering::SeqCst);
+        let restarted = LibraryNormalizationService::new(
+            Db::open(&f.dir.join("state.db")).unwrap(),
+            reqwest::Client::new(),
+        );
+        let result = restarted
+            .execute_preview(&preview.preview_id, &["b".into()], true, false, &f.komga)
+            .await
+            .unwrap();
+        assert_eq!(result.normalized_count, 1);
+        assert_eq!(entry(&f.path, "000-cover.jpg"), jpeg(103));
+        f.service
+            .rollback_normalization(&result.items[0].id, None)
+            .await
+            .unwrap();
+        f.art.store(150, Ordering::SeqCst);
+        let preview = f.analyze().await;
+        fs::write(&f.path, b"changed after approval").unwrap();
+        let sha = calculate_file_sha256(&f.path).unwrap();
+        let result = f.execute(&preview).await;
+        assert_eq!(result.failed_count, 1);
+        assert_eq!(calculate_file_sha256(&f.path).unwrap(), sha);
+    }
+    #[tokio::test]
+    async fn changed_exact_art_updates_owned_cover_and_edition_is_preserved() {
+        let f = Fixture::new(None, "master").await;
+        f.metadata_only("master").await;
+        let first = f.execute(&f.analyze().await).await;
+        assert_eq!(first.normalized_count, 1);
+        assert_eq!(entry(&f.path, "000-cover.jpg"), jpeg(123));
+        let original = entry(&f.path, "001.jpg");
+        f.art.store(150, Ordering::SeqCst);
+        let preview = f.analyze().await;
+        assert_eq!(
+            preview.series[0].books[0].mangabaka_release_id.as_deref(),
+            Some("master-3")
+        );
+        assert_eq!(f.execute(&preview).await.normalized_count, 1);
+        assert_eq!(entry(&f.path, "000-cover.jpg"), jpeg(173));
+        assert_eq!(entry(&f.path, "001.jpg"), original);
+        assert!(read_comic_info_xml_from_cbz(&f.path)
+            .unwrap()
+            .unwrap()
+            .contains("Fixture Master Edition"));
+        assert_eq!(f.analyze().await.already_normalized_count, 1);
+    }
+    #[tokio::test]
+    async fn optional_download_validation_and_collision_leave_canonical_safe() {
+        for collision in [None, Some("000-COVER.JPG")] {
+            let f = Fixture::new(collision, "standard").await;
+            f.metadata_only("standard").await;
+            let sha = calculate_file_sha256(&f.path).unwrap();
+            if collision.is_some() {
+                let p = f.analyze().await;
+                assert_eq!(p.error_count, 1);
+                assert_eq!(p.needs_update_count, 0);
+            } else {
+                for value in [0, 1, 2] {
+                    f.art.store(value, Ordering::SeqCst);
+                    let p = f.analyze().await;
+                    assert_eq!(p.already_normalized_count, 1);
+                    assert_eq!(p.needs_update_count, 0);
+                }
+            }
+            assert_eq!(calculate_file_sha256(&f.path).unwrap(), sha);
+        }
+    }
+    #[tokio::test]
+    async fn legacy_owned_cover_is_retained_and_damaged_ownership_is_refused() {
+        let f = Fixture::new(None, "standard").await;
+        f.metadata_only("standard").await;
+        let preview = f.analyze().await;
+        let legacy = serde_json::to_string(&preview.series[0].books[0]).unwrap();
+        assert!(serde_json::from_str::<FrozenItem>(&legacy)
+            .unwrap()
+            .mango_cover
+            .is_none());
+        assert_eq!(f.execute(&preview).await.normalized_count, 1);
+        let mut marker: serde_json::Value =
+            serde_json::from_slice(&entry(&f.path, "mango-volume-cover.json")).unwrap();
+        marker.as_object_mut().unwrap().remove("source_sha256");
+        let xml = read_comic_info_xml_from_cbz(&f.path).unwrap().unwrap();
+        mangabaka::rewrite_comic_info_with_entries(
+            &f.path,
+            &xml,
+            &["mango-volume-cover.json"],
+            &[(
+                "mango-volume-cover.json",
+                &serde_json::to_vec(&marker).unwrap(),
+            )],
+        )
+        .unwrap();
+        let sha = calculate_file_sha256(&f.path).unwrap();
+        f.art.store(150, Ordering::SeqCst);
+        assert_eq!(f.analyze().await.already_normalized_count, 1);
+        assert_eq!(calculate_file_sha256(&f.path).unwrap(), sha);
+        mangabaka::rewrite_comic_info_with_entries(
+            &f.path,
+            &xml,
+            &["000-cover.jpg"],
+            &[("000-cover.jpg", &jpeg(200))],
+        )
+        .unwrap();
+        let sha = calculate_file_sha256(&f.path).unwrap();
+        assert_eq!(f.analyze().await.error_count, 1);
+        assert_eq!(calculate_file_sha256(&f.path).unwrap(), sha);
+    }
+
+    #[tokio::test]
+    async fn canonical_repair_routes_through_backup_history_and_cover_normalization() {
+        let f = Fixture::new(None, "standard").await;
+        let original = calculate_file_sha256(&f.path).unwrap();
+        let source = entry(&f.path, "001.jpg");
+        let base = f.base.clone();
+        f.service
+            .db
+            .call(move |c| {
+                crate::settings::set(c, "pipeline.mangabaka_url", &json!(base))?;
+                crate::settings::set(c, "pipeline.komga_enabled", &json!(false))?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let pipeline = crate::pipeline::Pipeline::new(f.service.db.clone());
+        let result = pipeline
+            .repair_canonical_cbz(&f.path, Some("Fixture"), Some(3.), None, Some(83))
+            .await
+            .unwrap();
+        assert_eq!(result.status, "repaired");
+        assert_eq!(result.page_count, 3);
+        assert_eq!(entry(&f.path, "000-cover.jpg"), jpeg(103));
+        assert_eq!(entry(&f.path, "001.jpg"), source);
+        let history = f.service.list_history(10).await.unwrap();
+        assert_eq!(history.len(), 1);
+        assert!(history[0].rollback_available);
+        let sha = calculate_file_sha256(&f.path).unwrap();
+        assert_eq!(
+            pipeline
+                .repair_canonical_cbz(&f.path, Some("Fixture"), Some(3.), None, Some(83))
+                .await
+                .unwrap()
+                .status,
+            "already_normalized"
+        );
+        assert_eq!(calculate_file_sha256(&f.path).unwrap(), sha);
+        assert_eq!(f.service.list_history(10).await.unwrap().len(), 1);
+        f.service
+            .rollback_normalization(&history[0].id, None)
+            .await
+            .unwrap();
+        assert_eq!(calculate_file_sha256(&f.path).unwrap(), original);
+    }
+
+    #[test]
+    fn legacy_preview_and_edition_conflict_remain_safe() {
+        assert!(maintenance_edition(
+            "Fixture Master Edition",
+            Some("<ComicInfo><Series>Fixture Deluxe Edition</Series></ComicInfo>")
+        )
+        .is_err());
+        assert_eq!(
+            maintenance_edition(
+                "Fixture",
+                Some("<ComicInfo><Series>Fixture Master Edition</Series></ComicInfo>")
+            )
+            .unwrap()
+            .as_deref(),
+            Some("master")
+        );
     }
 }
