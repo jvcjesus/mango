@@ -157,6 +157,10 @@ pub fn router(state: Spaces) -> Router {
         .route("/downloads/{chapter}", delete(cancel_download))
         .route("/downloads/{chapter}/retry", post(retry_download))
         .route(
+            "/downloads/{chapter}/retry-metadata",
+            post(retry_metadata_download),
+        )
+        .route(
             "/downloads/{chapter}/retry-komga",
             post(retry_komga_download),
         )
@@ -1098,6 +1102,11 @@ async fn cancel_download(Me(app): Me, Path(chapter): Path<i64>) -> Result<Json<V
 async fn retry_download(Me(app): Me, Path(chapter): Path<i64>) -> Result<Json<Value>> {
     app.downloads.retry(chapter).await?;
     Ok(done())
+}
+
+async fn retry_metadata_download(Me(app): Me, Path(chapter): Path<i64>) -> Result<Json<Value>> {
+    let msg = app.downloads.retry_metadata(chapter).await?;
+    Ok(Json(serde_json::json!({"message": msg})))
 }
 
 async fn retry_komga_download(Me(app): Me, Path(chapter): Path<i64>) -> Result<Json<Value>> {

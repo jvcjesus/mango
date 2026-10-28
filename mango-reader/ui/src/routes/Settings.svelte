@@ -1753,6 +1753,13 @@
           </section>
 
           <section class="card">
+            <h3>KOMF book metadata</h3>
+            <div class="set"><div class="what"><strong>Hand off published English volumes</strong><span>Apply metadata to the exact indexed book. Failures preserve the published book and can be retried separately.</span></div>
+              <div class="how">{@render toggle(pipeline.komf_enabled ?? false, 'KOMF handoff', () => { if (pipeline) pipeline.komf_enabled = !pipeline.komf_enabled; })}</div></div>
+            <div class="set stack"><div class="what"><strong>KOMF server URL</strong><span>Use an address reachable from the Mango server.</span></div><div class="how wide"><label class="field grow"><input type="url" bind:value={pipeline.komf_url} placeholder="https://komf.example" /></label></div></div>
+          </section>
+
+          <section class="card">
             <h3>Komga Server Integration</h3>
             <div class="set">
               <div class="what">

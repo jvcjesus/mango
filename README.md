@@ -346,6 +346,8 @@ Mango knows how many pages it has.
 
 ### Native Acquisition Pipeline
 
+An optional [single-book KOMF metadata handoff](docs/features/22-komf-handoff.md) can apply final metadata/artwork after exact Komga visibility, with durable job recovery and metadata-only retry. It is disabled by default.
+
 Mango includes a native acquisition and publishing pipeline to automatically process completed downloads into your permanent manga library (with Komga as the canonical library and reader backend):
 
 ```

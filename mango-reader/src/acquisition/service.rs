@@ -1211,6 +1211,7 @@ impl AcquisitionService {
                             anilist_id: r.get(16)?,
                             requested_unit: r.get(17)?,
                             metadata_status: r.get(18)?,
+                            metadata_handoff: match r.get::<_,Option<i64>>(1)? { Some(id)=>crate::pipeline::komf::read(conn,id)?, None=>None },
                         })
                     })?
                     .filter_map(std::result::Result::ok)
@@ -1237,6 +1238,7 @@ impl AcquisitionService {
                             anilist_id: r.get(16)?,
                             requested_unit: r.get(17)?,
                             metadata_status: r.get(18)?,
+                            metadata_handoff: match r.get::<_,Option<i64>>(1)? { Some(id)=>crate::pipeline::komf::read(conn,id)?, None=>None },
                         })
                     })?
                     .filter_map(std::result::Result::ok)

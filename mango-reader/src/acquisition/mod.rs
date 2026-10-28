@@ -303,6 +303,8 @@ pub struct AcquisitionHistoryRecord {
     pub anilist_id: Option<i64>,
     pub requested_unit: Option<String>,
     pub metadata_status: Option<String>,
+    #[serde(default)]
+    pub metadata_handoff: Option<crate::pipeline::komf::Handoff>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -8,6 +8,7 @@
 //! 5. Detailed in-memory audit trail of recent pipeline executions
 
 mod cover;
+pub mod komf;
 pub mod komga;
 pub mod mangabaka;
 pub mod metadata;
@@ -83,6 +84,7 @@ impl VerificationPolicy {
 pub enum AcquisitionOutcome {
     Complete(PathBuf),
     PublishedPendingKomga(PathBuf),
+    PublishedPendingMetadata(PathBuf),
     PublishedScanFailed { destination: PathBuf, error: String },
 }
 
@@ -112,6 +114,10 @@ pub struct PipelineConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mangabaka_token: Option<String>,
     pub has_mangabaka_token: bool,
+    #[serde(default)]
+    pub komf_enabled: bool,
+    #[serde(default)]
+    pub komf_url: Option<String>,
     pub komga_enabled: bool,
     pub komga_url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -155,6 +161,8 @@ impl Default for PipelineConfig {
             mangabaka_url: Some(mangabaka::DEFAULT_MANGABAKA_API.to_string()),
             mangabaka_token: None,
             has_mangabaka_token: false,
+            komf_enabled: false,
+            komf_url: None,
             komga_enabled: false,
             komga_url: Some(komga::DEFAULT_KOMGA_URL.to_string()),
             komga_api_key: None,
@@ -292,6 +300,8 @@ impl Pipeline {
             mangabaka_url: raw_cfg.mangabaka_url,
             mangabaka_token: None, // Secret redacted in config view
             has_mangabaka_token: mangabaka_token.is_some_and(|t| !t.trim().is_empty()),
+            komf_enabled: raw_cfg.komf_enabled,
+            komf_url: raw_cfg.komf_url,
             komga_enabled: raw_cfg.komga_enabled,
             komga_url: raw_cfg.komga_url,
             komga_api_key: None, // Secret redacted in config view
@@ -351,6 +361,9 @@ impl Pipeline {
                         .unwrap_or(true);
                 let mangabaka_url = crate::settings::get::<String>(conn, "pipeline.mangabaka_url")
                     .or_else(|| Some(mangabaka::DEFAULT_MANGABAKA_API.to_string()));
+                let komf_enabled =
+                    crate::settings::get::<bool>(conn, "pipeline.komf_enabled").unwrap_or(false);
+                let komf_url = crate::settings::get::<String>(conn, "pipeline.komf_url");
                 let komga_enabled =
                     crate::settings::get::<bool>(conn, "pipeline.komga_enabled").unwrap_or(false);
                 let komga_url = crate::settings::get::<String>(conn, "pipeline.komga_url")
@@ -403,6 +416,8 @@ impl Pipeline {
                     mangabaka_url,
                     mangabaka_token: None,
                     has_mangabaka_token: mangabaka_token.is_some(),
+                    komf_enabled,
+                    komf_url,
                     komga_enabled,
                     komga_url,
                     komga_api_key: None,
@@ -433,6 +448,26 @@ impl Pipeline {
     /// Authoritative server-side safety checks ensure the pipeline cannot be enabled
     /// with invalid, missing, or non-writable destination directories.
     pub async fn save_config(&self, mut patch: PipelineConfig) -> Result<()> {
+        if patch.komf_enabled
+            || patch
+                .komf_url
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+        {
+            komf::KomfClient::new(self.http.clone(), patch.komf_url.as_deref().unwrap_or(""))?;
+        }
+        if patch.komf_enabled {
+            if !patch.komga_enabled
+                || patch
+                    .komga_library_id
+                    .as_deref()
+                    .is_none_or(|s| s.trim().is_empty())
+            {
+                return Err(AppError::bad_request(
+                    "KOMF requires Komga and an explicit English library ID",
+                ));
+            }
+        }
         // Normalize legacy optimizer path: replace untouched legacy default with None (bundled default)
         patch.optimizer_bin = match patch.optimizer_bin.as_deref().map(str::trim) {
             Some(s) if s == LEGACY_DEFAULT_OPTIMIZER_BIN || s.is_empty() => None,
@@ -565,6 +600,14 @@ impl Pipeline {
                     serde_json::json!(patch.min_savings_percent),
                 );
 
+                map.insert(
+                    "pipeline.komf_enabled".into(),
+                    serde_json::json!(patch.komf_enabled),
+                );
+                map.insert(
+                    "pipeline.komf_url".into(),
+                    serde_json::json!(patch.komf_url),
+                );
                 crate::settings::put(conn, &map)?;
 
                 // Update secrets in state table if provided (non-empty and not masked placeholder)
@@ -1379,6 +1422,28 @@ impl Pipeline {
             Ok(())
         }).await?;
 
+        if config.komf_enabled
+            && !is_chinese
+            && (!config.komga_enabled || !config.komga_scan_enabled)
+        {
+            let done = self
+                .handoff_metadata(
+                    job.chapter,
+                    &publication_title,
+                    &canonical_dest,
+                    target_library_id,
+                    is_volume,
+                    release_num,
+                    false,
+                )
+                .await
+                .unwrap_or(false);
+            return Ok(if done {
+                AcquisitionOutcome::Complete(canonical_dest)
+            } else {
+                AcquisitionOutcome::PublishedPendingMetadata(canonical_dest)
+            });
+        }
         if !config.komga_enabled || !config.komga_scan_enabled {
             self.record_event(PipelineEvent {
                 id: format!("{}-{}", job.chapter, now),
@@ -1409,6 +1474,27 @@ impl Pipeline {
 
             on_stage("complete", "Acquisition complete", Some(canonical_dest_str));
             return Ok(AcquisitionOutcome::Complete(canonical_dest));
+        }
+
+        if config.komf_enabled
+            && !is_chinese
+            && target_library_id.is_none_or(|id| {
+                Some(id) != config.komga_library_id.as_deref()
+                    || Some(id) == config.komga_chinese_library_id.as_deref()
+            })
+        {
+            let _ = self
+                .handoff_metadata(
+                    job.chapter,
+                    &publication_title,
+                    &canonical_dest,
+                    target_library_id,
+                    is_volume,
+                    release_num,
+                    false,
+                )
+                .await;
+            return Ok(AcquisitionOutcome::PublishedPendingMetadata(canonical_dest));
         }
 
         // 7. Trigger only the configured destination Komga library scan
@@ -1467,6 +1553,31 @@ impl Pipeline {
             Some(canonical_dest_str.clone()),
         );
         let policy = self.verification_policy();
+
+        if config.komf_enabled && !is_chinese {
+            on_stage(
+                "metadata",
+                "Resolving exact Komga book / waiting for KOMF metadata",
+                Some(canonical_dest_str),
+            );
+            let done = self
+                .handoff_metadata(
+                    job.chapter,
+                    &publication_title,
+                    &canonical_dest,
+                    target_library_id,
+                    is_volume,
+                    release_num,
+                    false,
+                )
+                .await
+                .unwrap_or(false);
+            return Ok(if done {
+                AcquisitionOutcome::Complete(canonical_dest)
+            } else {
+                AcquisitionOutcome::PublishedPendingMetadata(canonical_dest)
+            });
+        }
 
         let verified = self
             .poll_verify_release(

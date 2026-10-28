@@ -221,6 +221,7 @@ export type Queued = {
   retryAt: number | null;
   error: string | null;
   canRetryKomga?: boolean;
+  metadataHandoff?: { state: string; message: string; jobId: string | null; komgaBookId: string | null } | null;
   failureStage?: string | null;
   publishedPath?: string | null;
   sourceType?: string | null;
@@ -403,6 +404,8 @@ export interface PipelineConfig {
   mangabaka_url: string | null;
   mangabaka_token?: string | null;
   has_mangabaka_token: boolean;
+  komf_enabled?: boolean;
+  komf_url?: string | null;
   komga_enabled: boolean;
   komga_url: string | null;
   komga_api_key?: string | null;
@@ -894,6 +897,7 @@ export interface AcquisitionHistoryRecord {
   releaseSize?: number | null;
   completedAt: number;
   error?: string | null;
+  metadataHandoff?: Queued["metadataHandoff"];
 }
 
 export const getTitleAcquisitionReleases = (

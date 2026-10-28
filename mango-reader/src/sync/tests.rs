@@ -47,6 +47,7 @@ fn test_evaluate_volume_series_progress() {
 
     let books = vec![
         KomgaBook {
+            library_id: None,
             id: "b1".into(),
             series_id: "series-blue-lock".into(),
             name: "Blue Lock v01".into(),
@@ -64,6 +65,7 @@ fn test_evaluate_volume_series_progress() {
             url: None,
         },
         KomgaBook {
+            library_id: None,
             id: "b2".into(),
             series_id: "series-blue-lock".into(),
             name: "Blue Lock v02".into(),
@@ -81,6 +83,7 @@ fn test_evaluate_volume_series_progress() {
             url: None,
         },
         KomgaBook {
+            library_id: None,
             id: "b3".into(),
             series_id: "series-blue-lock".into(),
             name: "Blue Lock v03".into(),
@@ -119,6 +122,7 @@ fn test_evaluate_chapter_series_completed() {
 
     let books = vec![
         KomgaBook {
+            library_id: None,
             id: "b1".into(),
             series_id: "series-sololeveling".into(),
             name: "Solo Leveling c001".into(),
@@ -132,6 +136,7 @@ fn test_evaluate_chapter_series_completed() {
             url: None,
         },
         KomgaBook {
+            library_id: None,
             id: "b2".into(),
             series_id: "series-sololeveling".into(),
             name: "Solo Leveling c002".into(),

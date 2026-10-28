@@ -57,6 +57,8 @@ pub struct Queued {
     pub retry_at: Option<i64>,
     pub error: Option<String>,
     pub can_retry_komga: bool,
+    #[serde(default)]
+    pub metadata_handoff: Option<crate::pipeline::komf::Handoff>,
     pub failure_stage: Option<String>,
     pub published_path: Option<String>,
     pub source_type: Option<String>,
@@ -303,8 +305,44 @@ impl Downloads {
         Ok(view)
     }
 
+    /// Retry/resume metadata delivery only. Never queues source retrieval or physical processing.
+    pub async fn retry_metadata(&self, chapter: i64) -> Result<String> {
+        let (title, path, library, name, number): (String,String,Option<String>,String,f64) = self.db.call(move |c| {
+            Ok(c.query_row("SELECT m.title,COALESCE(d.published_path,h.canonical_path),COALESCE(d.target_library_id,h.library_id),ch.name,ch.chapter_number FROM chapters ch JOIN manga m ON m.id=ch.manga_id LEFT JOIN downloads d ON d.chapter_id=ch.id LEFT JOIN metadata_handoffs h ON h.chapter_id=ch.id WHERE ch.id=?1 AND COALESCE(d.published_path,h.canonical_path) IS NOT NULL",[chapter],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?)
+        }).await?;
+        let pipeline = self
+            .pipeline
+            .as_ref()
+            .ok_or_else(|| AppError::bad_request("Pipeline unavailable"))?;
+        let release = crate::release::parse_release(&name, number);
+        crate::pipeline::publisher::verify_cbz_integrity(std::path::Path::new(&path))?;
+        let done = pipeline
+            .handoff_metadata(
+                chapter,
+                &title,
+                std::path::Path::new(&path),
+                library.as_deref(),
+                release.release_type == crate::release::ReleaseType::Volume,
+                release.volume.unwrap_or(number),
+                true,
+            )
+            .await?;
+        Ok(if done {
+            "KOMF metadata job completed".into()
+        } else {
+            "Metadata handoff recorded; inspect status before retrying".into()
+        })
+    }
+
     /// Retries the Komga library scan stage without re-downloading or re-optimizing.
     pub async fn retry_komga(&self, chapter: i64) -> Result<String> {
+        if self
+            .db
+            .call(move |c| Ok(crate::pipeline::komf::read(c, chapter)?.is_some()))
+            .await?
+        {
+            return self.retry_metadata(chapter).await;
+        }
         let (manga_id, title, lang, pub_path_opt, target_lib_opt, is_vol, rel_num) = self
             .db
             .call(move |conn| {
@@ -526,6 +564,14 @@ impl Downloads {
 
     /// Gives a parked chapter a fresh set of tries.
     pub async fn retry(&self, chapter: i64) -> Result<()> {
+        if self
+            .db
+            .call(move |c| Ok(crate::pipeline::komf::read(c, chapter)?.is_some()))
+            .await?
+        {
+            self.retry_metadata(chapter).await?;
+            return Ok(());
+        }
         self.tracker.remove(chapter);
         self.db
             .call(move |conn| {
@@ -641,7 +687,7 @@ impl Downloads {
                     let path = PathBuf::from(&pub_path);
                     if path.is_file() && crate::pipeline::publisher::verify_cbz_integrity(&path).is_ok() {
                         conn.execute(
-                            "UPDATE downloads SET state = 'verifying', error = 'Published — waiting for Komga' WHERE chapter_id = ?1",
+                            "UPDATE downloads SET state = CASE WHEN EXISTS(SELECT 1 FROM metadata_handoffs h WHERE h.chapter_id=downloads.chapter_id) THEN CASE WHEN state='metadata_wait' THEN 'metadata_wait' ELSE state END ELSE 'verifying' END WHERE chapter_id = ?1",
                             [ch_id],
                         )?;
                     } else {
@@ -715,6 +761,58 @@ impl Downloads {
 
                         let (config, _, komga_key) =
                             pipeline.load_internal_config().await.unwrap_or_default();
+                        if config.komf_enabled
+                            && job.lang.as_deref().is_none_or(|l| {
+                                !matches!(l.to_lowercase().as_str(), "zh" | "chinese" | "mandarin")
+                            })
+                        {
+                            let target_lib = job
+                                .target_library_id
+                                .as_deref()
+                                .or(config.komga_library_id.as_deref());
+                            let existing = self
+                                .db
+                                .call(move |c| {
+                                    Ok(crate::pipeline::komf::read(c, chapter_id)?.is_some_and(
+                                        |h| h.state != "waiting_komga" || h.job_id.is_some(),
+                                    ))
+                                })
+                                .await
+                                .unwrap_or(true);
+                            if !existing && config.komga_scan_enabled {
+                                if let Some(lib) = target_lib.filter(|id| {
+                                    Some(*id) == config.komga_library_id.as_deref()
+                                        && Some(*id) != config.komga_chinese_library_id.as_deref()
+                                }) {
+                                    let client = crate::pipeline::komga::KomgaClient::new(
+                                        pipeline.http.clone(),
+                                        config.komga_url.clone(),
+                                        komga_key,
+                                    );
+                                    let _ = client.trigger_scan(Some(lib)).await;
+                                }
+                            }
+                            let is_vol = job.release_type == crate::release::ReleaseType::Volume;
+                            let number = if is_vol {
+                                job.volume.unwrap_or(job.number)
+                            } else {
+                                job.chapter_number.unwrap_or(job.number)
+                            };
+                            let _ = pipeline
+                                .handoff_metadata(
+                                    chapter_id,
+                                    &job.publication_title(),
+                                    &canonical_path,
+                                    target_lib,
+                                    is_vol,
+                                    number,
+                                    false,
+                                )
+                                .await;
+                            *self.live_stage.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                            self.tracker.release_worker(ch_id);
+                            continue;
+                        }
                         if config.komga_enabled && config.komga_scan_enabled {
                             let komga_client = crate::pipeline::komga::KomgaClient::new(
                                 pipeline.http.clone(),
@@ -958,6 +1056,10 @@ impl Downloads {
                                     )
                                     .await;
                             }
+                            *self.live_stage.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                            continue;
+                        }
+                        Ok(crate::pipeline::AcquisitionOutcome::PublishedPendingMetadata(_)) => {
                             *self.live_stage.lock().unwrap_or_else(|e| e.into_inner()) = None;
                             continue;
                         }
@@ -1865,14 +1967,16 @@ pub(crate) fn read_queue(conn: &Connection) -> Result<QueueView> {
                         .as_deref()
                         .map(|e| e.to_lowercase().contains("komga"))
                         .unwrap_or(false));
-            let failure_stage = if can_retry_komga {
+            let failure_stage = if state.starts_with("metadata_") {
+                Some("metadata".to_string())
+            } else if can_retry_komga {
                 Some("komga".to_string())
             } else if state == "failed" {
                 Some("download".to_string())
             } else {
                 None
             };
-            let status_message = if state == "verifying" {
+            let status_message = if state == "verifying" || state.starts_with("metadata_") {
                 Some(
                     error
                         .clone()
@@ -1909,6 +2013,7 @@ pub(crate) fn read_queue(conn: &Connection) -> Result<QueueView> {
                 retry_at: r.get(7)?,
                 error,
                 can_retry_komga,
+                metadata_handoff: crate::pipeline::komf::read(conn, r.get(0)?)?,
                 failure_stage,
                 published_path,
                 source_type: r.get(13)?,
@@ -1947,7 +2052,7 @@ fn next_job(conn: &Connection) -> Result<Option<Job>> {
                     d.uploader, d.release_size, d.retrieved_path, d.collection_id, d.collection_name, d.magnet_url, d.retrieval_identity_json
              FROM downloads d JOIN chapters c ON c.id = d.chapter_id JOIN manga m ON m.id = c.manga_id
              LEFT JOIN sources s ON s.id = m.source_id
-             WHERE (d.state = 'queued' OR d.state = 'verifying') AND (d.retry_at IS NULL OR d.retry_at <= ?1)
+             WHERE (d.state = 'queued' OR d.state = 'verifying' OR d.state = 'metadata_wait') AND (d.retry_at IS NULL OR d.retry_at <= ?1)
              ORDER BY d.position, d.chapter_id LIMIT 1",
             [now()],
             |r| {

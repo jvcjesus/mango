@@ -50,6 +50,8 @@ pub struct KomgaReadProgress {
 pub struct KomgaBook {
     pub id: String,
     pub series_id: String,
+    #[serde(default)]
+    pub library_id: Option<String>,
     pub name: String,
     pub number: f64,
     pub metadata: Option<KomgaBookMetadata>,
@@ -437,6 +439,142 @@ impl KomgaClient {
 
         tracing::info!("KOMGA: series metadata refresh triggered ({series_id})");
         Ok(())
+    }
+
+    /// Resolve a publication without choosing the first title/number match.
+    /// A title is discovery only: mutation requires a mapped exact path or a known series ID.
+    pub async fn resolve_published_book(
+        &self,
+        title: &str,
+        library: &str,
+        canonical: &std::path::Path,
+        local_root: &std::path::Path,
+        known_series: Option<&str>,
+        is_volume: bool,
+        number: f64,
+    ) -> Result<Option<KomgaBook>> {
+        if library.trim().is_empty() || !number.is_finite() || number < 0.0 {
+            return Err(AppError::bad_request(
+                "Missing library or ambiguous release number",
+            ));
+        }
+        let canonical = std::fs::canonicalize(canonical)?;
+        let root = std::fs::canonicalize(local_root)?;
+        if !canonical.starts_with(&root) {
+            return Err(AppError::bad_request(
+                "Publication escapes configured library",
+            ));
+        }
+        let libraries = self.list_libraries().await?;
+        let lib = libraries
+            .iter()
+            .find(|l| l.id == library && !l.unavailable)
+            .ok_or_else(|| AppError::bad_request("Expected Komga library is unavailable"))?;
+        let candidates = if known_series.is_some() {
+            self.list_series(Some(library)).await?
+        } else {
+            self.all_pages(
+                "/api/v1/series",
+                &[
+                    ("search", title.to_string()),
+                    ("library_id", library.to_string()),
+                ],
+            )
+            .await?
+        };
+        let mut matched = Vec::new();
+        for series in candidates {
+            if series.library_id != library {
+                continue;
+            }
+            if let Some(id) = known_series {
+                if series.id != id {
+                    continue;
+                }
+            } else if crate::pipeline::mangabaka::normalize_title(&series.name)
+                != crate::pipeline::mangabaka::normalize_title(title)
+            {
+                continue;
+            }
+            let books = self.get_books_in_series(&series.id).await?;
+            let context = crate::release::determine_series_context(books.iter().map(|b| {
+                (
+                    b.name.as_str(),
+                    b.metadata.as_ref().and_then(|m| m.title.as_deref()),
+                )
+            }));
+            for book in books {
+                if book.library_id.as_deref().is_some_and(|id| id != library) {
+                    return Err(AppError::bad_request("Conflicting Komga book library"));
+                }
+                if book.series_id != series.id {
+                    return Err(AppError::bad_request("Conflicting Komga series identity"));
+                }
+                let meta = book.metadata.as_ref();
+                let (unit, n) = crate::release::classify_komga_book(
+                    &book.name,
+                    meta.and_then(|m| m.title.as_deref()),
+                    meta.and_then(|m| m.number.as_deref()),
+                    book.number,
+                    context,
+                );
+                if unit
+                    != if is_volume {
+                        crate::release::ReleaseUnit::Volume
+                    } else {
+                        crate::release::ReleaseUnit::Chapter
+                    }
+                {
+                    continue;
+                }
+                if is_volume
+                    && crate::release::parse_volume(&book.name).is_none()
+                    && meta
+                        .and_then(|m| m.title.as_deref())
+                        .and_then(crate::release::parse_volume)
+                        .is_none()
+                    && meta
+                        .and_then(|m| m.number.as_deref())
+                        .and_then(|v| v.parse::<f64>().ok())
+                        .is_none()
+                {
+                    continue;
+                }
+                let Some(n) = n else {
+                    continue;
+                };
+                if (n - number).abs() >= 0.001 {
+                    continue;
+                }
+                if meta
+                    .and_then(|m| m.number.as_deref())
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .is_some_and(|v| (v - n).abs() >= 0.001)
+                {
+                    return Err(AppError::bad_request("Conflicting Komga release numbering"));
+                }
+                let path = book.url.as_deref().map(|url| {
+                    super::normalization::book_path(
+                        std::path::Path::new(&lib.root),
+                        &root,
+                        Some(url),
+                    )
+                });
+                match path {
+                    Some(Ok(p)) if p == canonical => matched.push(book),
+                    Some(_) => continue, // A reported path is stronger than number evidence; never override a conflict.
+                    None if known_series == Some(series.id.as_str()) => matched.push(book),
+                    None => continue,
+                }
+            }
+        }
+        match matched.len() {
+            0 => Ok(None),
+            1 => Ok(matched.pop()),
+            _ => Err(AppError::bad_request(
+                "Ambiguous Komga books; metadata needs review",
+            )),
+        }
     }
 
     /// Verifies whether a specific canonical release (Volume N or Chapter N) of a series

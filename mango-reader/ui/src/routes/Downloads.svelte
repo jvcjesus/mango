@@ -221,6 +221,7 @@
   }
 
   function describe(entry: Queued): string {
+    if (entry.metadataHandoff) return entry.metadataHandoff.message;
     if (entry.statusMessage) return entry.statusMessage;
     if (entry.isStalled) return 'Transfer stalled — waiting for progress';
     if (entry.stage === 'retrying' || entry.transferStatus === 'retrying') {
@@ -287,6 +288,9 @@
       case 'downloading': return 'Downloading';
       case 'identifying': return 'Identifying';
       case 'metadata': return 'Metadata';
+      case 'metadata_wait': return 'Waiting for KOMF';
+      case 'metadata_failed': return 'Metadata retry';
+      case 'metadata_review': return 'Metadata Needs Review';
       case 'optimizing': return 'Optimizing';
       case 'validating': return 'Validating';
       case 'publishing': return 'Publishing';
@@ -430,7 +434,12 @@
                           {/if}
                         </div>
                         <span class="tools">
-                          {#if entry.canRetryKomga}
+                          {#if entry.metadataHandoff}
+                            {#if entry.metadataHandoff.state !== 'succeeded'}
+                              <button class="btn pill" disabled={busyItems[entry.chapterId] || (entry.metadataHandoff.state === 'unknown' && !entry.metadataHandoff.jobId) || entry.metadataHandoff.state === 'submitting'} onclick={() => act('POST', `/downloads/${entry.chapterId}/retry-metadata`)}>{entry.metadataHandoff.jobId && entry.metadataHandoff.state !== 'failed' ? 'Check metadata job' : 'Retry metadata'}</button>
+                            {/if}
+                          {/if}
+                          {#if entry.canRetryKomga && !entry.metadataHandoff}
                             <button class="btn pill" disabled={busyItems[entry.chapterId]} onclick={() => act('POST', `/downloads/${entry.chapterId}/retry-komga`)}>
                               <Icon name="refresh" size={16} />Retry Komga
                             </button>
@@ -496,7 +505,12 @@
                   {/if}
                 </a>
                 <span class="tools">
-                  {#if entry.canRetryKomga}
+                  {#if entry.metadataHandoff}
+                            {#if entry.metadataHandoff.state !== 'succeeded'}
+                              <button class="btn pill" disabled={busyItems[entry.chapterId] || (entry.metadataHandoff.state === 'unknown' && !entry.metadataHandoff.jobId) || entry.metadataHandoff.state === 'submitting'} onclick={() => act('POST', `/downloads/${entry.chapterId}/retry-metadata`)}>{entry.metadataHandoff.jobId && entry.metadataHandoff.state !== 'failed' ? 'Check metadata job' : 'Retry metadata'}</button>
+                            {/if}
+                          {/if}
+                          {#if entry.canRetryKomga && !entry.metadataHandoff}
                     <button class="btn pill" disabled={busyItems[entry.chapterId]} onclick={() => act('POST', `/downloads/${entry.chapterId}/retry-komga`)}>
                       <Icon name="refresh" size={16} />Retry Komga Scan
                     </button>

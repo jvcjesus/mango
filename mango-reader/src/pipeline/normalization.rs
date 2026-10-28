@@ -414,7 +414,11 @@ fn unique_id(prefix: &str) -> String {
 
 // Komga and Mango may mount the same library under different absolute roots.
 // Translate only a selected-library-relative path; never search or guess a basename.
-fn book_path(komga_root: &Path, local_root: &Path, url: Option<&str>) -> Result<PathBuf> {
+pub(crate) fn book_path(
+    komga_root: &Path,
+    local_root: &Path,
+    url: Option<&str>,
+) -> Result<PathBuf> {
     use std::path::Component;
     let raw = url.ok_or_else(|| AppError::bad_request("Komga did not provide a filesystem URL"))?;
     // URL parsing normalizes dot segments. Reject them before parsing, including
