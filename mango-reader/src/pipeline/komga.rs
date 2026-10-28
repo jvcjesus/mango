@@ -511,11 +511,37 @@ impl KomgaClient {
                     return Err(AppError::bad_request("Conflicting Komga series identity"));
                 }
                 let meta = book.metadata.as_ref();
+
+                // An exact Komga filesystem URL is stronger identity evidence
+                // than Komga's positional book number. Komga may temporarily
+                // number partially imported series as 1, 2, ... even when the
+                // canonical filenames are v02, v04, etc.
+                //
+                // We still require a unique exact canonical path. Number-only
+                // fallback remains strict.
+                let path = book.url.as_deref().map(|url| {
+                    super::normalization::book_path(
+                        std::path::Path::new(&lib.root),
+                        &root,
+                        Some(url),
+                    )
+                });
+                let exact_path = matches!(&path, Some(Ok(p)) if p == &canonical);
+
                 let (unit, n) = crate::release::classify_komga_book(
                     &book.name,
                     meta.and_then(|m| m.title.as_deref()),
-                    meta.and_then(|m| m.number.as_deref()),
-                    book.number,
+                    if exact_path {
+                        None
+                    } else {
+                        meta.and_then(|m| m.number.as_deref())
+                    },
+                    if exact_path {
+                        crate::release::parse_volume(&book.name)
+                            .unwrap_or(book.number)
+                    } else {
+                        book.number
+                    },
                     context,
                 );
                 if unit
@@ -546,20 +572,14 @@ impl KomgaClient {
                 if (n - number).abs() >= 0.001 {
                     continue;
                 }
-                if meta
-                    .and_then(|m| m.number.as_deref())
-                    .and_then(|v| v.parse::<f64>().ok())
-                    .is_some_and(|v| (v - n).abs() >= 0.001)
+                if !exact_path
+                    && meta
+                        .and_then(|m| m.number.as_deref())
+                        .and_then(|v| v.parse::<f64>().ok())
+                        .is_some_and(|v| (v - n).abs() >= 0.001)
                 {
                     return Err(AppError::bad_request("Conflicting Komga release numbering"));
                 }
-                let path = book.url.as_deref().map(|url| {
-                    super::normalization::book_path(
-                        std::path::Path::new(&lib.root),
-                        &root,
-                        Some(url),
-                    )
-                });
                 match path {
                     Some(Ok(p)) if p == canonical => matched.push(book),
                     Some(_) => continue, // A reported path is stronger than number evidence; never override a conflict.
