@@ -1,6 +1,16 @@
 <script lang="ts">
- import AcquisitionDialog from "../lib/AcquisitionDialog.svelte";
- let unifiedAcquisition = $state<{release:string;mode: "missing"|"complete"|"specific"} | null>(null);
+  import AcquisitionDialog from "../lib/AcquisitionDialog.svelte";
+  import SeriesSummaryCard from "../lib/SeriesSummaryCard.svelte";
+  import VolumeRow from "../lib/VolumeRow.svelte";
+  import {
+    resolveSeriesSummary,
+    resolveVolumePresentation,
+    type VolumePresentation,
+    type SeriesSummary,
+  } from "../lib/volumeStatus";
+  import type { ImportBook } from "../lib/importReview";
+  import type { PipelineEvent, Queue, Queued } from "../lib/api";
+  let unifiedAcquisition = $state<{release:string;mode: "missing"|"complete"|"specific"} | null>(null);
   import { onDestroy } from 'svelte';
   import {
     get,
@@ -102,11 +112,19 @@
     keep(`title.${id}.uploader`, val);
   }
 
+  let ownership = $state<TitleOwnership | null>(null);
+  let refreshingOwnership = $state(false);
+  let showOwnershipDetails = $state(false);
+  let missingContent = $state<MissingContentSummary | null>(null);
+  let loadingMissing = $state(false);
+
   const chapters = $derived(title?.chapters ?? []);
   const unread = $derived(chapters.filter((c) => !c.read).length);
   const saved = $derived(chapters.filter((c) => c.downloaded).length);
   const hasVolumes = $derived(
-    chapters.some((c) => (c.volume !== undefined && c.volume !== null) || parseVolume(c.name) !== null)
+    chapters.some((c) => (c.volume !== undefined && c.volume !== null) || parseVolume(c.name) !== null) ||
+    Boolean(ownership?.volumes && ownership.volumes.length > 0) ||
+    Boolean(missingContent?.totalKnownVolumes)
   );
   // The order is kept for every title, on the server like the library's.
   // When trustworthy volumes exist, default to volume view unless user explicitly chose otherwise.
@@ -159,9 +177,6 @@
     return view.down ? list : list.reverse();
   });
   const filteredUnread = $derived(listed.filter((c) => !c.read && !c.downloaded));
-  let ownership = $state<TitleOwnership | null>(null);
-  let refreshingOwnership = $state(false);
-  let showOwnershipDetails = $state(false);
 
   function updateCandidateStatusesFromOwnership(own: TitleOwnership | null) {
     if (!own || !nyaaReleases.length) return;
@@ -191,6 +206,7 @@
       ownership = await get<TitleOwnership>(`/manga/${id}/ownership`);
       updateCandidateStatusesFromOwnership(ownership);
       loadMissingAndProfile();
+      loadTitleAcquisitions();
     } catch {
       ownership = null;
     }
@@ -202,6 +218,7 @@
       ownership = await send<TitleOwnership>('POST', `/manga/${id}/refresh-ownership`);
       updateCandidateStatusesFromOwnership(ownership);
       loadMissingAndProfile();
+      loadTitleAcquisitions();
       toast.success('Ownership refreshed from Komga');
     } catch (e) {
       toast.error(`Ownership refresh failed: ${message(e)}`);
@@ -213,8 +230,6 @@
   // ---------- Missing Content & Acquisition Planning ----------
   let currentProfile = $state<AcquisitionProfile | null>(null);
   let availableProfiles = $state<AcquisitionProfile[]>([]);
-  let missingContent = $state<MissingContentSummary | null>(null);
-  let loadingMissing = $state(false);
 
   // Execution state
   let titleExecutions = $state<AcquisitionExecution[]>([]);
@@ -223,6 +238,48 @@
   let executionActionLoading = $state(false);
   let executionPollTimer: any = null;
   let showExecutionHistory = $state(false);
+
+  // Active downloads and candidate items for this title
+  let titleDownloads = $state<Queued[]>([]);
+  let titleCandidates = $state<ImportBook[]>([]);
+  let titleEvents = $state<PipelineEvent[]>([]);
+
+  async function loadTitleAcquisitions() {
+    try {
+      const [freshQueue, freshEvents, freshImports] = await Promise.all([
+        get<Queue>('/downloads').catch(() => null),
+        get<PipelineEvent[]>('/pipeline/events').catch(() => []),
+        get<ImportBook[]>('/imports').catch(() => []),
+      ]);
+      if (freshQueue?.queue) {
+        titleDownloads = freshQueue.queue.filter(
+          (q) => q.mangaId === id || (title && q.title.toLowerCase() === title.title.toLowerCase())
+        );
+      }
+      if (freshEvents) {
+        titleEvents = freshEvents.filter(
+          (e) => title && e.series.toLowerCase() === title.title.toLowerCase()
+        );
+      }
+      if (freshImports) {
+        titleCandidates = freshImports.filter(
+          (c) => title && c.series.toLowerCase() === title.title.toLowerCase()
+        );
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  async function act(method: string, path: string, body?: unknown) {
+    try {
+      await send(method, path, body);
+      toast.success('Action submitted');
+      await Promise.all([loadTitleAcquisitions(), refreshOwnership()]);
+    } catch (e) {
+      toast.error(message(e));
+    }
+  }
 
   onDestroy(() => {
     if (executionPollTimer) {
@@ -427,6 +484,7 @@
     ownershipStatus: OwnershipStatus | null;
     ownedBookName: string | null;
     error: string | null;
+    presentation: VolumePresentation | null;
   };
   const volumeGroups = $derived.by<VolumeGroup[]>(() => {
     if (!view.volumes) {
@@ -444,6 +502,7 @@
         ownershipStatus: null,
         ownedBookName: null,
         error: null,
+        presentation: null,
       }];
     }
     const map = new Map<number | null, Chapter[]>();
@@ -452,6 +511,27 @@
       const list = map.get(vol) ?? [];
       list.push(c);
       map.set(vol, list);
+    }
+    // Also include known volumes from Komga ownership or missing content
+    if (ownership?.volumes) {
+      for (const v of ownership.volumes) {
+        if (!map.has(v.volume)) map.set(v.volume, []);
+      }
+    }
+    if (missingContent?.missingVolumes) {
+      for (const v of missingContent.missingVolumes) {
+        if (!map.has(v)) map.set(v, []);
+      }
+    }
+    if (missingContent?.ownedVolumes) {
+      for (const v of missingContent.ownedVolumes) {
+        if (!map.has(v)) map.set(v, []);
+      }
+    }
+    if (ownership?.summary?.totalSourceVolumes) {
+      for (let i = 1; i <= ownership.summary.totalSourceVolumes; i++) {
+        if (!map.has(i)) map.set(i, []);
+      }
     }
     const entries = Array.from(map.entries());
     entries.sort(([a], [b]) => {
@@ -462,7 +542,23 @@
     return entries.map(([vol, chs]) => {
       const downloadedCount = chs.filter((c) => c.downloaded).length;
       const missingCount = chs.filter((c) => !c.downloaded).length;
-      const volOwnership = vol !== null ? ownership?.volumes.find((v) => Math.abs(v.volume - vol) < 0.001) : null;
+      const volOwnership = vol !== null ? ownership?.volumes?.find((v) => Math.abs(v.volume - vol) < 0.001) : null;
+      const volQueued = vol !== null ? titleDownloads.filter((q) => q.volume != null && Math.abs(q.volume - vol) < 0.001) : [];
+      const volCandidates = vol !== null ? titleCandidates.filter((c) => (c.assignedNumber != null && Math.abs(c.assignedNumber - vol) < 0.001) || (c.suggestedNumber != null && Math.abs(c.suggestedNumber - vol) < 0.001)) : [];
+      const volEvents = vol !== null ? titleEvents.filter((e) => e.is_volume && Math.abs(e.number - vol) < 0.001) : [];
+
+      const presentation = vol !== null ? resolveVolumePresentation({
+        volume: vol,
+        isOwnedInKomga: volOwnership?.status === 'owned',
+        bookId: volOwnership?.bookId,
+        bookName: volOwnership?.bookName,
+        ownershipError: volOwnership?.error,
+        queuedItems: volQueued,
+        importCandidates: volCandidates,
+        pipelineEvents: volEvents,
+        isMissingReported: missingContent?.missingVolumes?.includes(vol) ?? false,
+      }) : null;
+
       return {
         volume: vol,
         label: volumeHeading(vol),
@@ -472,10 +568,30 @@
         isFullyDownloaded: chs.length > 0 && missingCount === 0,
         isPartiallyDownloaded: downloadedCount > 0 && missingCount > 0,
         isBusy: chs.some((c) => busyChapter[c.id]),
-        ownershipStatus: volOwnership?.status ?? null,
-        ownedBookName: volOwnership?.bookName ?? null,
-        error: volOwnership?.error ?? null,
+        ownershipStatus: volOwnership?.status ?? (presentation?.status === 'complete' || presentation?.status === 'owned' ? 'owned' : null),
+        ownedBookName: presentation?.bookName ?? volOwnership?.bookName ?? null,
+        error: presentation?.error ?? volOwnership?.error ?? null,
+        presentation,
       };
+    });
+  });
+
+  const seriesSummary = $derived.by<SeriesSummary | null>(() => {
+    if (!ownership && !missingContent) return null;
+    const volumes = volumeGroups
+      .map((g) => g.presentation)
+      .filter((p): p is VolumePresentation => p !== null);
+
+    const totalSourceVolumes =
+      ownership?.summary?.totalSourceVolumes ??
+      missingContent?.totalKnownVolumes ??
+      null;
+
+    return resolveSeriesSummary({
+      title: title?.title ?? '',
+      volumes,
+      totalExpectedVolumes: totalSourceVolumes,
+      isOngoing: title?.status === 1,
     });
   });
   const nothing = $derived(
@@ -497,6 +613,7 @@
       keep('title', fresh);
       title = fresh;
       loadOwnership();
+      loadTitleAcquisitions();
       // A title only seen in a list has no details or chapters yet.
       if (!title.initialized || title.chapters.length === 0) refresh();
     } catch (e) {
@@ -925,32 +1042,16 @@
               </div>
             {/if}
 
-            <!-- Missing Content & Acquisition Overview -->
-            {#if missingContent}
-              <div class="missing-content-overview-row">
-                <div class="missing-status-line">
-                  {#if missingContent.hasMissing}
-                    <span class="tag warn" style="font-weight: 700;">
-                      MISSING: {missingContent.missingVolumes.length === 1 ? `Volume ${missingContent.missingVolumes[0]}` : `v${formatVolumeRanges(missingContent.missingVolumes)}`}
-                    </span>
-                  {:else if missingContent.isFullyOwned}
-                    <span class="tag spot">FULLY OWNED IN KOMGA</span>
-                  {/if}
-                  {#if missingContent.acquiringVolumes.length > 0}
-                    <span class="tag">ACQUIRING: v{formatVolumeRanges(missingContent.acquiringVolumes)}</span>
-                  {/if}
-                </div>
-
-                <div class="planner-actions-row">
-                  {#if missingContent.hasMissing}
-                    <button class="btn spot pill icon-text" onclick={() => openPlanModal(true)}>
-                      <Icon name="puzzle" size={14} /> Plan Missing Volumes
-                    </button>
-                  {/if}
-                  <button class="btn pill icon-text" onclick={() => searchNyaa()} disabled={loadingNyaa}>
-                    <Icon name="search" size={14} /> Find Best Release
-                  </button>
-                </div>
+            <!-- Series Summary & Missing Content Overview -->
+            {#if seriesSummary && (ownership || missingContent)}
+              <div class="series-summary-wrapper">
+                <SeriesSummaryCard
+                  summary={seriesSummary}
+                  onPlanMissing={() => openPlanModal(true)}
+                  onFindReleases={() => searchNyaa()}
+                  onRefreshKomga={refreshOwnership}
+                  refreshingKomga={refreshingOwnership}
+                />
               </div>
             {/if}
 
@@ -972,7 +1073,7 @@
             {#if titleExecutions.length > 0}
               <div class="executions-history-section">
                 <button class="btn pill icon-text sm" onclick={() => (showExecutionHistory = !showExecutionHistory)}>
-                  <Icon name={showExecutionHistory ? 'chevron-up' : 'chevron-down'} size={14} />
+                  <Icon name={showExecutionHistory ? 'up' : 'down'} size={14} />
                   Acquisition Executions ({titleExecutions.length})
                 </button>
 
@@ -1202,7 +1303,7 @@
                           onclick={() => unifiedAcquisition = {release:cand.release.sourceItemId,mode:'complete'}}
 
                         >
-                          <Icon name="folder" size={14} /> View Collection ({cand.unitsIncluded.length} vols)
+                          <Icon name="book" size={14} /> View Collection ({cand.unitsIncluded.length} vols)
                         </button>
                       {:else if cand.ownershipStatus === 'owned'}
                         <button class="btn pill" disabled title="Already owned in canonical library">
@@ -1344,40 +1445,107 @@
 
         {#each volumeGroups as grp (grp.volume ?? 'unassigned')}
           {#if grp.label}
-            <div class="volume-header">
+            <div class="volume-header" class:has-warning={Boolean(grp.presentation?.contradictionWarning)}>
               <div class="volume-info">
                 <h3 class="display">{grp.label}</h3>
-                <span class="tag">{grp.chapters.length} {grp.chapters.length === 1 ? 'chapter' : 'chapters'}</span>
-                {#if grp.ownershipStatus === 'owned'}
-                  <span class="tag spot" title="Present in canonical Komga library"><Icon name="check" size={14} /> Owned in Komga</span>
-                {:else if grp.ownershipStatus === 'acquiring'}
-                  <span class="tag" title="In acquisition pipeline"><span class="spin"><Icon name="spinner" size={14} stroke={3} /></span> Acquiring</span>
-                {:else if grp.ownershipStatus === 'failed'}
-                  <span class="tag danger" title={grp.error ? `Acquisition failed: ${grp.error}` : 'Acquisition failed'}><Icon name="info" size={14} /> Failed</span>
+                {#if grp.chapters.length > 0}
+                  <span class="tag">{grp.chapters.length} {grp.chapters.length === 1 ? 'chapter' : 'chapters'}</span>
                 {/if}
+
+                {#if grp.presentation}
+                  <!-- Normalized status badge -->
+                  <span class="status-badge status-{grp.presentation.badgeVariant}">
+                    {#if grp.presentation.status === 'complete' || grp.presentation.status === 'owned'}
+                      <Icon name="check" size={13} stroke={2.5} />
+                    {:else if grp.presentation.status === 'acquiring' || grp.presentation.status === 'processing' || grp.presentation.status === 'metadata'}
+                      <span class="spin"><Icon name="spinner" size={13} stroke={2.5} /></span>
+                    {:else if grp.presentation.status === 'attention'}
+                      <Icon name="info" size={13} stroke={2.5} />
+                    {/if}
+                    {grp.presentation.statusLabel}
+                  </span>
+
+                  <!-- Distinct physical vs metadata breakdown -->
+                  <div class="sub-states">
+                    <span class="sub-state physical" title="Canonical library physical state">
+                      <Icon name="book" size={12} />
+                      <span>{grp.presentation.physicalLabel}</span>
+                    </span>
+                    {#if grp.presentation.metadataState !== 'not_applicable' && grp.presentation.physicalState === 'in_library'}
+                      <span
+                        class="sub-state metadata"
+                        class:metadata-error={grp.presentation.metadataState === 'failed'}
+                        title="Komga/MangaBaka/KOMF metadata state"
+                      >
+                        <Icon name="info" size={12} />
+                        <span>Metadata: {grp.presentation.metadataLabel}</span>
+                      </span>
+                    {/if}
+                  </div>
+                {:else}
+                  <!-- Fallback when no presentation (e.g. unassigned volume) -->
+                  {#if grp.ownershipStatus === 'owned'}
+                    <span class="tag spot" title="Present in canonical Komga library"><Icon name="check" size={14} /> Owned in Komga</span>
+                  {:else if grp.ownershipStatus === 'acquiring'}
+                    <span class="tag" title="In acquisition pipeline"><span class="spin"><Icon name="spinner" size={14} stroke={3} /></span> Acquiring</span>
+                  {:else if grp.ownershipStatus === 'failed'}
+                    <span class="tag danger" title={grp.error ? `Acquisition failed: ${grp.error}` : 'Acquisition failed'}><Icon name="info" size={14} /> Failed</span>
+                  {/if}
+                {/if}
+
                 {#if grp.isFullyDownloaded}
                   <span class="tag spot">Downloaded</span>
                 {:else if grp.isPartiallyDownloaded}
                   <span class="tag">{grp.downloadedCount}/{grp.chapters.length} saved</span>
                 {/if}
               </div>
+
               {#if grp.volume !== null}
                 <div class="volume-actions">
-                  {#if grp.ownershipStatus === 'owned'}
+                  {#if grp.presentation?.canRetryMetadata}
                     <button
-                      class="btn pill"
-                      aria-label="Re-acquire {grp.label}"
-                      disabled={downloading || grp.isBusy || !grp.chapters.length}
-                      onclick={() => downloadVolume(grp)}
-                      title="Already in Komga library. Click to re-acquire"
+                      class="btn pill warn"
+                      onclick={() => grp.presentation?.chapterId && act('POST', `/downloads/${grp.presentation.chapterId}/retry-metadata`)}
                     >
-                      {#if grp.isBusy}
-                        <span class="spin"><Icon name="spinner" size={14} stroke={3} /></span>
-                      {:else}
-                        <Icon name="refresh" size={14} />
-                      {/if}
-                      Re-acquire
+                      <Icon name="refresh" size={14} /> Retry metadata
                     </button>
+                  {/if}
+
+                  {#if grp.presentation?.canRetryKomga}
+                    <button
+                      class="btn pill warn"
+                      onclick={() => grp.presentation?.chapterId && act('POST', `/downloads/${grp.presentation.chapterId}/retry-komga`)}
+                    >
+                      <Icon name="refresh" size={14} /> Retry Komga
+                    </button>
+                  {/if}
+
+                  {#if grp.presentation?.canRetryDownload}
+                    <button
+                      class="btn pill warn"
+                      onclick={() => grp.presentation?.chapterId && act('POST', `/downloads/${grp.presentation.chapterId}/retry`)}
+                    >
+                      <Icon name="refresh" size={14} /> Try again
+                    </button>
+                  {/if}
+
+                  {#if grp.presentation?.status === 'complete' || grp.presentation?.status === 'owned'}
+                    {#if grp.chapters.length > 0}
+                      <button
+                        class="btn pill"
+                        aria-label="Re-acquire {grp.label}"
+                        disabled={downloading || grp.isBusy}
+                        onclick={() => downloadVolume(grp)}
+                        title="Already in Komga library. Click to re-acquire"
+                      >
+                        {#if grp.isBusy}
+                          <span class="spin"><Icon name="spinner" size={14} stroke={3} /></span>
+                        {:else}
+                          <Icon name="refresh" size={14} />
+                        {/if}
+                        Re-acquire
+                      </button>
+                    {/if}
                   {:else if grp.isFullyDownloaded}
                     <span class="tag spot"><Icon name="check" size={14} /> Complete</span>
                   {:else if grp.isPartiallyDownloaded}
@@ -1394,11 +1562,11 @@
                       {/if}
                       Missing ({grp.missingCount})
                     </button>
-                  {:else}
+                  {:else if grp.chapters.length > 0}
                     <button
                       class="btn pill spot"
                       aria-label="Download {grp.label}"
-                      disabled={downloading || grp.isBusy || !grp.chapters.length}
+                      disabled={downloading || grp.isBusy}
                       onclick={() => downloadVolume(grp)}
                     >
                       {#if grp.isBusy}
@@ -1409,17 +1577,130 @@
                       Download Volume
                     </button>
                   {/if}
-                  {#if grp.ownershipStatus !== 'owned'}
+
+                  {#if grp.presentation?.status !== 'owned' && grp.presentation?.status !== 'complete'}
                     <button
                       class="btn pill"
                       aria-label="Find {grp.label} on Nyaa"
-                      onclick={() => searchNyaa('volume', grp.volume)}
+                      onclick={() => searchNyaa('volume', grp.volume ?? undefined)}
                       title="Search Nyaa for {grp.label}"
                     >
                       <Icon name="search" size={14} /> Find Nyaa
                     </button>
                   {/if}
                 </div>
+              {/if}
+            </div>
+
+            <!-- Contradiction Warning Banner -->
+            {#if grp.presentation?.contradictionWarning}
+              <div class="volume-warning-box">
+                <Icon name="info" size={14} />
+                <span>{grp.presentation.contradictionWarning}</span>
+              </div>
+            {/if}
+
+            <!-- Active progress bar -->
+            {#if grp.presentation?.progressPercent != null && (grp.presentation.status === 'acquiring' || grp.presentation.physicalState === 'downloading')}
+              <div class="volume-progress-bar">
+                <div class="fill" style:width="{grp.presentation.progressPercent}%"></div>
+              </div>
+            {/if}
+
+            <!-- Empty volume notice when 0 chapters in reader source -->
+            {#if grp.chapters.length === 0}
+              <div class="empty-volume-notice">
+                <span>No source chapters listed for this volume in the current reader source.</span>
+                {#if grp.presentation?.status === 'owned' || grp.presentation?.status === 'complete'}
+                  <span class="muted">Owned canonically in Komga ({grp.presentation.bookName ?? 'CBZ file present'}).</span>
+                {:else}
+                  <button class="btn pill sm" onclick={() => searchNyaa('volume', grp.volume ?? undefined)}>
+                    <Icon name="search" size={12} /> Acquire via Nyaa
+                  </button>
+                {/if}
+              </div>
+            {/if}
+          {/if}
+
+          {#if grp.chapters.length > 0}
+            <ul class="rows">
+              {#each grp.chapters as chapter}
+                <li class:done={chapter.read}>
+                  <a class="main" href="#/read/{chapter.id}">
+                    <strong>
+                      {#if chapter.bookmark}<span class="kept"><Icon name="bookmark" size={14} fill /><span class="sr">Bookmarked.</span></span>{/if}
+                      {#if (chapter.volume !== undefined && chapter.volume !== null ? chapter.volume : parseVolume(chapter.name)) !== null && !view.volumes}
+                        <span class="tag vol">Vol. {chapter.volume ?? parseVolume(chapter.name)}</span>
+                      {/if}
+                      {chapter.name}
+                    </strong>
+                    <span>{about(chapter)}</span>
+                  </a>
+                  {#if isNew(chapter)}
+                    <span class="tag spot">New</span>
+                  {:else if !chapter.read && chapter.lastPageRead > 0 && chapter.pageCount}
+                    <span class="meter" aria-hidden="true"><span style:width="{Math.round(((chapter.lastPageRead + 1) / chapter.pageCount) * 100)}%"></span></span>
+                  {/if}
+                  {#if chapter.downloaded}
+                    <button
+                      class="btn icon"
+                      aria-label="Delete the saved file of {chapter.name}"
+                      disabled={busyChapter[chapter.id]}
+                      onclick={() => deleteFile(chapter)}
+                    >
+                      {#if busyChapter[chapter.id]}
+                        <span class="spin"><Icon name="spinner" size={18} stroke={3} /></span>
+                      {:else}
+                        <Icon name="trash" />
+                      {/if}
+                    </button>
+                  {:else}
+                    <button
+                      class="btn icon"
+                      aria-label="Download {chapter.name}"
+                      disabled={busyChapter[chapter.id]}
+                      onclick={() => download([chapter])}
+                    >
+                      {#if busyChapter[chapter.id]}
+                        <span class="spin"><Icon name="spinner" size={18} stroke={3} /></span>
+                      {:else}
+                        <Icon name="download" />
+                      {/if}
+                    </button>
+                  {/if}
+                  <!-- What is seldom wanted waits behind one button, so a row keeps to two. -->
+                  <div class="menu own">
+                    <button class="btn icon" aria-label="More for {chapter.name}" aria-expanded={opened === chapter.id} onclick={() => (opened = opened === chapter.id ? null : chapter.id)}>
+                      <Icon name="more" fill />
+                    </button>
+                    {#if opened === chapter.id}
+                      <div class="panel sheet">
+                        {#if title.webUrl}
+                          <a class="btn" href={title.webUrl} target="_blank" rel="noreferrer noopener">
+                            <Icon name="globe" size={18} stroke={3} />Open on site
+                          </a>
+                        {/if}
+                        <button class="btn" onclick={() => mark([chapter], !chapter.read)}>
+                          <Icon name="check" size={18} stroke={3} />{chapter.read ? 'Mark unread' : 'Mark read'}
+                        </button>
+                        <button class="btn" onclick={() => bookmark(chapter)}>
+                          <Icon name="bookmark" size={18} fill={chapter.bookmark} />{chapter.bookmark ? 'Take the bookmark off' : 'Bookmark'}
+                        </button>
+                      </div>
+                    {/if}
+                  </div>
+                </li>
+              {/each}
+            </ul>
+          {:else if grp.presentation}
+            <div class="empty-volume-notice">
+              <span>No reader extension chapters available for this volume.</span>
+              {#if grp.presentation.status === 'owned' || grp.presentation.status === 'complete'}
+                <span class="muted">Owned canonically in Komga ({grp.presentation.bookName ?? 'CBZ file present'}).</span>
+              {:else}
+                <button class="btn pill sm" onclick={() => searchNyaa('volume', grp.volume ?? undefined)}>
+                  <Icon name="search" size={12} /> Acquire via Nyaa
+                </button>
               {/if}
             </div>
           {/if}
@@ -1596,7 +1877,7 @@
               </div>
               {#if item.errorMessage}
                 <div class="item-error-box">
-                  <Icon name="alert-triangle" size={14} />
+                  <Icon name="info" size={14} />
                   <span>{item.errorMessage}</span>
                 </div>
               {/if}
@@ -1606,13 +1887,13 @@
       </div>
 
       <div class="modal-footer">
-        {#if ['APPROVED', 'PREFLIGHT', 'REVALIDATING', 'QUEUED', 'DOWNLOADING', 'VERIFYING', 'PUBLISHING', 'RECONCILING'].includes(activeExecution.status)}
-          <button class="btn danger" onclick={() => handleCancelExecution(activeExecution.id)} disabled={executionActionLoading}>
+        {#if activeExecution && ['APPROVED', 'PREFLIGHT', 'REVALIDATING', 'QUEUED', 'DOWNLOADING', 'VERIFYING', 'PUBLISHING', 'RECONCILING'].includes(activeExecution.status)}
+          <button class="btn danger" onclick={() => activeExecution && handleCancelExecution(activeExecution.id)} disabled={executionActionLoading}>
             Cancel Execution
           </button>
         {/if}
-        {#if ['PARTIAL', 'FAILED'].includes(activeExecution.status)}
-          <button class="btn spot" onclick={() => handleRetryExecution(activeExecution.id)} disabled={executionActionLoading}>
+        {#if activeExecution && ['PARTIAL', 'FAILED'].includes(activeExecution.status)}
+          <button class="btn spot" onclick={() => activeExecution && handleRetryExecution(activeExecution.id)} disabled={executionActionLoading}>
             Retry Failed Items
           </button>
         {/if}
@@ -2760,6 +3041,123 @@
     color: var(--spot, #ff7a00);
     font-weight: 600;
     font-size: 0.8rem;
+  }
+
+  /* Series Summary & Normalized Volume Status */
+  .series-summary-wrapper {
+    margin-bottom: 1.25rem;
+  }
+
+  .volume-group-row {
+    margin-top: 1.25rem;
+    margin-bottom: 0.5rem;
+  }
+
+  .status-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0.2rem 0.6rem;
+    border-radius: 9999px;
+    font-size: 0.78rem;
+    font-weight: 600;
+    letter-spacing: 0.02em;
+    line-height: 1.2;
+  }
+
+  .status-badge.status-complete,
+  .status-badge.status-neutral {
+    background: rgba(34, 197, 94, 0.15);
+    color: #4ade80;
+    border: 1px solid rgba(34, 197, 94, 0.3);
+  }
+
+  .status-badge.status-active {
+    background: rgba(59, 130, 246, 0.15);
+    color: #60a5fa;
+    border: 1px solid rgba(59, 130, 246, 0.3);
+  }
+
+  .status-badge.status-waiting {
+    background: rgba(245, 158, 11, 0.15);
+    color: #f59e0b;
+    border: 1px solid rgba(245, 158, 11, 0.3);
+  }
+
+  .status-badge.status-attention {
+    background: rgba(239, 68, 68, 0.15);
+    color: #f87171;
+    border: 1px solid rgba(239, 68, 68, 0.3);
+  }
+
+  .sub-states {
+    display: inline-flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    font-size: 0.75rem;
+    color: var(--muted, #888);
+  }
+
+  .sub-state {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+  }
+
+  .sub-state.physical {
+    color: var(--fg, #e2e8f0);
+  }
+
+  .sub-state.metadata {
+    color: var(--spot, #ff7a00);
+  }
+
+  .sub-state.metadata.metadata-error {
+    color: #ef4444;
+  }
+
+  .volume-warning-box {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.5rem 0.75rem;
+    background: rgba(245, 158, 11, 0.12);
+    border: 1px solid rgba(245, 158, 11, 0.3);
+    border-radius: 6px;
+    color: #f59e0b;
+    font-size: 0.8rem;
+    margin: 0.25rem 0 0.5rem;
+  }
+
+  .volume-progress-bar {
+    height: 4px;
+    background: rgba(255, 255, 255, 0.1);
+    border-radius: 2px;
+    overflow: hidden;
+    margin: 0.25rem 0;
+  }
+
+  .volume-progress-bar .fill {
+    height: 100%;
+    background: var(--spot, #ff7a00);
+    border-radius: 2px;
+    transition: width 0.3s ease;
+  }
+
+  .empty-volume-notice {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+    padding: 0.6rem 0.9rem;
+    background: rgba(255, 255, 255, 0.02);
+    border: 1px dashed var(--border-color, rgba(255, 255, 255, 0.1));
+    border-radius: 6px;
+    font-size: 0.82rem;
+    color: var(--muted, #888);
+    margin: 0.35rem 0 0.75rem;
   }
 </style>
 

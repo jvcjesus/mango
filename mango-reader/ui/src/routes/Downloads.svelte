@@ -5,25 +5,48 @@
   import Notice from '../lib/Notice.svelte';
   import { toast } from '../lib/toast.svelte';
   import { ago, formatBytes } from '../lib/util';
+  import { assignmentFor, unambiguousSuggestions, type ImportBook } from '../lib/importReview';
+  import { getStagingSummary } from '../lib/volumeStatus';
 
-  import {assignmentFor,unambiguousSuggestions,type ImportBook} from '../lib/importReview';
   let importBooks = $state<ImportBook[]>([]);
-  let importSeries = $state<Record<number,string>>({});
-  let importNumbers = $state<Record<number,string>>({});
-  let importKinds = $state<Record<number,string>>({});
-  let importEditions = $state<Record<number,string>>({});
-  async function assignBook(book:ImportBook,ignore=false) {try {
-    await send('POST',`/imports/${book.id}/assignment`,assignmentFor(book,{series:importSeries[book.id],kind:importKinds[book.id],number:importNumbers[book.id],edition:importEditions[book.id]},ignore));await load(true);
-  } catch(e){toast.error(message(e));}}
+  let importSeries = $state<Record<number, string>>({});
+  let importNumbers = $state<Record<number, string>>({});
+  let importKinds = $state<Record<number, string>>({});
+  let importEditions = $state<Record<number, string>>({});
+
+  async function assignBook(book: ImportBook, ignore = false) {
+    try {
+      await send(
+        'POST',
+        `/imports/${book.id}/assignment`,
+        assignmentFor(
+          book,
+          {
+            series: importSeries[book.id],
+            kind: importKinds[book.id],
+            number: importNumbers[book.id],
+            edition: importEditions[book.id],
+          },
+          ignore
+        )
+      );
+      await load(true);
+    } catch (e) {
+      toast.error(message(e));
+    }
+  }
+
   let data = $state<Queue | null>(null);
   let events = $state<PipelineEvent[]>([]);
   let loading = $state(true);
   let error = $state<string | null>(null);
   let togglingPause = $state(false);
   let clearing = $state(false);
+  let cleaningStaging = $state(false);
   let reordering = $state(false);
   let busyItems = $state<Record<number, boolean>>({});
   let expandedCollections = $state<Record<string, boolean>>({});
+  let showHistory = $state(false);
 
   type CollectionGroup = {
     collectionId: string;
@@ -34,9 +57,51 @@
   };
 
   const queue = $derived(data?.queue ?? []);
-  // Only chapters still waiting can be moved; active or verifying items stay where they are.
-  const movable = $derived(
+
+  // 1. Needs Attention items
+  const booksNeedingReview = $derived(importBooks.filter((b) => b.state === 'needs_review'));
+  const attentionQueue = $derived(
     queue.filter(
+      (q) =>
+        q.state === 'failed' ||
+        q.isStalled ||
+        q.metadataHandoff?.state === 'failed' ||
+        q.state === 'metadata_failed' ||
+        (q.canRetryKomga && !q.metadataHandoff)
+    )
+  );
+  const totalAttentionCount = $derived(booksNeedingReview.length + attentionQueue.length);
+
+  // 2. Active acquisitions (genuinely in flight or legitimately queued, excluding completed and attention items)
+  const activeQueue = $derived(
+    queue.filter(
+      (q) =>
+        q.state !== 'completed' &&
+        q.stage !== 'complete' &&
+        q.publishedPath == null &&
+        !attentionQueue.includes(q)
+    )
+  );
+
+  // 3. Staging cleanup summary
+  const stagingSummary = $derived(getStagingSummary(importBooks));
+
+  // 4. Completed History
+  const completedQueue = $derived(
+    queue.filter(
+      (q) => q.state === 'completed' || q.stage === 'complete' || q.publishedPath != null
+    )
+  );
+  const completedBooks = $derived(
+    importBooks.filter((b) => b.state === 'completed' || b.state === 'ignored')
+  );
+  const totalCompletedCount = $derived(
+    events.length + completedQueue.length + completedBooks.length
+  );
+
+  // Movable waiting items
+  const movable = $derived(
+    activeQueue.filter(
       (q) =>
         q.state !== 'downloading' &&
         q.stage !== 'downloading' &&
@@ -45,11 +110,11 @@
     )
   );
 
-  const groupedQueue = $derived.by(() => {
+  const groupedActiveQueue = $derived.by(() => {
     const collectionsMap = new Map<string, CollectionGroup>();
     const standalone: Queued[] = [];
 
-    for (const entry of queue) {
+    for (const entry of activeQueue) {
       if (entry.collectionId) {
         let group = collectionsMap.get(entry.collectionId);
         if (!group) {
@@ -80,7 +145,7 @@
         get<Queue>('/downloads'),
         get<PipelineEvent[]>('/pipeline/events').catch(() => []),
       ]);
-      importBooks = await get<ImportBook[]>('/imports');
+      importBooks = await get<ImportBook[]>('/imports').catch(() => []);
       data = freshQueue;
       events = freshEvents;
       if (!isBackground) error = null;
@@ -91,8 +156,6 @@
   }
   load();
 
-  // The queue changes by itself: chapters finish, and updates add new ones. So the
-  // screen looks again every two seconds for as long as it is open.
   $effect(() => {
     const timer = setInterval(() => load(true), 2000);
     return () => clearInterval(timer);
@@ -220,6 +283,23 @@
     }
   }
 
+  async function cleanAllCompletedStaging() {
+    if (cleaningStaging || !stagingSummary.completedPayloadChapters.length) return;
+    cleaningStaging = true;
+    const count = stagingSummary.completedPayloadChapters.length;
+    try {
+      for (const payload of stagingSummary.completedPayloadChapters) {
+        await send('POST', `/imports/payload/${payload}/cleanup`);
+      }
+      toast.success(`Cleaned staging for ${count} completed ${count === 1 ? 'payload' : 'payloads'}`);
+      await load();
+    } catch (e) {
+      toast.error(message(e));
+    } finally {
+      cleaningStaging = false;
+    }
+  }
+
   function describe(entry: Queued): string {
     if (entry.metadataHandoff) return entry.metadataHandoff.message;
     if (entry.statusMessage) return entry.statusMessage;
@@ -296,7 +376,8 @@
       case 'publishing': return 'Publishing';
       case 'komga': return 'Komga';
       case 'verifying': return 'Verifying';
-      case 'complete': return 'Complete';
+      case 'complete':
+      case 'completed': return 'Complete';
       case 'failed': return 'Failed';
       default: return 'Queued';
     }
@@ -307,7 +388,15 @@
   <div class="page-head">
     <div class="heading">
       <h1 class="display">DOWNLOADS</h1>
-      <strong>{queue.length} in the queue{data?.paused ? ', paused' : ''}</strong>
+      <span class="queue-status-text">
+        <strong>{activeQueue.length} active</strong>
+        {#if totalAttentionCount > 0}
+          · <span class="attention-badge">{totalAttentionCount} need attention</span>
+        {/if}
+        {#if data?.paused}
+          · <span class="paused-badge">Paused</span>
+        {/if}
+      </span>
     </div>
     {#if data}
       <div class="tools">
@@ -330,58 +419,156 @@
             Pause
           </button>
         {/if}
-        {#if queue.length}
+        {#if activeQueue.length}
           <button class="btn" disabled={clearing} onclick={clear}>
             {#if clearing}
               <span class="spin"><Icon name="spinner" size={18} stroke={3} /></span>
             {:else}
               <Icon name="trash" size={18} />
             {/if}
-            Clear queue
+            Clear active
           </button>
         {/if}
       </div>
     {/if}
   </div>
 
-  {#if importBooks.length}
-    <section aria-label="Import assignments" class="import-review">
-      <h2>Inspected books</h2>
-      <p>{importBooks.length} books found · {importBooks.filter(b=>b.state==='needs_review').length} need review · {importBooks.filter(b=>b.assignedNumber !== null).length} assigned · {importBooks.filter(b=>b.state==='ignored').length} ignored</p>
-      {#if unambiguousSuggestions(importBooks).length}
-        <button class="btn" onclick={async()=>{const books=unambiguousSuggestions(importBooks);if(await confirm({title:'Approve book assignments',message:`Import ${books.length} books using the displayed series, edition and unit suggestions? Duplicate alternatives and unknown books stay in review.`,confirmText:'Assign & Import'})){for(const book of books) await assignBook(book);}}}>Import numbered suggestions</button>
-      {/if}
-      {#each [...new Set(importBooks.map(b=>b.payloadChapter))] as payload}
-        <button class="btn" onclick={()=>act('POST',`/imports/payload/${payload}/cleanup`)}>Clean completed payload staging</button>
-      {/each}<p>Assignments control how books enter your library. Filename numbers are suggestions. Metadata is enriched after approval.</p>
-      {#each importBooks as book (book.id)}
-        <div class="import-book">
-          <strong>{book.series} · {book.innerPath}</strong><span class="tag">{book.state === 'needs_review' ? 'Needs Review' : book.state}</span>
-          {#if book.assignedNumber !== null}<span>{book.assignedKind === 'chapter' ? 'Chapter' : 'Volume'} {book.assignedNumber}{book.assignedEdition ? ` · ${book.assignedEdition} Edition` : ''}</span>{/if}
-          {#if book.state === 'needs_review'}
-            <label>Series <input aria-label="Assigned series" placeholder={book.series} bind:value={importSeries[book.id]} /></label>
-            <label>Unit <select aria-label="Unit kind" bind:value={importKinds[book.id]}><option value="volume">Volume</option><option value="chapter">Chapter</option></select></label>
-            <label>Number <input type="number" min="0" step="any" aria-label="Assigned number" placeholder={String(book.suggestedNumber ?? 'Required')} bind:value={importNumbers[book.id]} /></label>
-            <label>Edition (optional) <input aria-label="Edition label" placeholder={book.suggestedEdition ?? 'Optional'} bind:value={importEditions[book.id]} /></label>
-            <button class="btn" onclick={()=>assignBook(book)}>Assign & Import</button><button class="btn" onclick={()=>assignBook(book,true)}>Ignore</button>
-          {/if}
-        </div>
-      {/each}
-    </section>
-  {/if}
   <Notice {loading} {error} retry={() => load(false)} />
 
-  {#if data}
-    {#if queue.length === 0}
-      <Notice>
-        Nothing is waiting. Chapters are queued from a title's page, from Updates, or by themselves for titles set to download new chapters.
-      </Notice>
-    {:else}
+  <!-- SECTION 1: NEEDS ATTENTION -->
+  {#if totalAttentionCount > 0}
+    <section class="section-card attention-card" aria-label="Items needing attention">
+      <div class="section-header">
+        <div class="header-left">
+          <span class="status-indicator error"></span>
+          <h2 class="display section-title">NEEDS ATTENTION ({totalAttentionCount})</h2>
+        </div>
+        {#if booksNeedingReview.length && unambiguousSuggestions(importBooks).length}
+          <button
+            class="btn pill spot action-btn"
+            onclick={async () => {
+              const books = unambiguousSuggestions(importBooks);
+              if (
+                await confirm({
+                  title: 'Approve book assignments',
+                  message: `Import ${books.length} books using the displayed series, edition and unit suggestions? Duplicate alternatives and unknown books stay in review.`,
+                  confirmText: 'Assign & Import',
+                })
+              ) {
+                for (const book of books) await assignBook(book);
+              }
+            }}
+          >
+            Import numbered suggestions ({unambiguousSuggestions(importBooks).length})
+          </button>
+        {/if}
+      </div>
+
+      <!-- Failed downloads / metadata errors -->
+      {#if attentionQueue.length > 0}
+        <ul class="rows attention-rows">
+          {#each attentionQueue as entry (entry.chapterId)}
+            <li class="attention-row">
+              <div class="main">
+                <div class="row-header">
+                  <strong>{entry.title}</strong>
+                  <span class="tag danger">{stageLabel(entry)}</span>
+                  {#if entry.volume != null}
+                    <span class="tag">Vol. {entry.volume}</span>
+                  {/if}
+                </div>
+                <span class="error-desc">{describe(entry)}</span>
+              </div>
+              <div class="tools">
+                {#if entry.metadataHandoff && entry.metadataHandoff.state !== 'succeeded'}
+                  <button
+                    class="btn pill spot"
+                    disabled={busyItems[entry.chapterId] || entry.metadataHandoff.state === 'submitting'}
+                    onclick={() => act('POST', `/downloads/${entry.chapterId}/retry-metadata`)}
+                  >
+                    <Icon name="refresh" size={14} /> Retry metadata
+                  </button>
+                {/if}
+                {#if entry.canRetryKomga && !entry.metadataHandoff}
+                  <button
+                    class="btn pill spot"
+                    disabled={busyItems[entry.chapterId]}
+                    onclick={() => act('POST', `/downloads/${entry.chapterId}/retry-komga`)}
+                  >
+                    <Icon name="refresh" size={14} /> Retry Komga
+                  </button>
+                {/if}
+                {#if entry.state === 'failed'}
+                  <button
+                    class="btn pill spot"
+                    disabled={busyItems[entry.chapterId]}
+                    onclick={() => act('POST', `/downloads/${entry.chapterId}/retry`)}
+                  >
+                    <Icon name="refresh" size={14} /> Try again
+                  </button>
+                {/if}
+                <button
+                  class="btn icon"
+                  aria-label="Cancel {entry.chapterName}"
+                  disabled={busyItems[entry.chapterId]}
+                  onclick={() => cancelDownload(entry)}
+                  title="Cancel this acquisition"
+                >
+                  <Icon name="close" size={16} />
+                </button>
+              </div>
+            </li>
+          {/each}
+        </ul>
+      {/if}
+
+      <!-- Inspected books needing review -->
+      {#if booksNeedingReview.length > 0}
+        <div class="review-books-list">
+          <p class="review-intro">Payload inspection discovered books that need series or volume confirmation before importing.</p>
+          {#each booksNeedingReview as book (book.id)}
+            <div class="import-book-card">
+              <div class="book-info">
+                <strong>{book.series}</strong>
+                <span class="inner-path-tag">{book.innerPath}</span>
+              </div>
+              <div class="book-inputs-row">
+                <label>Series <input aria-label="Assigned series" placeholder={book.series} bind:value={importSeries[book.id]} /></label>
+                <label>Unit
+                  <select aria-label="Unit kind" bind:value={importKinds[book.id]}>
+                    <option value="volume">Volume</option>
+                    <option value="chapter">Chapter</option>
+                  </select>
+                </label>
+                <label>Number <input type="number" min="0" step="any" aria-label="Assigned number" placeholder={String(book.suggestedNumber ?? 'Required')} bind:value={importNumbers[book.id]} /></label>
+                <label>Edition <input aria-label="Edition label" placeholder={book.suggestedEdition ?? 'Optional'} bind:value={importEditions[book.id]} /></label>
+                <div class="review-actions">
+                  <button class="btn spot" onclick={() => assignBook(book)}>Assign & Import</button>
+                  <button class="btn" onclick={() => assignBook(book, true)}>Ignore</button>
+                </div>
+              </div>
+            </div>
+          {/each}
+        </div>
+      {/if}
+    </section>
+  {/if}
+
+  <!-- SECTION 2: ACTIVE ACQUISITIONS -->
+  {#if activeQueue.length > 0}
+    <section class="section-card" aria-label="Active acquisitions">
+      <div class="section-header">
+        <div class="header-left">
+          <span class="status-indicator active"></span>
+          <h2 class="display section-title">ACTIVE WORK ({activeQueue.length})</h2>
+        </div>
+      </div>
+
       <div class="downloads-container">
         <!-- Grouped Collections if any -->
-        {#if groupedQueue.collections.length > 0}
+        {#if groupedActiveQueue.collections.length > 0}
           <div class="collections-section">
-            {#each groupedQueue.collections as col (col.collectionId)}
+            {#each groupedActiveQueue.collections as col (col.collectionId)}
               {@const isExpanded = expandedCollections[col.collectionId] ?? true}
               <div class="collection-card">
                 <div class="collection-header">
@@ -417,9 +604,7 @@
                         <div class="main">
                           <div class="row-header">
                             <strong>{entry.chapterName}</strong>
-                            <span class="tag" class:spot={entry.stage !== 'queued' && entry.stage !== 'failed' && !entry.isStalled} class:error={entry.stage === 'failed' || entry.isStalled}>
-                              {stageLabel(entry)}
-                            </span>
+                            <span class="tag spot">{stageLabel(entry)}</span>
                             {#if entry.rawTitle}
                               <span class="tag filename-tag">{entry.rawTitle}</span>
                             {/if}
@@ -434,22 +619,6 @@
                           {/if}
                         </div>
                         <span class="tools">
-                          {#if entry.metadataHandoff}
-                            {#if entry.metadataHandoff.state !== 'succeeded'}
-                              <button class="btn pill" disabled={busyItems[entry.chapterId] || (entry.metadataHandoff.state === 'unknown' && !entry.metadataHandoff.jobId) || entry.metadataHandoff.state === 'submitting'} onclick={() => act('POST', `/downloads/${entry.chapterId}/retry-metadata`)}>{entry.metadataHandoff.jobId && entry.metadataHandoff.state !== 'failed' ? 'Check metadata job' : 'Retry metadata'}</button>
-                            {/if}
-                          {/if}
-                          {#if entry.canRetryKomga && !entry.metadataHandoff}
-                            <button class="btn pill" disabled={busyItems[entry.chapterId]} onclick={() => act('POST', `/downloads/${entry.chapterId}/retry-komga`)}>
-                              <Icon name="refresh" size={16} />Retry Komga
-                            </button>
-                          {/if}
-                          {#if entry.state === 'needs_review'}<button class="btn" onclick={()=>act('POST',`/imports/payload/${entry.chapterId}/retry`)}>Retry inspection</button>{/if}
-                          {#if entry.state === 'failed'}
-                            <button class="btn" disabled={busyItems[entry.chapterId]} onclick={() => act('POST', `/downloads/${entry.chapterId}/retry`)}>
-                              <Icon name="refresh" size={18} />Try again
-                            </button>
-                          {/if}
                           <button
                             class="btn icon"
                             aria-label="Cancel {entry.chapterName}"
@@ -473,26 +642,24 @@
           </div>
         {/if}
 
-        <!-- Standalone items if any -->
-        {#if groupedQueue.standalone.length > 0}
+        <!-- Standalone active items -->
+        {#if groupedActiveQueue.standalone.length > 0}
           <ul class="rows">
-            {#each groupedQueue.standalone as entry (entry.chapterId)}
+            {#each groupedActiveQueue.standalone as entry (entry.chapterId)}
               {@const at = movable.indexOf(entry)}
               <li>
                 <a class="main" href="#/title/{entry.mangaId}">
                   <div class="row-header">
                     <strong>{entry.title}</strong>
-                    <span class="tag" class:spot={entry.stage !== 'queued' && entry.stage !== 'failed' && !entry.isStalled} class:error={entry.stage === 'failed' || entry.isStalled}>
-                      {stageLabel(entry)}
-                    </span>
+                    <span class="tag spot">{stageLabel(entry)}</span>
                     {#if entry.sourceType === 'nyaa'}
                       <span class="tag spot">Nyaa</span>
                     {/if}
                     {#if entry.uploader}
                       <span class="tag">{entry.uploader}</span>
                     {/if}
-                    {#if entry.releaseType === 'volume' || (entry.volume !== undefined && entry.volume !== null)}
-                      <span class="tag">Vol. {entry.volume ?? 'Special'}</span>
+                    {#if entry.volume != null}
+                      <span class="tag">Vol. {entry.volume}</span>
                     {/if}
                   </div>
                   <span>{entry.chapterName} · {describe(entry)}</span>
@@ -505,22 +672,6 @@
                   {/if}
                 </a>
                 <span class="tools">
-                  {#if entry.metadataHandoff}
-                            {#if entry.metadataHandoff.state !== 'succeeded'}
-                              <button class="btn pill" disabled={busyItems[entry.chapterId] || (entry.metadataHandoff.state === 'unknown' && !entry.metadataHandoff.jobId) || entry.metadataHandoff.state === 'submitting'} onclick={() => act('POST', `/downloads/${entry.chapterId}/retry-metadata`)}>{entry.metadataHandoff.jobId && entry.metadataHandoff.state !== 'failed' ? 'Check metadata job' : 'Retry metadata'}</button>
-                            {/if}
-                          {/if}
-                          {#if entry.canRetryKomga && !entry.metadataHandoff}
-                    <button class="btn pill" disabled={busyItems[entry.chapterId]} onclick={() => act('POST', `/downloads/${entry.chapterId}/retry-komga`)}>
-                      <Icon name="refresh" size={16} />Retry Komga Scan
-                    </button>
-                  {/if}
-                  {#if entry.state === 'needs_review'}<button class="btn" onclick={()=>act('POST',`/imports/payload/${entry.chapterId}/retry`)}>Retry inspection</button>{/if}
-                          {#if entry.state === 'failed'}
-                    <button class="btn" disabled={busyItems[entry.chapterId]} onclick={() => act('POST', `/downloads/${entry.chapterId}/retry`)}>
-                      <Icon name="refresh" size={18} />Try again
-                    </button>
-                  {/if}
                   {#if at >= 0}
                     <button class="btn icon" aria-label="Move {entry.chapterName} up" disabled={at === 0 || reordering} onclick={() => move(entry, -1)}>
                       <Icon name="up" />
@@ -547,117 +698,299 @@
           </ul>
         {/if}
       </div>
-    {/if}
+    </section>
+  {/if}
 
-    {#if events.length > 0}
-      <div class="acquisitions-section">
-        <div class="heading">
-          <h2 class="display">RECENT ACQUISITIONS</h2>
-          <strong>{events.length} recorded</strong>
+  <!-- SECTION 3: STAGING CLEANUP MAINTENANCE (CONSOLIDATED) -->
+  {#if stagingSummary.canClean}
+    <div class="staging-maintenance-card">
+      <div class="staging-info-group">
+        <Icon name="trash" size={18} />
+        <div>
+          <strong>Staging Cleanup</strong>
+          <p class="staging-subtext">
+            {stagingSummary.completedPayloadChapters.length} completed staging {stagingSummary.completedPayloadChapters.length === 1 ? 'payload is' : 'payloads are'} safely finished and ready for disk cleanup.
+          </p>
         </div>
-        <ul class="rows">
-          {#each events as evt (evt.id)}
-            <li class="event-item">
-              <div class="main">
-                <div class="row-header">
-                  <strong>{evt.series}</strong>
-                  {#if evt.outcome === 'published'}
-                    <span class="tag spot">Published</span>
-                  {:else if evt.outcome === 'already_published'}
-                    <span class="tag">Already in Library</span>
-                  {:else if evt.outcome === 'conflict'}
-                    <span class="tag error">Conflict</span>
-                  {:else if evt.outcome === 'error'}
-                    <span class="tag error">Error</span>
-                  {/if}
-                </div>
-                <span>
-                  {evt.release_name}
-                  {#if evt.destination}
-                    · <span class="muted" title={evt.destination}>Canonical library</span>
-                  {/if}
-                  · {ago(evt.timestamp * 1000)}
-                </span>
-                <div class="event-details">
-                  {#if evt.optimizer_status && !evt.optimizer_status.startsWith('skipped')}
-                    <span class="tag">{evt.optimizer_status}</span>
-                  {/if}
-                  {#if evt.mangabaka_status && !evt.mangabaka_status.startsWith('skipped')}
-                    <span class="tag">{evt.mangabaka_status}</span>
-                  {/if}
-                  {#if evt.komga_status && !evt.komga_status.startsWith('skipped')}
-                    <span class="tag">{evt.komga_status}</span>
-                  {/if}
-                  {#if evt.error}
-                    <span class="muted error-text">{evt.error}</span>
-                  {/if}
-                </div>
-              </div>
-            </li>
-          {/each}
-        </ul>
       </div>
-    {/if}
+      <button class="btn pill action-btn" disabled={cleaningStaging} onclick={cleanAllCompletedStaging}>
+        {#if cleaningStaging}
+          <span class="spin"><Icon name="spinner" size={14} stroke={3} /></span>
+        {/if}
+        Clean staging ({stagingSummary.completedPayloadChapters.length})
+      </button>
+    </div>
+  {/if}
+
+  <!-- SECTION 4: COMPLETED / HISTORY (COLLAPSED BY DEFAULT) -->
+  {#if totalCompletedCount > 0}
+    <div class="history-accordion-section">
+      <div class="section-header">
+        <button
+          class="btn pill icon-text history-toggle-btn"
+          aria-expanded={showHistory}
+          onclick={() => (showHistory = !showHistory)}
+        >
+          <Icon name={showHistory ? 'up' : 'down'} size={14} />
+          Acquisition History ({totalCompletedCount} completed)
+        </button>
+      </div>
+
+      {#if showHistory}
+        <div class="history-content">
+          {#if events.length > 0}
+            <div class="history-block">
+              <h3 class="display sub-title">RECENT CANONICAL PUBLICATIONS</h3>
+              <ul class="rows history-rows">
+                {#each events as evt (evt.id)}
+                  <li class="event-item">
+                    <div class="main">
+                      <div class="row-header">
+                        <strong>{evt.series}</strong>
+                        {#if evt.outcome === 'published'}
+                          <span class="tag spot">Published</span>
+                        {:else if evt.outcome === 'already_published'}
+                          <span class="tag">Already in Library</span>
+                        {:else if evt.outcome === 'conflict'}
+                          <span class="tag error">Conflict</span>
+                        {:else if evt.outcome === 'error'}
+                          <span class="tag error">Error</span>
+                        {/if}
+                      </div>
+                      <span>
+                        {evt.release_name}
+                        {#if evt.destination}
+                          · <span class="muted" title={evt.destination}>Canonical library</span>
+                        {/if}
+                        · {ago(evt.timestamp * 1000)}
+                      </span>
+                      <div class="event-details">
+                        {#if evt.optimizer_status && !evt.optimizer_status.startsWith('skipped')}
+                          <span class="tag">{evt.optimizer_status}</span>
+                        {/if}
+                        {#if evt.mangabaka_status && !evt.mangabaka_status.startsWith('skipped')}
+                          <span class="tag">{evt.mangabaka_status}</span>
+                        {/if}
+                        {#if evt.komga_status && !evt.komga_status.startsWith('skipped')}
+                          <span class="tag">{evt.komga_status}</span>
+                        {/if}
+                        {#if evt.error}
+                          <span class="muted error-text">{evt.error}</span>
+                        {/if}
+                      </div>
+                    </div>
+                  </li>
+                {/each}
+              </ul>
+            </div>
+          {/if}
+
+          {#if completedQueue.length > 0}
+            <div class="history-block">
+              <h3 class="display sub-title">COMPLETED DOWNLOAD JOBS</h3>
+              <ul class="rows history-rows">
+                {#each completedQueue as q (q.chapterId)}
+                  <li class="event-item">
+                    <div class="main">
+                      <div class="row-header">
+                        <strong>{q.title}</strong>
+                        <span class="tag spot">Complete</span>
+                        {#if q.volume != null}
+                          <span class="tag">Vol. {q.volume}</span>
+                        {/if}
+                      </div>
+                      <span class="muted">{q.chapterName} · {q.rawTitle ?? ''}</span>
+                    </div>
+                  </li>
+                {/each}
+              </ul>
+            </div>
+          {/if}
+        </div>
+      {/if}
+    </div>
+  {/if}
+
+  <!-- EMPTY STATE -->
+  {#if activeQueue.length === 0 && totalAttentionCount === 0 && totalCompletedCount === 0}
+    <Notice>
+      Nothing is waiting. Acquisitions are triggered from a title's page, from Updates, or by background title rules.
+    </Notice>
   {/if}
 </div>
 
 <style>
-  .heading {
+  .page {
     display: flex;
-    flex-wrap: wrap;
-    align-items: baseline;
-    gap: 6px 18px;
+    flex-direction: column;
+    gap: 24px;
   }
 
-  .row-header {
+  .heading {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .queue-status-text {
+    font-size: 14px;
+    color: var(--muted);
+  }
+
+  .attention-badge {
+    color: var(--error, #e53935);
+    font-weight: 700;
+  }
+
+  .paused-badge {
+    font-weight: 700;
+    color: var(--ink);
+  }
+
+  .section-card {
+    background: var(--surface);
+    border: 2px solid var(--ink);
+    border-radius: var(--radius, 6px);
+    overflow: hidden;
+    box-shadow: 2px 2px 0 var(--ink);
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+  }
+
+  .section-card.attention-card {
+    border-color: var(--error, #e53935);
+    background: #fff8f8;
+  }
+
+  .section-header {
     display: flex;
     align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+
+  .header-left {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .status-indicator {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    border: 1.5px solid var(--ink);
+  }
+
+  .status-indicator.error {
+    background: var(--error, #e53935);
+  }
+
+  .status-indicator.active {
+    background: #0284c7;
+  }
+
+  .section-title {
+    font-size: 16px;
+    margin: 0;
+  }
+
+  .sub-title {
+    font-size: 13px;
+    margin: 12px 0 6px;
+    color: var(--muted);
+  }
+
+  .attention-rows {
+    background: var(--surface);
+    border: 1px solid var(--ink);
+    border-radius: 4px;
+  }
+
+  .attention-row {
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--muted);
+  }
+
+  .attention-row:last-child {
+    border-bottom: none;
+  }
+
+  .error-desc {
+    font-size: 13px;
+    color: var(--error, #e53935);
+    font-weight: 500;
+  }
+
+  .review-intro {
+    font-size: 13px;
+    color: var(--muted);
+    margin-bottom: 8px;
+  }
+
+  .review-books-list {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .import-book-card {
+    background: var(--surface);
+    border: 1.5px solid var(--ink);
+    border-radius: 4px;
+    padding: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .book-info {
+    display: flex;
+    align-items: baseline;
     gap: 8px;
     flex-wrap: wrap;
   }
 
-  .acquisitions-section {
-    margin-top: 36px;
+  .inner-path-tag {
+    font-size: 12px;
+    color: var(--muted);
+    word-break: break-all;
   }
 
-  .event-details {
+  .book-inputs-row {
     display: flex;
+    align-items: flex-end;
+    gap: 8px;
     flex-wrap: wrap;
+  }
+
+  .book-inputs-row label {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+  }
+
+  .book-inputs-row input,
+  .book-inputs-row select {
+    padding: 4px 8px;
+    border: 1px solid var(--ink);
+    border-radius: 4px;
+    font-size: 13px;
+  }
+
+  .review-actions {
+    display: flex;
+    align-items: center;
     gap: 6px;
-    margin-top: 4px;
-    font-size: 0.85rem;
-  }
-
-  .error-text {
-    color: var(--error, #e53935);
-  }
-
-  ul {
-    margin: 0;
-    padding: 0;
-    list-style: none;
-  }
-
-  li {
-    flex-wrap: wrap;
-  }
-
-  .meter {
-    width: min(320px, 100%);
-    margin-top: 6px;
-  }
-
-  .meter span {
-    background: var(--spot);
   }
 
   .downloads-container {
-    display: flex;
-    flex-direction: column;
-    gap: 20px;
-  }
-
-  .collections-section {
     display: flex;
     flex-direction: column;
     gap: 16px;
@@ -675,7 +1008,7 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    padding: 12px 16px;
+    padding: 10px 14px;
     background: var(--shade);
     border-bottom: 2px solid var(--ink);
     gap: 12px;
@@ -696,7 +1029,7 @@
   }
 
   .collection-title {
-    font-size: 15px;
+    font-size: 14px;
     margin: 0;
     word-break: break-word;
   }
@@ -713,7 +1046,7 @@
   }
 
   .collection-unit-rows li {
-    padding: 10px 16px;
+    padding: 8px 14px;
     border-bottom: 1px solid var(--ink);
   }
 
@@ -721,12 +1054,104 @@
     border-bottom: none;
   }
 
+  .staging-maintenance-card {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 16px;
+    background: var(--surface);
+    border: 2px dashed var(--ink);
+    border-radius: 6px;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+
+  .staging-info-group {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .staging-subtext {
+    font-size: 12px;
+    color: var(--muted);
+    margin: 2px 0 0;
+  }
+
+  .history-accordion-section {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .history-toggle-btn {
+    font-size: 13px;
+    font-weight: 700;
+  }
+
+  .history-content {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    padding: 12px 16px;
+    background: var(--surface);
+    border: 2px solid var(--ink);
+    border-radius: 6px;
+  }
+
+  .history-rows li {
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--muted);
+  }
+
+  .history-rows li:last-child {
+    border-bottom: none;
+  }
+
+  .row-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .event-details {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin-top: 4px;
+    font-size: 0.85rem;
+  }
+
+  .meter {
+    width: min(320px, 100%);
+    margin-top: 4px;
+    height: 8px;
+  }
+
+  .meter span {
+    background: #0284c7;
+  }
+
   .filename-tag {
     font-size: 11px;
-    max-width: 280px;
+    max-width: 260px;
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
   }
-.import-review {padding:16px;border:1px solid var(--ink);margin-bottom:24px;} .import-book {display:flex;flex-wrap:wrap;gap:12px;padding:16px 0;align-items:center;border-bottom:1px solid var(--muted);} .import-book strong {width:100%;overflow-wrap:anywhere;} .import-book input {max-width:100%;} .import-book label {display:flex;flex-direction:column;gap:4px;}
+
+  ul {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+  }
+
+  li {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
 </style>
