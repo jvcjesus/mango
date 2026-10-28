@@ -298,20 +298,74 @@ pub fn resolve_missing_content_for_title(
         }
     }
 
-    // Query acquiring downloads from active download queue
+    // Query acquiring downloads from active download queue for this manga
     let mut acquiring_vols = Vec::new();
-    let acquiring_chaps = Vec::new();
+    let mut acquiring_chaps = Vec::new();
     if let Ok(mut stmt) = conn.prepare(
-        "SELECT raw_title, chapter_id FROM downloads WHERE (state = 'downloading' OR state = 'queued' OR state = 'pending') AND (raw_title LIKE ?1 OR collection_name LIKE ?1)",
+        "SELECT d.raw_title, c.name, c.chapter_number, d.retrieval_identity_json, d.published_path
+         FROM downloads d
+         JOIN chapters c ON c.id = d.chapter_id
+         WHERE c.manga_id = ?1
+           AND d.state IN ('downloading', 'queued', 'pending', 'verifying', 'metadata_wait', 'metadata_review', 'metadata_failed', 'importing', 'needs_review')",
     ) {
-        let pattern = format!("%{title}%");
-        if let Ok(rows) = stmt.query_map([&pattern], |r| {
-            Ok((r.get::<_, Option<String>>(0)?, r.get::<_, Option<i64>>(1)?))
+        if let Ok(rows) = stmt.query_map([manga_id], |r| {
+            Ok((
+                r.get::<_, Option<String>>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, f64>(2)?,
+                r.get::<_, Option<String>>(3)?,
+                r.get::<_, Option<String>>(4)?,
+            ))
         }) {
-            for row in rows.flatten() {
-                if let Some(raw) = row.0 {
-                    if let Some(v) = crate::release::parse_volume(&raw) {
+            for (raw, name, num, identity_json, pub_path) in rows.flatten() {
+                // If already published, it is owned/published, not just acquiring
+                if pub_path.is_some() {
+                    let vol_opt = crate::release::parse_volume(&name)
+                        .or_else(|| pub_path.as_deref().and_then(crate::release::parse_volume))
+                        .or_else(|| raw.as_deref().and_then(crate::release::parse_volume));
+                    if let Some(v) = vol_opt {
+                        if !owned_vols.iter().any(|(ov, _)| (*ov - v).abs() < 0.001) {
+                            owned_vols.push((v, None));
+                        }
+                    } else if num >= 0.0 && !owned_chaps.iter().any(|oc| (*oc - num).abs() < 0.001) {
+                        owned_chaps.push(num);
+                    }
+                    continue;
+                }
+                let parsed_unit = identity_json
+                    .as_deref()
+                    .and_then(|s| serde_json::from_str::<super::edition::RetrievalIdentity>(s).ok())
+                    .map(|id| id.requested_unit);
+                if let Some(super::AcquisitionReleaseUnit::Volume(v)) = parsed_unit {
+                    acquiring_vols.push(v);
+                } else if let Some(super::AcquisitionReleaseUnit::Chapter(c)) = parsed_unit {
+                    acquiring_chaps.push(c);
+                } else {
+                    let vol_opt = raw.as_deref().and_then(crate::release::parse_volume)
+                        .or_else(|| crate::release::parse_volume(&name));
+                    if let Some(v) = vol_opt {
                         acquiring_vols.push(v);
+                    } else if num >= 0.0 {
+                        acquiring_chaps.push(num);
+                    }
+                }
+            }
+        }
+    }
+
+    // Also check acquisition_history for completed/published items
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT release_name, canonical_path FROM acquisition_history
+         WHERE manga_id = ?1 AND outcome IN ('completed', 'published') AND canonical_path IS NOT NULL",
+    ) {
+        if let Ok(rows) = stmt.query_map([manga_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        }) {
+            for (rel_name, can_path) in rows.flatten() {
+                let path_ref = can_path.as_deref().unwrap_or(&rel_name);
+                if let Some(v) = crate::release::parse_volume(path_ref).or_else(|| crate::release::parse_volume(&rel_name)) {
+                    if !owned_vols.iter().any(|(ov, _)| (*ov - v).abs() < 0.001) {
+                        owned_vols.push((v, None));
                     }
                 }
             }

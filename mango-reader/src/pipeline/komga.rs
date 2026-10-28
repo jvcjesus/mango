@@ -528,10 +528,15 @@ impl KomgaClient {
                 });
                 let exact_path = matches!(&path, Some(Ok(p)) if p == &canonical);
 
+                let meta_num_is_positional = meta
+                    .and_then(|m| m.number.as_deref())
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .is_some_and(|v| (v - book.number).abs() < 0.001);
+
                 let (unit, n) = crate::release::classify_komga_book(
                     &book.name,
                     meta.and_then(|m| m.title.as_deref()),
-                    if exact_path {
+                    if exact_path && meta_num_is_positional {
                         None
                     } else {
                         meta.and_then(|m| m.number.as_deref())
@@ -572,13 +577,15 @@ impl KomgaClient {
                 if (n - number).abs() >= 0.001 {
                     continue;
                 }
-                if !exact_path
-                    && meta
-                        .and_then(|m| m.number.as_deref())
-                        .and_then(|v| v.parse::<f64>().ok())
-                        .is_some_and(|v| (v - n).abs() >= 0.001)
+                if let Some(meta_num) = meta
+                    .and_then(|m| m.number.as_deref())
+                    .and_then(|v| v.parse::<f64>().ok())
                 {
-                    return Err(AppError::bad_request("Conflicting Komga release numbering"));
+                    let is_conflict = (meta_num - n).abs() >= 0.001;
+                    let is_ignorable_positional = exact_path && (meta_num - book.number).abs() < 0.001;
+                    if is_conflict && !is_ignorable_positional {
+                        return Err(AppError::bad_request("Conflicting Komga release numbering"));
+                    }
                 }
                 match path {
                     Some(Ok(p)) if p == canonical => matched.push(book),

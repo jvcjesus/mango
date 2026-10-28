@@ -405,15 +405,98 @@ impl Pipeline {
             .await?;
         self.ownership.invalidate(manga_id);
         let sid = book.series_id.clone();
-        let mb=self.db.call(move|c| {
-            let mapping:Option<(String,String)>=c.query_row("SELECT tracker_id,confidence FROM tracker_mappings WHERE komga_series_id=?1 AND tracker='mangabaka'",[sid],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
-            let mapped=if let Some((value,confidence))=mapping {
-                if confidence!="resolved" {return Err(AppError::bad_request("Unresolved MangaBaka mapping"));}
-                Some(value.parse::<i64>().ok().filter(|v|*v>0).ok_or_else(||AppError::bad_request("Invalid MangaBaka mapping"))?)
-            } else {None};
-            if identity.zip(mapped).is_some_and(|(a,b)|a!=b) {return Err(AppError::bad_request("Conflicting MangaBaka mappings"));}
-            identity.or(mapped).ok_or_else(||AppError::bad_request("Missing authoritative MangaBaka identity"))
-        }).await;
+        let pub_title = title.to_string();
+        let mb = self
+            .db
+            .call(move |c| {
+                let mapping: Option<(String, String)> = c
+                    .query_row(
+                        "SELECT tracker_id, confidence FROM tracker_mappings WHERE komga_series_id=?1 AND tracker='mangabaka'",
+                        [&sid],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                let mapped = if let Some((value, confidence)) = mapping {
+                    if confidence != "resolved" {
+                        return Err(AppError::bad_request("Unresolved MangaBaka mapping"));
+                    }
+                    Some(
+                        value
+                            .parse::<i64>()
+                            .ok()
+                            .filter(|v| *v > 0)
+                            .ok_or_else(|| AppError::bad_request("Invalid MangaBaka mapping"))?,
+                    )
+                } else {
+                    None
+                };
+                if identity.zip(mapped).is_some_and(|(a, b)| a != b) {
+                    return Err(AppError::bad_request("Conflicting MangaBaka mappings"));
+                }
+                if let Some(id) = identity.or(mapped) {
+                    return Ok(id);
+                }
+
+                // Check acquisition_history for this series
+                let hist_id: Option<i64> = c
+                    .query_row(
+                        "SELECT CASE WHEN COUNT(DISTINCT mangabaka_id) = 1 THEN MAX(mangabaka_id) ELSE NULL END
+                         FROM acquisition_history
+                         WHERE (manga_id = ?1 OR series = ?2) AND mangabaka_id IS NOT NULL AND mangabaka_id > 0",
+                        rusqlite::params![manga_id, &pub_title],
+                        |r| r.get(0),
+                    )
+                    .optional()?
+                    .flatten();
+                if let Some(id) = hist_id {
+                    let _ = c.execute(
+                        "INSERT OR IGNORE INTO tracker_mappings (komga_series_id, tracker, tracker_id, updated_at, mapping_source, confidence)
+                         VALUES (?1, 'mangabaka', ?2, strftime('%s','now'), 'history_provenance', 'resolved')",
+                        rusqlite::params![&sid, id.to_string()],
+                    );
+                    return Ok(id);
+                }
+
+                // Check tracker_list_entries for an exact title match with tracker = 'mangabaka'
+                let norm = crate::pipeline::mangabaka::normalize_title(&pub_title);
+                let mut stmt = c.prepare(
+                    "SELECT tracker_id, title, english_title, romaji_title FROM tracker_list_entries WHERE tracker = 'mangabaka'",
+                )?;
+                let rows = stmt.query_map([], |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, Option<String>>(3)?,
+                    ))
+                })?;
+                let mut matched_ids = std::collections::BTreeSet::new();
+                for r in rows.flatten() {
+                    let (tid, t_title, en_title, ro_title) = r;
+                    if crate::pipeline::mangabaka::normalize_title(&t_title) == norm
+                        || en_title.as_deref().map(crate::pipeline::mangabaka::normalize_title) == Some(norm.clone())
+                        || ro_title.as_deref().map(crate::pipeline::mangabaka::normalize_title) == Some(norm.clone())
+                    {
+                        if let Ok(num) = tid.parse::<i64>() {
+                            if num > 0 {
+                                matched_ids.insert(num);
+                            }
+                        }
+                    }
+                }
+                if matched_ids.len() == 1 {
+                    let id = matched_ids.into_iter().next().unwrap();
+                    let _ = c.execute(
+                        "INSERT OR IGNORE INTO tracker_mappings (komga_series_id, tracker, tracker_id, updated_at, mapping_source, confidence)
+                         VALUES (?1, 'mangabaka', ?2, strftime('%s','now'), 'catalog_exact_match', 'resolved')",
+                        rusqlite::params![&sid, id.to_string()],
+                    );
+                    return Ok(id);
+                }
+
+                Err(AppError::bad_request("Missing authoritative MangaBaka identity"))
+            })
+            .await;
         let mb = match mb {
             Ok(v) => v,
             Err(_) => {
@@ -1025,5 +1108,83 @@ mod tests {
         assert_eq!(f.server.polls.load(Ordering::SeqCst), book_polls);
         assert_eq!(before, fs::read(&f.path).unwrap());
         assert_eq!(f.record().await.state, "succeeded");
+    }
+
+    #[tokio::test]
+    async fn komf_resolves_mangabaka_from_tracker_list_and_links_mapping() {
+        let f = Fixture::new().await;
+        // Clear mangabaka_id from acquisition_history to simulate manual/interactive acquisition
+        f.db.call(|c| {
+            c.execute("UPDATE acquisition_history SET mangabaka_id=NULL WHERE chapter_id=1", [])?;
+            // Insert exact match in tracker_list_entries
+            c.execute(
+                "INSERT INTO tracker_list_entries (tracker, tracker_id, title, status, normalized_status, updated_at)
+                 VALUES ('mangabaka', '3251', 'Handoff Series', 'plan_to_read', 'planning', 0)",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        assert!(f.run(false).await);
+        assert_eq!(f.posts(), 1);
+        assert_eq!(
+            f.server.posts.lock().unwrap()[0],
+            json!({"bookId":"book-1","provider":"MANGA_BAKA","providerSeriesId":"3251","libraryId":"english"})
+        );
+        // Verify mapping was saved to tracker_mappings
+        let saved_mapping: String = f
+            .db
+            .call(|c| {
+                Ok(c.query_row(
+                    "SELECT tracker_id FROM tracker_mappings WHERE komga_series_id='series-1' AND tracker='mangabaka'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(saved_mapping, "3251");
+        assert_eq!(f.record().await.state, "succeeded");
+    }
+
+    #[tokio::test]
+    async fn komf_retry_on_published_book_never_resets_to_download() {
+        let f = Fixture::new().await;
+        // Simulate metadata in review or failed
+        f.db.call(|c| {
+            c.execute("UPDATE downloads SET state='metadata_review', error='Needs review' WHERE chapter_id=1", [])?;
+            c.execute("UPDATE metadata_handoffs SET state='needs_review' WHERE chapter_id=1", [])?;
+            Ok(())
+        }).await.unwrap();
+
+        let host = crate::host::Host::new(
+            crate::config::HostConfig::default(),
+            f.root.join("host-worker-retry"),
+            &f.root,
+        )
+        .unwrap();
+        let images = crate::images::Images::new(
+            f.db.clone(),
+            host,
+            crate::local::Local::new(f.root.join("local-worker-retry")),
+            &f.root,
+            10,
+        );
+        let mut downloads = crate::downloads::Downloads::new(f.db.clone(), images, &f.root, 0);
+        let restarted = Pipeline::new(f.db.clone());
+        restarted.set_verification_policy(VerificationPolicy::fast_test());
+        downloads.set_pipeline(Arc::new(restarted));
+
+        // Call downloads.retry()
+        downloads.retry(1).await.unwrap();
+
+        // Verify downloads did NOT reset to queued or downloading!
+        let state: String = f.db.call(|c| {
+            Ok(c.query_row("SELECT state FROM downloads WHERE chapter_id=1", [], |r| r.get(0)).unwrap_or_else(|_| "completed".into()))
+        }).await.unwrap();
+        assert_ne!(state, "queued");
+        assert_ne!(state, "downloading");
     }
 }

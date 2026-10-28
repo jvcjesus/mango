@@ -762,6 +762,35 @@ impl AcquisitionService {
             }
         }
 
+        // Query published/completed items from acquisition history to ensure canonical publications are treated as owned
+        let published_history: Vec<(String, Option<String>)> = self
+            .db
+            .call(move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT release_name, canonical_path FROM acquisition_history WHERE manga_id = ?1 AND outcome IN ('completed', 'published') AND canonical_path IS NOT NULL",
+                )?;
+                let rows = stmt
+                    .query_map([manga_id], |r| Ok((r.get(0)?, r.get(1)?)))?
+                    .filter_map(std::result::Result::ok)
+                    .collect();
+                Ok(rows)
+            })
+            .await?;
+        for (rel_name, can_path) in published_history {
+            let path_ref = can_path.as_deref().unwrap_or(&rel_name);
+            let rel = crate::release::parse_release(path_ref, 0.0);
+            let key = if rel.release_type == crate::release::ReleaseType::Volume {
+                rel.volume
+                    .map(|v| format!("v{v}"))
+                    .or_else(|| crate::release::parse_volume(path_ref).map(|v| format!("v{v}")))
+            } else {
+                rel.chapter_number.map(|c| format!("c{c}"))
+            };
+            if let Some(k) = key {
+                owned_set.insert(k);
+            }
+        }
+
         Ok((owned_set, acquiring_set))
     }
 
@@ -1836,11 +1865,11 @@ impl AcquisitionService {
         }
 
         // D. Existing Ownership reconciliation
-        let (owned_set, _) = if exec
+        let physical = exec
             .items
             .iter()
-            .all(|item| !item.frozen_candidate.provider_metadata["selectedArchive"].is_null())
-        {
+            .all(|item| item.frozen_candidate.provider_metadata["inspectPayload"] == true);
+        let (owned_set, _) = if physical {
             (
                 std::collections::HashSet::new(),
                 std::collections::HashSet::new(),
@@ -1856,23 +1885,22 @@ impl AcquisitionService {
 
         let mut all_skipped = true;
         for item in &mut exec.items {
-            let edition_owned =
-                if !item.frozen_candidate.provider_metadata["selectedArchive"].is_null() {
-                    vec![]
-                } else if let Some(edition) = item.frozen_candidate.provider_metadata
-                    ["requestedEdition"]
-                    .as_str()
-                    .filter(|ed| *ed != "standard")
-                {
-                    self.source_edition_ownership(exec.manga_id, &exec.title, edition)
-                        .await?
-                        .1
-                } else {
-                    vec![]
-                };
+            let edition_owned = if item.frozen_candidate.provider_metadata["inspectPayload"] == true {
+                vec![]
+            } else if let Some(edition) = item.frozen_candidate.provider_metadata
+                ["requestedEdition"]
+                .as_str()
+                .filter(|ed| *ed != "standard")
+            {
+                self.source_edition_ownership(exec.manga_id, &exec.title, edition)
+                    .await?
+                    .1
+            } else {
+                vec![]
+            };
             let (still_needed, _) = crate::acquisition::execution::reconcile_preflight_ownership(
                 &item.expected_units,
-                if !item.frozen_candidate.provider_metadata["selectedArchive"].is_null()
+                if item.frozen_candidate.provider_metadata["inspectPayload"] == true
                     || item.frozen_candidate.provider_metadata["requestedUnit"]["type"] == "chapter"
                 {
                     &[]
@@ -1897,7 +1925,7 @@ impl AcquisitionService {
                                 &iid,
                                 ExecutionItemStatus::Skipped,
                                 None,
-                                Some("All expected units are already owned"),
+                                Some("All expected units are already owned or published"),
                             )
                         }
                     })
@@ -2166,7 +2194,8 @@ impl AcquisitionService {
                         ?1, 'queued', (SELECT COALESCE(MAX(position), 0) + 1 FROM downloads), 0, ?2,
                         ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11
                     ) ON CONFLICT(chapter_id) DO UPDATE SET
-                        state = 'queued', attempts = 0, retry_at = NULL, error = NULL,
+                        state = CASE WHEN downloads.published_path IS NOT NULL OR (SELECT download_path FROM chapters WHERE id = downloads.chapter_id) IS NOT NULL THEN 'verifying' ELSE 'queued' END,
+                        attempts = 0, retry_at = NULL, error = NULL,
                         source_type = excluded.source_type, backend_type = excluded.backend_type,
                         raw_title = excluded.raw_title, uploader = excluded.uploader,
                         release_size = excluded.release_size, torrent_hash = excluded.torrent_hash,

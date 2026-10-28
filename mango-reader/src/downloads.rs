@@ -308,7 +308,31 @@ impl Downloads {
     /// Retry/resume metadata delivery only. Never queues source retrieval or physical processing.
     pub async fn retry_metadata(&self, chapter: i64) -> Result<String> {
         let (title, path, library, name, number): (String,String,Option<String>,String,f64) = self.db.call(move |c| {
-            Ok(c.query_row("SELECT m.title,COALESCE(d.published_path,h.canonical_path),COALESCE(d.target_library_id,h.library_id),ch.name,ch.chapter_number FROM chapters ch JOIN manga m ON m.id=ch.manga_id LEFT JOIN downloads d ON d.chapter_id=ch.id LEFT JOIN metadata_handoffs h ON h.chapter_id=ch.id WHERE ch.id=?1 AND COALESCE(d.published_path,h.canonical_path) IS NOT NULL",[chapter],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?)))?)
+            Ok(c.query_row(
+                "SELECT m.title,
+                        COALESCE(
+                            d.published_path,
+                            h.canonical_path,
+                            ch.download_path,
+                            (SELECT ah.canonical_path FROM acquisition_history ah WHERE ah.chapter_id = ch.id AND ah.outcome IN ('completed', 'published') AND ah.canonical_path IS NOT NULL ORDER BY ah.id DESC LIMIT 1)
+                        ),
+                        COALESCE(d.target_library_id, h.library_id),
+                        ch.name,
+                        ch.chapter_number
+                 FROM chapters ch
+                 JOIN manga m ON m.id = ch.manga_id
+                 LEFT JOIN downloads d ON d.chapter_id = ch.id
+                 LEFT JOIN metadata_handoffs h ON h.chapter_id = ch.id
+                 WHERE ch.id = ?1
+                   AND COALESCE(
+                       d.published_path,
+                       h.canonical_path,
+                       ch.download_path,
+                       (SELECT ah.canonical_path FROM acquisition_history ah WHERE ah.chapter_id = ch.id AND ah.outcome IN ('completed', 'published') AND ah.canonical_path IS NOT NULL ORDER BY ah.id DESC LIMIT 1)
+                   ) IS NOT NULL",
+                [chapter],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )?)
         }).await?;
         let pipeline = self
             .pipeline
@@ -564,10 +588,34 @@ impl Downloads {
 
     /// Gives a parked chapter a fresh set of tries.
     pub async fn retry(&self, chapter: i64) -> Result<()> {
-        if self
+        let has_canonical: bool = self
             .db
-            .call(move |c| Ok(crate::pipeline::komf::read(c, chapter)?.is_some()))
-            .await?
+            .call(move |c| {
+                let path: Option<String> = c
+                    .query_row(
+                        "SELECT COALESCE(
+                            d.published_path,
+                            (SELECT h.canonical_path FROM metadata_handoffs h WHERE h.chapter_id = ?1),
+                            c.download_path,
+                            (SELECT ah.canonical_path FROM acquisition_history ah WHERE ah.chapter_id = ?1 AND ah.outcome IN ('completed', 'published') AND ah.canonical_path IS NOT NULL ORDER BY ah.id DESC LIMIT 1)
+                        ) FROM chapters c LEFT JOIN downloads d ON d.chapter_id = c.id WHERE c.id = ?1",
+                        [chapter],
+                        |r| r.get(0),
+                    )
+                    .optional()?
+                    .flatten();
+                Ok(path
+                    .map(PathBuf::from)
+                    .is_some_and(|p| p.is_file() && crate::pipeline::publisher::verify_cbz_integrity(&p).is_ok()))
+            })
+            .await
+            .unwrap_or(false);
+
+        if has_canonical
+            || self
+                .db
+                .call(move |c| Ok(crate::pipeline::komf::read(c, chapter)?.is_some()))
+                .await?
         {
             self.retry_metadata(chapter).await?;
             return Ok(());
@@ -691,10 +739,30 @@ impl Downloads {
                             [ch_id],
                         )?;
                     } else {
-                        conn.execute(
-                            "UPDATE downloads SET published_path = NULL, state = 'queued', error = NULL WHERE chapter_id = ?1",
-                            [ch_id],
-                        )?;
+                        let alt_path: Option<String> = conn
+                            .query_row(
+                                "SELECT download_path FROM chapters WHERE id = ?1",
+                                [ch_id],
+                                |r| r.get(0),
+                            )
+                            .optional()?
+                            .flatten();
+                        let recovered = alt_path
+                            .as_ref()
+                            .map(PathBuf::from)
+                            .filter(|p| p.is_file() && crate::pipeline::publisher::verify_cbz_integrity(p).is_ok());
+                        if let Some(rec) = recovered {
+                            let rec_str = rec.to_string_lossy().to_string();
+                            conn.execute(
+                                "UPDATE downloads SET published_path = ?2, state = 'verifying', error = NULL WHERE chapter_id = ?1",
+                                rusqlite::params![ch_id, rec_str],
+                            )?;
+                        } else {
+                            conn.execute(
+                                "UPDATE downloads SET state = 'failed', error = 'Published canonical file verification failed on startup' WHERE chapter_id = ?1",
+                                [ch_id],
+                            )?;
+                        }
                     }
                 }
 
@@ -738,8 +806,51 @@ impl Downloads {
                 continue;
             }
 
+            let mut resolved_published_path = job.published_path.clone();
+            if resolved_published_path.is_none() {
+                let chapter_id = job.chapter;
+                let existing_canonical: Option<String> = self
+                    .db
+                    .call(move |conn| {
+                        let path: Option<String> = conn
+                            .query_row(
+                                "SELECT COALESCE(
+                                    c.download_path,
+                                    (SELECT h.canonical_path FROM metadata_handoffs h WHERE h.chapter_id = ?1),
+                                    (SELECT ah.canonical_path FROM acquisition_history ah WHERE ah.chapter_id = ?1 AND ah.outcome IN ('completed', 'published') AND ah.canonical_path IS NOT NULL ORDER BY ah.id DESC LIMIT 1)
+                                ) FROM chapters c WHERE c.id = ?1",
+                                [chapter_id],
+                                |r| r.get(0),
+                            )
+                            .optional()?
+                            .flatten();
+                        Ok(path)
+                    })
+                    .await
+                    .unwrap_or(None);
+
+                if let Some(ref p) = existing_canonical {
+                    let pb = PathBuf::from(p);
+                    if pb.is_file() && crate::pipeline::publisher::verify_cbz_integrity(&pb).is_ok() {
+                        resolved_published_path = Some(p.clone());
+                        let p_clone = p.clone();
+                        let _ = self
+                            .db
+                            .call(move |conn| {
+                                conn.execute(
+                                    "UPDATE downloads SET published_path = ?2, state = 'verifying' WHERE chapter_id = ?1",
+                                    rusqlite::params![chapter_id, p_clone],
+                                )?;
+                                crate::acquisition::service::persist_publication_provenance(conn, chapter_id)?;
+                                Ok(())
+                            })
+                            .await;
+                    }
+                }
+            }
+
             // If this job was already published (e.g. restart recovery or retry from verification timeout):
-            if let Some(ref pub_path) = job.published_path {
+            if let Some(ref pub_path) = resolved_published_path {
                 let canonical_path = PathBuf::from(pub_path);
                 if canonical_path.is_file()
                     && crate::pipeline::publisher::verify_cbz_integrity(&canonical_path).is_ok()
