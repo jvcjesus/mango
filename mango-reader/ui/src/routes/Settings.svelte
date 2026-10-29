@@ -44,6 +44,12 @@
     type SyncSummary,
     type SyncScheduleConfig,
     type UnresolvedTitleDiagnostic,
+    getNotificationConfig,
+    saveNotificationConfig,
+    sendTestNotification,
+    getNotificationOutbox,
+    type NtfyConfig,
+    type OutboxEntry,
   } from '../lib/api';
   import { confirm } from '../lib/confirm.svelte';
   import { COVERS, display, MENUS, setDisplay, SIZES } from '../lib/display.svelte';
@@ -67,6 +73,7 @@
     { id: 'library', label: 'Library', icon: 'bookmark', about: 'Categories, and the check for new chapters.' },
     { id: 'downloads', label: 'Downloads', icon: 'download', about: 'Chapters kept on this server.' },
     ...(session.admin ? [{ id: 'pipeline', label: 'Pipeline', icon: 'upload' as IconName, about: 'Komga publication, MangaBaka, and image optimization.' }] : []),
+    ...(session.admin ? [{ id: 'notifications', label: 'Notifications', icon: 'bell' as IconName, about: 'ntfy notifications and delivery preferences.' }] : []),
     { id: 'sources', label: 'Sources', icon: 'puzzle', about: 'Where titles come from, and backups in and out.' },
     { id: 'trackers', label: 'Trackers', icon: 'link', about: 'Keep reading progress in step with a tracking site.' },
     { id: 'account', label: 'Account', icon: 'user', about: 'The password, signing out, and who else may use this Mango.' },
@@ -615,6 +622,104 @@
   let nyaaEnabledInput = $state(true);
   let nyaaUrlInput = $state('https://nyaa.si');
   let nyaaCategoryInput = $state('3_1');
+
+  // Notifications tab state
+  let ntfyConfig = $state<NtfyConfig | null>(null);
+  let ntfyLoading = $state(false);
+  let ntfySaving = $state(false);
+  let ntfyTesting = $state(false);
+  let ntfyTestResult = $state<{ success: boolean; message: string } | null>(null);
+  let ntfyOutbox = $state<OutboxEntry[]>([]);
+  let ntfyOutboxLoading = $state(false);
+  let ntfyServerUrl = $state('https://ntfy.sh');
+  let ntfyTopic = $state('');
+  let ntfyToken = $state('');
+
+  let askedNotifications = false;
+  $effect(() => {
+    if (tab.id !== 'notifications' || askedNotifications || !session.admin) return;
+    askedNotifications = true;
+    loadNotifications();
+  });
+
+  async function loadNotifications() {
+    ntfyLoading = true;
+    try {
+      ntfyConfig = await getNotificationConfig();
+      ntfyServerUrl = ntfyConfig.serverUrl || 'https://ntfy.sh';
+      ntfyTopic = ntfyConfig.topic || '';
+      ntfyToken = ntfyConfig.hasToken ? '****' : '';
+      loadOutbox();
+    } catch (e: any) {
+      toast.error(e?.message || 'Failed to load notification settings');
+    } finally {
+      ntfyLoading = false;
+    }
+  }
+
+  async function loadOutbox() {
+    ntfyOutboxLoading = true;
+    try {
+      ntfyOutbox = await getNotificationOutbox();
+    } catch (e) {
+      // ignore
+    } finally {
+      ntfyOutboxLoading = false;
+    }
+  }
+
+  async function handleSaveNotifications() {
+    if (!ntfyConfig) return;
+    ntfySaving = true;
+    try {
+      const payload: Partial<NtfyConfig> = {
+        enabled: ntfyConfig.enabled,
+        serverUrl: ntfyServerUrl,
+        topic: ntfyTopic,
+        prefNewVolume: ntfyConfig.prefNewVolume,
+        prefReleaseAvailable: ntfyConfig.prefReleaseAvailable,
+        prefAcquisitionComplete: ntfyConfig.prefAcquisitionComplete,
+        prefActionRequired: ntfyConfig.prefActionRequired,
+      };
+      if (ntfyToken !== '****') {
+        payload.token = ntfyToken;
+      }
+      ntfyConfig = await saveNotificationConfig(payload);
+      ntfyServerUrl = ntfyConfig.serverUrl;
+      ntfyTopic = ntfyConfig.topic;
+      ntfyToken = ntfyConfig.hasToken ? '****' : '';
+      toast.success('Notification settings saved');
+    } catch (e: any) {
+      toast.error(e?.message || 'Failed to save notification settings');
+    } finally {
+      ntfySaving = false;
+    }
+  }
+
+  async function handleTestNotification() {
+    ntfyTesting = true;
+    ntfyTestResult = null;
+    try {
+      const res = await sendTestNotification({
+        serverUrl: ntfyServerUrl,
+        topic: ntfyTopic,
+        token: ntfyToken !== '****' ? ntfyToken : undefined,
+      });
+      if (res.success) {
+        ntfyTestResult = { success: true, message: res.message || 'Test notification sent successfully!' };
+        toast.success('Test notification sent successfully!');
+      } else {
+        ntfyTestResult = { success: false, message: res.error || 'Failed to send test notification' };
+        toast.error(res.error || 'Failed to send test notification');
+      }
+    } catch (e: any) {
+      const err = e?.message || 'Network error sending test notification';
+      ntfyTestResult = { success: false, message: err };
+      toast.error(err);
+    } finally {
+      ntfyTesting = false;
+    }
+  }
 
   let askedPipeline = false;
   $effect(() => {
@@ -2445,6 +2550,178 @@
               </div>
             {/if}
           </section>
+      {:else if tab.id === 'notifications'}
+        <section class="card">
+          <div class="card-header-row">
+            <h3>ntfy Notification Service</h3>
+            <div class="card-actions">
+              <button class="btn small" onclick={handleTestNotification} disabled={ntfyTesting || !ntfyTopic}>
+                <Icon name="bell" size={16} />
+                {ntfyTesting ? 'Testing…' : 'Send Test Notification'}
+              </button>
+              <button class="btn small primary" onclick={handleSaveNotifications} disabled={ntfySaving}>
+                <Icon name="check" size={16} />
+                {ntfySaving ? 'Saving…' : 'Save'}
+              </button>
+            </div>
+          </div>
+
+          {#if ntfyTestResult}
+            <div class="set stack">
+              <div class="test-result-box {ntfyTestResult.success ? 'test-success' : 'test-failure'}">
+                <strong>{ntfyTestResult.success ? '✓ Notification Sent' : '✗ Test Failed'}</strong>
+                <span>{ntfyTestResult.message}</span>
+              </div>
+            </div>
+          {/if}
+
+          <div class="set">
+            <div class="what">
+              <strong>Enable ntfy Notifications</strong>
+              <span>Deliver real-time push alerts to mobile devices and browsers via ntfy for releases, completions, and attention events.</span>
+            </div>
+            <div class="how">
+              {#if ntfyConfig}
+                {@render toggle(ntfyConfig.enabled, 'Enable notifications', () => {
+                  if (ntfyConfig) ntfyConfig.enabled = !ntfyConfig.enabled;
+                })}
+              {/if}
+            </div>
+          </div>
+
+          <div class="set stack">
+            <div class="what">
+              <strong>ntfy Server URL</strong>
+              <span>Base URL of the ntfy instance (default: <code>https://ntfy.sh</code>).</span>
+            </div>
+            <div class="how wide">
+              <label class="field grow">
+                <input type="text" bind:value={ntfyServerUrl} placeholder="https://ntfy.sh" autocomplete="off" />
+              </label>
+            </div>
+          </div>
+
+          <div class="set stack">
+            <div class="what">
+              <strong>ntfy Topic</strong>
+              <span>Topic name where notifications will be sent (e.g. <code>my-manga-library</code>).</span>
+            </div>
+            <div class="how wide">
+              <label class="field grow">
+                <input type="text" bind:value={ntfyTopic} placeholder="topic-name" autocomplete="off" />
+              </label>
+            </div>
+          </div>
+
+          <div class="set stack">
+            <div class="what">
+              <strong>Access Token (Optional)</strong>
+              <span>Authentication token for protected or self-hosted topics. Keep empty if public.</span>
+            </div>
+            <div class="how wide">
+              <label class="field grow">
+                <input type="password" bind:value={ntfyToken} placeholder={ntfyConfig?.hasToken ? '•••••••• (configured)' : 'Optional token'} autocomplete="off" />
+              </label>
+            </div>
+          </div>
+        </section>
+
+        <section class="card">
+          <h3>Notification Preferences</h3>
+          <p class="section-desc">Select which logical events trigger push notifications.</p>
+
+          <div class="set">
+            <div class="what">
+              <strong>📚 New Volume Detected</strong>
+              <span>When a new official volume is released on MangaBaka for followed series.</span>
+            </div>
+            <div class="how">
+              {#if ntfyConfig}
+                {@render toggle(ntfyConfig.prefNewVolume, 'New Volume', () => {
+                  if (ntfyConfig) ntfyConfig.prefNewVolume = !ntfyConfig.prefNewVolume;
+                })}
+              {/if}
+            </div>
+          </div>
+
+          <div class="set">
+            <div class="what">
+              <strong>🔎 Release Available</strong>
+              <span>When high-confidence download candidates are discovered for missing volumes.</span>
+            </div>
+            <div class="how">
+              {#if ntfyConfig}
+                {@render toggle(ntfyConfig.prefReleaseAvailable, 'Release Available', () => {
+                  if (ntfyConfig) ntfyConfig.prefReleaseAvailable = !ntfyConfig.prefReleaseAvailable;
+                })}
+              {/if}
+            </div>
+          </div>
+
+          <div class="set">
+            <div class="what">
+              <strong>✅ Acquisition Complete</strong>
+              <span>When a volume has been downloaded, canonicalized, published, and verified in Komga.</span>
+            </div>
+            <div class="how">
+              {#if ntfyConfig}
+                {@render toggle(ntfyConfig.prefAcquisitionComplete, 'Acquisition Complete', () => {
+                  if (ntfyConfig) ntfyConfig.prefAcquisitionComplete = !ntfyConfig.prefAcquisitionComplete;
+                })}
+              {/if}
+            </div>
+          </div>
+
+          <div class="set">
+            <div class="what">
+              <strong>⚠️ Action Required</strong>
+              <span>When series matching is ambiguous, metadata fails, or review is required.</span>
+            </div>
+            <div class="how">
+              {#if ntfyConfig}
+                {@render toggle(ntfyConfig.prefActionRequired, 'Action Required', () => {
+                  if (ntfyConfig) ntfyConfig.prefActionRequired = !ntfyConfig.prefActionRequired;
+                })}
+              {/if}
+            </div>
+          </div>
+        </section>
+
+        <section class="card">
+          <div class="card-header-row">
+            <h3>Notification Outbox History</h3>
+            <button class="btn small" onclick={loadOutbox} disabled={ntfyOutboxLoading}>
+              <Icon name="link" size={16} />
+              {ntfyOutboxLoading ? 'Refreshing…' : 'Refresh'}
+            </button>
+          </div>
+
+          {#if ntfyOutbox.length === 0}
+            <div class="empty-state">No recent notification outbox entries.</div>
+          {:else}
+            <div class="outbox-list">
+              {#each ntfyOutbox as item}
+                <div class="outbox-row">
+                  <div class="outbox-header">
+                    <span class="status-badge status-{item.eventType.toLowerCase()}">{item.eventType}</span>
+                    <span class="status-badge status-{item.status}">{item.status}</span>
+                    <span class="hist-time">{ago(item.createdAt)}</span>
+                  </div>
+                  {#if item.lastError}
+                    <div class="event-error">{item.lastError}</div>
+                  {/if}
+                  <div class="outbox-details">
+                    <span>Topic: <code>{item.destination}</code></span>
+                    <span>Attempts: {item.attempts}</span>
+                    {#if item.deliveredAt}
+                      <span>Delivered: {ago(item.deliveredAt)}</span>
+                    {/if}
+                  </div>
+                </div>
+              {/each}
+            </div>
+          {/if}
+        </section>
       {:else if tab.id === 'sources'}
         <section class="card">
           <h3>Sources</h3>
@@ -4275,5 +4552,86 @@
   .status-badge.status-reverted {
     background: rgba(100, 116, 139, 0.15);
     color: #94a3b8;
+  }
+
+  .test-result-box {
+    padding: 0.75rem 1rem;
+    border-radius: 6px;
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    font-size: 0.85rem;
+  }
+
+  .test-result-box.test-success {
+    background: rgba(34, 197, 94, 0.12);
+    border: 1px solid rgba(34, 197, 94, 0.3);
+    color: #22c55e;
+  }
+
+  .test-result-box.test-failure {
+    background: rgba(239, 68, 68, 0.12);
+    border: 1px solid rgba(239, 68, 68, 0.3);
+    color: #ef4444;
+  }
+
+  .outbox-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    margin-top: 0.5rem;
+  }
+
+  .outbox-row {
+    border: 1px solid var(--border-color, rgba(255, 255, 255, 0.08));
+    border-radius: 6px;
+    padding: 0.65rem 0.85rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+  }
+
+  .outbox-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .outbox-details {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 1rem;
+    font-size: 0.75rem;
+    color: var(--muted, #888);
+  }
+
+  .status-badge.status-delivered {
+    background: rgba(34, 197, 94, 0.15);
+    color: #22c55e;
+  }
+
+  .status-badge.status-pending {
+    background: rgba(59, 130, 246, 0.15);
+    color: #3b82f6;
+  }
+
+  .status-badge.status-sending {
+    background: rgba(234, 179, 8, 0.15);
+    color: #eab308;
+  }
+
+  .status-badge.status-retry_wait {
+    background: rgba(255, 122, 0, 0.15);
+    color: var(--spot, #ff7a00);
+  }
+
+  .status-badge.status-permanently_failed {
+    background: rgba(239, 68, 68, 0.15);
+    color: #ef4444;
+  }
+
+  .status-badge.status-suppressed {
+    background: rgba(255, 255, 255, 0.06);
+    color: #888;
   }
 </style>

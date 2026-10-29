@@ -61,6 +61,7 @@ pub struct AppState {
     pub pipeline: Arc<crate::pipeline::Pipeline>,
     pub sync: Arc<crate::sync::service::SyncService>,
     pub acquisition: Arc<crate::acquisition::service::AcquisitionService>,
+    pub notification: Arc<crate::notification::NotificationService>,
     /// The local source's folder, shown in Settings so the owner knows where to put files.
     pub local_dir: String,
 }
@@ -134,6 +135,9 @@ pub fn router(state: Spaces) -> Router {
         .route("/manga/{id}/volumes/{volume}/discover", post(post_manga_volume_discover))
         .route("/manga/{id}/discover-missing", post(post_manga_discover_missing))
         .route("/manga/{id}/discovery", get(get_manga_series_discovery))
+        .route("/notifications/config", get(get_notification_config).post(post_notification_config))
+        .route("/notifications/test", post(post_notification_test))
+        .route("/notifications/outbox", get(get_notification_outbox))
         .route("/manga/{id}/cover", get(cover))
         .route("/manga/{id}/library", put(set_library))
         .route("/manga/{id}/reader", put(set_reader))
@@ -2886,4 +2890,51 @@ async fn retry_import_inspection(Me(app): Me, Path(id): Path<i64>) -> Result<Jso
 async fn cleanup_import_payload(Me(app): Me, Path(id): Path<i64>) -> Result<Json<Value>> {
     crate::acquisition::physical::cleanup(&app.db, id, app.downloads.dir()).await?;
     Ok(Json(json!({"ok":true})))
+}
+
+async fn get_notification_config(
+    Me(app): Me,
+) -> Result<Json<crate::notification::NtfyConfigDto>> {
+    app.me.admin()?;
+    let config = app.notification.get_config().await?;
+    Ok(Json(config))
+}
+
+async fn post_notification_config(
+    Me(app): Me,
+    Json(payload): Json<crate::notification::service::UpdateNtfyConfigRequest>,
+) -> Result<Json<crate::notification::NtfyConfigDto>> {
+    app.me.admin()?;
+    let updated = app.notification.save_config(payload).await?;
+    Ok(Json(updated))
+}
+
+async fn post_notification_test(
+    Me(app): Me,
+    body: axum::body::Bytes,
+) -> Result<Json<Value>> {
+    app.me.admin()?;
+    let req: Option<crate::notification::service::TestNotificationRequest> = if body.is_empty() {
+        None
+    } else {
+        serde_json::from_slice(&body).ok()
+    };
+    match app.notification.send_test(req).await {
+        Ok(()) => Ok(Json(json!({
+            "success": true,
+            "message": "Test notification sent successfully"
+        }))),
+        Err(e) => Ok(Json(json!({
+            "success": false,
+            "error": e.to_string()
+        }))),
+    }
+}
+
+async fn get_notification_outbox(
+    Me(app): Me,
+) -> Result<Json<Vec<crate::notification::OutboxEntry>>> {
+    app.me.admin()?;
+    let entries = app.notification.get_outbox(50).await?;
+    Ok(Json(entries))
 }

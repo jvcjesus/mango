@@ -727,9 +727,10 @@ pub async fn reconcile_series(
         }
 
         for &rv in &released_vols_c {
-            let is_new = prev_c.as_ref().is_none_or(|p| {
+            let is_new = prev_c.as_ref().is_some_and(|p| {
                 !p.owned_volumes.iter().any(|&ov| (ov - rv).abs() < 0.001)
                     && !p.missing_volumes.iter().any(|&mv| (mv - rv).abs() < 0.001)
+                    && !p.future_volumes.iter().any(|&fv| (fv - rv).abs() < 0.001)
             });
             if is_new {
                 record_event(
@@ -1085,6 +1086,40 @@ pub fn record_event_full(
         ],
     )
     .map_err(|e| AppError::internal(format!("Failed to record reconciliation event: {e}")))?;
+
+    let event_id: Option<i64> = if let Some(v) = volume_number {
+        conn.query_row(
+            "SELECT id FROM reconciliation_events
+             WHERE series_id = ?1 AND event_type = ?2 AND ABS(volume_number - ?3) < 0.001
+             ORDER BY id DESC LIMIT 1",
+            params![series_id, event_type, v],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap_or(None)
+    } else {
+        conn.query_row(
+            "SELECT id FROM reconciliation_events
+             WHERE series_id = ?1 AND event_type = ?2 AND volume_number IS NULL
+             ORDER BY id DESC LIMIT 1",
+            params![series_id, event_type],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap_or(None)
+    };
+
+    if let Some(id) = event_id {
+        let _ = crate::notification::outbox::enqueue_from_event(
+            conn,
+            id,
+            series_id,
+            series_title,
+            volume_number,
+            event_type,
+            message,
+        );
+    }
 
     Ok(())
 }

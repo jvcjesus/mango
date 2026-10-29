@@ -19,6 +19,7 @@ mod library;
 mod local;
 mod migrate;
 mod net;
+pub(crate) mod notification;
 mod opds;
 pub(crate) mod pipeline;
 pub(crate) mod release;

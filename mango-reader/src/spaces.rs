@@ -125,6 +125,7 @@ impl Spaces {
         let updates = Updates::new(db.clone(), titles.clone(), downloads.clone());
         let trackers_inst = Trackers::new(db.clone())?;
         let sync = Arc::new(crate::sync::service::SyncService::new(db.clone(), trackers_inst.clone(), pipeline.clone()));
+        let notification = Arc::new(crate::notification::NotificationService::new(db.clone(), reqwest::Client::new()));
         let acq_startup = acquisition.clone();
         let tasks = vec![
             tokio::spawn(async move {
@@ -137,6 +138,7 @@ impl Spaces {
             tokio::spawn(stores.clone().refresh_on_schedule(shared.stores_refresh_hours)),
             tokio::spawn(stores.clone().keep_blocked_out()),
             tokio::spawn(crate::sync::scheduler::run_scheduler_forever((*sync).clone(), db.clone())),
+            tokio::spawn(crate::notification::worker::run_worker_forever(db.clone(), reqwest::Client::new())),
         ];
         let app = AppState {
             me: Who::default(),
@@ -144,6 +146,7 @@ impl Spaces {
             trackers: trackers_inst,
             sync,
             acquisition,
+            notification,
             auth: self.auth.clone(),
             releases: shared.releases.clone(),
             host: shared.host.clone(),

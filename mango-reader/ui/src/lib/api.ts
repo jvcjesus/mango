@@ -1453,5 +1453,53 @@ export const discoverAllMissingCandidates = (id: number) =>
 export const getSeriesDiscovery = (id: number) =>
   get<VolumeDiscoveryResult[]>(`/manga/${id}/discovery`);
 
+export interface NtfyConfig {
+  enabled: boolean;
+  serverUrl: string;
+  topic: string;
+  hasToken: boolean;
+  token?: string;
+  prefNewVolume: boolean;
+  prefReleaseAvailable: boolean;
+  prefAcquisitionComplete: boolean;
+  prefActionRequired: boolean;
+  activatedAt?: number;
+}
+
+export interface OutboxEntry {
+  id: number;
+  eventId: number;
+  eventType: string;
+  transport: string;
+  destination: string;
+  payloadJson: string;
+  status: 'pending' | 'sending' | 'delivered' | 'retry_wait' | 'permanently_failed' | 'suppressed';
+  attempts: number;
+  nextAttemptAt: number;
+  lastAttemptAt?: number;
+  deliveredAt?: number;
+  lastError?: string;
+  createdAt: number;
+}
+
+export interface TestNotificationResponse {
+  success: boolean;
+  message?: string;
+  error?: string;
+}
+
+export const getNotificationConfig = () =>
+  get<NtfyConfig>('/notifications/config');
+
+export const saveNotificationConfig = (config: Partial<NtfyConfig>) =>
+  send<NtfyConfig>('POST', '/notifications/config', config);
+
+export const sendTestNotification = (params?: { serverUrl?: string; topic?: string; token?: string }) =>
+  send<TestNotificationResponse>('POST', '/notifications/test', params ?? {});
+
+export const getNotificationOutbox = () =>
+  get<OutboxEntry[]>('/notifications/outbox');
+
+
 
 
