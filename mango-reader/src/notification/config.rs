@@ -87,9 +87,7 @@ pub fn set_ntfy_config(conn: &Connection, cfg: &NtfyConfig) -> crate::error::Res
     if let Some(ref t) = cfg.token {
         set_state(conn, KEY_NTFY_TOKEN, t)?;
     } else {
-        // If explicitly set to None, we only keep or clear if needed.
-        // Usually None means do not change if called via update,
-        // but if someone passes None in pure config set, we can keep or delete.
+        set_state(conn, KEY_NTFY_TOKEN, "")?;
     }
 
     set_state(conn, KEY_PREF_NEW_VOLUME, if cfg.pref_new_volume { "true" } else { "false" })?;
