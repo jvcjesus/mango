@@ -1358,3 +1358,46 @@ export const getNormalizationHistory = (limit: number = 50) =>
 export const rollbackNormalizationRecord = (id: string) =>
   send<NormalizationHistoryRecord>('POST', `/pipeline/maintenance/rollback/${encodeURIComponent(id)}`, {});
 
+export type ReconciliationStatus = 'up_to_date' | 'missing_volume' | 'review_required' | 'sync_error';
+
+export interface ReconciliationSummary {
+  seriesId: string;
+  mangaId: number | null;
+  komgaSeriesId: string | null;
+  mangabakaId: number | null;
+  collectionId: string | null;
+  title: string;
+  edition: string;
+  status: ReconciliationStatus;
+  isOngoing: boolean;
+  totalOfficialVolumes: number | null;
+  ownedVolumesCount: number;
+  missingVolumesCount: number;
+  ownedVolumes: number[];
+  missingVolumes: number[];
+  futureVolumes: number[];
+  lastReconciledAt: number;
+  lastError: string | null;
+  reviewReason: string | null;
+  displayStatus: string;
+}
+
+export const getMangaFollow = (id: number) =>
+  get<{ followed: boolean }>(`/manga/${id}/follow`);
+
+export const followManga = (id: number) =>
+  send<{ followed: boolean }>('POST', `/manga/${id}/follow`, {});
+
+export const unfollowManga = (id: number) =>
+  send<{ followed: boolean }>('POST', `/manga/${id}/unfollow`, {});
+
+export const getMangaReconciliation = (id: number) =>
+  get<ReconciliationSummary | null>(`/manga/${id}/reconciliation`);
+
+export const reconcileManga = (id: number) =>
+  send<ReconciliationSummary>('POST', `/manga/${id}/reconcile`, {});
+
+export const getFollowedReconciliations = () =>
+  get<ReconciliationSummary[]>('/reconciliation/followed');
+
+

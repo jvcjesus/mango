@@ -1,19 +1,27 @@
 <script lang="ts">
   import Icon from './Icon.svelte';
   import type { SeriesSummary } from './volumeStatus';
+  import type { ReconciliationSummary } from './api';
+  import { ago } from './util';
 
   let {
     summary,
+    reconciliation = null,
     onPlanMissing,
     onFindReleases,
     onRefreshKomga,
     refreshingKomga = false,
+    onReconcile,
+    reconciling = false,
   }: {
     summary: SeriesSummary;
+    reconciliation?: ReconciliationSummary | null;
     onPlanMissing?: () => void;
     onFindReleases?: () => void;
     onRefreshKomga?: () => void;
     refreshingKomga?: boolean;
+    onReconcile?: () => void;
+    reconciling?: boolean;
   } = $props();
 </script>
 
@@ -29,9 +37,40 @@
       {#if summary.totalExpectedVolumes != null && summary.progressPercent != null}
         <span class="progress-pct-label">{summary.progressPercent}% of released volumes acquired</span>
       {/if}
+      {#if reconciliation}
+        <div class="reconciliation-row">
+          <span
+            class="reconciliation-badge"
+            class:badge-uptodate={reconciliation.status === 'up_to_date'}
+            class:badge-missing={reconciliation.status === 'missing_volume'}
+            class:badge-review={reconciliation.status === 'review_required'}
+            class:badge-error={reconciliation.status === 'sync_error'}
+          >
+            {reconciliation.displayStatus}
+          </span>
+          {#if reconciliation.lastReconciledAt}
+            <span class="reconciled-time">MangaBaka reconciled {ago(reconciliation.lastReconciledAt)}</span>
+          {/if}
+        </div>
+      {/if}
     </div>
 
     <div class="summary-actions">
+      {#if onReconcile}
+        <button
+          class="btn pill icon-text"
+          disabled={reconciling}
+          onclick={onReconcile}
+          title="Reconcile official volumes directly with MangaBaka"
+        >
+          {#if reconciling}
+            <span class="spin"><Icon name="spinner" size={14} stroke={3} /></span>
+          {:else}
+            <Icon name="refresh" size={14} />
+          {/if}
+          MangaBaka
+        </button>
+      {/if}
       {#if summary.missingCount > 0 && onPlanMissing}
         <button class="btn pill spot icon-text" onclick={onPlanMissing}>
           <Icon name="puzzle" size={14} /> Plan Missing
@@ -137,6 +176,52 @@
 
   .progress-pct-label {
     font-size: 13px;
+    color: var(--muted);
+  }
+
+  .reconciliation-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    margin-top: 4px;
+  }
+
+  .reconciliation-badge {
+    font-size: 12px;
+    font-weight: 700;
+    padding: 3px 8px;
+    border-radius: 4px;
+    border: 1px solid var(--ink);
+    background: var(--paper);
+  }
+
+  .reconciliation-badge.badge-uptodate {
+    background: #e6f9ed;
+    color: #137333;
+    border-color: #137333;
+  }
+
+  .reconciliation-badge.badge-missing {
+    background: #fef7e0;
+    color: #b06000;
+    border-color: #b06000;
+  }
+
+  .reconciliation-badge.badge-review {
+    background: #fce8e6;
+    color: #c5221f;
+    border-color: #c5221f;
+  }
+
+  .reconciliation-badge.badge-error {
+    background: #f1f3f4;
+    color: #5f6368;
+    border-color: #5f6368;
+  }
+
+  .reconciled-time {
+    font-size: 11px;
     color: var(--muted);
   }
 

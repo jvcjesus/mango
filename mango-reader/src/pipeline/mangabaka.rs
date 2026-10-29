@@ -359,6 +359,24 @@ impl MangaBakaOutcome {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct MangaBakaOfficialVolume {
+    pub id: String,
+    pub volume_number: f64,
+    pub title: Option<String>,
+    pub release_date: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum MangaBakaVolumesResult {
+    Found(Vec<MangaBakaOfficialVolume>),
+    Empty,
+    RateLimited,
+    AuthError(String),
+    NetworkError(String),
+}
+
 #[derive(Clone)]
 pub struct MangaBakaClient {
     http: Client,
@@ -1424,6 +1442,144 @@ impl MangaBakaClient {
             }
         }
         Ok(None)
+    }
+
+    /// Fetches all official volumes in a MangaBaka collection.
+    pub async fn fetch_collection_volumes(
+        &self,
+        collection_id: &str,
+    ) -> Result<MangaBakaVolumesResult> {
+        let mut works_url = Some(format!("/collections/{collection_id}/works?per_page=100"));
+        let mut volumes = Vec::new();
+        let mut pages_checked = 0;
+
+        while let Some(url) = works_url {
+            if pages_checked >= 50 {
+                break;
+            }
+            pages_checked += 1;
+
+            let w_resp = match self.public_request(reqwest::Method::GET, &url).send().await {
+                Ok(r) if r.status().is_success() => r,
+                Ok(r) if r.status() == reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                    return Ok(MangaBakaVolumesResult::RateLimited);
+                }
+                Ok(r)
+                    if r.status() == reqwest::StatusCode::UNAUTHORIZED
+                        || r.status() == reqwest::StatusCode::FORBIDDEN =>
+                {
+                    return Ok(MangaBakaVolumesResult::AuthError(format!(
+                        "HTTP {}",
+                        r.status()
+                    )));
+                }
+                Ok(r) => {
+                    return Ok(MangaBakaVolumesResult::NetworkError(format!(
+                        "Works request returned HTTP {}",
+                        r.status()
+                    )));
+                }
+                Err(e) => {
+                    return Ok(MangaBakaVolumesResult::NetworkError(e.to_string()));
+                }
+            };
+
+            let w_body: serde_json::Value = match w_resp.json().await {
+                Ok(v) => v,
+                Err(e) => return Ok(MangaBakaVolumesResult::NetworkError(e.to_string())),
+            };
+
+            let works = w_body
+                .get("data")
+                .and_then(|d| d.as_array())
+                .cloned()
+                .unwrap_or_default();
+
+            for work in works {
+                let sequence = work
+                    .get("sequence_numeric")
+                    .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|i| i as f64)))
+                    .or_else(|| {
+                        work.get("sequence")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| s.parse::<f64>().ok())
+                    })
+                    .or_else(|| {
+                        work.get("volume")
+                            .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|i| i as f64)))
+                    });
+
+                if let Some(vol_num) = sequence {
+                    let work_id = work
+                        .get("id")
+                        .and_then(|v| {
+                            if let Some(s) = v.as_str() {
+                                Some(s.to_string())
+                            } else if let Some(n) = v.as_i64() {
+                                Some(n.to_string())
+                            } else {
+                                None
+                            }
+                        })
+                        .unwrap_or_default();
+
+                    let title = work
+                        .get("title")
+                        .or_else(|| work.get("name"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty());
+
+                    let release_date = work
+                        .get("release_date")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty());
+
+                    volumes.push(MangaBakaOfficialVolume {
+                        id: work_id,
+                        volume_number: vol_num,
+                        title,
+                        release_date,
+                    });
+                }
+            }
+
+            works_url = w_body
+                .get("pagination")
+                .and_then(|p| p.get("next"))
+                .and_then(|n| n.as_str())
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.to_string());
+        }
+
+        if volumes.is_empty() {
+            return Ok(MangaBakaVolumesResult::Empty);
+        }
+
+        volumes.sort_by(|a, b| a.volume_number.partial_cmp(&b.volume_number).unwrap_or(std::cmp::Ordering::Equal));
+        volumes.dedup_by(|a, b| (a.volume_number - b.volume_number).abs() < 0.001);
+
+        Ok(MangaBakaVolumesResult::Found(volumes))
+    }
+
+    /// Fetches series publication status ("ongoing", "completed", "hiatus", etc.) from MangaBaka.
+    pub async fn fetch_series_status(&self, series_id: i64) -> Result<Option<String>> {
+        let url = format!("/series/{series_id}");
+        let resp = match self.public_request(reqwest::Method::GET, &url).send().await {
+            Ok(r) if r.status().is_success() => r,
+            _ => return Ok(None),
+        };
+        let body: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(_) => return Ok(None),
+        };
+        let series = body.get("data").unwrap_or(&body);
+        let status = series
+            .get("status")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_lowercase());
+        Ok(status)
     }
 
     /// Authoritatively resolves volume metadata from MangaBaka.

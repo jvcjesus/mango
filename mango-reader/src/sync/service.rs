@@ -481,4 +481,75 @@ impl SyncService {
         let _ = self.db.call(move |conn| record_sync(conn, &rec)).await;
         summary.records.push(record);
     }
+
+    /// Reconciles a single series against MangaBaka and Komga with fail-closed precision.
+    pub async fn run_reconciliation(
+        &self,
+        target: super::reconciliation::ReconciliationTarget,
+    ) -> Result<super::reconciliation::ReconciliationSummary> {
+        let (cfg, mb_token, komga_api_key) = self.pipeline.load_internal_config().await?;
+
+        let komga_client = if cfg.komga_enabled && cfg.komga_url.is_some() {
+            Some(KomgaClient::new(
+                self.http.clone(),
+                cfg.komga_url,
+                komga_api_key,
+            ))
+        } else {
+            None
+        };
+
+        let mb_client = MangaBakaClient::new(
+            self.http.clone(),
+            cfg.mangabaka_url,
+            mb_token,
+        );
+
+        super::reconciliation::reconcile_series(
+            &self.db,
+            komga_client.as_ref(),
+            &mb_client,
+            &target,
+        )
+        .await
+    }
+
+    /// Reconciles all actively followed series in the tracked catalog.
+    pub async fn run_reconciliation_all_followed(
+        &self,
+    ) -> Result<Vec<super::reconciliation::ReconciliationSummary>> {
+        let targets = self
+            .db
+            .call(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT manga_id, komga_series_id, title FROM tracked_catalog WHERE tracked = 1",
+                )?;
+                let rows = stmt.query_map([], |r| {
+                    Ok(super::reconciliation::ReconciliationTarget {
+                        manga_id: r.get(0)?,
+                        komga_series_id: r.get(1)?,
+                        title: r.get(2)?,
+                        edition: None,
+                    })
+                })?;
+                let mut list = Vec::new();
+                for row in rows.flatten() {
+                    list.push(row);
+                }
+                Ok(list)
+            })
+            .await?;
+
+        let mut summaries = Vec::new();
+        for target in targets {
+            match self.run_reconciliation(target).await {
+                Ok(summary) => summaries.push(summary),
+                Err(e) => {
+                    tracing::warn!("Failed to reconcile series: {e}");
+                }
+            }
+        }
+
+        Ok(summaries)
+    }
 }

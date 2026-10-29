@@ -3,7 +3,42 @@
 //! Exposes provider metadata, supported release units (volume, collection, chapter),
 //! whether external backends are required, and operational health.
 
+use crate::error::Result;
 use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleaseCandidate {
+    pub provider: String,
+    pub release_id: String,
+    pub title: String,
+    pub raw_title: String,
+    pub target_volume: Option<f64>,
+    pub target_chapter: Option<f64>,
+    pub download_url: Option<String>,
+    pub magnet_url: Option<String>,
+    pub info_hash: Option<String>,
+    pub size_bytes: Option<u64>,
+    pub seeders: Option<u32>,
+    pub published_at: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleaseQuery {
+    pub series_title: String,
+    pub target_volume: Option<f64>,
+    pub target_chapter: Option<f64>,
+    pub preferred_edition: Option<String>,
+}
+
+pub trait ReleaseProvider: Send + Sync {
+    fn name(&self) -> &'static str;
+    fn search_releases(
+        &self,
+        query: &ReleaseQuery,
+    ) -> impl std::future::Future<Output = Result<Vec<ReleaseCandidate>>> + Send;
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

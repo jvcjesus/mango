@@ -122,6 +122,14 @@ pub fn router(state: Spaces) -> Router {
             "/manga/{id}/refresh-ownership",
             post(refresh_manga_ownership),
         )
+        .route(
+            "/manga/{id}/follow",
+            get(get_manga_follow).post(post_manga_follow),
+        )
+        .route("/manga/{id}/unfollow", post(post_manga_unfollow))
+        .route("/manga/{id}/reconciliation", get(get_manga_reconciliation))
+        .route("/manga/{id}/reconcile", post(post_manga_reconcile))
+        .route("/reconciliation/followed", get(get_followed_reconciliations))
         .route("/manga/{id}/cover", get(cover))
         .route("/manga/{id}/library", put(set_library))
         .route("/manga/{id}/reader", put(set_reader))
@@ -920,6 +928,108 @@ async fn manga_ownership(
         .get_title_ownership(id, &title_view.title)
         .await;
     Ok(Json(ownership))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct FollowResponse {
+    followed: bool,
+}
+
+async fn get_manga_follow(
+    Me(app): Me,
+    Path(id): Path<i64>,
+) -> Result<Json<FollowResponse>> {
+    let title_view = app.titles.get(id).await?;
+    let followed = app
+        .db
+        .call(move |conn| crate::sync::reconciliation::is_series_followed(conn, Some(id), &title_view.title))
+        .await?;
+    Ok(Json(FollowResponse { followed }))
+}
+
+async fn post_manga_follow(
+    Me(app): Me,
+    Path(id): Path<i64>,
+) -> Result<Json<FollowResponse>> {
+    let title_view = app.titles.get(id).await?;
+    let ownership = app
+        .pipeline
+        .ownership
+        .get_title_ownership(id, &title_view.title)
+        .await;
+    let komga_series_id = ownership.series_id.clone();
+    let title = title_view.title.clone();
+
+    app.db
+        .call(move |conn| {
+            crate::sync::reconciliation::follow_series(
+                conn,
+                &title,
+                komga_series_id.as_deref(),
+                Some(id),
+            )
+        })
+        .await?;
+    Ok(Json(FollowResponse { followed: true }))
+}
+
+async fn post_manga_unfollow(
+    Me(app): Me,
+    Path(id): Path<i64>,
+) -> Result<Json<FollowResponse>> {
+    let title_view = app.titles.get(id).await?;
+    let title = title_view.title.clone();
+
+    app.db
+        .call(move |conn| {
+            crate::sync::reconciliation::unfollow_series(conn, Some(id), &title)
+        })
+        .await?;
+    Ok(Json(FollowResponse { followed: false }))
+}
+
+async fn get_manga_reconciliation(
+    Me(app): Me,
+    Path(id): Path<i64>,
+) -> Result<Json<Option<crate::sync::reconciliation::ReconciliationSummary>>> {
+    let summary = app
+        .db
+        .call(move |conn| crate::sync::reconciliation::get_reconciliation_for_manga(conn, id))
+        .await?;
+    Ok(Json(summary))
+}
+
+async fn post_manga_reconcile(
+    Me(app): Me,
+    Path(id): Path<i64>,
+) -> Result<Json<crate::sync::reconciliation::ReconciliationSummary>> {
+    let title_view = app.titles.get(id).await?;
+    let ownership = app
+        .pipeline
+        .ownership
+        .get_title_ownership(id, &title_view.title)
+        .await;
+
+    let target = crate::sync::reconciliation::ReconciliationTarget {
+        manga_id: Some(id),
+        komga_series_id: ownership.series_id,
+        title: title_view.title,
+        edition: None,
+    };
+
+    let summary = app.sync.run_reconciliation(target).await?;
+    Ok(Json(summary))
+}
+
+async fn get_followed_reconciliations(
+    Me(app): Me,
+) -> Result<Json<Vec<crate::sync::reconciliation::ReconciliationSummary>>> {
+    let list = app
+        .db
+        .call(|conn| crate::sync::reconciliation::list_reconciliations(conn))
+        .await?;
+    Ok(Json(list))
 }
 
 async fn refresh_manga_ownership(

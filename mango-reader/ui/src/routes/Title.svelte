@@ -25,6 +25,12 @@
     getAcquisitionExecution,
     cancelExecution,
     retryExecution,
+    getMangaFollow,
+    followManga,
+    unfollowManga,
+    getMangaReconciliation,
+    reconcileManga,
+    type ReconciliationSummary,
     type AcquisitionProfile,
     type MissingContentSummary,
     type AcquisitionPlan,
@@ -117,6 +123,10 @@
   let showOwnershipDetails = $state(false);
   let missingContent = $state<MissingContentSummary | null>(null);
   let loadingMissing = $state(false);
+  let isFollowed = $state(false);
+  let togglingFollow = $state(false);
+  let reconciliation = $state<ReconciliationSummary | null>(null);
+  let reconciling = $state(false);
 
   const chapters = $derived(title?.chapters ?? []);
   const unread = $derived(chapters.filter((c) => !c.read).length);
@@ -207,8 +217,56 @@
       updateCandidateStatusesFromOwnership(ownership);
       loadMissingAndProfile();
       loadTitleAcquisitions();
+      loadFollowAndReconciliation();
     } catch {
       ownership = null;
+    }
+  }
+
+  async function loadFollowAndReconciliation() {
+    try {
+      const fol = await getMangaFollow(id);
+      isFollowed = fol.followed;
+    } catch {
+      isFollowed = false;
+    }
+    try {
+      reconciliation = await getMangaReconciliation(id);
+    } catch {
+      reconciliation = null;
+    }
+  }
+
+  async function toggleFollow() {
+    if (togglingFollow) return;
+    togglingFollow = true;
+    try {
+      if (isFollowed) {
+        await unfollowManga(id);
+        isFollowed = false;
+        toast.success(`Unfollowed "${title?.title}"`);
+      } else {
+        await followManga(id);
+        isFollowed = true;
+        toast.success(`Following "${title?.title}"`);
+      }
+    } catch (e) {
+      toast.error(`Follow update failed: ${message(e)}`);
+    } finally {
+      togglingFollow = false;
+    }
+  }
+
+  async function runReconcile() {
+    if (reconciling) return;
+    reconciling = true;
+    try {
+      reconciliation = await reconcileManga(id);
+      toast.success(reconciliation.displayStatus);
+    } catch (e) {
+      toast.error(`Reconciliation failed: ${message(e)}`);
+    } finally {
+      reconciling = false;
     }
   }
 
@@ -872,6 +930,20 @@
           {/if}
           {title.inLibrary ? 'In library' : 'Add to library'}
         </button>
+        <button
+          class="btn lift"
+          class:spot-on={isFollowed}
+          disabled={togglingFollow}
+          onclick={toggleFollow}
+          title={isFollowed ? 'Unfollow ongoing releases' : 'Follow ongoing releases'}
+        >
+          {#if togglingFollow}
+            <span class="spin"><Icon name="spinner" size={18} stroke={3} /></span>
+          {:else}
+            <Icon name="bell" fill={isFollowed} />
+          {/if}
+          {isFollowed ? 'Following' : 'Follow'}
+        </button>
         <div class="menu">
           <button class="btn icon lift" aria-label="More actions" aria-expanded={menu} onclick={() => (menu = !menu)}><Icon name="more" fill /></button>
           {#if menu}
@@ -1047,10 +1119,13 @@
               <div class="series-summary-wrapper">
                 <SeriesSummaryCard
                   summary={seriesSummary}
+                  reconciliation={reconciliation}
                   onPlanMissing={() => openPlanModal(true)}
                   onFindReleases={() => searchNyaa()}
                   onRefreshKomga={refreshOwnership}
                   refreshingKomga={refreshingOwnership}
+                  onReconcile={runReconcile}
+                  reconciling={reconciling}
                 />
               </div>
             {/if}

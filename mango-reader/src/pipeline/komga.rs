@@ -54,6 +54,7 @@ pub struct KomgaBook {
     pub library_id: Option<String>,
     pub name: String,
     pub number: f64,
+    #[serde(default)]
     pub metadata: Option<KomgaBookMetadata>,
     #[serde(default)]
     pub read_progress: Option<KomgaReadProgress>,
