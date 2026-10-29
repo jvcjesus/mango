@@ -1047,6 +1047,48 @@ pub fn list_reconciliations(conn: &Connection) -> Result<Vec<ReconciliationSumma
     rows.map_err(|e| AppError::internal(format!("Failed to list reconciliations: {e}")))
 }
 
+pub fn record_event_full(
+    conn: &Connection,
+    series_id: &str,
+    series_title: &str,
+    mangabaka_id: Option<i64>,
+    mangabaka_volume_id: Option<&str>,
+    edition: &str,
+    volume_number: Option<f64>,
+    event_type: &str,
+    top_candidate_id: Option<&str>,
+    candidate_count: i64,
+    message: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO reconciliation_events (
+            series_id, series_title, mangabaka_id, mangabaka_volume_id, edition,
+            volume_number, event_type, top_candidate_id, candidate_count, message, created_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+        ON CONFLICT(series_id, volume_number, event_type) DO UPDATE SET
+            top_candidate_id = excluded.top_candidate_id,
+            candidate_count = excluded.candidate_count,
+            message = excluded.message,
+            created_at = excluded.created_at",
+        params![
+            series_id,
+            series_title,
+            mangabaka_id,
+            mangabaka_volume_id,
+            edition,
+            volume_number,
+            event_type,
+            top_candidate_id,
+            candidate_count,
+            message,
+            now(),
+        ],
+    )
+    .map_err(|e| AppError::internal(format!("Failed to record reconciliation event: {e}")))?;
+
+    Ok(())
+}
+
 /// Records a deduplicated event in `reconciliation_events`.
 pub fn record_event(
     conn: &Connection,
@@ -1056,23 +1098,20 @@ pub fn record_event(
     event_type: &str,
     message: &str,
 ) -> Result<()> {
-    conn.execute(
-        "INSERT INTO reconciliation_events (
-            series_title, mangabaka_id, volume_number, event_type, message, created_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-        ON CONFLICT(series_title, volume_number, event_type) DO NOTHING",
-        params![
-            series_title,
-            mangabaka_id,
-            volume_number,
-            event_type,
-            message,
-            now(),
-        ],
+    let series_id = format!("title:{}", normalize_title(series_title));
+    record_event_full(
+        conn,
+        &series_id,
+        series_title,
+        mangabaka_id,
+        None,
+        "standard",
+        volume_number,
+        event_type,
+        None,
+        0,
+        message,
     )
-    .map_err(|e| AppError::internal(format!("Failed to record reconciliation event: {e}")))?;
-
-    Ok(())
 }
 
 /// Checks whether a series is followed (tracked = 1 in tracked_catalog).

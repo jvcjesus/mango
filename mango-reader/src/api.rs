@@ -130,6 +130,10 @@ pub fn router(state: Spaces) -> Router {
         .route("/manga/{id}/reconciliation", get(get_manga_reconciliation))
         .route("/manga/{id}/reconcile", post(post_manga_reconcile))
         .route("/reconciliation/followed", get(get_followed_reconciliations))
+        .route("/manga/{id}/volumes/{volume}/candidates", get(get_manga_volume_candidates))
+        .route("/manga/{id}/volumes/{volume}/discover", post(post_manga_volume_discover))
+        .route("/manga/{id}/discover-missing", post(post_manga_discover_missing))
+        .route("/manga/{id}/discovery", get(get_manga_series_discovery))
         .route("/manga/{id}/cover", get(cover))
         .route("/manga/{id}/library", put(set_library))
         .route("/manga/{id}/reader", put(set_reader))
@@ -1030,6 +1034,137 @@ async fn get_followed_reconciliations(
         .call(|conn| crate::sync::reconciliation::list_reconciliations(conn))
         .await?;
     Ok(Json(list))
+}
+
+async fn get_manga_volume_candidates(
+    Me(app): Me,
+    Path((id, volume)): Path<(i64, f64)>,
+) -> Result<Json<Option<crate::acquisition::discovery::VolumeDiscoveryResult>>> {
+    let series_id = app
+        .db
+        .call(move |conn| {
+            if let Some(sum) = crate::sync::reconciliation::get_reconciliation_for_manga(conn, id)? {
+                Ok(Some(sum.series_id))
+            } else {
+                Ok(None)
+            }
+        })
+        .await?;
+
+    let Some(s_id) = series_id else {
+        return Ok(Json(None));
+    };
+
+    let res = app
+        .db
+        .call(move |conn| crate::acquisition::discovery::get_volume_discovery(conn, &s_id, volume))
+        .await?;
+
+    Ok(Json(res))
+}
+
+async fn get_manga_series_discovery(
+    Me(app): Me,
+    Path(id): Path<i64>,
+) -> Result<Json<Vec<crate::acquisition::discovery::VolumeDiscoveryResult>>> {
+    let series_id = app
+        .db
+        .call(move |conn| {
+            if let Some(sum) = crate::sync::reconciliation::get_reconciliation_for_manga(conn, id)? {
+                Ok(Some(sum.series_id))
+            } else {
+                Ok(None)
+            }
+        })
+        .await?;
+
+    let Some(s_id) = series_id else {
+        return Ok(Json(Vec::new()));
+    };
+
+    let results = app
+        .db
+        .call(move |conn| crate::acquisition::discovery::list_series_discovery(conn, &s_id))
+        .await?;
+
+    Ok(Json(results))
+}
+
+async fn post_manga_volume_discover(
+    Me(app): Me,
+    Path((id, volume)): Path<(i64, f64)>,
+) -> Result<Json<crate::acquisition::discovery::VolumeDiscoveryResult>> {
+    let existing = app
+        .db
+        .call(move |conn| crate::sync::reconciliation::get_reconciliation_for_manga(conn, id))
+        .await?;
+
+    let series_id = if let Some(rec) = existing {
+        rec.series_id
+    } else {
+        let title_view = app.titles.get(id).await?;
+        let ownership = app
+            .pipeline
+            .ownership
+            .get_title_ownership(id, &title_view.title)
+            .await;
+        let target = crate::sync::reconciliation::ReconciliationTarget {
+            manga_id: Some(id),
+            komga_series_id: ownership.series_id,
+            title: title_view.title,
+            edition: None,
+        };
+        let summary = app.sync.run_reconciliation(target).await?;
+        summary.series_id
+    };
+
+    let result = crate::acquisition::discovery::discover_for_volume(
+        &app.db,
+        app.acquisition.http.clone(),
+        &series_id,
+        volume,
+    )
+    .await?;
+
+    Ok(Json(result))
+}
+
+async fn post_manga_discover_missing(
+    Me(app): Me,
+    Path(id): Path<i64>,
+) -> Result<Json<crate::acquisition::discovery::SeriesDiscoverySummary>> {
+    let existing = app
+        .db
+        .call(move |conn| crate::sync::reconciliation::get_reconciliation_for_manga(conn, id))
+        .await?;
+
+    let series_id = if let Some(rec) = existing {
+        rec.series_id
+    } else {
+        let title_view = app.titles.get(id).await?;
+        let ownership = app
+            .pipeline
+            .ownership
+            .get_title_ownership(id, &title_view.title)
+            .await;
+        let target = crate::sync::reconciliation::ReconciliationTarget {
+            manga_id: Some(id),
+            komga_series_id: ownership.series_id,
+            title: title_view.title,
+            edition: None,
+        };
+        let summary = app.sync.run_reconciliation(target).await?;
+        summary.series_id
+    };
+
+    let summary = crate::acquisition::discovery::discover_missing_for_series(
+        &app.db,
+        app.acquisition.http.clone(),
+        &series_id,
+    )
+    .await?;
+
+    Ok(Json(summary))
 }
 
 async fn refresh_manga_ownership(

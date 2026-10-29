@@ -7,6 +7,7 @@
 //! 4. Seamless handoff into the existing native Mango downstream acquisition pipeline
 
 pub mod candidates;
+pub mod discovery;
 pub mod edition;
 pub mod execution;
 pub mod intelligence;

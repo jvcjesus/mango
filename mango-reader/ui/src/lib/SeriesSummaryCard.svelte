@@ -9,6 +9,8 @@
     reconciliation = null,
     onPlanMissing,
     onFindReleases,
+    onDiscoverMissing,
+    discoveringMissing = false,
     onRefreshKomga,
     refreshingKomga = false,
     onReconcile,
@@ -18,6 +20,8 @@
     reconciliation?: ReconciliationSummary | null;
     onPlanMissing?: () => void;
     onFindReleases?: () => void;
+    onDiscoverMissing?: () => void;
+    discoveringMissing?: boolean;
     onRefreshKomga?: () => void;
     refreshingKomga?: boolean;
     onReconcile?: () => void;
@@ -74,6 +78,21 @@
       {#if summary.missingCount > 0 && onPlanMissing}
         <button class="btn pill spot icon-text" onclick={onPlanMissing}>
           <Icon name="puzzle" size={14} /> Plan Missing
+        </button>
+      {/if}
+      {#if summary.missingCount > 0 && onDiscoverMissing}
+        <button
+          class="btn pill icon-text"
+          disabled={discoveringMissing}
+          onclick={onDiscoverMissing}
+          title="Discover release candidates for all missing volumes"
+        >
+          {#if discoveringMissing}
+            <span class="spin"><Icon name="spinner" size={14} stroke={3} /></span>
+          {:else}
+            <Icon name="search" size={14} />
+          {/if}
+          Discover Missing
         </button>
       {/if}
       {#if onFindReleases}

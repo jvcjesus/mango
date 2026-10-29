@@ -1400,4 +1400,58 @@ export const reconcileManga = (id: number) =>
 export const getFollowedReconciliations = () =>
   get<ReconciliationSummary[]>('/reconciliation/followed');
 
+export interface DiscoveredCandidate {
+  candidateId: string;
+  provider: string;
+  providerItemId: string;
+  title: string;
+  rawTitle: string;
+  matchType: 'exact_volume' | 'volume_range_containing_target' | 'series_pack' | 'possible_match' | 'rejected';
+  targetVolume?: number;
+  sizeBytes?: number;
+  uploader?: string;
+  isTrusted: boolean;
+  isDigital: boolean;
+  score: number;
+  scoreExplanation: string;
+  downloadUrl?: string;
+  magnetUrl?: string;
+  infoHash?: string;
+  seeders?: number;
+  leechers?: number;
+  publishedAt?: number;
+}
+
+export interface VolumeDiscoveryResult {
+  seriesId: string;
+  volumeNumber: number;
+  status: string;
+  candidateCount: number;
+  topCandidate?: DiscoveredCandidate;
+  candidates: DiscoveredCandidate[];
+  providersChecked: string[];
+  providerErrors: Record<string, string>;
+  lastDiscoveredAt: number;
+}
+
+export interface SeriesDiscoverySummary {
+  seriesId: string;
+  missingVolumesCount: number;
+  discoveredVolumesCount: number;
+  results: VolumeDiscoveryResult[];
+}
+
+export const getVolumeCandidates = (id: number, volume: number) =>
+  get<VolumeDiscoveryResult | null>(`/manga/${id}/volumes/${volume}/candidates`);
+
+export const discoverVolumeCandidates = (id: number, volume: number) =>
+  send<VolumeDiscoveryResult>('POST', `/manga/${id}/volumes/${volume}/discover`, {});
+
+export const discoverAllMissingCandidates = (id: number) =>
+  send<SeriesDiscoverySummary>('POST', `/manga/${id}/discover-missing`, {});
+
+export const getSeriesDiscovery = (id: number) =>
+  get<VolumeDiscoveryResult[]>(`/manga/${id}/discovery`);
+
+
 

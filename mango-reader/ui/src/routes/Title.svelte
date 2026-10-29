@@ -30,6 +30,11 @@
     unfollowManga,
     getMangaReconciliation,
     reconcileManga,
+    getSeriesDiscovery,
+    discoverVolumeCandidates,
+    discoverAllMissingCandidates,
+    type VolumeDiscoveryResult,
+    type DiscoveredCandidate,
     type ReconciliationSummary,
     type AcquisitionProfile,
     type MissingContentSummary,
@@ -57,7 +62,7 @@
   import { back } from '../lib/router.svelte';
   import { toast } from '../lib/toast.svelte';
   import Tracking from '../lib/Tracking.svelte';
-  import { ago, chapterShort, langName, parseVolume, volumeHeading, STATUS } from '../lib/util';
+  import { ago, chapterShort, formatBytes, langName, parseVolume, volumeHeading, STATUS } from '../lib/util';
 
   const WEEK = 7 * 86400;
 
@@ -127,6 +132,10 @@
   let togglingFollow = $state(false);
   let reconciliation = $state<ReconciliationSummary | null>(null);
   let reconciling = $state(false);
+  let seriesDiscovery = $state<Map<number, VolumeDiscoveryResult>>(new Map());
+  let discoveringVolume = $state<number | null>(null);
+  let discoveringAll = $state(false);
+  let expandedCandidates = $state<Set<number>>(new Set());
 
   const chapters = $derived(title?.chapters ?? []);
   const unread = $derived(chapters.filter((c) => !c.read).length);
@@ -235,6 +244,78 @@
     } catch {
       reconciliation = null;
     }
+    loadDiscovery();
+  }
+
+  async function loadDiscovery() {
+    try {
+      const list = await getSeriesDiscovery(id);
+      const map = new Map<number, VolumeDiscoveryResult>();
+      for (const item of list) {
+        map.set(item.volumeNumber, item);
+      }
+      seriesDiscovery = map;
+    } catch {
+      seriesDiscovery = new Map();
+    }
+  }
+
+  async function findReleasesForVolume(vol: number) {
+    if (discoveringVolume !== null) return;
+    discoveringVolume = vol;
+    try {
+      const res = await discoverVolumeCandidates(id, vol);
+      const updated = new Map(seriesDiscovery);
+      updated.set(vol, res);
+      seriesDiscovery = updated;
+      if (res.candidateCount > 0) {
+        toast.success(`Found ${res.candidateCount} release candidate(s) for Volume ${vol}`);
+        const updatedExp = new Set(expandedCandidates);
+        updatedExp.add(vol);
+        expandedCandidates = updatedExp;
+      } else {
+        toast.info(`No release candidates found for Volume ${vol}`);
+      }
+    } catch (e) {
+      toast.error(`Discovery failed: ${message(e)}`);
+    } finally {
+      discoveringVolume = null;
+    }
+  }
+
+  async function findAllMissingReleases() {
+    if (discoveringAll) return;
+    discoveringAll = true;
+    try {
+      const summary = await discoverAllMissingCandidates(id);
+      const updated = new Map(seriesDiscovery);
+      const updatedExp = new Set(expandedCandidates);
+      for (const res of summary.results) {
+        updated.set(res.volumeNumber, res);
+        if (res.candidateCount > 0) {
+          updatedExp.add(res.volumeNumber);
+        }
+      }
+      seriesDiscovery = updated;
+      expandedCandidates = updatedExp;
+      toast.success(
+        `Discovered releases for ${summary.discoveredVolumesCount} of ${summary.missingVolumesCount} missing volume(s)`
+      );
+    } catch (e) {
+      toast.error(`Discovery failed: ${message(e)}`);
+    } finally {
+      discoveringAll = false;
+    }
+  }
+
+  function toggleExpandedCandidates(vol: number) {
+    const updated = new Set(expandedCandidates);
+    if (updated.has(vol)) {
+      updated.delete(vol);
+    } else {
+      updated.add(vol);
+    }
+    expandedCandidates = updated;
   }
 
   async function toggleFollow() {
@@ -1122,6 +1203,8 @@
                   reconciliation={reconciliation}
                   onPlanMissing={() => openPlanModal(true)}
                   onFindReleases={() => searchNyaa()}
+                  onDiscoverMissing={findAllMissingReleases}
+                  discoveringMissing={discoveringAll}
                   onRefreshKomga={refreshOwnership}
                   refreshingKomga={refreshingOwnership}
                   onReconcile={runReconcile}
@@ -1557,6 +1640,23 @@
                       </span>
                     {/if}
                   </div>
+
+                  {#if grp.volume !== null && seriesDiscovery.has(grp.volume)}
+                    {@const disc = seriesDiscovery.get(grp.volume)}
+                    {#if disc && disc.candidateCount > 0}
+                      <button
+                        class="btn pill sm candidate-toggle-btn"
+                        class:spot={expandedCandidates.has(grp.volume)}
+                        onclick={() => grp.volume !== null && toggleExpandedCandidates(grp.volume)}
+                        title="Toggle {disc.candidateCount} discovered candidate(s)"
+                      >
+                        <Icon name={expandedCandidates.has(grp.volume) ? 'up' : 'down'} size={12} />
+                        {disc.candidateCount} {disc.candidateCount === 1 ? 'candidate' : 'candidates'} (Top: {disc.topCandidate?.score.toFixed(0)})
+                      </button>
+                    {:else if disc && disc.status === 'no_candidates'}
+                      <span class="tag muted sm">No releases</span>
+                    {/if}
+                  {/if}
                 {:else}
                   <!-- Fallback when no presentation (e.g. unassigned volume) -->
                   {#if grp.ownershipStatus === 'owned'}
@@ -1656,16 +1756,75 @@
                   {#if grp.presentation?.status !== 'owned' && grp.presentation?.status !== 'complete'}
                     <button
                       class="btn pill"
+                      aria-label="Find release candidates for {grp.label}"
+                      disabled={discoveringVolume === grp.volume}
+                      onclick={() => grp.volume !== null && findReleasesForVolume(grp.volume)}
+                      title="Discover release candidates for {grp.label}"
+                    >
+                      {#if discoveringVolume === grp.volume}
+                        <span class="spin"><Icon name="spinner" size={14} stroke={3} /></span>
+                      {:else}
+                        <Icon name="search" size={14} />
+                      {/if}
+                      Find Releases
+                    </button>
+                    <button
+                      class="btn pill"
                       aria-label="Find {grp.label} on Nyaa"
                       onclick={() => searchNyaa('volume', grp.volume ?? undefined)}
-                      title="Search Nyaa for {grp.label}"
+                      title="Search Nyaa manually for {grp.label}"
                     >
-                      <Icon name="search" size={14} /> Find Nyaa
+                      <Icon name="search" size={14} /> Nyaa
                     </button>
                   {/if}
                 </div>
               {/if}
             </div>
+
+            <!-- Discovered candidates card list -->
+            {#if grp.volume !== null && expandedCandidates.has(grp.volume)}
+              {@const disc = seriesDiscovery.get(grp.volume)}
+              {#if disc && disc.candidates.length > 0}
+                <div class="discovered-candidates-box">
+                  <div class="candidates-header">
+                    <span class="cand-heading">Discovered Releases ({disc.candidates.length})</span>
+                    <span class="cand-providers">Checked: {disc.providersChecked.join(', ')}</span>
+                  </div>
+                  <div class="candidates-list">
+                    {#each disc.candidates as cand (cand.candidateId)}
+                      <div class="candidate-row">
+                        <div class="candidate-main">
+                          <span class="candidate-title" title={cand.rawTitle}>{cand.title || cand.rawTitle}</span>
+                          <div class="candidate-meta">
+                            <span class="cand-badge match-{cand.matchType}">{cand.matchType.replace(/_/g, ' ')}</span>
+                            <span class="cand-badge score-badge">Score: {cand.score.toFixed(0)}</span>
+                            {#if cand.isDigital}
+                              <span class="cand-badge digital-badge">Digital</span>
+                            {/if}
+                            {#if cand.isTrusted}
+                              <span class="cand-badge trusted-badge">Trusted</span>
+                            {/if}
+                            {#if cand.seeders !== undefined && cand.seeders !== null}
+                              <span class="cand-meta-text">{cand.seeders} seeds</span>
+                            {/if}
+                            {#if cand.sizeBytes}
+                              <span class="cand-meta-text">{formatBytes(cand.sizeBytes)}</span>
+                            {/if}
+                            {#if cand.uploader}
+                              <span class="cand-meta-text">by {cand.uploader}</span>
+                            {/if}
+                            <span class="cand-meta-text">via {cand.provider}</span>
+                          </div>
+                          {#if cand.scoreExplanation}
+                            <div class="score-explanation">{cand.scoreExplanation}</div>
+                          {/if}
+                        </div>
+                      </div>
+                    {/each}
+                  </div>
+                </div>
+              {/if}
+            {/if}
 
             <!-- Contradiction Warning Banner -->
             {#if grp.presentation?.contradictionWarning}
@@ -3233,6 +3392,127 @@
     font-size: 0.82rem;
     color: var(--muted, #888);
     margin: 0.35rem 0 0.75rem;
+  }
+
+  .candidate-badge {
+    cursor: pointer;
+    background: var(--surface-2);
+    border: 1px solid var(--ink);
+  }
+
+  .candidate-toggle-btn {
+    font-size: 0.8rem;
+    padding: 3px 8px;
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+  }
+
+  .discovered-candidates-box {
+    margin: 4px 0 12px;
+    padding: 10px 12px;
+    background: var(--surface-2, rgba(255, 255, 255, 0.03));
+    border: 1px solid var(--edge, rgba(255, 255, 255, 0.1));
+    border-radius: var(--radius, 6px);
+  }
+
+  .candidates-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 8px;
+    font-size: 0.82rem;
+    font-weight: 600;
+  }
+
+  .cand-providers {
+    font-size: 0.75rem;
+    color: var(--subtle, #888);
+  }
+
+  .candidates-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .candidate-row {
+    padding: 6px 10px;
+    background: var(--surface, rgba(0, 0, 0, 0.2));
+    border: 1px solid var(--edge, rgba(255, 255, 255, 0.08));
+    border-radius: 4px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .candidate-title {
+    font-weight: 500;
+    font-size: 0.88rem;
+    word-break: break-all;
+  }
+
+  .candidate-meta {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    flex-wrap: wrap;
+    font-size: 0.78rem;
+  }
+
+  .cand-badge {
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-size: 0.72rem;
+    font-weight: 600;
+    text-transform: capitalize;
+  }
+
+  .cand-badge.match-exact_volume {
+    background: #10b981;
+    color: white;
+  }
+
+  .cand-badge.match-volume_range_containing_target {
+    background: #3b82f6;
+    color: white;
+  }
+
+  .cand-badge.match-series_pack {
+    background: #8b5cf6;
+    color: white;
+  }
+
+  .cand-badge.match-possible_match {
+    background: #f59e0b;
+    color: white;
+  }
+
+  .cand-badge.score-badge {
+    background: var(--surface-3, #333);
+    color: var(--ink, #eee);
+    border: 1px solid var(--edge, #555);
+  }
+
+  .cand-badge.digital-badge {
+    background: #0284c7;
+    color: white;
+  }
+
+  .cand-badge.trusted-badge {
+    background: #059669;
+    color: white;
+  }
+
+  .cand-meta-text {
+    color: var(--subtle, #999);
+  }
+
+  .score-explanation {
+    font-size: 0.74rem;
+    color: var(--subtle, #888);
+    font-style: italic;
+    margin-top: 1px;
   }
 </style>
 

@@ -478,4 +478,42 @@ describe('Normalized Volume Presentation Model', () => {
     expect(summary.pendingPayloadChapters).toEqual([300]);
     expect(summary.canClean).toBe(true);
   });
+
+  it('Discovery candidates presentation: formats scores and match types correctly', () => {
+    const candidate: import('./api').DiscoveredCandidate = {
+      candidateId: 'nyaa:12345',
+      provider: 'nyaa',
+      providerItemId: '12345',
+      title: 'Akane-banashi Vol. 17',
+      rawTitle: '[danke-Empire] Akane-banashi - Vol. 17 [Digital]',
+      matchType: 'exact_volume',
+      targetVolume: 17,
+      sizeBytes: 150_000_000,
+      uploader: 'danke-Empire',
+      isTrusted: true,
+      isDigital: true,
+      score: 95.0,
+      scoreExplanation: 'Exact single volume match (+60); Digital edition (+15); Trusted uploader (+10); Well-seeded (+10)',
+      seeders: 25,
+      leechers: 2,
+    };
+
+    const discovery: import('./api').VolumeDiscoveryResult = {
+      seriesId: 'manga:10',
+      volumeNumber: 17,
+      status: 'found',
+      candidateCount: 1,
+      topCandidate: candidate,
+      candidates: [candidate],
+      providersChecked: ['nyaa', 'madokami'],
+      providerErrors: { madokami: 'Madokami is currently offline / unavailable' },
+      lastDiscoveredAt: 1700000000,
+    };
+
+    expect(discovery.status).toBe('found');
+    expect(discovery.candidateCount).toBe(1);
+    expect(discovery.topCandidate?.score).toBe(95.0);
+    expect(discovery.topCandidate?.matchType).toBe('exact_volume');
+    expect(discovery.providerErrors['madokami']).toContain('offline');
+  });
 });
