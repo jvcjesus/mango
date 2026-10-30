@@ -49,13 +49,7 @@ pub(crate) fn persist_publication_provenance(
     Ok(())
 }
 
-pub(crate) fn complete_queued_publication(conn: &rusqlite::Connection, chapter: i64) -> Result<()> {
-    persist_publication_provenance(conn, chapter)?;
-    conn.execute("UPDATE acquisition_history SET outcome='completed', completed_at=strftime('%s','now')
-        WHERE chapter_id=?1 AND canonical_path=(SELECT published_path FROM downloads WHERE chapter_id=?1)
-        AND outcome IN ('published','verification_pending','published_scan_failed')", [chapter])?;
-
-    // Record ACQUISITION_COMPLETE domain event before deleting the downloads queue row
+pub(crate) fn record_acquisition_complete(conn: &rusqlite::Connection, chapter: i64) -> Result<()> {
     let chapter_info: Option<(i64, String, String)> = conn
         .query_row(
             "SELECT c.manga_id, m.title, c.name
@@ -113,6 +107,85 @@ pub(crate) fn complete_queued_publication(conn: &rusqlite::Connection, chapter: 
             &msg,
         );
     }
+    Ok(())
+}
+
+pub(crate) fn record_metadata_action_required(
+    conn: &rusqlite::Connection,
+    chapter: i64,
+    error_msg: &str,
+) -> Result<()> {
+    let chapter_info: Option<(i64, String, String)> = conn
+        .query_row(
+            "SELECT c.manga_id, m.title, c.name
+             FROM downloads d
+             JOIN chapters c ON c.id = d.chapter_id
+             JOIN manga m ON m.id = c.manga_id
+             WHERE d.chapter_id = ?1",
+            [chapter],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()
+        .unwrap_or(None);
+
+    if let Some((manga_id, series_title, chapter_name)) = chapter_info {
+        let vol_num = crate::release::parse_volume(&chapter_name);
+        let series_id = conn
+            .query_row(
+                "SELECT series_id FROM series_reconciliations WHERE manga_id = ?1 LIMIT 1",
+                [manga_id],
+                |r| r.get::<_, String>(0),
+            )
+            .unwrap_or_else(|_| format!("manga:{manga_id}"));
+
+        let mb_id: Option<i64> = conn
+            .query_row(
+                "SELECT mangabaka_id FROM series_reconciliations WHERE series_id = ?1",
+                [&series_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap_or(None);
+
+        let vol_display = vol_num
+            .map(|v| {
+                if (v.fract()).abs() < 0.001 {
+                    format!("{}", v as i64)
+                } else {
+                    format!("{v}")
+                }
+            })
+            .unwrap_or_else(|| chapter_name.clone());
+
+        let msg = format!(
+            "Physical media acquired successfully for {} Vol. {} · Metadata needs attention: {}",
+            series_title, vol_display, error_msg
+        );
+        let _ = crate::sync::reconciliation::record_event_full(
+            conn,
+            &series_id,
+            &series_title,
+            mb_id,
+            None,
+            "standard",
+            vol_num,
+            "ACTION_REQUIRED",
+            None,
+            0,
+            &msg,
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn complete_queued_publication(conn: &rusqlite::Connection, chapter: i64) -> Result<()> {
+    persist_publication_provenance(conn, chapter)?;
+    conn.execute("UPDATE acquisition_history SET outcome='completed', completed_at=strftime('%s','now')
+        WHERE chapter_id=?1 AND canonical_path=(SELECT published_path FROM downloads WHERE chapter_id=?1)
+        AND outcome IN ('published','verification_pending','published_scan_failed')", [chapter])?;
+
+    // Record ACQUISITION_COMPLETE if not already recorded
+    record_acquisition_complete(conn, chapter)?;
 
     conn.execute("DELETE FROM downloads WHERE chapter_id=?1", [chapter])?;
     Ok(())
@@ -1088,7 +1161,7 @@ impl AcquisitionService {
         Ok(chapter_id)
     }
 
-    fn canonical_file_exists_for_unit(
+    pub(crate) fn canonical_file_exists_for_unit(
         &self,
         series_dir: &Path,
         unit: &AcquisitionReleaseUnit,

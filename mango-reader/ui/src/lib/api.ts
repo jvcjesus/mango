@@ -1453,6 +1453,33 @@ export const discoverAllMissingCandidates = (id: number) =>
 export const getSeriesDiscovery = (id: number) =>
   get<VolumeDiscoveryResult[]>(`/manga/${id}/discovery`);
 
+export interface ApproveCandidateRequest {
+  confirmRange?: boolean;
+  confirmPack?: boolean;
+  confirmReview?: boolean;
+}
+
+export interface ApproveCandidateResponse {
+  status: string;
+  message: string;
+  executionId?: string;
+  chapterIds: number[];
+  alreadyOwned: boolean;
+  alreadyAcquiring: boolean;
+}
+
+export const acquireMangaVolumeCandidate = (
+  id: number,
+  volume: number,
+  candidateId: string,
+  req?: ApproveCandidateRequest
+) =>
+  send<ApproveCandidateResponse>(
+    'POST',
+    `/manga/${id}/volumes/${volume}/candidates/${encodeURIComponent(candidateId)}/acquire`,
+    req ?? {}
+  );
+
 export interface NtfyConfig {
   enabled: boolean;
   serverUrl: string;

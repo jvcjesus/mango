@@ -192,6 +192,9 @@ async fn finish(db: &Db, chapter: i64, state: &str, message: &str) -> Result<boo
         let queue_state = if state=="waiting_komga" {"verifying"} else if state=="needs_review" {"metadata_review"}
             else if state=="unknown" && read(conn,chapter)?.is_some_and(|h|h.job_id.is_some()) {"metadata_wait"} else {"metadata_failed"};
         conn.execute("UPDATE downloads SET state=?2,error=?3,retry_at=strftime('%s','now')+60 WHERE chapter_id=?1", rusqlite::params![chapter,queue_state,message])?;
+        if state == "failed" || state == "needs_review" {
+            let _ = crate::acquisition::service::record_metadata_action_required(conn, chapter, &message);
+        }
         Ok(false)
     }).await
 }

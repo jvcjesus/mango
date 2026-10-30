@@ -207,7 +207,7 @@ describe('Normalized Volume Presentation Model', () => {
     });
 
     expect(pres.status).toBe('attention');
-    expect(pres.statusLabel).toBe('Metadata failed');
+    expect(pres.statusLabel).toBe('Media acquired · Metadata needs attention');
     expect(pres.badgeVariant).toBe('attention');
     expect(pres.physicalState).toBe('in_library');
     expect(pres.metadataState).toBe('failed');

@@ -33,6 +33,8 @@
     getSeriesDiscovery,
     discoverVolumeCandidates,
     discoverAllMissingCandidates,
+    acquireMangaVolumeCandidate,
+    type ApproveCandidateRequest,
     type VolumeDiscoveryResult,
     type DiscoveredCandidate,
     type ReconciliationSummary,
@@ -136,6 +138,7 @@
   let discoveringVolume = $state<number | null>(null);
   let discoveringAll = $state(false);
   let expandedCandidates = $state<Set<number>>(new Set());
+  let acquiringCandidates = $state<Set<string>>(new Set());
 
   const chapters = $derived(title?.chapters ?? []);
   const unread = $derived(chapters.filter((c) => !c.read).length);
@@ -316,6 +319,81 @@
       updated.add(vol);
     }
     expandedCandidates = updated;
+  }
+
+  async function handleAcquireCandidate(volume: number, cand: DiscoveredCandidate) {
+    if (acquiringCandidates.has(cand.candidateId)) return;
+
+    if (cand.provider === 'madokami') {
+      toast.info('Madokami releases are discovery-only and cannot be acquired directly.');
+      return;
+    }
+
+    if (cand.matchType === 'rejected') {
+      toast.error('Rejected candidates cannot be acquired.');
+      return;
+    }
+
+    const req: ApproveCandidateRequest = {};
+
+    if (cand.matchType === 'possible_match') {
+      const ok = await confirm({
+        title: 'Review Required for Possible Match',
+        message: `"${cand.title || cand.rawTitle}" is marked as a possible match rather than an exact match for Volume ${volume}. Are you sure you want to acquire this candidate?`,
+        confirmText: 'Acquire Candidate',
+        danger: false,
+      });
+      if (!ok) return;
+      req.confirmReview = true;
+    } else if (cand.matchType === 'volume_range_containing_target') {
+      const ok = await confirm({
+        title: 'Multi-Volume Range Release',
+        message: `"${cand.title || cand.rawTitle}" covers a range of volumes containing Volume ${volume}. Any volumes you already own will be protected and not republished. Proceed with acquisition?`,
+        confirmText: 'Acquire Range',
+        danger: false,
+      });
+      if (!ok) return;
+      req.confirmRange = true;
+    } else if (cand.matchType === 'series_pack') {
+      const ok = await confirm({
+        title: 'Series Pack Release',
+        message: `"${cand.title || cand.rawTitle}" contains multiple volumes or an entire series pack. Any volumes you already own will be protected and not republished. Proceed with acquisition?`,
+        confirmText: 'Acquire Series Pack',
+        danger: false,
+      });
+      if (!ok) return;
+      req.confirmPack = true;
+    }
+
+    const nextSet = new Set(acquiringCandidates);
+    nextSet.add(cand.candidateId);
+    acquiringCandidates = nextSet;
+
+    try {
+      const res = await acquireMangaVolumeCandidate(id, volume, cand.candidateId, req);
+      if (res.alreadyOwned) {
+        toast.info(res.message || `Volume ${volume} is already owned in Komga library`);
+        await refreshOwnership();
+      } else if (res.alreadyAcquiring) {
+        toast.info(res.message || `Volume ${volume} is already actively being acquired`);
+        await Promise.all([loadTitleAcquisitions(), loadTitleExecutions()]);
+      } else {
+        toast.success(res.message || `Acquisition queued for Volume ${volume}`);
+        await Promise.all([
+          loadTitleAcquisitions(),
+          loadTitleExecutions(),
+          loadMissingAndProfile(),
+          refreshOwnership(),
+          load(),
+        ]);
+      }
+    } catch (e) {
+      toast.error(`Acquisition failed: ${message(e)}`);
+    } finally {
+      const resetSet = new Set(acquiringCandidates);
+      resetSet.delete(cand.candidateId);
+      acquiringCandidates = resetSet;
+    }
   }
 
   async function toggleFollow() {
@@ -1817,6 +1895,38 @@
                           </div>
                           {#if cand.scoreExplanation}
                             <div class="score-explanation">{cand.scoreExplanation}</div>
+                          {/if}
+                        </div>
+                        <div class="candidate-actions">
+                          {#if cand.provider === 'madokami'}
+                            <button
+                              class="btn mini cand-acquire-btn"
+                              disabled
+                              title="Madokami is discovery-only and cannot be acquired directly"
+                            >
+                              Madokami Only
+                            </button>
+                          {:else if cand.matchType === 'rejected'}
+                            <button
+                              class="btn mini cand-acquire-btn"
+                              disabled
+                              title="Rejected candidate cannot be acquired"
+                            >
+                              Rejected
+                            </button>
+                          {:else}
+                            <button
+                              class="btn mini spot cand-acquire-btn"
+                              disabled={acquiringCandidates.has(cand.candidateId) || grp.ownershipStatus === 'owned'}
+                              onclick={() => handleAcquireCandidate(grp.volume!, cand)}
+                              title={grp.ownershipStatus === 'owned' ? 'Volume already owned in Komga' : `Acquire ${cand.title || cand.rawTitle}`}
+                            >
+                              {#if acquiringCandidates.has(cand.candidateId)}
+                                <span class="spin"><Icon name="spinner" size={13} stroke={2.5} /></span> Acquiring…
+                              {:else}
+                                <Icon name="download" size={13} /> Acquire
+                              {/if}
+                            </button>
                           {/if}
                         </div>
                       </div>
@@ -3437,13 +3547,37 @@
   }
 
   .candidate-row {
-    padding: 6px 10px;
+    padding: 8px 10px;
     background: var(--surface, rgba(0, 0, 0, 0.2));
     border: 1px solid var(--edge, rgba(255, 255, 255, 0.08));
     border-radius: 4px;
     display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+
+  .candidate-main {
+    display: flex;
     flex-direction: column;
     gap: 4px;
+    flex: 1;
+    min-width: 0;
+  }
+
+  .candidate-actions {
+    display: flex;
+    align-items: center;
+    flex-shrink: 0;
+  }
+
+  .cand-acquire-btn {
+    white-space: nowrap;
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    font-size: 0.8rem;
+    padding: 4px 10px;
   }
 
   .candidate-title {

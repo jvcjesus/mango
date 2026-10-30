@@ -1426,6 +1426,13 @@ impl Pipeline {
             && !is_chinese
             && (!config.komga_enabled || !config.komga_scan_enabled)
         {
+            let _ = self
+                .db
+                .call(move |conn| {
+                    crate::acquisition::service::record_acquisition_complete(conn, chapter_id)?;
+                    Ok(())
+                })
+                .await;
             let done = self
                 .handoff_metadata(
                     job.chapter,
@@ -1483,6 +1490,13 @@ impl Pipeline {
                     || Some(id) == config.komga_chinese_library_id.as_deref()
             })
         {
+            let _ = self
+                .db
+                .call(move |conn| {
+                    crate::acquisition::service::record_acquisition_complete(conn, chapter_id)?;
+                    Ok(())
+                })
+                .await;
             let _ = self
                 .handoff_metadata(
                     job.chapter,
@@ -1555,6 +1569,13 @@ impl Pipeline {
         let policy = self.verification_policy();
 
         if config.komf_enabled && !is_chinese {
+            let _ = self
+                .db
+                .call(move |conn| {
+                    crate::acquisition::service::record_acquisition_complete(conn, chapter_id)?;
+                    Ok(())
+                })
+                .await;
             on_stage(
                 "metadata",
                 "Resolving exact Komga book / waiting for KOMF metadata",

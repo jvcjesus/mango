@@ -182,7 +182,7 @@ export function resolveVolumePresentation(input: VolumeDataInputs): VolumePresen
 
     if (hasMetadataError) {
       status = 'attention';
-      statusLabel = 'Metadata failed';
+      statusLabel = 'Media acquired · Metadata needs attention';
       badgeVariant = 'attention';
       metadataState = 'failed';
       metadataLabel =

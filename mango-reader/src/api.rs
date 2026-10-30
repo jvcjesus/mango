@@ -132,6 +132,7 @@ pub fn router(state: Spaces) -> Router {
         .route("/manga/{id}/reconcile", post(post_manga_reconcile))
         .route("/reconciliation/followed", get(get_followed_reconciliations))
         .route("/manga/{id}/volumes/{volume}/candidates", get(get_manga_volume_candidates))
+        .route("/manga/{id}/volumes/{volume}/candidates/{candidate_id}/acquire", post(post_manga_volume_candidate_acquire))
         .route("/manga/{id}/volumes/{volume}/discover", post(post_manga_volume_discover))
         .route("/manga/{id}/discover-missing", post(post_manga_discover_missing))
         .route("/manga/{id}/discovery", get(get_manga_series_discovery))
@@ -1064,6 +1065,18 @@ async fn get_manga_volume_candidates(
         .call(move |conn| crate::acquisition::discovery::get_volume_discovery(conn, &s_id, volume))
         .await?;
 
+    Ok(Json(res))
+}
+
+async fn post_manga_volume_candidate_acquire(
+    Me(app): Me,
+    Path((id, volume, candidate_id)): Path<(i64, f64, String)>,
+    Json(payload): Json<Option<crate::acquisition::approval::ApproveCandidateRequest>>,
+) -> Result<Json<crate::acquisition::approval::ApproveCandidateResponse>> {
+    let res = app
+        .acquisition
+        .approve_candidate(id, volume, &candidate_id, payload.unwrap_or_default())
+        .await?;
     Ok(Json(res))
 }
 
