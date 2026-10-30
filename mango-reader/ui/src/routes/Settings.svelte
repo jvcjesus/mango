@@ -50,6 +50,10 @@
     getNotificationOutbox,
     type NtfyConfig,
     type OutboxEntry,
+    getOpenTomeStatus,
+    updateOpenTomeCatalogue,
+    setOpenTomeConfig,
+    type OpenTomeStatus,
   } from '../lib/api';
   import { confirm } from '../lib/confirm.svelte';
   import { COVERS, display, MENUS, setDisplay, SIZES } from '../lib/display.svelte';
@@ -771,10 +775,52 @@
       loadProfiles();
       loadSourceHealth();
       loadNormalizationHistory();
+      loadOpenTome();
     } catch (e) {
       pipelineError = message(e);
     } finally {
       pipelineLoading = false;
+    }
+  }
+
+  // ---------- OpenTome Release Intelligence ----------
+  let openTomeStatus = $state<OpenTomeStatus | null>(null);
+  let openTomeUpdating = $state(false);
+
+  async function loadOpenTome() {
+    try {
+      openTomeStatus = await getOpenTomeStatus();
+    } catch {
+      openTomeStatus = null;
+    }
+  }
+
+  async function toggleOpenTome() {
+    if (!openTomeStatus) return;
+    try {
+      await setOpenTomeConfig({ enabled: !openTomeStatus.enabled });
+      await loadOpenTome();
+      toast.success(openTomeStatus?.enabled ? 'OpenTome enabled' : 'OpenTome disabled');
+    } catch {
+      toast.error('Failed to change OpenTome setting');
+    }
+  }
+
+  async function triggerOpenTomeUpdate(force = false) {
+    if (openTomeUpdating) return;
+    openTomeUpdating = true;
+    try {
+      const res = await updateOpenTomeCatalogue(force);
+      await loadOpenTome();
+      if (res.updated) {
+        toast.success('OpenTome catalogue updated successfully');
+      } else {
+        toast.info('OpenTome catalogue is already up to date');
+      }
+    } catch (e: any) {
+      toast.error(`OpenTome update failed: ${e?.message ?? e}`);
+    } finally {
+      openTomeUpdating = false;
     }
   }
 
@@ -1862,6 +1908,112 @@
             <div class="set"><div class="what"><strong>Hand off published English volumes</strong><span>Apply metadata to the exact indexed book. Failures preserve the published book and can be retried separately.</span></div>
               <div class="how">{@render toggle(pipeline.komf_enabled ?? false, 'KOMF handoff', () => { if (pipeline) pipeline.komf_enabled = !pipeline.komf_enabled; })}</div></div>
             <div class="set stack"><div class="what"><strong>KOMF server URL</strong><span>Use an address reachable from the Mango server.</span></div><div class="how wide"><label class="field grow"><input type="url" bind:value={pipeline.komf_url} placeholder="https://komf.example" /></label></div></div>
+          </section>
+
+          <!-- OpenTome Physical Release Intelligence Card -->
+          <section class="card">
+            <div class="card-header-row">
+              <div>
+                <h3>OpenTome Physical Release Intelligence</h3>
+                <span class="muted">Market-specific physical volume release schedules from published OpenTome SQLite catalogues.</span>
+              </div>
+              {#if openTomeStatus}
+                <span
+                  class="status-badge"
+                  class:status-valid={openTomeStatus.enabled && openTomeStatus.available}
+                  class:status-not_configured={!openTomeStatus.enabled}
+                  class:status-failed={openTomeStatus.enabled && !openTomeStatus.available}
+                >
+                  {#if !openTomeStatus.enabled}
+                    DISABLED
+                  {:else if openTomeStatus.available}
+                    AVAILABLE
+                  {:else}
+                    UNAVAILABLE
+                  {/if}
+                </span>
+              {/if}
+            </div>
+
+            <div class="set">
+              <div class="what">
+                <strong>Enable OpenTome Release Intelligence</strong>
+                <span>Evaluate physical volume schedules (Japan/English) for followed titles and notify when volumes release. Strictly read-only; never auto-acquires.</span>
+              </div>
+              <div class="how">
+                {#if openTomeStatus}
+                  {@render toggle(openTomeStatus.enabled, 'OpenTome Intelligence', toggleOpenTome)}
+                {/if}
+              </div>
+            </div>
+
+            {#if openTomeStatus}
+              <div class="set stack">
+                <div class="what">
+                  <strong>Catalogue Details</strong>
+                  <span>Current local database file and dump metadata.</span>
+                </div>
+                <div class="how wide">
+                  <div class="opentome-status-grid">
+                    <div class="ot-meta-item">
+                      <span class="ot-k">Dump Version:</span>
+                      <strong class="ot-v">{openTomeStatus.version ?? 'Not downloaded'}</strong>
+                    </div>
+                    <div class="ot-meta-item">
+                      <span class="ot-k">Database Size:</span>
+                      <strong class="ot-v">
+                        {openTomeStatus.fileSize ? (openTomeStatus.fileSize / 1024 / 1024).toFixed(1) + ' MB' : '0 MB'}
+                      </strong>
+                    </div>
+                    <div class="ot-meta-item">
+                      <span class="ot-k">Catalogue Path:</span>
+                      <code class="ot-v ot-path">{openTomeStatus.cataloguePath}</code>
+                    </div>
+                    {#if openTomeStatus.lastUpdatedAt}
+                      <div class="ot-meta-item">
+                        <span class="ot-k">Last Updated:</span>
+                        <strong class="ot-v">{ago(openTomeStatus.lastUpdatedAt * 1000)}</strong>
+                      </div>
+                    {/if}
+                    {#if openTomeStatus.lastCheckedAt}
+                      <div class="ot-meta-item">
+                        <span class="ot-k">Last Checked:</span>
+                        <strong class="ot-v">{ago(openTomeStatus.lastCheckedAt * 1000)}</strong>
+                      </div>
+                    {/if}
+                  </div>
+                </div>
+              </div>
+
+              {#if openTomeStatus.lastError}
+                <div class="set stack">
+                  <Notice error={openTomeStatus.lastError}>
+                    <span>{openTomeStatus.lastError}</span>
+                  </Notice>
+                </div>
+              {/if}
+
+              <div class="set">
+                <div class="what">
+                  <strong>Update Catalogue</strong>
+                  <span>Check for new releases of the OpenTome database manifest (version.json) and stream the verified SQLite archive.</span>
+                </div>
+                <div class="how opentome-btn-row">
+                  <button class="btn" onclick={() => triggerOpenTomeUpdate(false)} disabled={openTomeUpdating}>
+                    {#if openTomeUpdating}
+                      <span class="spin"><Icon name="spinner" size={16} stroke={3} /></span>
+                      Checking…
+                    {:else}
+                      <Icon name="refresh" size={16} />
+                      Check for Updates
+                    {/if}
+                  </button>
+                  <button class="btn" onclick={() => triggerOpenTomeUpdate(true)} disabled={openTomeUpdating} title="Force full re-download regardless of dump date">
+                    Force Re-download
+                  </button>
+                </div>
+              </div>
+            {/if}
           </section>
 
           <section class="card">
@@ -4633,5 +4785,42 @@
   .status-badge.status-suppressed {
     background: rgba(255, 255, 255, 0.06);
     color: #888;
+  }
+
+  .opentome-status-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 12px;
+    background: var(--surface-2, rgba(255, 255, 255, 0.03));
+    border: 1px solid var(--edge, rgba(255, 255, 255, 0.08));
+    border-radius: 6px;
+    padding: 12px 14px;
+    width: 100%;
+  }
+
+  .ot-meta-item {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .ot-k {
+    font-size: 0.75rem;
+    color: var(--subtle, #888);
+  }
+
+  .ot-v {
+    font-size: 0.85rem;
+  }
+
+  .ot-path {
+    font-size: 0.75rem;
+    word-break: break-all;
+  }
+
+  .opentome-btn-row {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
   }
 </style>

@@ -1527,6 +1527,65 @@ export const sendTestNotification = (params?: { serverUrl?: string; topic?: stri
 export const getNotificationOutbox = () =>
   get<OutboxEntry[]>('/notifications/outbox');
 
+export interface OpenTomeStatus {
+  enabled: boolean;
+  available: boolean;
+  version?: string;
+  fileSize?: number;
+  lastUpdatedAt?: number;
+  lastCheckedAt?: number;
+  lastError?: string;
+  cataloguePath: string;
+}
+
+export interface OpenTomeVolumeRelease {
+  volumeNumber: number;
+  title?: string;
+  releaseDate?: string;
+  releaseDateRaw?: string;
+  precision: 'day' | 'month' | 'year' | 'unknown' | string;
+  dateType: 'published' | 'projected' | 'unknown' | string;
+  status: 'released' | 'releases_today' | 'future' | 'unknown' | string;
+}
+
+export interface OpenTomeMarketSchedule {
+  market: 'ja' | 'en' | string;
+  lineName: string;
+  publisher?: string;
+  tomeId: string;
+  gcdSeriesId: number;
+  latestVolume?: OpenTomeVolumeRelease;
+  nextVolume?: OpenTomeVolumeRelease;
+  totalVolumes: number;
+}
+
+export interface OpenTomeSeriesSchedule {
+  workId: string;
+  mappingConfidence: 'exact' | 'high' | 'ambiguous' | 'user_confirmed' | 'unmatched' | 'rejected' | string;
+  japanese?: OpenTomeMarketSchedule;
+  english?: OpenTomeMarketSchedule;
+  lastEvaluatedAt: number;
+}
+
+export const getOpenTomeStatus = () =>
+  get<OpenTomeStatus>('/opentome/status');
+
+export const updateOpenTomeCatalogue = (force = false) =>
+  send<{ updated: boolean }>('POST', `/opentome/update?force=${force}`);
+
+export const setOpenTomeConfig = (params: { enabled?: boolean; manifestUrl?: string }) =>
+  send<{ success: boolean }>('POST', '/opentome/config', params);
+
+export const getMangaOpenTome = (id: number) =>
+  get<OpenTomeSeriesSchedule | null>(`/manga/${id}/opentome`);
+
+export const remapMangaOpenTome = (
+  id: number,
+  workId?: string | null,
+  action: 'confirm' | 'reject' | 'auto' = 'confirm'
+) =>
+  send<{ success: boolean }>('POST', `/manga/${id}/opentome/remap`, { workId: workId ?? null, action });
+
 
 
 

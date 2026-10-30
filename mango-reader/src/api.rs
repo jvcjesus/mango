@@ -62,6 +62,7 @@ pub struct AppState {
     pub sync: Arc<crate::sync::service::SyncService>,
     pub acquisition: Arc<crate::acquisition::service::AcquisitionService>,
     pub notification: Arc<crate::notification::NotificationService>,
+    pub opentome: Arc<crate::opentome::service::OpenTomeService>,
     /// The local source's folder, shown in Settings so the owner knows where to put files.
     pub local_dir: String,
 }
@@ -139,6 +140,11 @@ pub fn router(state: Spaces) -> Router {
         .route("/notifications/config", get(get_notification_config).post(post_notification_config))
         .route("/notifications/test", post(post_notification_test))
         .route("/notifications/outbox", get(get_notification_outbox))
+        .route("/opentome/status", get(get_opentome_status))
+        .route("/opentome/update", post(post_opentome_update))
+        .route("/opentome/config", post(post_opentome_config))
+        .route("/manga/{id}/opentome", get(get_manga_opentome))
+        .route("/manga/{id}/opentome/remap", post(post_manga_opentome_remap))
         .route("/manga/{id}/cover", get(cover))
         .route("/manga/{id}/library", put(set_library))
         .route("/manga/{id}/reader", put(set_reader))
@@ -2950,4 +2956,68 @@ async fn get_notification_outbox(
     app.me.admin()?;
     let entries = app.notification.get_outbox(50).await?;
     Ok(Json(entries))
+}
+
+async fn get_opentome_status(
+    Me(app): Me,
+) -> Result<Json<crate::opentome::updater::OpenTomeStatus>> {
+    let status = app.opentome.status().await?;
+    Ok(Json(status))
+}
+
+#[derive(Deserialize, Default)]
+struct OpenTomeUpdatePayload {
+    force: Option<bool>,
+}
+
+async fn post_opentome_update(
+    Me(app): Me,
+    payload: Option<Json<OpenTomeUpdatePayload>>,
+) -> Result<Json<Value>> {
+    app.me.admin()?;
+    let force = payload.and_then(|p| p.force).unwrap_or(false);
+    let updated = app.opentome.check_for_updates(force).await?;
+    Ok(Json(json!({
+        "success": true,
+        "updated": updated
+    })))
+}
+
+#[derive(Deserialize)]
+struct OpenTomeConfigPayload {
+    enabled: bool,
+}
+
+async fn post_opentome_config(
+    Me(app): Me,
+    Json(payload): Json<OpenTomeConfigPayload>,
+) -> Result<Json<Value>> {
+    app.me.admin()?;
+    app.opentome.set_enabled(payload.enabled).await?;
+    Ok(Json(json!({"ok": true})))
+}
+
+async fn get_manga_opentome(
+    Me(app): Me,
+    Path(id): Path<i64>,
+) -> Result<Json<Option<crate::opentome::catalog::OpenTomeSeriesSchedule>>> {
+    let schedule = app.opentome.get_series_schedule(id).await?;
+    Ok(Json(schedule))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OpenTomeRemapPayload {
+    work_id: Option<String>,
+    action: String,
+}
+
+async fn post_manga_opentome_remap(
+    Me(app): Me,
+    Path(id): Path<i64>,
+    Json(payload): Json<OpenTomeRemapPayload>,
+) -> Result<Json<Value>> {
+    app.me.admin()?;
+    app.opentome.remap_manga(id, payload.work_id, &payload.action).await?;
+    Ok(Json(json!({"ok": true})))
 }

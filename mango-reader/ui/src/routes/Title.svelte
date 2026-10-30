@@ -30,6 +30,9 @@
     unfollowManga,
     getMangaReconciliation,
     reconcileManga,
+    getMangaOpenTome,
+    remapMangaOpenTome,
+    type OpenTomeSeriesSchedule,
     getSeriesDiscovery,
     discoverVolumeCandidates,
     discoverAllMissingCandidates,
@@ -134,6 +137,8 @@
   let togglingFollow = $state(false);
   let reconciliation = $state<ReconciliationSummary | null>(null);
   let reconciling = $state(false);
+  let openTomeSchedule = $state<OpenTomeSeriesSchedule | null>(null);
+  let openTomeLoading = $state(false);
   let seriesDiscovery = $state<Map<number, VolumeDiscoveryResult>>(new Map());
   let discoveringVolume = $state<number | null>(null);
   let discoveringAll = $state(false);
@@ -247,7 +252,26 @@
     } catch {
       reconciliation = null;
     }
+    try {
+      openTomeSchedule = await getMangaOpenTome(id);
+    } catch {
+      openTomeSchedule = null;
+    }
     loadDiscovery();
+  }
+
+  async function handleOpenTomeRemap(action: 'confirm' | 'reject' | 'auto') {
+    if (!openTomeSchedule) return;
+    openTomeLoading = true;
+    try {
+      await remapMangaOpenTome(id, openTomeSchedule.workId, action);
+      openTomeSchedule = await getMangaOpenTome(id);
+      toast.success(action === 'reject' ? 'OpenTome mapping rejected' : action === 'auto' ? 'Reset to automatic matching' : 'OpenTome mapping confirmed');
+    } catch {
+      toast.error('Failed to update OpenTome mapping');
+    } finally {
+      openTomeLoading = false;
+    }
   }
 
   async function loadDiscovery() {
@@ -1288,6 +1312,141 @@
                   onReconcile={runReconcile}
                   reconciling={reconciling}
                 />
+              </div>
+            {/if}
+
+            <!-- OpenTome Physical Release Schedule -->
+            {#if openTomeSchedule && (openTomeSchedule.english || openTomeSchedule.japanese)}
+              <div class="opentome-schedule-card">
+                <div class="opentome-header">
+                  <div class="opentome-title-group">
+                    <span class="opentome-badge">OpenTome</span>
+                    <h4>Physical Release Intelligence</h4>
+                    <span
+                      class="confidence-badge"
+                      class:conf-exact={openTomeSchedule.mappingConfidence === 'exact' || openTomeSchedule.mappingConfidence === 'user_confirmed'}
+                      class:conf-high={openTomeSchedule.mappingConfidence === 'high'}
+                      class:conf-ambiguous={openTomeSchedule.mappingConfidence === 'ambiguous'}
+                    >
+                      {openTomeSchedule.mappingConfidence.toUpperCase()}
+                    </span>
+                  </div>
+                  <div class="opentome-actions">
+                    {#if openTomeSchedule.mappingConfidence !== 'user_confirmed'}
+                      <button class="btn pill xs" disabled={openTomeLoading} onclick={() => handleOpenTomeRemap('confirm')} title="Confirm this OpenTome match">
+                        <Icon name="check" size={12} /> Confirm
+                      </button>
+                    {/if}
+                    <button class="btn pill xs" disabled={openTomeLoading} onclick={() => handleOpenTomeRemap('reject')} title="Reject this OpenTome match">
+                      <Icon name="close" size={12} /> Reject
+                    </button>
+                    <button class="btn pill xs" disabled={openTomeLoading} onclick={() => handleOpenTomeRemap('auto')} title="Reset to automatic detection">
+                      <Icon name="refresh" size={12} /> Auto
+                    </button>
+                  </div>
+                </div>
+
+                <div class="opentome-markets-grid">
+                  <!-- English Market -->
+                  {#if openTomeSchedule.english}
+                    {@const en = openTomeSchedule.english}
+                    <div class="market-col">
+                      <div class="market-title">
+                        <span class="market-tag en-tag">EN</span>
+                        <strong>English Release</strong>
+                        {#if en.publisher}
+                          <span class="publisher-label">({en.publisher})</span>
+                        {/if}
+                      </div>
+
+                      <div class="market-content">
+                        <div class="market-row">
+                          <span class="m-label">Total Volumes:</span>
+                          <span class="m-val">{en.totalVolumes}</span>
+                        </div>
+
+                        {#if en.latestVolume}
+                          <div class="market-row">
+                            <span class="m-label">Latest Published:</span>
+                            <span class="m-val">
+                              Vol. {en.latestVolume.volumeNumber}
+                              {#if en.latestVolume.releaseDate}
+                                <span class="m-date">({en.latestVolume.releaseDate})</span>
+                              {/if}
+                            </span>
+                          </div>
+                        {/if}
+
+                        {#if en.nextVolume}
+                          <div class="market-row next-row" class:releases-today={en.nextVolume.status === 'releases_today'}>
+                            <span class="m-label">Next Volume:</span>
+                            <span class="m-val">
+                              <strong>Vol. {en.nextVolume.volumeNumber}</strong>
+                              {#if en.nextVolume.releaseDate}
+                                <span class="m-date">({en.nextVolume.releaseDate})</span>
+                              {/if}
+                              {#if en.nextVolume.status === 'releases_today'}
+                                <span class="today-badge">RELEASES TODAY</span>
+                              {:else if en.nextVolume.precision !== 'day' && en.nextVolume.precision !== 'unknown'}
+                                <span class="precision-tag">{en.nextVolume.precision}</span>
+                              {/if}
+                            </span>
+                          </div>
+                        {/if}
+                      </div>
+                    </div>
+                  {/if}
+
+                  <!-- Japanese Market -->
+                  {#if openTomeSchedule.japanese}
+                    {@const ja = openTomeSchedule.japanese}
+                    <div class="market-col">
+                      <div class="market-title">
+                        <span class="market-tag ja-tag">JA</span>
+                        <strong>Japanese Release</strong>
+                        {#if ja.publisher}
+                          <span class="publisher-label">({ja.publisher})</span>
+                        {/if}
+                      </div>
+
+                      <div class="market-content">
+                        <div class="market-row">
+                          <span class="m-label">Total Volumes:</span>
+                          <span class="m-val">{ja.totalVolumes}</span>
+                        </div>
+
+                        {#if ja.latestVolume}
+                          <div class="market-row">
+                            <span class="m-label">Latest Published:</span>
+                            <span class="m-val">
+                              Vol. {ja.latestVolume.volumeNumber}
+                              {#if ja.latestVolume.releaseDate}
+                                <span class="m-date">({ja.latestVolume.releaseDate})</span>
+                              {/if}
+                            </span>
+                          </div>
+                        {/if}
+
+                        {#if ja.nextVolume}
+                          <div class="market-row next-row" class:releases-today={ja.nextVolume.status === 'releases_today'}>
+                            <span class="m-label">Next Volume:</span>
+                            <span class="m-val">
+                              <strong>Vol. {ja.nextVolume.volumeNumber}</strong>
+                              {#if ja.nextVolume.releaseDate}
+                                <span class="m-date">({ja.nextVolume.releaseDate})</span>
+                              {/if}
+                              {#if ja.nextVolume.status === 'releases_today'}
+                                <span class="today-badge">RELEASES TODAY</span>
+                              {:else if ja.nextVolume.precision !== 'day' && ja.nextVolume.precision !== 'unknown'}
+                                <span class="precision-tag">{ja.nextVolume.precision}</span>
+                              {/if}
+                            </span>
+                          </div>
+                        {/if}
+                      </div>
+                    </div>
+                  {/if}
+                </div>
               </div>
             {/if}
 
@@ -3647,6 +3806,188 @@
     color: var(--subtle, #888);
     font-style: italic;
     margin-top: 1px;
+  }
+
+  .opentome-schedule-card {
+    background: var(--surface-2, rgba(255, 255, 255, 0.04));
+    border: 1px solid var(--edge, rgba(255, 255, 255, 0.08));
+    border-radius: var(--radius, 8px);
+    padding: 14px 16px;
+    margin-top: 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .opentome-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 8px;
+    border-bottom: 1px solid var(--edge, rgba(255, 255, 255, 0.06));
+    padding-bottom: 8px;
+  }
+
+  .opentome-title-group {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .opentome-title-group h4 {
+    margin: 0;
+    font-size: 0.92rem;
+    font-weight: 600;
+  }
+
+  .opentome-badge {
+    font-size: 0.68rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    padding: 2px 6px;
+    border-radius: 4px;
+    background: var(--brand, #3b82f6);
+    color: white;
+    letter-spacing: 0.03em;
+  }
+
+  .confidence-badge {
+    font-size: 0.65rem;
+    font-weight: 600;
+    padding: 1px 6px;
+    border-radius: 4px;
+    background: var(--surface-3, #444);
+    color: var(--subtle, #aaa);
+    border: 1px solid var(--edge, #555);
+  }
+
+  .confidence-badge.conf-exact {
+    background: #059669;
+    color: white;
+    border-color: #059669;
+  }
+
+  .confidence-badge.conf-high {
+    background: #0284c7;
+    color: white;
+    border-color: #0284c7;
+  }
+
+  .confidence-badge.conf-ambiguous {
+    background: #d97706;
+    color: white;
+    border-color: #d97706;
+  }
+
+  .opentome-actions {
+    display: flex;
+    gap: 6px;
+  }
+
+  .opentome-markets-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 16px;
+  }
+
+  .market-col {
+    background: var(--surface-1, rgba(0, 0, 0, 0.2));
+    border: 1px solid var(--edge, rgba(255, 255, 255, 0.05));
+    border-radius: 6px;
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .market-title {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.85rem;
+    border-bottom: 1px solid var(--edge, rgba(255, 255, 255, 0.05));
+    padding-bottom: 6px;
+  }
+
+  .market-tag {
+    font-size: 0.65rem;
+    font-weight: 700;
+    padding: 1px 4px;
+    border-radius: 3px;
+    color: white;
+  }
+
+  .market-tag.en-tag {
+    background: #2563eb;
+  }
+
+  .market-tag.ja-tag {
+    background: #dc2626;
+  }
+
+  .publisher-label {
+    font-size: 0.75rem;
+    color: var(--subtle, #888);
+  }
+
+  .market-content {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 0.82rem;
+  }
+
+  .market-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+
+  .market-row.next-row {
+    background: var(--surface-2, rgba(255, 255, 255, 0.03));
+    border-radius: 4px;
+    padding: 4px 6px;
+  }
+
+  .market-row.releases-today {
+    background: rgba(16, 185, 129, 0.15);
+    border: 1px solid #10b981;
+  }
+
+  .m-label {
+    color: var(--subtle, #999);
+  }
+
+  .m-val {
+    font-weight: 500;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .m-date {
+    font-size: 0.74rem;
+    color: var(--subtle, #888);
+  }
+
+  .today-badge {
+    font-size: 0.65rem;
+    font-weight: 800;
+    padding: 2px 6px;
+    border-radius: 4px;
+    background: #10b981;
+    color: white;
+    letter-spacing: 0.03em;
+  }
+
+  .precision-tag {
+    font-size: 0.65rem;
+    color: var(--subtle, #aaa);
+    background: var(--surface-3, #333);
+    padding: 1px 4px;
+    border-radius: 3px;
   }
 </style>
 

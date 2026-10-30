@@ -20,6 +20,7 @@ mod local;
 mod migrate;
 mod net;
 pub(crate) mod notification;
+pub(crate) mod opentome;
 mod opds;
 pub(crate) mod pipeline;
 pub(crate) mod release;
