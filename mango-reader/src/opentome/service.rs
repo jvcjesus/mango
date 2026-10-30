@@ -2,6 +2,7 @@ use super::catalog::{
     self, OpenTomeSeriesSchedule,
 };
 use super::updater::{OpenTomeStatus, OpenTomeUpdater, DEFAULT_MANIFEST_URL};
+use crate::acquisition::release_discovery::ReleaseDiscoveryTarget;
 use crate::db::Db;
 use crate::error::{AppError, Result};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
@@ -11,16 +12,25 @@ use std::sync::Arc;
 pub struct OpenTomeService {
     db: Db,
     updater: Arc<OpenTomeUpdater>,
+    http: reqwest::Client,
 }
 
 impl OpenTomeService {
     pub fn new(db: Db, data_dir: &Path, http: reqwest::Client) -> Self {
-        let updater = Arc::new(OpenTomeUpdater::new(data_dir, http));
-        Self { db, updater }
+        let updater = Arc::new(OpenTomeUpdater::new(data_dir, http.clone()));
+        Self { db, updater, http }
     }
 
     pub fn updater(&self) -> &Arc<OpenTomeUpdater> {
         &self.updater
+    }
+
+    pub fn http(&self) -> &reqwest::Client {
+        &self.http
+    }
+
+    pub fn db(&self) -> &Db {
+        &self.db
     }
 
     pub async fn is_enabled(&self) -> bool {
@@ -397,8 +407,12 @@ impl OpenTomeService {
 
         let today = self.current_date_str().await;
 
-        self.db
+        let http = self.http.clone();
+
+        let count = self.db
             .call(move |conn| {
+                let activation_date = crate::acquisition::release_discovery::get_or_init_activation_date(conn)?;
+
                 let mut stmt = conn.prepare(
                     "SELECT sr.manga_id, sr.series_id, sr.title, sr.mangabaka_id
                      FROM series_reconciliations sr
@@ -421,6 +435,17 @@ impl OpenTomeService {
                         .unwrap_or(None);
 
                     if let Some(schedule) = schedule_opt {
+                        // Sync release discovery targets
+                        let _ = crate::acquisition::release_discovery::sync_series_release_targets(
+                            conn,
+                            manga_id,
+                            &series_id,
+                            &series_title,
+                            &schedule,
+                            &today,
+                            &activation_date,
+                        );
+
                         // Check English next volume
                         if let Some(ref en) = schedule.english {
                             if let Some(ref next_vol) = en.next_volume {
@@ -481,6 +506,83 @@ impl OpenTomeService {
 
                 Ok(event_count)
             })
+            .await?;
+
+        // Evaluate all pending release discovery targets
+        let _ = crate::acquisition::release_discovery::evaluate_all_pending_targets(&self.db, http).await;
+
+        Ok(count)
+    }
+
+    /// Evaluate and trigger release-aware discovery targets for a specific manga.
+    pub async fn evaluate_manga_release_discovery(
+        &self,
+        manga_id: i64,
+    ) -> Result<Vec<ReleaseDiscoveryTarget>> {
+        if !self.is_enabled().await {
+            return self.db.call(move |conn| crate::acquisition::release_discovery::list_targets_for_manga(conn, manga_id)).await;
+        }
+
+        let ot_conn_opt = self.open_catalogue_connection()?;
+        let Some(ot_conn) = ot_conn_opt else {
+            return self.db.call(move |conn| crate::acquisition::release_discovery::list_targets_for_manga(conn, manga_id)).await;
+        };
+
+        let today = self.current_date_str().await;
+        let http = self.http.clone();
+
+        // 1. Resolve schedule and sync targets
+        let due_target_ids: Vec<i64> = self.db
+            .call(move |conn| {
+                let activation_date = crate::acquisition::release_discovery::get_or_init_activation_date(conn)?;
+
+                let (series_title, series_id): (String, String) = conn
+                    .query_row(
+                        "SELECT m.title, COALESCE(sr.series_id, 'manga:' || m.id)
+                         FROM manga m
+                         LEFT JOIN series_reconciliations sr ON sr.manga_id = m.id
+                         WHERE m.id = ?1",
+                        params![manga_id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .map_err(|e| AppError::not_found(format!("Manga not found: {e}")))?;
+
+                if let Some(schedule) = Self::resolve_or_refresh_schedule_internal(conn, &ot_conn, manga_id, &today)? {
+                    let _ = crate::acquisition::release_discovery::sync_series_release_targets(
+                        conn,
+                        manga_id,
+                        &series_id,
+                        &series_title,
+                        &schedule,
+                        &today,
+                        &activation_date,
+                    );
+                }
+
+                let cur_time = crate::db::now();
+                let mut stmt = conn.prepare(
+                    "SELECT id FROM release_discovery_targets
+                     WHERE manga_id = ?1
+                       AND (status = 'releases_today' OR (status = 'not_found_retry_wait' AND next_attempt_at <= ?2))
+                     ORDER BY id ASC",
+                )?;
+                let rows = stmt.query_map(params![manga_id, cur_time], |r| r.get(0))?;
+                let mut ids = Vec::new();
+                for r in rows {
+                    ids.push(r?);
+                }
+                Ok(ids)
+            })
+            .await?;
+
+        // 2. Process due targets for this manga
+        for tid in due_target_ids {
+            let _ = crate::acquisition::release_discovery::process_target_discovery(&self.db, http.clone(), tid).await;
+        }
+
+        // 3. Return all targets for this manga
+        self.db
+            .call(move |conn| crate::acquisition::release_discovery::list_targets_for_manga(conn, manga_id))
             .await
     }
 }

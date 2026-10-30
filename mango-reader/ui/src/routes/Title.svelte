@@ -33,6 +33,10 @@
     getMangaOpenTome,
     remapMangaOpenTome,
     type OpenTomeSeriesSchedule,
+    getMangaReleaseDiscovery,
+    checkMangaReleaseDiscovery,
+    retryReleaseDiscoveryTarget,
+    type ReleaseDiscoveryTarget,
     getSeriesDiscovery,
     discoverVolumeCandidates,
     discoverAllMissingCandidates,
@@ -139,6 +143,7 @@
   let reconciling = $state(false);
   let openTomeSchedule = $state<OpenTomeSeriesSchedule | null>(null);
   let openTomeLoading = $state(false);
+  let releaseDiscoveryTargets = $state<ReleaseDiscoveryTarget[]>([]);
   let seriesDiscovery = $state<Map<number, VolumeDiscoveryResult>>(new Map());
   let discoveringVolume = $state<number | null>(null);
   let discoveringAll = $state(false);
@@ -256,6 +261,11 @@
       openTomeSchedule = await getMangaOpenTome(id);
     } catch {
       openTomeSchedule = null;
+    }
+    try {
+      releaseDiscoveryTargets = await getMangaReleaseDiscovery(id);
+    } catch {
+      releaseDiscoveryTargets = [];
     }
     loadDiscovery();
   }
@@ -465,6 +475,55 @@
       toast.error(`Ownership refresh failed: ${message(e)}`);
     } finally {
       refreshingOwnership = false;
+    }
+  }
+
+  function handleReviewRelease() {
+    const target = releaseDiscoveryTargets.find((t) => t.status === 'candidate_available');
+    let targetVol = target?.volumeNumber;
+
+    if (targetVol === undefined || targetVol === null) {
+      for (const [vol, disc] of seriesDiscovery.entries()) {
+        if (disc.candidateCount > 0) {
+          targetVol = vol;
+          break;
+        }
+      }
+    }
+
+    if (targetVol !== undefined && targetVol !== null) {
+      const updatedExp = new Set(expandedCandidates);
+      updatedExp.add(targetVol);
+      expandedCandidates = updatedExp;
+
+      setTimeout(() => {
+        const el = document.getElementById(`volume-${targetVol}`);
+        if (el) {
+          el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+      }, 50);
+    }
+  }
+
+  async function handleRetryMetadata() {
+    if (!title) return;
+    try {
+      await act('POST', `/manga/${title.id}/retry-metadata`);
+      toast.success('Triggered series metadata retry');
+      loadOwnership();
+    } catch (e) {
+      toast.error(`Retry metadata failed: ${message(e)}`);
+    }
+  }
+
+  async function handleCheckReleaseDiscovery() {
+    try {
+      const targets = await checkMangaReleaseDiscovery(id);
+      releaseDiscoveryTargets = targets;
+      toast.success(`Evaluated ${targets.length} release discovery target(s)`);
+      loadDiscovery();
+    } catch (e) {
+      toast.error(`Release discovery check failed: ${message(e)}`);
     }
   }
 
@@ -828,11 +887,22 @@
       missingContent?.totalKnownVolumes ??
       null;
 
+    const isIdentityAmbiguous =
+      reconciliation?.status === 'review_required' ||
+      reconciliation?.status === 'sync_error';
+
+    const hasAvailableRelease =
+      (seriesDiscovery.size > 0 && Array.from(seriesDiscovery.values()).some((v) => v.candidateCount > 0)) ||
+      releaseDiscoveryTargets.some((t) => t.status === 'candidate_available');
+
     return resolveSeriesSummary({
       title: title?.title ?? '',
       volumes,
       totalExpectedVolumes: totalSourceVolumes,
       isOngoing: title?.status === 1,
+      reconciliationStatus: reconciliation?.status,
+      isIdentityAmbiguous,
+      hasAvailableRelease,
     });
   });
   const nothing = $derived(
@@ -1303,150 +1373,23 @@
                 <SeriesSummaryCard
                   summary={seriesSummary}
                   reconciliation={reconciliation}
-                  onPlanMissing={() => openPlanModal(true)}
-                  onFindReleases={() => searchNyaa()}
+                  openTomeSchedule={openTomeSchedule}
+                  openTomeLoading={openTomeLoading}
+                  releaseDiscoveryTargets={releaseDiscoveryTargets}
+                  onResolveIdentity={runReconcile}
+                  onReviewRelease={handleReviewRelease}
+                  onRetryMetadata={handleRetryMetadata}
                   onDiscoverMissing={findAllMissingReleases}
                   discoveringMissing={discoveringAll}
+                  onPlanMissing={() => openPlanModal(true)}
                   onRefreshKomga={refreshOwnership}
                   refreshingKomga={refreshingOwnership}
                   onReconcile={runReconcile}
                   reconciling={reconciling}
+                  onOpenTomeRemap={handleOpenTomeRemap}
+                  onSearchNyaa={() => searchNyaa()}
+                  onCheckReleaseDiscovery={handleCheckReleaseDiscovery}
                 />
-              </div>
-            {/if}
-
-            <!-- OpenTome Physical Release Schedule -->
-            {#if openTomeSchedule && (openTomeSchedule.english || openTomeSchedule.japanese)}
-              <div class="opentome-schedule-card">
-                <div class="opentome-header">
-                  <div class="opentome-title-group">
-                    <span class="opentome-badge">OpenTome</span>
-                    <h4>Physical Release Intelligence</h4>
-                    <span
-                      class="confidence-badge"
-                      class:conf-exact={openTomeSchedule.mappingConfidence === 'exact' || openTomeSchedule.mappingConfidence === 'user_confirmed'}
-                      class:conf-high={openTomeSchedule.mappingConfidence === 'high'}
-                      class:conf-ambiguous={openTomeSchedule.mappingConfidence === 'ambiguous'}
-                    >
-                      {openTomeSchedule.mappingConfidence.toUpperCase()}
-                    </span>
-                  </div>
-                  <div class="opentome-actions">
-                    {#if openTomeSchedule.mappingConfidence !== 'user_confirmed'}
-                      <button class="btn pill xs" disabled={openTomeLoading} onclick={() => handleOpenTomeRemap('confirm')} title="Confirm this OpenTome match">
-                        <Icon name="check" size={12} /> Confirm
-                      </button>
-                    {/if}
-                    <button class="btn pill xs" disabled={openTomeLoading} onclick={() => handleOpenTomeRemap('reject')} title="Reject this OpenTome match">
-                      <Icon name="close" size={12} /> Reject
-                    </button>
-                    <button class="btn pill xs" disabled={openTomeLoading} onclick={() => handleOpenTomeRemap('auto')} title="Reset to automatic detection">
-                      <Icon name="refresh" size={12} /> Auto
-                    </button>
-                  </div>
-                </div>
-
-                <div class="opentome-markets-grid">
-                  <!-- English Market -->
-                  {#if openTomeSchedule.english}
-                    {@const en = openTomeSchedule.english}
-                    <div class="market-col">
-                      <div class="market-title">
-                        <span class="market-tag en-tag">EN</span>
-                        <strong>English Release</strong>
-                        {#if en.publisher}
-                          <span class="publisher-label">({en.publisher})</span>
-                        {/if}
-                      </div>
-
-                      <div class="market-content">
-                        <div class="market-row">
-                          <span class="m-label">Total Volumes:</span>
-                          <span class="m-val">{en.totalVolumes}</span>
-                        </div>
-
-                        {#if en.latestVolume}
-                          <div class="market-row">
-                            <span class="m-label">Latest Published:</span>
-                            <span class="m-val">
-                              Vol. {en.latestVolume.volumeNumber}
-                              {#if en.latestVolume.releaseDate}
-                                <span class="m-date">({en.latestVolume.releaseDate})</span>
-                              {/if}
-                            </span>
-                          </div>
-                        {/if}
-
-                        {#if en.nextVolume}
-                          <div class="market-row next-row" class:releases-today={en.nextVolume.status === 'releases_today'}>
-                            <span class="m-label">Next Volume:</span>
-                            <span class="m-val">
-                              <strong>Vol. {en.nextVolume.volumeNumber}</strong>
-                              {#if en.nextVolume.releaseDate}
-                                <span class="m-date">({en.nextVolume.releaseDate})</span>
-                              {/if}
-                              {#if en.nextVolume.status === 'releases_today'}
-                                <span class="today-badge">RELEASES TODAY</span>
-                              {:else if en.nextVolume.precision !== 'day' && en.nextVolume.precision !== 'unknown'}
-                                <span class="precision-tag">{en.nextVolume.precision}</span>
-                              {/if}
-                            </span>
-                          </div>
-                        {/if}
-                      </div>
-                    </div>
-                  {/if}
-
-                  <!-- Japanese Market -->
-                  {#if openTomeSchedule.japanese}
-                    {@const ja = openTomeSchedule.japanese}
-                    <div class="market-col">
-                      <div class="market-title">
-                        <span class="market-tag ja-tag">JA</span>
-                        <strong>Japanese Release</strong>
-                        {#if ja.publisher}
-                          <span class="publisher-label">({ja.publisher})</span>
-                        {/if}
-                      </div>
-
-                      <div class="market-content">
-                        <div class="market-row">
-                          <span class="m-label">Total Volumes:</span>
-                          <span class="m-val">{ja.totalVolumes}</span>
-                        </div>
-
-                        {#if ja.latestVolume}
-                          <div class="market-row">
-                            <span class="m-label">Latest Published:</span>
-                            <span class="m-val">
-                              Vol. {ja.latestVolume.volumeNumber}
-                              {#if ja.latestVolume.releaseDate}
-                                <span class="m-date">({ja.latestVolume.releaseDate})</span>
-                              {/if}
-                            </span>
-                          </div>
-                        {/if}
-
-                        {#if ja.nextVolume}
-                          <div class="market-row next-row" class:releases-today={ja.nextVolume.status === 'releases_today'}>
-                            <span class="m-label">Next Volume:</span>
-                            <span class="m-val">
-                              <strong>Vol. {ja.nextVolume.volumeNumber}</strong>
-                              {#if ja.nextVolume.releaseDate}
-                                <span class="m-date">({ja.nextVolume.releaseDate})</span>
-                              {/if}
-                              {#if ja.nextVolume.status === 'releases_today'}
-                                <span class="today-badge">RELEASES TODAY</span>
-                              {:else if ja.nextVolume.precision !== 'day' && ja.nextVolume.precision !== 'unknown'}
-                                <span class="precision-tag">{ja.nextVolume.precision}</span>
-                              {/if}
-                            </span>
-                          </div>
-                        {/if}
-                      </div>
-                    </div>
-                  {/if}
-                </div>
               </div>
             {/if}
 
@@ -1506,23 +1449,28 @@
         {/if}
         <Tracking {id} title={title.title} />
 
-        <div class="nyaa-discovery-card">
-          <div class="nyaa-header-row">
-            <div>
-              <h3 class="display nyaa-title">NYAA RELEASES</h3>
-              <span class="nyaa-subtext">Discover manga releases on Nyaa and acquire via TorBox.</span>
+        {#if showNyaa}
+          <div class="nyaa-discovery-card">
+            <div class="nyaa-header-row">
+              <div>
+                <h3 class="display nyaa-title">MANUAL NYAA SEARCH</h3>
+                <span class="nyaa-subtext">Direct release query results on Nyaa.</span>
+              </div>
+              <div class="nyaa-header-actions">
+                <button class="btn pill" onclick={() => searchNyaa()} disabled={loadingNyaa}>
+                  {#if loadingNyaa}
+                    <span class="spin"><Icon name="spinner" size={14} stroke={3} /></span>
+                  {:else}
+                    <Icon name="refresh" size={14} />
+                  {/if}
+                  Refresh
+                </button>
+                <button class="btn pill" onclick={() => (showNyaa = false)}>
+                  <Icon name="close" size={14} /> Close
+                </button>
+              </div>
             </div>
-            <button class="btn pill" onclick={() => searchNyaa()} disabled={loadingNyaa}>
-              {#if loadingNyaa}
-                <span class="spin"><Icon name="spinner" size={14} stroke={3} /></span>
-              {:else}
-                <Icon name="search" size={14} />
-              {/if}
-              {showNyaa ? 'Refresh Nyaa' : 'Find Releases on Nyaa'}
-            </button>
-          </div>
 
-          {#if showNyaa}
             <div class="nyaa-controls">
               <div class="nyaa-filter-bar">
                 <div class="filter-group">
@@ -1735,8 +1683,8 @@
                 {/each}
               </ul>
             {/if}
-          {/if}
-        </div>
+          </div>
+        {/if}
       </div>
 
       <div class="chapters">
@@ -1842,7 +1790,7 @@
               <span>Some volumes have completed physical acquisition but require metadata delivery.</span>
               <button
                 class="btn pill warn"
-                onclick={() => act('POST', `/manga/${title.id}/retry-metadata`)}
+                onclick={() => title && act('POST', `/manga/${title.id}/retry-metadata`)}
               >
                 <Icon name="refresh" size={14} /> Retry all metadata
               </button>
@@ -1853,7 +1801,7 @@
 
         {#each volumeGroups as grp (grp.volume ?? 'unassigned')}
           {#if grp.label}
-            <div class="volume-header" class:has-warning={Boolean(grp.presentation?.contradictionWarning)}>
+            <div id={grp.volume !== null ? `volume-${grp.volume}` : undefined} class="volume-header" class:has-warning={Boolean(grp.presentation?.contradictionWarning)}>
               <div class="volume-info">
                 <h3 class="display">{grp.label}</h3>
                 {#if grp.chapters.length > 0}
@@ -2017,14 +1965,6 @@
                         <Icon name="search" size={14} />
                       {/if}
                       Find Releases
-                    </button>
-                    <button
-                      class="btn pill"
-                      aria-label="Find {grp.label} on Nyaa"
-                      onclick={() => searchNyaa('volume', grp.volume ?? undefined)}
-                      title="Search Nyaa manually for {grp.label}"
-                    >
-                      <Icon name="search" size={14} /> Nyaa
                     </button>
                   {/if}
                 </div>
@@ -3819,188 +3759,6 @@
     color: var(--subtle, #888);
     font-style: italic;
     margin-top: 1px;
-  }
-
-  .opentome-schedule-card {
-    background: var(--surface-2, rgba(255, 255, 255, 0.04));
-    border: 1px solid var(--edge, rgba(255, 255, 255, 0.08));
-    border-radius: var(--radius, 8px);
-    padding: 14px 16px;
-    margin-top: 12px;
-    display: flex;
-    flex-direction: column;
-    gap: 12px;
-  }
-
-  .opentome-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    flex-wrap: wrap;
-    gap: 8px;
-    border-bottom: 1px solid var(--edge, rgba(255, 255, 255, 0.06));
-    padding-bottom: 8px;
-  }
-
-  .opentome-title-group {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-
-  .opentome-title-group h4 {
-    margin: 0;
-    font-size: 0.92rem;
-    font-weight: 600;
-  }
-
-  .opentome-badge {
-    font-size: 0.68rem;
-    font-weight: 700;
-    text-transform: uppercase;
-    padding: 2px 6px;
-    border-radius: 4px;
-    background: var(--brand, #3b82f6);
-    color: white;
-    letter-spacing: 0.03em;
-  }
-
-  .confidence-badge {
-    font-size: 0.65rem;
-    font-weight: 600;
-    padding: 1px 6px;
-    border-radius: 4px;
-    background: var(--surface-3, #444);
-    color: var(--subtle, #aaa);
-    border: 1px solid var(--edge, #555);
-  }
-
-  .confidence-badge.conf-exact {
-    background: #059669;
-    color: white;
-    border-color: #059669;
-  }
-
-  .confidence-badge.conf-high {
-    background: #0284c7;
-    color: white;
-    border-color: #0284c7;
-  }
-
-  .confidence-badge.conf-ambiguous {
-    background: #d97706;
-    color: white;
-    border-color: #d97706;
-  }
-
-  .opentome-actions {
-    display: flex;
-    gap: 6px;
-  }
-
-  .opentome-markets-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-    gap: 16px;
-  }
-
-  .market-col {
-    background: var(--surface-1, rgba(0, 0, 0, 0.2));
-    border: 1px solid var(--edge, rgba(255, 255, 255, 0.05));
-    border-radius: 6px;
-    padding: 10px 12px;
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-  }
-
-  .market-title {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 0.85rem;
-    border-bottom: 1px solid var(--edge, rgba(255, 255, 255, 0.05));
-    padding-bottom: 6px;
-  }
-
-  .market-tag {
-    font-size: 0.65rem;
-    font-weight: 700;
-    padding: 1px 4px;
-    border-radius: 3px;
-    color: white;
-  }
-
-  .market-tag.en-tag {
-    background: #2563eb;
-  }
-
-  .market-tag.ja-tag {
-    background: #dc2626;
-  }
-
-  .publisher-label {
-    font-size: 0.75rem;
-    color: var(--subtle, #888);
-  }
-
-  .market-content {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    font-size: 0.82rem;
-  }
-
-  .market-row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    gap: 8px;
-  }
-
-  .market-row.next-row {
-    background: var(--surface-2, rgba(255, 255, 255, 0.03));
-    border-radius: 4px;
-    padding: 4px 6px;
-  }
-
-  .market-row.releases-today {
-    background: rgba(16, 185, 129, 0.15);
-    border: 1px solid #10b981;
-  }
-
-  .m-label {
-    color: var(--subtle, #999);
-  }
-
-  .m-val {
-    font-weight: 500;
-    display: flex;
-    align-items: center;
-    gap: 6px;
-  }
-
-  .m-date {
-    font-size: 0.74rem;
-    color: var(--subtle, #888);
-  }
-
-  .today-badge {
-    font-size: 0.65rem;
-    font-weight: 800;
-    padding: 2px 6px;
-    border-radius: 4px;
-    background: #10b981;
-    color: white;
-    letter-spacing: 0.03em;
-  }
-
-  .precision-tag {
-    font-size: 0.65rem;
-    color: var(--subtle, #aaa);
-    background: var(--surface-3, #333);
-    padding: 1px 4px;
-    border-radius: 3px;
   }
 </style>
 

@@ -1586,6 +1586,53 @@ export const remapMangaOpenTome = (
 ) =>
   send<{ success: boolean }>('POST', `/manga/${id}/opentome/remap`, { workId: workId ?? null, action });
 
+export interface ReleaseDiscoveryTarget {
+  id: number;
+  seriesId: string;
+  mangaId?: number | null;
+  seriesTitle: string;
+  volumeNumber: number;
+  market: string;
+  edition: string;
+  releaseDate: string;
+  releaseDatePrecision: string;
+  dateType: string;
+  status:
+    | 'scheduled'
+    | 'releases_today'
+    | 'discovering'
+    | 'candidate_available'
+    | 'not_found_retry_wait'
+    | 'already_owned'
+    | 'mapping_review_required'
+    | 'dormant'
+    | string;
+  attempts: number;
+  maxAttempts: number;
+  nextAttemptAt: number;
+  lastAttemptAt?: number | null;
+  candidatesCount: number;
+  topCandidateId?: string | null;
+  topCandidateTitle?: string | null;
+  lastError?: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export const getMangaReleaseDiscovery = (id: number) =>
+  get<ReleaseDiscoveryTarget[]>(`/manga/${id}/release-discovery`);
+
+export const checkMangaReleaseDiscovery = (id: number) =>
+  send<ReleaseDiscoveryTarget[]>('POST', `/manga/${id}/release-discovery/check`, {});
+
+export const retryReleaseDiscoveryTarget = (id: number, targetId: number) =>
+  send<ReleaseDiscoveryTarget | null>(
+    'POST',
+    `/manga/${id}/release-discovery/targets/${targetId}/retry`,
+    {}
+  );
+
+
 
 
 

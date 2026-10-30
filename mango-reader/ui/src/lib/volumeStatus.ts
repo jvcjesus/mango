@@ -92,6 +92,9 @@ export interface SeriesSummary {
   progressPercent: number | null;
   isOngoing: boolean;
   statusExplanation: string;
+  isIdentityAmbiguous: boolean;
+  primaryActionType: 'resolve_identity' | 'review_release' | 'retry_metadata' | 'discover' | 'none';
+  primaryActionLabel: string;
 }
 
 export interface SeriesSummaryInputs {
@@ -99,6 +102,9 @@ export interface SeriesSummaryInputs {
   volumes: VolumePresentation[];
   totalExpectedVolumes?: number | null;
   isOngoing?: boolean;
+  isIdentityAmbiguous?: boolean;
+  reconciliationStatus?: string | null;
+  hasAvailableRelease?: boolean;
 }
 
 export interface StagingSummary {
@@ -460,7 +466,20 @@ export function resolveVolumePresentation(input: VolumeDataInputs): VolumePresen
  * Calculates the overall series summary metrics from volume presentations.
  */
 export function resolveSeriesSummary(inputs: SeriesSummaryInputs): SeriesSummary {
-  const { title, volumes, totalExpectedVolumes = null, isOngoing = false } = inputs;
+  const {
+    title,
+    volumes,
+    totalExpectedVolumes = null,
+    isOngoing = false,
+    isIdentityAmbiguous = false,
+    reconciliationStatus = null,
+    hasAvailableRelease = false,
+  } = inputs;
+
+  const isAmbiguous =
+    isIdentityAmbiguous ||
+    reconciliationStatus === 'review_required' ||
+    reconciliationStatus === 'unmatched';
 
   let ownedCount = 0;
   let missingCount = 0;
@@ -489,6 +508,24 @@ export function resolveSeriesSummary(inputs: SeriesSummaryInputs): SeriesSummary
     }
   }
 
+  // If identity is ambiguous, do not present misleading 0/14 counts or 14 missing
+  if (isAmbiguous) {
+    return {
+      title,
+      ownedCount,
+      totalExpectedVolumes: null,
+      missingCount: 0,
+      activeCount,
+      attentionCount,
+      progressPercent: null,
+      isOngoing,
+      statusExplanation: 'Series identity needs review',
+      isIdentityAmbiguous: true,
+      primaryActionType: 'resolve_identity',
+      primaryActionLabel: 'Resolve identity',
+    };
+  }
+
   // If total expected volumes is specified and higher than volumes list, adjust missing
   const total = totalExpectedVolumes != null && totalExpectedVolumes > 0
     ? totalExpectedVolumes
@@ -509,6 +546,20 @@ export function resolveSeriesSummary(inputs: SeriesSummaryInputs): SeriesSummary
     statusExplanation = `${ownedCount} ${ownedCount === 1 ? 'volume' : 'volumes'} owned`;
   }
 
+  let primaryActionType: SeriesSummary['primaryActionType'] = 'none';
+  let primaryActionLabel = '';
+
+  if (volumes.some((v) => v.canRetryMetadata || v.metadataState === 'failed')) {
+    primaryActionType = 'retry_metadata';
+    primaryActionLabel = 'Retry metadata';
+  } else if (hasAvailableRelease) {
+    primaryActionType = 'review_release';
+    primaryActionLabel = 'Review release';
+  } else if (missingCount > 0) {
+    primaryActionType = 'discover';
+    primaryActionLabel = 'Discover releases';
+  }
+
   return {
     title,
     ownedCount,
@@ -519,6 +570,9 @@ export function resolveSeriesSummary(inputs: SeriesSummaryInputs): SeriesSummary
     progressPercent,
     isOngoing,
     statusExplanation,
+    isIdentityAmbiguous: false,
+    primaryActionType,
+    primaryActionLabel,
   };
 }
 

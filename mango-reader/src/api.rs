@@ -146,6 +146,12 @@ pub fn router(state: Spaces) -> Router {
         .route("/opentome/config", post(post_opentome_config))
         .route("/manga/{id}/opentome", get(get_manga_opentome))
         .route("/manga/{id}/opentome/remap", post(post_manga_opentome_remap))
+        .route("/manga/{id}/release-discovery", get(get_manga_release_discovery))
+        .route("/manga/{id}/release-discovery/check", post(post_manga_release_discovery_check))
+        .route(
+            "/manga/{id}/release-discovery/targets/{target_id}/retry",
+            post(post_manga_release_discovery_retry),
+        )
         .route("/manga/{id}/cover", get(cover))
         .route("/manga/{id}/library", put(set_library))
         .route("/manga/{id}/reader", put(set_reader))
@@ -3059,4 +3065,49 @@ async fn post_manga_opentome_remap(
     app.me.admin()?;
     app.opentome.remap_manga(id, payload.work_id, &payload.action).await?;
     Ok(Json(json!({"ok": true})))
+}
+
+async fn get_manga_release_discovery(
+    Me(app): Me,
+    Path(id): Path<i64>,
+) -> Result<Json<Vec<crate::acquisition::release_discovery::ReleaseDiscoveryTarget>>> {
+    let targets = app.opentome.evaluate_manga_release_discovery(id).await?;
+    Ok(Json(targets))
+}
+
+async fn post_manga_release_discovery_check(
+    Me(app): Me,
+    Path(id): Path<i64>,
+) -> Result<Json<Vec<crate::acquisition::release_discovery::ReleaseDiscoveryTarget>>> {
+    app.me.admin()?;
+    let targets = app.opentome.evaluate_manga_release_discovery(id).await?;
+    Ok(Json(targets))
+}
+
+async fn post_manga_release_discovery_retry(
+    Me(app): Me,
+    Path((_id, target_id)): Path<(i64, i64)>,
+) -> Result<Json<Option<crate::acquisition::release_discovery::ReleaseDiscoveryTarget>>> {
+    app.me.admin()?;
+    // Reset status to releases_today to force re-evaluation
+    let cur_time = crate::db::now();
+    app.db
+        .call(move |conn| {
+            conn.execute(
+                "UPDATE release_discovery_targets
+                 SET status = 'releases_today', next_attempt_at = 0, updated_at = ?1
+                 WHERE id = ?2 AND status IN ('not_found_retry_wait', 'dormant', 'mapping_review_required')",
+                [cur_time, target_id],
+            )?;
+            Ok(())
+        })
+        .await?;
+
+    let res = crate::acquisition::release_discovery::process_target_discovery(
+        &app.db,
+        app.opentome.http().clone(),
+        target_id,
+    )
+    .await?;
+    Ok(Json(res))
 }

@@ -465,6 +465,158 @@ describe('Normalized Volume Presentation Model', () => {
     expect(summary.statusExplanation).not.toContain('2 of 2');
   });
 
+  it('M6.6: Ambiguous series identity pauses authoritative metrics and highlights resolve identity CTA', () => {
+    const volumes: VolumePresentation[] = [
+      {
+        volume: 1,
+        label: 'Volume 1',
+        status: 'missing',
+        statusLabel: 'Missing',
+        badgeVariant: 'neutral',
+        physicalState: 'missing',
+        physicalLabel: 'Missing from library',
+        metadataState: 'not_applicable',
+        metadataLabel: 'None',
+        progressPercent: null,
+        canRetryMetadata: false,
+        canRetryKomga: false,
+        canRetryDownload: false,
+        canReview: false,
+        canAcquire: true,
+      },
+    ];
+
+    const summary = resolveSeriesSummary({
+      title: 'Delicious in Dungeon',
+      volumes,
+      totalExpectedVolumes: 14,
+      isOngoing: false,
+      isIdentityAmbiguous: true,
+      reconciliationStatus: 'review_required',
+    });
+
+    expect(summary.isIdentityAmbiguous).toBe(true);
+    expect(summary.statusExplanation).toBe('Series identity needs review');
+    expect(summary.primaryActionType).toBe('resolve_identity');
+    expect(summary.primaryActionLabel).toBe('Resolve identity');
+  });
+
+  it('M6.6: Candidate available triggers primary CTA review_release', () => {
+    const volumes: VolumePresentation[] = [
+      {
+        volume: 1,
+        label: 'Volume 1',
+        status: 'complete',
+        statusLabel: 'Owned',
+        badgeVariant: 'complete',
+        physicalState: 'in_library',
+        physicalLabel: 'Stored in library',
+        metadataState: 'complete',
+        metadataLabel: 'Complete',
+        progressPercent: null,
+        canRetryMetadata: false,
+        canRetryKomga: false,
+        canRetryDownload: false,
+        canReview: false,
+        canAcquire: false,
+      },
+      {
+        volume: 2,
+        label: 'Volume 2',
+        status: 'missing',
+        statusLabel: 'Missing',
+        badgeVariant: 'neutral',
+        physicalState: 'missing',
+        physicalLabel: 'Missing from library',
+        metadataState: 'not_applicable',
+        metadataLabel: 'None',
+        progressPercent: null,
+        canRetryMetadata: false,
+        canRetryKomga: false,
+        canRetryDownload: false,
+        canReview: false,
+        canAcquire: true,
+      },
+    ];
+
+    const summary = resolveSeriesSummary({
+      title: 'Kagurabachi',
+      volumes,
+      totalExpectedVolumes: 2,
+      isOngoing: true,
+      hasAvailableRelease: true,
+    });
+
+    expect(summary.isIdentityAmbiguous).toBe(false);
+    expect(summary.primaryActionType).toBe('review_release');
+    expect(summary.primaryActionLabel).toBe('Review release');
+  });
+
+  it('M6.6: Missing volumes with no available release triggers discover CTA', () => {
+    const volumes: VolumePresentation[] = [
+      {
+        volume: 1,
+        label: 'Volume 1',
+        status: 'missing',
+        statusLabel: 'Missing',
+        badgeVariant: 'neutral',
+        physicalState: 'missing',
+        physicalLabel: 'Missing from library',
+        metadataState: 'not_applicable',
+        metadataLabel: 'None',
+        progressPercent: null,
+        canRetryMetadata: false,
+        canRetryKomga: false,
+        canRetryDownload: false,
+        canReview: false,
+        canAcquire: true,
+      },
+    ];
+
+    const summary = resolveSeriesSummary({
+      title: 'Kagurabachi',
+      volumes,
+      totalExpectedVolumes: 3,
+      isOngoing: true,
+      hasAvailableRelease: false,
+    });
+
+    expect(summary.primaryActionType).toBe('discover');
+    expect(summary.primaryActionLabel).toBe('Discover releases');
+  });
+
+  it('M6.6: Post-publication metadata failure triggers retry_metadata CTA', () => {
+    const volumes: VolumePresentation[] = [
+      {
+        volume: 1,
+        label: 'Volume 1',
+        status: 'attention',
+        statusLabel: 'Needs attention',
+        badgeVariant: 'attention',
+        physicalState: 'in_library',
+        physicalLabel: 'Stored in library',
+        metadataState: 'failed',
+        metadataLabel: 'Metadata retry failed',
+        progressPercent: null,
+        canRetryMetadata: true,
+        canRetryKomga: false,
+        canRetryDownload: false,
+        canReview: false,
+        canAcquire: false,
+      },
+    ];
+
+    const summary = resolveSeriesSummary({
+      title: 'Delicious in Dungeon',
+      volumes,
+      totalExpectedVolumes: 1,
+      isOngoing: false,
+    });
+
+    expect(summary.primaryActionType).toBe('retry_metadata');
+    expect(summary.primaryActionLabel).toBe('Retry metadata');
+  });
+
   it('Staging cleanup: consolidates completed staging payloads into single action', () => {
     const importBooks: ImportBook[] = [
       {
