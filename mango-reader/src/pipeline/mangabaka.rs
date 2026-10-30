@@ -1223,6 +1223,18 @@ impl MangaBakaClient {
         }
 
         if exact_matches.len() > 1 {
+            // If multiple candidates matched on aliases/alternative titles, but exactly one
+            // candidate matches on the canonical/primary series title, prefer that exact primary title.
+            let primary_matches: Vec<_> = exact_matches
+                .iter()
+                .filter(|(_, title)| normalize_title(title) == wanted_norm)
+                .cloned()
+                .collect();
+            if primary_matches.len() == 1 {
+                let (id, title) = primary_matches.into_iter().next().unwrap();
+                return Ok(MangaBakaSeriesMatch::Found { id, title });
+            }
+
             let candidate_names: Vec<String> = exact_matches.into_iter().map(|(_, t)| t).collect();
             return Ok(MangaBakaSeriesMatch::Ambiguous(candidate_names));
         }
@@ -2692,6 +2704,26 @@ mod tests {
                                 ]
                             }))
                             .into_response()
+                        } else if q == "Delicious in Dungeon" {
+                            Json(json!({
+                                "data": [
+                                    {
+                                        "id": 6886,
+                                        "title": "Delicious in Dungeon",
+                                        "titles": [
+                                            { "title": "Delicious in Dungeon", "traits": ["official"] }
+                                        ]
+                                    },
+                                    {
+                                        "id": 172098,
+                                        "title": "Dungeon Meshi",
+                                        "titles": [
+                                            { "title": "Delicious in Dungeon", "traits": [] }
+                                        ]
+                                    }
+                                ]
+                            }))
+                            .into_response()
                         } else {
                             Json(json!({ "data": [] })).into_response()
                         }
@@ -2820,6 +2852,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outcome_ambig, MangaBakaOutcome::AmbiguousSeries(2));
+
+        // 4b. Disambiguation when multiple candidates match on alias but only one has matching primary title
+        let match_disambig = client.match_series("Delicious in Dungeon").await.unwrap();
+        assert_eq!(
+            match_disambig,
+            MangaBakaSeriesMatch::Found {
+                id: 6886,
+                title: "Delicious in Dungeon".into(),
+            }
+        );
 
         // 5. Unknown series rejection
         let outcome_unknown = client

@@ -131,6 +131,7 @@ pub fn router(state: Spaces) -> Router {
         .route("/manga/{id}/unfollow", post(post_manga_unfollow))
         .route("/manga/{id}/reconciliation", get(get_manga_reconciliation))
         .route("/manga/{id}/reconcile", post(post_manga_reconcile))
+        .route("/manga/{id}/retry-metadata", post(post_manga_retry_metadata))
         .route("/reconciliation/followed", get(get_followed_reconciliations))
         .route("/manga/{id}/volumes/{volume}/candidates", get(get_manga_volume_candidates))
         .route("/manga/{id}/volumes/{volume}/candidates/{candidate_id}/acquire", post(post_manga_volume_candidate_acquire))
@@ -1375,6 +1376,44 @@ async fn retry_download(Me(app): Me, Path(chapter): Path<i64>) -> Result<Json<Va
 async fn retry_metadata_download(Me(app): Me, Path(chapter): Path<i64>) -> Result<Json<Value>> {
     let msg = app.downloads.retry_metadata(chapter).await?;
     Ok(Json(serde_json::json!({"message": msg})))
+}
+
+async fn post_manga_retry_metadata(Me(app): Me, Path(id): Path<i64>) -> Result<Json<Value>> {
+    let chapters = app
+        .db
+        .call(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT c.id FROM chapters c
+                 LEFT JOIN downloads d ON d.chapter_id = c.id
+                 LEFT JOIN metadata_handoffs h ON h.chapter_id = c.id
+                 WHERE c.manga_id = ?1
+                   AND (h.state IN ('needs_review', 'failed', 'rejected', 'unavailable', 'waiting_komga')
+                        OR d.state IN ('metadata_review', 'metadata_failed', 'verifying'))
+                 ORDER BY c.chapter_number ASC",
+            )?;
+            let rows = stmt
+                .query_map([id], |r| r.get::<_, i64>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+        .await?;
+
+    let mut succeeded = 0;
+    let mut failed = 0;
+    for chapter in chapters {
+        match app.downloads.retry_metadata(chapter).await {
+            Ok(_) => succeeded += 1,
+            Err(e) => {
+                tracing::warn!("Failed to retry metadata for chapter {chapter}: {e}");
+                failed += 1;
+            }
+        }
+    }
+
+    Ok(Json(json!({
+        "succeeded": succeeded,
+        "failed": failed,
+    })))
 }
 
 async fn retry_komga_download(Me(app): Me, Path(chapter): Path<i64>) -> Result<Json<Value>> {

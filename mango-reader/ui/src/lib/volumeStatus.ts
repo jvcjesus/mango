@@ -155,7 +155,12 @@ export function resolveVolumePresentation(input: VolumeDataInputs): VolumePresen
     const handoff = activeQueueWithHandoff?.metadataHandoff;
     const hasMetadataError =
       handoff?.state === 'failed' ||
-      queuedItems.some((q) => q.state === 'metadata_failed') ||
+      handoff?.state === 'needs_review' ||
+      handoff?.state === 'rejected' ||
+      handoff?.state === 'unavailable' ||
+      queuedItems.some(
+        (q) => q.state === 'metadata_failed' || q.state === 'metadata_review'
+      ) ||
       (publishedEvent?.komga_status != null &&
         publishedEvent.komga_status.toLowerCase().includes('error')) ||
       (publishedEvent?.mangabaka_status != null &&
@@ -169,8 +174,9 @@ export function resolveVolumePresentation(input: VolumeDataInputs): VolumePresen
 
     const isMetadataUpdating =
       handoff?.state === 'submitting' ||
+      handoff?.state === 'pending' ||
       handoff?.state === 'in_progress' ||
-      queuedItems.some((q) => q.state === 'metadata');
+      queuedItems.some((q) => q.state === 'metadata' || q.state === 'metadata_wait');
 
     let status: NormalizedStatus;
     let statusLabel: string;

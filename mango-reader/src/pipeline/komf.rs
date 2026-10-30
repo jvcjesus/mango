@@ -460,6 +460,26 @@ impl Pipeline {
                     return Ok(id);
                 }
 
+                // Check series_reconciliations for this series
+                let rec_id: Option<i64> = c
+                    .query_row(
+                        "SELECT CASE WHEN COUNT(DISTINCT mangabaka_id) = 1 THEN MAX(mangabaka_id) ELSE NULL END
+                         FROM series_reconciliations
+                         WHERE (manga_id = ?1 OR title = ?2) AND mangabaka_id IS NOT NULL AND mangabaka_id > 0",
+                        rusqlite::params![manga_id, &pub_title],
+                        |r| r.get(0),
+                    )
+                    .optional()?
+                    .flatten();
+                if let Some(id) = rec_id {
+                    let _ = c.execute(
+                        "INSERT OR IGNORE INTO tracker_mappings (komga_series_id, tracker, tracker_id, updated_at, mapping_source, confidence)
+                         VALUES (?1, 'mangabaka', ?2, strftime('%s','now'), 'reconciliation_provenance', 'resolved')",
+                        rusqlite::params![&sid, id.to_string()],
+                    );
+                    return Ok(id);
+                }
+
                 // Check tracker_list_entries for an exact title match with tracker = 'mangabaka'
                 let norm = crate::pipeline::mangabaka::normalize_title(&pub_title);
                 let mut stmt = c.prepare(
@@ -503,13 +523,62 @@ impl Pipeline {
         let mb = match mb {
             Ok(v) => v,
             Err(_) => {
-                return finish(
-                    &self.db,
-                    chapter,
-                    "needs_review",
-                    "Missing/ambiguous/conflicting MangaBaka identity — metadata needs review",
-                )
-                .await
+                if config.mangabaka_enabled {
+                    let mb_token = self
+                        .db
+                        .call(|conn| crate::db::state(conn, "pipeline.mangabaka_token"))
+                        .await?;
+                    let mb_client = crate::pipeline::mangabaka::MangaBakaClient::new(
+                        self.http.clone(),
+                        config.mangabaka_url.clone(),
+                        mb_token,
+                    );
+                    match mb_client.match_series(title).await {
+                        Ok(crate::pipeline::mangabaka::MangaBakaSeriesMatch::Found { id, .. }) => {
+                            let sid_clone = book.series_id.clone();
+                            let pub_title_clone = title.to_string();
+                            let _ = self
+                                .db
+                                .call(move |c| {
+                                    let _ = c.execute(
+                                        "INSERT OR IGNORE INTO tracker_mappings (komga_series_id, tracker, tracker_id, updated_at, mapping_source, confidence)
+                                         VALUES (?1, 'mangabaka', ?2, strftime('%s','now'), 'pipeline_match_series', 'resolved')",
+                                        rusqlite::params![&sid_clone, id.to_string()],
+                                    );
+                                    let _ = c.execute(
+                                        "UPDATE acquisition_history SET mangabaka_id = ?1
+                                         WHERE (manga_id = ?2 OR series = ?3) AND (mangabaka_id IS NULL OR mangabaka_id <= 0)",
+                                        rusqlite::params![id, manga_id, &pub_title_clone],
+                                    );
+                                    let _ = c.execute(
+                                        "UPDATE series_reconciliations SET mangabaka_id = ?1
+                                         WHERE (manga_id = ?2 OR title = ?3) AND (mangabaka_id IS NULL OR mangabaka_id <= 0)",
+                                        rusqlite::params![id, manga_id, &pub_title_clone],
+                                    );
+                                    Ok(())
+                                })
+                                .await;
+                            id
+                        }
+                        _ => {
+                            return finish(
+                                &self.db,
+                                chapter,
+                                "needs_review",
+                                "Missing/ambiguous/conflicting MangaBaka identity — metadata needs review",
+                            )
+                            .await;
+                        }
+                    }
+                } else {
+                    return finish(
+                        &self.db,
+                        chapter,
+                        "needs_review",
+                        "Missing/ambiguous/conflicting MangaBaka identity — metadata needs review",
+                    )
+                    .await;
+                }
             }
         };
         let client =
@@ -1189,5 +1258,108 @@ mod tests {
         }).await.unwrap();
         assert_ne!(state, "queued");
         assert_ne!(state, "downloading");
+    }
+
+    #[tokio::test]
+    async fn komf_resolves_mangabaka_from_series_reconciliation_and_links_mapping() {
+        let f = Fixture::new().await;
+        f.db.call(|c| {
+            c.execute("UPDATE acquisition_history SET mangabaka_id=NULL WHERE chapter_id=1", [])?;
+            c.execute(
+                "INSERT INTO series_reconciliations (series_id, manga_id, mangabaka_id, title, status, last_reconciled_at, updated_at)
+                 VALUES ('manga:1', 1, 9999, 'Handoff Series', 'matched', 0, 0)",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        assert!(f.run(false).await);
+        assert_eq!(f.posts(), 1);
+        assert_eq!(
+            f.server.posts.lock().unwrap()[0],
+            json!({"bookId":"book-1","provider":"MANGA_BAKA","providerSeriesId":"9999","libraryId":"english"})
+        );
+        let saved_mapping: String = f
+            .db
+            .call(|c| {
+                Ok(c.query_row(
+                    "SELECT tracker_id FROM tracker_mappings WHERE komga_series_id='series-1' AND tracker='mangabaka'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(saved_mapping, "9999");
+        assert_eq!(f.record().await.state, "succeeded");
+    }
+
+    #[tokio::test]
+    async fn komf_resolves_mangabaka_from_match_series_when_enabled() {
+        let f = Fixture::new().await;
+        let mock_mb = Router::new().route(
+            "/series/search",
+            get(|axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>| async move {
+                let q = params.get("q").cloned().unwrap_or_default();
+                if q == "Handoff Series" {
+                    Json(json!({
+                        "data": [
+                            {
+                                "id": 7777,
+                                "title": "Handoff Series",
+                                "titles": [
+                                    { "title": "Handoff Series", "traits": ["official"] }
+                                ]
+                            }
+                        ]
+                    }))
+                } else {
+                    Json(json!({ "data": [] }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, mock_mb).await.unwrap();
+        });
+
+        f.db.call(move |c| {
+            c.execute("UPDATE acquisition_history SET mangabaka_id=NULL WHERE chapter_id=1", [])?;
+            crate::settings::set(c, "pipeline.mangabaka_enabled", &json!(true))?;
+            crate::settings::set(c, "pipeline.mangabaka_url", &json!(format!("http://{addr}")))?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        assert!(f.run(false).await);
+        assert_eq!(f.posts(), 1);
+        assert_eq!(
+            f.server.posts.lock().unwrap()[0],
+            json!({"bookId":"book-1","provider":"MANGA_BAKA","providerSeriesId":"7777","libraryId":"english"})
+        );
+        let (saved_mapping, saved_hist): (String, i64) = f
+            .db
+            .call(|c| {
+                let m = c.query_row(
+                    "SELECT tracker_id FROM tracker_mappings WHERE komga_series_id='series-1' AND tracker='mangabaka'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let h = c.query_row(
+                    "SELECT mangabaka_id FROM acquisition_history WHERE chapter_id=1",
+                    [],
+                    |r| r.get(0),
+                )?;
+                Ok((m, h))
+            })
+            .await
+            .unwrap();
+        assert_eq!(saved_mapping, "7777");
+        assert_eq!(saved_hist, 7777);
+        assert_eq!(f.record().await.state, "succeeded");
     }
 }

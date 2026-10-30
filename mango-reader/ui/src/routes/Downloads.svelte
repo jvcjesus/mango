@@ -65,8 +65,12 @@
       (q) =>
         q.state === 'failed' ||
         q.isStalled ||
-        q.metadataHandoff?.state === 'failed' ||
         q.state === 'metadata_failed' ||
+        q.state === 'metadata_review' ||
+        q.metadataHandoff?.state === 'failed' ||
+        q.metadataHandoff?.state === 'needs_review' ||
+        q.metadataHandoff?.state === 'rejected' ||
+        q.metadataHandoff?.state === 'unavailable' ||
         (q.canRetryKomga && !q.metadataHandoff)
     )
   );
@@ -89,7 +93,9 @@
   // 4. Completed History
   const completedQueue = $derived(
     queue.filter(
-      (q) => q.state === 'completed' || q.stage === 'complete' || q.publishedPath != null
+      (q) =>
+        (q.state === 'completed' || q.stage === 'complete' || (q.publishedPath != null && (q.metadataHandoff == null || q.metadataHandoff.state === 'succeeded'))) &&
+        !attentionQueue.includes(q)
     )
   );
   const completedBooks = $derived(

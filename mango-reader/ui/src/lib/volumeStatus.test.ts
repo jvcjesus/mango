@@ -215,6 +215,48 @@ describe('Normalized Volume Presentation Model', () => {
     expect(pres.canRetryDownload).toBe(false); // Media exists, cannot re-download
   });
 
+  it('Case G2: Published with metadata in review -> Attention with canRetryMetadata', () => {
+    const reviewMetadataItem: Queued = {
+      chapterId: 107,
+      chapterName: 'Volume 11',
+      mangaId: 1,
+      title: 'Delicious in Dungeon',
+      state: 'metadata_review',
+      stage: 'metadata_review',
+      source: 'test',
+      sourceType: 'test',
+      backendType: 'test',
+      externalJobId: '',
+      collectionId: '',
+      payloadChapter: null,
+      volume: 11,
+      number: 11,
+      publishedPath: '/srv/media/manga/Delicious in Dungeon/Delicious in Dungeon v11.cbz',
+      canRetryKomga: false,
+      metadataHandoff: {
+        chapterId: 107,
+        canonicalPath: '/srv/media/manga/Delicious in Dungeon/Delicious in Dungeon v11.cbz',
+        state: 'needs_review',
+        message: 'Missing/ambiguous/conflicting MangaBaka identity — metadata needs review',
+      },
+      error: 'Missing/ambiguous/conflicting MangaBaka identity — metadata needs review',
+    };
+
+    const pres = resolveVolumePresentation({
+      volume: 11,
+      isOwnedInKomga: true,
+      queuedItems: [reviewMetadataItem],
+    });
+
+    expect(pres.status).toBe('attention');
+    expect(pres.statusLabel).toBe('Media acquired · Metadata needs attention');
+    expect(pres.badgeVariant).toBe('attention');
+    expect(pres.physicalState).toBe('in_library');
+    expect(pres.metadataState).toBe('failed');
+    expect(pres.canRetryMetadata).toBe(true);
+    expect(pres.canRetryDownload).toBe(false);
+  });
+
   it('Case H: Fully successful handoff -> Complete', () => {
     const event: PipelineEvent = {
       id: 'evt-101',

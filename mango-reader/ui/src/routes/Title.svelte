@@ -1836,6 +1836,19 @@
         {#if ownership?.activeError}
           <Notice error={`Acquisition failed: ${ownership.activeError}`} retry={refreshOwnership} />
         {/if}
+        {#if volumeGroups.some(g => g.presentation?.canRetryMetadata)}
+          <Notice>
+            <div style="display: flex; align-items: center; justify-content: space-between; width: 100%; gap: 12px; flex-wrap: wrap;">
+              <span>Some volumes have completed physical acquisition but require metadata delivery.</span>
+              <button
+                class="btn pill warn"
+                onclick={() => act('POST', `/manga/${title.id}/retry-metadata`)}
+              >
+                <Icon name="refresh" size={14} /> Retry all metadata
+              </button>
+            </div>
+          </Notice>
+        {/if}
         {#if note}<p role="status"><strong>{note}</strong> <a class="link" href="#/downloads">See downloads</a></p>{/if}
 
         {#each volumeGroups as grp (grp.volume ?? 'unassigned')}
