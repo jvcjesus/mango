@@ -1,7 +1,7 @@
 use rusqlite::{params, Connection, Result as SqlResult};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OpenTomeVolumeRelease {
     pub volume_number: f64,
@@ -13,7 +13,7 @@ pub struct OpenTomeVolumeRelease {
     pub status: String,    // "released", "releases_today", "future", "unknown"
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OpenTomeMarketSchedule {
     pub market: String, // "ja" or "en"
@@ -26,7 +26,7 @@ pub struct OpenTomeMarketSchedule {
     pub total_volumes: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OpenTomeSeriesSchedule {
     pub work_id: String,
@@ -36,7 +36,7 @@ pub struct OpenTomeSeriesSchedule {
     pub last_evaluated_at: i64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct OpenTomeWorkCandidate {
     pub work_id: String,

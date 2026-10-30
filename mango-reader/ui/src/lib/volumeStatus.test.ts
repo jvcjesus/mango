@@ -6,7 +6,7 @@ import {
   type VolumePresentation,
 } from './volumeStatus';
 import type { ImportBook } from './importReview';
-import type { PipelineEvent, Queued } from './api';
+import type { PipelineEvent, Queued, CanonicalLibraryReleasesSummary } from './api';
 
 describe('Normalized Volume Presentation Model', () => {
   it('Case A: Missing volume -> Missing', () => {
@@ -461,8 +461,10 @@ describe('Normalized Volume Presentation Model', () => {
 
     expect(summary.ownedCount).toBe(2);
     expect(summary.isOngoing).toBe(true);
-    expect(summary.statusExplanation).toContain('Ongoing');
-    expect(summary.statusExplanation).not.toContain('2 of 2');
+    expect(summary.isCompleted).toBe(false);
+    expect(summary.libraryStatus).toBe('up_to_date');
+    expect(summary.statusExplanation).toContain('Up to date');
+    expect(summary.statusExplanation).not.toContain('Complete');
   });
 
   it('M6.6: Ambiguous series identity pauses authoritative metrics and highlights resolve identity CTA', () => {
@@ -709,5 +711,378 @@ describe('Normalized Volume Presentation Model', () => {
     expect(discovery.topCandidate?.score).toBe(95.0);
     expect(discovery.topCandidate?.matchType).toBe('exact_volume');
     expect(discovery.providerErrors['madokami']).toContain('offline');
+  });
+
+  it('M6.6.1 Section 23 - Case 1: Healthy ongoing / up-to-date', () => {
+    const libraryState: CanonicalLibraryReleasesSummary = {
+      mangaId: 18,
+      title: 'Kagurabachi',
+      acquisitionMarket: 'en',
+      identityStatus: 'verified',
+      isIdentityAmbiguous: false,
+      isOngoing: true,
+      isCompleted: false,
+      ownedVolumesCount: 8,
+      ownedVolumes: [1, 2, 3, 4, 5, 6, 7, 8],
+      releasedVolumesCount: 8,
+      releasedVolumes: [1, 2, 3, 4, 5, 6, 7, 8],
+      missingReleasedCount: 0,
+      missingReleasedVolumes: [],
+      upcomingVolumes: [9],
+      nextRelease: {
+        volumeNumber: 9,
+        releaseDate: '2026-11-03',
+      },
+      releasesToday: [],
+      progressPercent: 100,
+      libraryStatus: 'up_to_date',
+      primaryActionType: 'none',
+      primaryActionLabel: '',
+      provenance: {
+        ownedSource: 'komga: 8 volumes verified',
+        releasedSource: 'opentome: 8 releases',
+        missingSource: 'diff: 0 missing',
+        upcomingSource: 'opentome: 1 upcoming',
+      },
+    };
+
+    const summary = resolveSeriesSummary({
+      title: 'Kagurabachi',
+      volumes: [],
+      libraryState,
+      isOngoing: true,
+    });
+
+    expect(summary.ownedCount).toBe(8);
+    expect(summary.totalExpectedVolumes).toBe(8);
+    expect(summary.missingCount).toBe(0);
+    expect(summary.progressPercent).toBe(100);
+    expect(summary.libraryStatus).toBe('up_to_date');
+    expect(summary.statusExplanation).toBe('8 / 8 released volumes owned · Up to date');
+    expect(summary.primaryActionType).toBe('none');
+    expect(summary.isCompleted).toBe(false);
+    expect(summary.isOngoing).toBe(true);
+    expect(summary.libraryState?.upcomingVolumes).toEqual([9]);
+    expect(summary.libraryState?.nextRelease?.volumeNumber).toBe(9);
+    expect(summary.libraryState?.nextRelease?.releaseDate).toBe('2026-11-03');
+  });
+
+  it('M6.6.1 Section 23 - Case 2: Missing released volume', () => {
+    const libraryState: CanonicalLibraryReleasesSummary = {
+      mangaId: 18,
+      title: 'Kagurabachi',
+      acquisitionMarket: 'en',
+      identityStatus: 'verified',
+      isIdentityAmbiguous: false,
+      isOngoing: true,
+      isCompleted: false,
+      ownedVolumesCount: 7,
+      ownedVolumes: [1, 2, 3, 4, 5, 6, 7],
+      releasedVolumesCount: 8,
+      releasedVolumes: [1, 2, 3, 4, 5, 6, 7, 8],
+      missingReleasedCount: 1,
+      missingReleasedVolumes: [8],
+      upcomingVolumes: [9],
+      nextRelease: { volumeNumber: 9, releaseDate: '2026-11-03' },
+      releasesToday: [],
+      progressPercent: 88,
+      libraryStatus: 'missing_released',
+      primaryActionType: 'discover',
+      primaryActionLabel: 'Discover releases',
+      provenance: {
+        ownedSource: 'komga: 7 volumes verified',
+        releasedSource: 'opentome: 8 releases',
+        missingSource: 'diff: 1 missing',
+        upcomingSource: 'opentome: 1 upcoming',
+      },
+    };
+
+    const summary = resolveSeriesSummary({
+      title: 'Kagurabachi',
+      volumes: [],
+      libraryState,
+      isOngoing: true,
+    });
+
+    expect(summary.ownedCount).toBe(7);
+    expect(summary.totalExpectedVolumes).toBe(8);
+    expect(summary.missingCount).toBe(1);
+    expect(summary.progressPercent).toBe(88);
+    expect(summary.libraryStatus).toBe('missing_released');
+    expect(summary.statusExplanation).toBe('7 / 8 released volumes owned · 1 missing');
+    expect(summary.primaryActionType).toBe('discover');
+    expect(summary.primaryActionLabel).toBe('Discover releases');
+  });
+
+  it('M6.6.1 Section 23 - Case 3: Candidate available triggers Review release', () => {
+    const libraryState: CanonicalLibraryReleasesSummary = {
+      mangaId: 18,
+      title: 'Kagurabachi',
+      acquisitionMarket: 'en',
+      identityStatus: 'verified',
+      isIdentityAmbiguous: false,
+      isOngoing: true,
+      isCompleted: false,
+      ownedVolumesCount: 7,
+      ownedVolumes: [1, 2, 3, 4, 5, 6, 7],
+      releasedVolumesCount: 8,
+      releasedVolumes: [1, 2, 3, 4, 5, 6, 7, 8],
+      missingReleasedCount: 1,
+      missingReleasedVolumes: [8],
+      upcomingVolumes: [],
+      nextRelease: null,
+      releasesToday: [],
+      progressPercent: 88,
+      libraryStatus: 'candidate_available',
+      primaryActionType: 'review_release',
+      primaryActionLabel: 'Review release',
+      provenance: {
+        ownedSource: 'komga: 7 volumes verified',
+        releasedSource: 'opentome: 8 releases',
+        missingSource: 'candidate ready for review',
+      },
+    };
+
+    const summary = resolveSeriesSummary({
+      title: 'Kagurabachi',
+      volumes: [],
+      libraryState,
+      isOngoing: true,
+    });
+
+    expect(summary.primaryActionType).toBe('review_release');
+    expect(summary.primaryActionLabel).toBe('Review release');
+  });
+
+  it('M6.6.1 Section 23 - Case 4: Future volume displayed as upcoming and not counted missing', () => {
+    const libraryState: CanonicalLibraryReleasesSummary = {
+      mangaId: 18,
+      title: 'Kagurabachi',
+      acquisitionMarket: 'en',
+      identityStatus: 'verified',
+      isIdentityAmbiguous: false,
+      isOngoing: true,
+      isCompleted: false,
+      ownedVolumesCount: 8,
+      ownedVolumes: [1, 2, 3, 4, 5, 6, 7, 8],
+      releasedVolumesCount: 8,
+      releasedVolumes: [1, 2, 3, 4, 5, 6, 7, 8],
+      missingReleasedCount: 0,
+      missingReleasedVolumes: [],
+      upcomingVolumes: [9, 10],
+      nextRelease: { volumeNumber: 9, releaseDate: '2026-11-03' },
+      releasesToday: [],
+      progressPercent: 100,
+      libraryStatus: 'up_to_date',
+      primaryActionType: 'none',
+      primaryActionLabel: '',
+      provenance: {
+        ownedSource: 'komga: 8 volumes verified',
+        releasedSource: 'opentome: 8 releases',
+        missingSource: 'diff: 0 missing',
+        upcomingSource: 'opentome: 2 upcoming',
+      },
+    };
+
+    const summary = resolveSeriesSummary({
+      title: 'Kagurabachi',
+      volumes: [],
+      libraryState,
+      isOngoing: true,
+    });
+
+    expect(summary.missingCount).toBe(0);
+    expect(summary.totalExpectedVolumes).toBe(8);
+    expect(summary.libraryState?.upcomingVolumes).toEqual([9, 10]);
+  });
+
+  it('M6.6.1 Section 23 - Case 5: Japanese release schedule does not inflate English missing count', () => {
+    const libraryState: CanonicalLibraryReleasesSummary = {
+      mangaId: 30,
+      title: 'Witch Hat Atelier',
+      acquisitionMarket: 'en',
+      identityStatus: 'verified',
+      isIdentityAmbiguous: false,
+      isOngoing: true,
+      isCompleted: false,
+      ownedVolumesCount: 14,
+      ownedVolumes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+      releasedVolumesCount: 14,
+      releasedVolumes: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+      missingReleasedCount: 0,
+      missingReleasedVolumes: [],
+      upcomingVolumes: [],
+      nextRelease: null,
+      releasesToday: [],
+      progressPercent: 100,
+      libraryStatus: 'up_to_date',
+      primaryActionType: 'none',
+      primaryActionLabel: '',
+      provenance: {
+        ownedSource: 'komga: 14 volumes verified',
+        releasedSource: 'opentome: 14 releases',
+        missingSource: 'diff: 0 missing',
+      },
+    };
+
+    const summary = resolveSeriesSummary({
+      title: 'Witch Hat Atelier',
+      volumes: [],
+      libraryState,
+      isOngoing: true,
+    });
+
+    expect(summary.ownedCount).toBe(14);
+    expect(summary.totalExpectedVolumes).toBe(14); // EN released, NOT JA 16!
+    expect(summary.missingCount).toBe(0);
+    expect(summary.libraryState?.acquisitionMarket).toBe('en');
+  });
+
+  it('M6.6.1 Section 23 - Case 6: Ambiguous identity suppresses authoritative counts and highlights resolve identity CTA', () => {
+    const libraryState: CanonicalLibraryReleasesSummary = {
+      mangaId: 99,
+      title: 'Ambiguous Series',
+      acquisitionMarket: 'en',
+      identityStatus: 'ambiguous',
+      isIdentityAmbiguous: true,
+      isOngoing: true,
+      isCompleted: false,
+      ownedVolumesCount: 3,
+      ownedVolumes: [1, 2, 3],
+      releasedVolumesCount: 0,
+      releasedVolumes: [],
+      missingReleasedCount: 0,
+      missingReleasedVolumes: [],
+      upcomingVolumes: [],
+      nextRelease: null,
+      releasesToday: [],
+      progressPercent: null,
+      libraryStatus: 'identity_review_required',
+      primaryActionType: 'resolve_identity',
+      primaryActionLabel: 'Resolve identity',
+      provenance: {
+        ownedSource: 'komga: 3 volumes verified',
+        releasedSource: 'suppressed: ambiguous identity',
+        missingSource: 'suppressed: ambiguous identity',
+      },
+    };
+
+    const summary = resolveSeriesSummary({
+      title: 'Ambiguous Series',
+      volumes: [],
+      libraryState,
+    });
+
+    expect(summary.isIdentityAmbiguous).toBe(true);
+    expect(summary.totalExpectedVolumes).toBeNull();
+    expect(summary.missingCount).toBe(0);
+    expect(summary.primaryActionType).toBe('resolve_identity');
+    expect(summary.primaryActionLabel).toBe('Resolve identity');
+    expect(summary.statusExplanation).toBe('Series identity needs review');
+  });
+
+  it('M6.6.1 Section 23 - Case 7: Metadata attention keeps physical media owned and offers retry metadata', () => {
+    const volumes: VolumePresentation[] = [
+      {
+        volume: 14,
+        label: 'Volume 14',
+        status: 'attention',
+        statusLabel: 'Metadata error',
+        badgeVariant: 'attention',
+        physicalState: 'in_library',
+        physicalLabel: 'In canonical library',
+        metadataState: 'failed',
+        metadataLabel: 'Failed to enrich metadata',
+        progressPercent: null,
+        canRetryMetadata: true,
+        canRetryKomga: false,
+        canRetryDownload: false,
+        canReview: false,
+        canAcquire: false,
+      },
+    ];
+
+    const summary = resolveSeriesSummary({
+      title: 'Delicious in Dungeon',
+      volumes,
+      totalExpectedVolumes: 14,
+      isOngoing: false,
+      isCompleted: true,
+    });
+
+    expect(summary.ownedCount).toBe(1);
+    expect(summary.primaryActionType).toBe('retry_metadata');
+    expect(summary.primaryActionLabel).toBe('Retry metadata');
+  });
+
+  it('M6.6.1 Section 23 - Case 8: Active acquisition prevents duplicate acquire/discovery CTA', () => {
+    const queued: Queued = {
+      chapterId: 88,
+      chapterName: 'Volume 8',
+      mangaId: 18,
+      title: 'Kagurabachi',
+      state: 'downloading',
+      stage: 'torbox_retrieving',
+      done: 0,
+      total: null,
+      attempts: 0,
+      retryAt: null,
+      error: null,
+      bytesDownloaded: 50 * 1024 * 1024,
+      totalBytes: 100 * 1024 * 1024,
+      sourceType: 'nyaa',
+    };
+
+    const pres = resolveVolumePresentation({
+      volume: 8,
+      isOwnedInKomga: false,
+      queuedItems: [queued],
+    });
+
+    expect(pres.status).toBe('acquiring');
+    expect(pres.canAcquire).toBe(false);
+  });
+
+  it('M6.6.1 Section 23 - Case 9: OpenTome unavailable degrades gracefully without false 0/0 or missing', () => {
+    const libraryState: CanonicalLibraryReleasesSummary = {
+      mangaId: 18,
+      title: 'Kagurabachi',
+      acquisitionMarket: 'en',
+      identityStatus: 'verified',
+      isIdentityAmbiguous: false,
+      isOngoing: true,
+      isCompleted: false,
+      ownedVolumesCount: 8,
+      ownedVolumes: [1, 2, 3, 4, 5, 6, 7, 8],
+      releasedVolumesCount: 8,
+      releasedVolumes: [1, 2, 3, 4, 5, 6, 7, 8],
+      missingReleasedCount: 0,
+      missingReleasedVolumes: [],
+      upcomingVolumes: [],
+      nextRelease: null,
+      releasesToday: [],
+      progressPercent: 100,
+      libraryStatus: 'up_to_date',
+      primaryActionType: 'none',
+      primaryActionLabel: '',
+      provenance: {
+        ownedSource: 'komga: 8 volumes verified',
+        releasedSource: 'fallback: komga total volumes',
+        missingSource: 'diff: 0 missing',
+      },
+    };
+
+    const summary = resolveSeriesSummary({
+      title: 'Kagurabachi',
+      volumes: [],
+      libraryState,
+      isOngoing: true,
+    });
+
+    expect(summary.ownedCount).toBe(8);
+    expect(summary.totalExpectedVolumes).toBe(8);
+    expect(summary.missingCount).toBe(0);
+    expect(summary.statusExplanation).toBe('8 / 8 released volumes owned · Up to date');
+    expect(summary.libraryState?.acquisitionMarket).toBe('en');
   });
 });

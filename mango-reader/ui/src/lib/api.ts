@@ -1632,6 +1632,40 @@ export const retryReleaseDiscoveryTarget = (id: number, targetId: number) =>
     {}
   );
 
+export interface LibraryStateProvenance {
+  ownedSource: string;
+  releasedSource: string;
+  missingSource: string;
+  upcomingSource?: string | null;
+}
+
+export interface CanonicalLibraryReleasesSummary {
+  mangaId: number;
+  title: string;
+  acquisitionMarket: string;
+  identityStatus: string;
+  isIdentityAmbiguous: boolean;
+  isOngoing: boolean;
+  isCompleted: boolean;
+  ownedVolumesCount: number;
+  ownedVolumes: number[];
+  releasedVolumesCount: number;
+  releasedVolumes: number[];
+  missingReleasedCount: number;
+  missingReleasedVolumes: number[];
+  upcomingVolumes: number[];
+  nextRelease?: OpenTomeVolumeRelease | null;
+  releasesToday: number[];
+  progressPercent?: number | null;
+  libraryStatus: 'up_to_date' | 'library_complete' | 'missing_released' | 'identity_review_required' | string;
+  primaryActionType: 'none' | 'review_release' | 'retry_metadata' | 'discover' | 'resolve_identity' | string;
+  primaryActionLabel: string;
+  provenance: LibraryStateProvenance;
+}
+
+export const getMangaLibraryState = (id: number) =>
+  get<CanonicalLibraryReleasesSummary>(`/manga/${id}/library-state`);
+
 
 
 

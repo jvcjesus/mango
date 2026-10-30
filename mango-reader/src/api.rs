@@ -130,6 +130,7 @@ pub fn router(state: Spaces) -> Router {
         )
         .route("/manga/{id}/unfollow", post(post_manga_unfollow))
         .route("/manga/{id}/reconciliation", get(get_manga_reconciliation))
+        .route("/manga/{id}/library-state", get(get_manga_library_state))
         .route("/manga/{id}/reconcile", post(post_manga_reconcile))
         .route("/manga/{id}/retry-metadata", post(post_manga_retry_metadata))
         .route("/reconciliation/followed", get(get_followed_reconciliations))
@@ -1018,6 +1019,31 @@ async fn get_manga_reconciliation(
     let summary = app
         .db
         .call(move |conn| crate::sync::reconciliation::get_reconciliation_for_manga(conn, id))
+        .await?;
+    Ok(Json(summary))
+}
+
+async fn get_manga_library_state(
+    Me(app): Me,
+    Path(id): Path<i64>,
+) -> Result<Json<crate::sync::reconciliation::CanonicalLibraryReleasesSummary>> {
+    let ot_schedule = if app.opentome.is_enabled().await {
+        app.opentome.get_series_schedule(id).await.ok().flatten()
+    } else {
+        None
+    };
+    let today = app.opentome.current_date_str().await;
+    let summary = app
+        .db
+        .call(move |conn| {
+            crate::sync::reconciliation::resolve_canonical_library_state(
+                conn,
+                id,
+                ot_schedule.as_ref(),
+                "en",
+                &today,
+            )
+        })
         .await?;
     Ok(Json(summary))
 }

@@ -1,12 +1,42 @@
 <script lang="ts">
   import Icon from './Icon.svelte';
   import type { SeriesSummary } from './volumeStatus';
-  import type { ReconciliationSummary, OpenTomeSeriesSchedule, ReleaseDiscoveryTarget } from './api';
+  import type {
+    ReconciliationSummary,
+    OpenTomeSeriesSchedule,
+    ReleaseDiscoveryTarget,
+    CanonicalLibraryReleasesSummary,
+    TitleOwnership,
+  } from './api';
   import { ago } from './util';
+
+  function formatVolumeRanges(numbers: number[]): string {
+    if (!numbers.length) return 'None';
+    const sorted = [...numbers].sort((a, b) => a - b);
+    const ranges: string[] = [];
+    let start = sorted[0];
+    let end = start;
+
+    for (let i = 1; i < sorted.length; i++) {
+      if (sorted[i] === end + 1) {
+        end = sorted[i];
+      } else {
+        ranges.push(start === end ? `v${start}` : `v${start}–${end}`);
+        start = sorted[i];
+        end = start;
+      }
+    }
+    ranges.push(start === end ? `v${start}` : `v${start}–${end}`);
+    return ranges.join(', ');
+  }
 
   let {
     summary,
+    libraryState = null,
     reconciliation = null,
+    ownership = null,
+    ownedVolumeNumbers = [],
+    missingVolumeNumbers = [],
     openTomeSchedule = null,
     releaseDiscoveryTargets = [],
     onResolveIdentity,
@@ -25,7 +55,11 @@
     onCheckReleaseDiscovery,
   }: {
     summary: SeriesSummary;
+    libraryState?: CanonicalLibraryReleasesSummary | null;
     reconciliation?: ReconciliationSummary | null;
+    ownership?: TitleOwnership | null;
+    ownedVolumeNumbers?: number[];
+    missingVolumeNumbers?: number[];
     openTomeSchedule?: OpenTomeSeriesSchedule | null;
     releaseDiscoveryTargets?: ReleaseDiscoveryTarget[];
     onResolveIdentity?: () => void;
@@ -60,9 +94,20 @@
 
   const isComplete = $derived(
     !summary.isIdentityAmbiguous &&
-      summary.totalExpectedVolumes != null &&
-      summary.totalExpectedVolumes > 0 &&
-      summary.ownedCount >= summary.totalExpectedVolumes
+      (libraryState?.libraryStatus === 'library_complete' ||
+        summary.libraryStatus === 'library_complete' ||
+        (!summary.isOngoing &&
+          summary.totalExpectedVolumes != null &&
+          summary.totalExpectedVolumes > 0 &&
+          summary.ownedCount >= summary.totalExpectedVolumes))
+  );
+
+  const isUpToDate = $derived(
+    !summary.isIdentityAmbiguous &&
+      !isComplete &&
+      (libraryState?.libraryStatus === 'up_to_date' ||
+        summary.libraryStatus === 'up_to_date' ||
+        (summary.isOngoing && summary.missingCount === 0 && summary.ownedCount > 0))
   );
 </script>
 
@@ -74,6 +119,8 @@
         <h2 class="display section-heading">Library & Releases</h2>
         {#if isComplete}
           <span class="tag complete-tag">✓ Library Complete</span>
+        {:else if isUpToDate}
+          <span class="tag uptodate-tag">✓ Up to date</span>
         {:else if summary.isOngoing}
           <span class="tag ongoing-tag">Ongoing</span>
         {/if}
@@ -144,6 +191,10 @@
         {#if isComplete}
           <span class="status-text complete">
             {summary.ownedCount} / {summary.totalExpectedVolumes} released volumes owned · Complete
+          </span>
+        {:else if isUpToDate}
+          <span class="status-text uptodate">
+            {summary.ownedCount} / {summary.totalExpectedVolumes ?? summary.ownedCount} released volumes owned · Up to date
           </span>
         {:else}
           <span class="status-text">
@@ -241,8 +292,10 @@
                 {#if en.nextVolume.status === 'releases_today'}
                   <span class="today-tag">RELEASES TODAY</span>
                 {/if}
-              {:else}
+              {:else if isComplete}
                 {en.totalVolumes} released · Complete
+              {:else}
+                {en.totalVolumes} released
               {/if}
             </span>
           {:else}
@@ -261,8 +314,10 @@
                 {#if ja.nextVolume.status === 'releases_today'}
                   <span class="today-tag">RELEASES TODAY</span>
                 {/if}
-              {:else}
+              {:else if isComplete}
                 {ja.totalVolumes} released · Complete
+              {:else}
+                {ja.totalVolumes} released
               {/if}
             </span>
           {:else}
@@ -398,6 +453,63 @@
             </div>
           </div>
         {/if}
+
+        <!-- Komga Ownership and Provenance Details -->
+        <div class="provenance-details-box">
+          <div class="provenance-header">
+            <strong>Ownership & Provenance Details</strong>
+          </div>
+          {#if ownership?.seriesName}
+            <div class="detail-row">
+              <span class="detail-k">Matched Series:</span>
+              <span class="detail-v"><strong>{ownership.seriesName}</strong> <code class="detail-id">{ownership.seriesId}</code></span>
+            </div>
+          {/if}
+          {#if ownership?.libraryName || ownership?.libraryId}
+            <div class="detail-row">
+              <span class="detail-k">Komga Library:</span>
+              <span class="detail-v">{ownership.libraryName ?? ownership.libraryId}</span>
+            </div>
+          {/if}
+          {#if ownedVolumeNumbers.length > 0}
+            <div class="detail-row">
+              <span class="detail-k">Owned Volumes:</span>
+              <span class="detail-v">{formatVolumeRanges(ownedVolumeNumbers)}</span>
+            </div>
+          {/if}
+          {#if missingVolumeNumbers.length > 0}
+            <div class="detail-row">
+              <span class="detail-k">Missing Volumes:</span>
+              <span class="detail-v">{formatVolumeRanges(missingVolumeNumbers)}</span>
+            </div>
+          {/if}
+          {#if libraryState?.provenance}
+            <div class="detail-row">
+              <span class="detail-k">Ownership Source:</span>
+              <span class="detail-v">{libraryState.provenance.ownedSource}</span>
+            </div>
+            <div class="detail-row">
+              <span class="detail-k">Release Schedule:</span>
+              <span class="detail-v">{libraryState.provenance.releasedSource}</span>
+            </div>
+            <div class="detail-row">
+              <span class="detail-k">Missing Calculation:</span>
+              <span class="detail-v">{libraryState.provenance.missingSource}</span>
+            </div>
+            {#if libraryState.provenance.upcomingSource}
+              <div class="detail-row">
+                <span class="detail-k">Upcoming Release:</span>
+                <span class="detail-v">{libraryState.provenance.upcomingSource}</span>
+              </div>
+            {/if}
+          {/if}
+          {#if ownership?.lastRefreshed}
+            <div class="detail-row">
+              <span class="detail-k">Last Checked:</span>
+              <span class="detail-v">{ago(ownership.lastRefreshed)}</span>
+            </div>
+          {/if}
+        </div>
       </div>
     {/if}
   </div>
@@ -445,6 +557,16 @@
   }
 
   .complete-tag {
+    background: #e6f9ed;
+    color: #137333;
+    border: 1.5px solid #137333;
+    border-radius: 999px;
+    font-size: 11px;
+    padding: 2px 10px;
+    font-weight: 700;
+  }
+
+  .uptodate-tag {
     background: #e6f9ed;
     color: #137333;
     border: 1.5px solid #137333;
@@ -544,6 +666,11 @@
 
   .status-text.complete {
     color: #065f46;
+  }
+
+  .status-text.uptodate {
+    color: #065f46;
+    font-weight: 700;
   }
 
   .missing-accent {
@@ -804,5 +931,48 @@
   .remap-buttons {
     display: flex;
     gap: 6px;
+  }
+
+  .provenance-details-box {
+    margin-top: 14px;
+    padding-top: 14px;
+    border-top: 1px dashed var(--line);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    font-size: 12px;
+  }
+
+  .provenance-header {
+    font-size: 12px;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--muted);
+    margin-bottom: 4px;
+  }
+
+  .detail-row {
+    display: flex;
+    gap: 8px;
+    line-height: 1.4;
+  }
+
+  .detail-k {
+    color: var(--muted);
+    min-width: 140px;
+    flex-shrink: 0;
+  }
+
+  .detail-v {
+    color: var(--ink);
+  }
+
+  .detail-id {
+    font-family: var(--font-mono, monospace);
+    font-size: 11px;
+    background: var(--paper);
+    padding: 1px 4px;
+    border-radius: 4px;
   }
 </style>

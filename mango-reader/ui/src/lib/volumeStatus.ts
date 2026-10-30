@@ -1,5 +1,11 @@
 import type { ImportBook } from './importReview';
-import type { PipelineEvent, Queued, VolumeOwnership } from './api';
+import type {
+  PipelineEvent,
+  Queued,
+  VolumeOwnership,
+  CanonicalLibraryReleasesSummary,
+  ReconciliationSummary,
+} from './api';
 
 export type NormalizedStatus =
   | 'owned'
@@ -91,10 +97,13 @@ export interface SeriesSummary {
   attentionCount: number;
   progressPercent: number | null;
   isOngoing: boolean;
+  isCompleted?: boolean;
+  libraryStatus?: 'up_to_date' | 'library_complete' | 'missing_released' | 'identity_review_required' | string;
   statusExplanation: string;
   isIdentityAmbiguous: boolean;
   primaryActionType: 'resolve_identity' | 'review_release' | 'retry_metadata' | 'discover' | 'none';
   primaryActionLabel: string;
+  libraryState?: CanonicalLibraryReleasesSummary | null;
 }
 
 export interface SeriesSummaryInputs {
@@ -102,9 +111,12 @@ export interface SeriesSummaryInputs {
   volumes: VolumePresentation[];
   totalExpectedVolumes?: number | null;
   isOngoing?: boolean;
+  isCompleted?: boolean;
   isIdentityAmbiguous?: boolean;
   reconciliationStatus?: string | null;
   hasAvailableRelease?: boolean;
+  libraryState?: CanonicalLibraryReleasesSummary | null;
+  reconciliation?: ReconciliationSummary | null;
 }
 
 export interface StagingSummary {
@@ -471,14 +483,81 @@ export function resolveSeriesSummary(inputs: SeriesSummaryInputs): SeriesSummary
     volumes,
     totalExpectedVolumes = null,
     isOngoing = false,
+    isCompleted = false,
     isIdentityAmbiguous = false,
     reconciliationStatus = null,
     hasAvailableRelease = false,
+    libraryState = null,
+    reconciliation = null,
   } = inputs;
 
+  // 1. If libraryState is provided, it is the canonical backend authority
+  if (libraryState) {
+    if (libraryState.isIdentityAmbiguous) {
+      return {
+        title: libraryState.title || title,
+        ownedCount: libraryState.ownedVolumesCount,
+        totalExpectedVolumes: null,
+        missingCount: 0,
+        activeCount: 0,
+        attentionCount: 0,
+        progressPercent: null,
+        isOngoing: libraryState.isOngoing,
+        isCompleted: libraryState.isCompleted,
+        libraryStatus: 'identity_review_required',
+        statusExplanation: 'Series identity needs review',
+        isIdentityAmbiguous: true,
+        primaryActionType: 'resolve_identity',
+        primaryActionLabel: 'Resolve identity',
+        libraryState,
+      };
+    }
+
+    const ownedCount = libraryState.ownedVolumesCount;
+    const releasedCount = libraryState.releasedVolumesCount;
+    const missingCount = libraryState.missingReleasedCount;
+    const progressPercent = libraryState.progressPercent ?? null;
+    const isOngoingResolved = libraryState.isOngoing;
+    const isCompletedResolved = libraryState.isCompleted;
+
+    let statusExplanation = '';
+    if (isCompletedResolved || libraryState.libraryStatus === 'library_complete') {
+      statusExplanation = `${ownedCount} / ${releasedCount} released volumes owned · Complete`;
+    } else if (libraryState.libraryStatus === 'up_to_date') {
+      statusExplanation = `${ownedCount} / ${releasedCount} released volumes owned · Up to date`;
+    } else if (missingCount > 0) {
+      statusExplanation = `${ownedCount} / ${releasedCount} released volumes owned · ${missingCount} missing`;
+    } else {
+      statusExplanation = `${ownedCount} / ${releasedCount} released volumes owned`;
+    }
+
+    const actionType = (libraryState.primaryActionType ?? 'none') as SeriesSummary['primaryActionType'];
+    const actionLabel = libraryState.primaryActionLabel || '';
+
+    return {
+      title: libraryState.title || title,
+      ownedCount,
+      totalExpectedVolumes: releasedCount,
+      missingCount,
+      activeCount: 0,
+      attentionCount: 0,
+      progressPercent,
+      isOngoing: isOngoingResolved,
+      isCompleted: isCompletedResolved,
+      libraryStatus: libraryState.libraryStatus,
+      statusExplanation,
+      isIdentityAmbiguous: false,
+      primaryActionType: actionType,
+      primaryActionLabel: actionLabel,
+      libraryState,
+    };
+  }
+
+  // 2. Standalone / Fallback calculation (from volumes and reconciliation)
   const isAmbiguous =
     isIdentityAmbiguous ||
     reconciliationStatus === 'review_required' ||
+    reconciliationStatus === 'sync_error' ||
     reconciliationStatus === 'unmatched';
 
   let ownedCount = 0;
@@ -508,6 +587,13 @@ export function resolveSeriesSummary(inputs: SeriesSummaryInputs): SeriesSummary
     }
   }
 
+  // If volumes is empty (e.g. flat chapters view where volumeGroups has presentation: null),
+  // fallback to reconciliation so we never show false 0 owned / 8 missing!
+  if (volumes.length === 0 && reconciliation) {
+    ownedCount = reconciliation.ownedVolumesCount;
+    missingCount = reconciliation.missingVolumesCount;
+  }
+
   // If identity is ambiguous, do not present misleading 0/14 counts or 14 missing
   if (isAmbiguous) {
     return {
@@ -519,6 +605,8 @@ export function resolveSeriesSummary(inputs: SeriesSummaryInputs): SeriesSummary
       attentionCount,
       progressPercent: null,
       isOngoing,
+      isCompleted,
+      libraryStatus: 'identity_review_required',
       statusExplanation: 'Series identity needs review',
       isIdentityAmbiguous: true,
       primaryActionType: 'resolve_identity',
@@ -526,24 +614,35 @@ export function resolveSeriesSummary(inputs: SeriesSummaryInputs): SeriesSummary
     };
   }
 
-  // If total expected volumes is specified and higher than volumes list, adjust missing
-  const total = totalExpectedVolumes != null && totalExpectedVolumes > 0
-    ? totalExpectedVolumes
-    : Math.max(volumes.length, ownedCount + missingCount);
+  const effectiveTotal =
+    totalExpectedVolumes != null && totalExpectedVolumes > 0
+      ? totalExpectedVolumes
+      : reconciliation?.totalOfficialVolumes != null
+        ? reconciliation.totalOfficialVolumes
+        : Math.max(volumes.length, ownedCount + missingCount);
 
-  if (totalExpectedVolumes != null && totalExpectedVolumes > ownedCount + activeCount + attentionCount) {
-    missingCount = totalExpectedVolumes - (ownedCount + activeCount + attentionCount);
+  if (volumes.length > 0 && effectiveTotal != null && effectiveTotal > ownedCount + activeCount + attentionCount) {
+    missingCount = effectiveTotal - (ownedCount + activeCount + attentionCount);
   }
 
-  const progressPercent = total > 0 ? Math.min(100, Math.round((ownedCount / total) * 100)) : null;
+  const progressPercent = effectiveTotal > 0 ? Math.min(100, Math.round((ownedCount / effectiveTotal) * 100)) : null;
 
+  const isCompletedResolved = isCompleted || (!isOngoing && ownedCount >= effectiveTotal && effectiveTotal > 0);
+  const isUpToDateResolved = isOngoing && missingCount === 0 && ownedCount > 0;
+
+  let libraryStatus = 'missing_released';
   let statusExplanation = '';
-  if (isOngoing) {
-    statusExplanation = `${ownedCount} ${ownedCount === 1 ? 'volume' : 'volumes'} owned · Ongoing`;
-  } else if (totalExpectedVolumes != null) {
-    statusExplanation = `${ownedCount} of ${totalExpectedVolumes} ${totalExpectedVolumes === 1 ? 'volume' : 'volumes'} owned`;
+  if (isCompletedResolved) {
+    libraryStatus = 'library_complete';
+    statusExplanation = `${ownedCount} / ${effectiveTotal} released volumes owned · Complete`;
+  } else if (isUpToDateResolved) {
+    libraryStatus = 'up_to_date';
+    statusExplanation = `${ownedCount} / ${effectiveTotal} released volumes owned · Up to date`;
+  } else if (missingCount > 0) {
+    libraryStatus = 'missing_released';
+    statusExplanation = `${ownedCount} / ${effectiveTotal} released volumes owned · ${missingCount} missing`;
   } else {
-    statusExplanation = `${ownedCount} ${ownedCount === 1 ? 'volume' : 'volumes'} owned`;
+    statusExplanation = `${ownedCount} of ${effectiveTotal} volumes owned`;
   }
 
   let primaryActionType: SeriesSummary['primaryActionType'] = 'none';
@@ -563,12 +662,14 @@ export function resolveSeriesSummary(inputs: SeriesSummaryInputs): SeriesSummary
   return {
     title,
     ownedCount,
-    totalExpectedVolumes,
+    totalExpectedVolumes: effectiveTotal,
     missingCount,
     activeCount,
     attentionCount,
     progressPercent,
     isOngoing,
+    isCompleted: isCompletedResolved,
+    libraryStatus,
     statusExplanation,
     isIdentityAmbiguous: false,
     primaryActionType,

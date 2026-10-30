@@ -30,6 +30,7 @@ use crate::{
 };
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
+use crate::opentome::catalog::{OpenTomeSeriesSchedule, OpenTomeVolumeRelease};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -122,6 +123,41 @@ impl ReconciliationSummary {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LibraryStateProvenance {
+    pub owned_source: String,
+    pub released_source: String,
+    pub missing_source: String,
+    pub upcoming_source: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CanonicalLibraryReleasesSummary {
+    pub manga_id: i64,
+    pub title: String,
+    pub acquisition_market: String,
+    pub identity_status: String,
+    pub is_identity_ambiguous: bool,
+    pub is_ongoing: bool,
+    pub is_completed: bool,
+    pub owned_volumes_count: usize,
+    pub owned_volumes: Vec<f64>,
+    pub released_volumes_count: usize,
+    pub released_volumes: Vec<f64>,
+    pub missing_released_count: usize,
+    pub missing_released_volumes: Vec<f64>,
+    pub upcoming_volumes: Vec<f64>,
+    pub next_release: Option<OpenTomeVolumeRelease>,
+    pub releases_today: Vec<f64>,
+    pub progress_percent: Option<u32>,
+    pub library_status: String,
+    pub primary_action_type: String,
+    pub primary_action_label: String,
+    pub provenance: LibraryStateProvenance,
 }
 
 #[derive(Debug, Clone)]
@@ -1229,6 +1265,298 @@ pub fn unfollow_series(conn: &Connection, manga_id: Option<i64>, title: &str) ->
     Ok(())
 }
 
+/// Resolves the canonical physical ownership and market release state for a manga title (M6.6.1).
+///
+/// Ensures exactly one canonical definition of physical ownership:
+/// A volume is OWNED when verified physical media exists in Komga / local library.
+/// Released volumes count defines the relevant-market denominator (e.g. English).
+/// Upcoming volumes are never counted as missing.
+/// Completed-vs-ongoing distinction is derived authoritatively from series status.
+pub fn resolve_canonical_library_state(
+    conn: &Connection,
+    manga_id: i64,
+    ot_schedule: Option<&OpenTomeSeriesSchedule>,
+    target_market: &str,
+    today_str: &str,
+) -> Result<CanonicalLibraryReleasesSummary> {
+    let (manga_title, manga_status): (String, i64) = conn
+        .query_row(
+            "SELECT title, status FROM manga WHERE id = ?1",
+            params![manga_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(|e| AppError::internal(format!("Query failed: {e}")))?
+        .ok_or_else(|| AppError::not_found(format!("Manga {manga_id} not found")))?;
+
+    let recon_opt = get_reconciliation_for_manga(conn, manga_id)?;
+
+    // 1. Gather local and Komga physical ownership
+    let mut owned_volumes = gather_local_owned_volumes(conn, Some(manga_id))?;
+    if let Some(ref r) = recon_opt {
+        for &v in &r.owned_volumes {
+            if !owned_volumes.iter().any(|&ov| (ov - v).abs() < 0.001) {
+                owned_volumes.push(v);
+            }
+        }
+    }
+    owned_volumes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    // 2. Determine series lifecycle status
+    let is_ongoing = recon_opt.as_ref().map_or(manga_status == 1, |r| r.is_ongoing);
+    let is_completed = !is_ongoing;
+
+    // 3. Ambiguous identity check: fail-closed
+    let (identity_status, is_identity_ambiguous) = match &recon_opt {
+        Some(r) => match r.status {
+            ReconciliationStatus::ReviewRequired => ("review_required".to_string(), true),
+            ReconciliationStatus::SyncError => ("sync_error".to_string(), true),
+            _ if r.mangabaka_id.is_some() => ("resolved".to_string(), false),
+            _ => ("unmatched".to_string(), false),
+        },
+        None => ("unmatched".to_string(), false),
+    };
+
+    if is_identity_ambiguous {
+        return Ok(CanonicalLibraryReleasesSummary {
+            manga_id,
+            title: manga_title,
+            acquisition_market: target_market.to_string(),
+            identity_status,
+            is_identity_ambiguous: true,
+            is_ongoing,
+            is_completed,
+            owned_volumes_count: owned_volumes.len(),
+            owned_volumes: owned_volumes.clone(),
+            released_volumes_count: 0,
+            released_volumes: vec![],
+            missing_released_count: 0,
+            missing_released_volumes: vec![],
+            upcoming_volumes: vec![],
+            next_release: None,
+            releases_today: vec![],
+            progress_percent: None,
+            library_status: "identity_review_required".to_string(),
+            primary_action_type: "resolve_identity".to_string(),
+            primary_action_label: "Resolve Identity".to_string(),
+            provenance: LibraryStateProvenance {
+                owned_source: format!("Local / Komga library ({} volumes owned)", owned_volumes.len()),
+                released_source: "Suppressed due to ambiguous series identity".to_string(),
+                missing_source: "Suppressed due to ambiguous series identity".to_string(),
+                upcoming_source: None,
+            },
+        });
+    }
+
+    // 4. Resolve market line from OpenTome
+    let market_line = match target_market.to_ascii_lowercase().as_str() {
+        "en" => ot_schedule.as_ref().and_then(|s| s.english.as_ref()),
+        "ja" => ot_schedule.as_ref().and_then(|s| s.japanese.as_ref()),
+        _ => None,
+    };
+
+    let mut upcoming_volumes: Vec<f64> = Vec::new();
+    let mut releases_today: Vec<f64> = Vec::new();
+    let mut next_release: Option<OpenTomeVolumeRelease> = None;
+
+    if let Some(ml) = market_line {
+        if let Some(ref nv) = ml.next_volume {
+            let is_future = nv.release_date.as_deref().map_or(nv.status == "future", |d| d > today_str);
+            let is_today = nv.release_date.as_deref().map_or(nv.status == "releases_today", |d| d == today_str);
+            if is_future {
+                upcoming_volumes.push(nv.volume_number);
+                next_release = Some(nv.clone());
+            } else if is_today {
+                releases_today.push(nv.volume_number);
+                next_release = Some(nv.clone());
+            }
+        }
+    }
+
+    if upcoming_volumes.is_empty() {
+        if let Some(ref recon) = recon_opt {
+            for &fv in &recon.future_volumes {
+                if !upcoming_volumes.iter().any(|&v| (v - fv).abs() < 0.001) {
+                    upcoming_volumes.push(fv);
+                }
+            }
+        }
+    }
+
+    // 5. Partition released volumes for the target acquisition market
+    let mut released_volumes: Vec<f64> = Vec::new();
+
+    if let Some(ref recon) = recon_opt {
+        for &v in &recon.owned_volumes {
+            if !upcoming_volumes.iter().any(|&uv| (uv - v).abs() < 0.001) {
+                if !released_volumes.iter().any(|&rv| (rv - v).abs() < 0.001) {
+                    released_volumes.push(v);
+                }
+            }
+        }
+        for &v in &recon.missing_volumes {
+            if !upcoming_volumes.iter().any(|&uv| (uv - v).abs() < 0.001) {
+                if !released_volumes.iter().any(|&rv| (rv - v).abs() < 0.001) {
+                    released_volumes.push(v);
+                }
+            }
+        }
+    } else if let Some(ml) = market_line {
+        if let Some(ref lv) = ml.latest_volume {
+            let max_vol = lv.volume_number as i64;
+            for v in 1..=max_vol {
+                released_volumes.push(v as f64);
+            }
+        }
+    } else {
+        for &v in &owned_volumes {
+            released_volumes.push(v);
+        }
+    }
+
+    for &rt in &releases_today {
+        if !released_volumes.iter().any(|&rv| (rv - rt).abs() < 0.001) {
+            released_volumes.push(rt);
+        }
+    }
+
+    released_volumes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    // 6. Calculate missing released volumes
+    let mut missing_released_volumes: Vec<f64> = Vec::new();
+    for &rv in &released_volumes {
+        if !owned_volumes.iter().any(|&ov| (ov - rv).abs() < 0.001) {
+            missing_released_volumes.push(rv);
+        }
+    }
+    missing_released_volumes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    let released_volumes_count = released_volumes.len();
+    let owned_volumes_count = owned_volumes.len();
+    let missing_released_count = missing_released_volumes.len();
+
+    // 7. Calculate progress percentage against released denominator
+    let progress_percent = if released_volumes_count > 0 {
+        let owned_in_released = released_volumes
+            .iter()
+            .filter(|&rv| owned_volumes.iter().any(|&ov| (ov - rv).abs() < 0.001))
+            .count();
+        Some(std::cmp::min(100, ((owned_in_released as f64 / released_volumes_count as f64) * 100.0).round() as u32))
+    } else {
+        None
+    };
+
+    // 8. Overall library status
+    let library_status = if missing_released_count > 0 {
+        "missing_released".to_string()
+    } else if is_completed {
+        "library_complete".to_string()
+    } else {
+        "up_to_date".to_string()
+    };
+
+    // 9. Primary CTA evaluation
+    let mut has_candidate = false;
+    if let Ok(c) = conn.query_row(
+        "SELECT COUNT(*) FROM release_discovery_targets WHERE manga_id = ?1 AND status = 'candidate_available'",
+        params![manga_id],
+        |r| r.get::<_, i64>(0),
+    ) {
+        has_candidate = c > 0;
+    }
+
+    let mut has_metadata_attention = false;
+    if let Ok(c) = conn.query_row(
+        "SELECT COUNT(*) FROM downloads d
+         JOIN chapters c ON c.id = d.chapter_id
+         WHERE c.manga_id = ?1 AND d.state IN ('metadata_failed', 'metadata_review')",
+        params![manga_id],
+        |r| r.get::<_, i64>(0),
+    ) {
+        has_metadata_attention = c > 0;
+    }
+
+    let (primary_action_type, primary_action_label) = if has_metadata_attention {
+        ("retry_metadata".to_string(), "Retry Metadata".to_string())
+    } else if has_candidate {
+        ("review_release".to_string(), "Review Release".to_string())
+    } else if missing_released_count > 0 {
+        ("discover".to_string(), "Discover Releases".to_string())
+    } else {
+        ("none".to_string(), String::new())
+    };
+
+    // 10. Provenance explainability
+    let owned_source = format!(
+        "Komga verified physical media ({} volumes owned)",
+        owned_volumes_count
+    );
+    let released_source = if let Some(ml) = market_line {
+        format!(
+            "OpenTome {} release schedule ({} released)",
+            ml.market.to_uppercase(),
+            released_volumes_count
+        )
+    } else if recon_opt.is_some() {
+        format!(
+            "MangaBaka official collection ({} released)",
+            released_volumes_count
+        )
+    } else {
+        format!(
+            "Local library releases ({} known)",
+            released_volumes_count
+        )
+    };
+    let missing_source = if missing_released_count == 0 {
+        "0 released volumes missing from Komga".to_string()
+    } else {
+        format!(
+            "{} released volumes missing from Komga",
+            missing_released_count
+        )
+    };
+    let upcoming_source = next_release.as_ref().map(|nr| {
+        format!(
+            "OpenTome {}: Vol. {} on {}",
+            target_market.to_uppercase(),
+            nr.volume_number,
+            nr.release_date.as_deref().unwrap_or("upcoming")
+        )
+    });
+
+    let provenance = LibraryStateProvenance {
+        owned_source,
+        released_source,
+        missing_source,
+        upcoming_source,
+    };
+
+    Ok(CanonicalLibraryReleasesSummary {
+        manga_id,
+        title: manga_title,
+        acquisition_market: target_market.to_string(),
+        identity_status,
+        is_identity_ambiguous,
+        is_ongoing,
+        is_completed,
+        owned_volumes_count,
+        owned_volumes,
+        released_volumes_count,
+        released_volumes,
+        missing_released_count,
+        missing_released_volumes,
+        upcoming_volumes,
+        next_release,
+        releases_today,
+        progress_percent,
+        library_status,
+        primary_action_type,
+        primary_action_label,
+        provenance,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1885,6 +2213,757 @@ mod tests {
         assert_eq!(initial_dl_count, final_dl_count);
 
         server.abort();
+    }
+
+    // =========================================================================
+    // M6.6.1 Section 22 Canonical Ownership & Release State Regression Suite
+    // =========================================================================
+
+    fn seed_test_manga_row(conn: &Connection, id: i64, title: &str, status: i64) {
+        conn.execute(
+            "INSERT OR REPLACE INTO manga (id, source_id, url, title, status) VALUES (?1, 1, ?2, ?3, ?4)",
+            params![id, format!("/manga/{id}"), title, status],
+        ).unwrap();
+    }
+
+    fn make_test_ot_vol(vol: f64, date: Option<&str>, status: &str, prec: &str) -> OpenTomeVolumeRelease {
+        OpenTomeVolumeRelease {
+            volume_number: vol,
+            title: None,
+            release_date: date.map(|d| d.to_string()),
+            release_date_raw: date.map(|d| d.to_string()),
+            precision: prec.to_string(),
+            date_type: "unknown".to_string(),
+            status: status.to_string(),
+        }
+    }
+
+    fn make_test_ot_schedule(
+        work_id: &str,
+        en: Option<crate::opentome::catalog::OpenTomeMarketSchedule>,
+        ja: Option<crate::opentome::catalog::OpenTomeMarketSchedule>,
+    ) -> OpenTomeSeriesSchedule {
+        OpenTomeSeriesSchedule {
+            work_id: work_id.to_string(),
+            mapping_confidence: "exact".to_string(),
+            japanese: ja,
+            english: en,
+            last_evaluated_at: 1000,
+        }
+    }
+
+    fn make_test_market_line(
+        market: &str,
+        latest: Option<OpenTomeVolumeRelease>,
+        next: Option<OpenTomeVolumeRelease>,
+        total: i64,
+    ) -> crate::opentome::catalog::OpenTomeMarketSchedule {
+        crate::opentome::catalog::OpenTomeMarketSchedule {
+            market: market.to_string(),
+            line_name: format!("{market} line"),
+            publisher: Some("Publisher".to_string()),
+            tome_id: format!("tome_{market}"),
+            gcd_series_id: 12345,
+            latest_volume: latest,
+            next_volume: next,
+            total_volumes: total,
+        }
+    }
+
+    // 1. Komga v1–8 + EN released v1–8 + EN v9 future -> owned 8, missing 0
+    #[test]
+    fn test_case_1_komga_1_8_en_released_1_8_future_9() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::migrate(&mut conn).unwrap();
+
+        seed_test_manga_row(&conn, 1001, "Kagurabachi", 1);
+        let recon = ReconciliationSummary {
+            series_id: "manga:1001".to_string(),
+            manga_id: Some(1001),
+            komga_series_id: Some("k1001".to_string()),
+            mangabaka_id: Some(708),
+            collection_id: Some("col1".to_string()),
+            title: "Kagurabachi".to_string(),
+            edition: "standard".to_string(),
+            status: ReconciliationStatus::UpToDate,
+            is_ongoing: true,
+            total_official_volumes: Some(8),
+            owned_volumes_count: 8,
+            missing_volumes_count: 0,
+            owned_volumes: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            missing_volumes: vec![],
+            future_volumes: vec![9.0],
+            last_reconciled_at: 1000,
+            last_error: None,
+            review_reason: None,
+            display_status: String::new(),
+        };
+        save_reconciliation(&conn, &recon).unwrap();
+
+        let en_line = make_test_market_line(
+            "en",
+            Some(make_test_ot_vol(8.0, Some("2026-08-04"), "released", "day")),
+            Some(make_test_ot_vol(9.0, Some("2026-11-03"), "future", "day")),
+            9,
+        );
+        let ot = make_test_ot_schedule("w_kb", Some(en_line), None);
+
+        let res = resolve_canonical_library_state(&conn, 1001, Some(&ot), "en", "2026-10-30").unwrap();
+
+        assert_eq!(res.owned_volumes_count, 8);
+        assert_eq!(res.released_volumes_count, 8);
+        assert_eq!(res.missing_released_count, 0);
+        assert_eq!(res.upcoming_volumes, vec![9.0]);
+        assert_eq!(res.releases_today, Vec::<f64>::new());
+        assert_eq!(res.library_status, "up_to_date");
+        assert_eq!(res.primary_action_type, "none");
+        assert_eq!(res.progress_percent, Some(100));
+        assert!(res.is_ongoing);
+        assert!(!res.is_completed);
+        assert!(!res.is_identity_ambiguous);
+    }
+
+    // 2. Komga v1–7 + EN released v1–8 -> owned 7, missing 1
+    #[test]
+    fn test_case_2_komga_1_7_en_released_1_8() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::migrate(&mut conn).unwrap();
+
+        seed_test_manga_row(&conn, 1002, "Test Missing", 1);
+        let recon = ReconciliationSummary {
+            series_id: "manga:1002".to_string(),
+            manga_id: Some(1002),
+            komga_series_id: Some("k1002".to_string()),
+            mangabaka_id: Some(709),
+            collection_id: Some("col2".to_string()),
+            title: "Test Missing".to_string(),
+            edition: "standard".to_string(),
+            status: ReconciliationStatus::MissingVolume,
+            is_ongoing: true,
+            total_official_volumes: Some(8),
+            owned_volumes_count: 7,
+            missing_volumes_count: 1,
+            owned_volumes: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0],
+            missing_volumes: vec![8.0],
+            future_volumes: vec![9.0],
+            last_reconciled_at: 1000,
+            last_error: None,
+            review_reason: None,
+            display_status: String::new(),
+        };
+        save_reconciliation(&conn, &recon).unwrap();
+
+        let en_line = make_test_market_line(
+            "en",
+            Some(make_test_ot_vol(8.0, Some("2026-08-04"), "released", "day")),
+            Some(make_test_ot_vol(9.0, Some("2026-11-03"), "future", "day")),
+            9,
+        );
+        let ot = make_test_ot_schedule("w_tm", Some(en_line), None);
+
+        let res = resolve_canonical_library_state(&conn, 1002, Some(&ot), "en", "2026-10-30").unwrap();
+
+        assert_eq!(res.owned_volumes_count, 7);
+        assert_eq!(res.released_volumes_count, 8);
+        assert_eq!(res.missing_released_count, 1);
+        assert_eq!(res.missing_released_volumes, vec![8.0]);
+        assert_eq!(res.library_status, "missing_released");
+        assert_eq!(res.primary_action_type, "discover");
+        assert_eq!(res.progress_percent, Some(88));
+    }
+
+    // 3. JA ahead of EN does not create English missing volumes
+    #[test]
+    fn test_case_3_ja_ahead_does_not_create_english_missing() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::migrate(&mut conn).unwrap();
+
+        seed_test_manga_row(&conn, 1003, "Witch Hat Atelier", 1);
+        let recon = ReconciliationSummary {
+            series_id: "manga:1003".to_string(),
+            manga_id: Some(1003),
+            komga_series_id: Some("k1003".to_string()),
+            mangabaka_id: Some(2409),
+            collection_id: Some("col3".to_string()),
+            title: "Witch Hat Atelier".to_string(),
+            edition: "standard".to_string(),
+            status: ReconciliationStatus::UpToDate,
+            is_ongoing: true,
+            total_official_volumes: Some(14),
+            owned_volumes_count: 14,
+            missing_volumes_count: 0,
+            owned_volumes: (1..=14).map(|v| v as f64).collect(),
+            missing_volumes: vec![],
+            future_volumes: vec![],
+            last_reconciled_at: 1000,
+            last_error: None,
+            review_reason: None,
+            display_status: String::new(),
+        };
+        save_reconciliation(&conn, &recon).unwrap();
+
+        let ja_line = make_test_market_line(
+            "ja",
+            Some(make_test_ot_vol(16.0, Some("2026-04-23"), "released", "day")),
+            None,
+            16,
+        );
+        let en_line = make_test_market_line(
+            "en",
+            Some(make_test_ot_vol(14.0, Some("2026-03-17"), "released", "day")),
+            Some(make_test_ot_vol(15.0, Some("2026-12-08"), "future", "day")),
+            15,
+        );
+        let ot = make_test_ot_schedule("w_wha", Some(en_line), Some(ja_line));
+
+        let res = resolve_canonical_library_state(&conn, 1003, Some(&ot), "en", "2026-10-30").unwrap();
+
+        assert_eq!(res.released_volumes_count, 14);
+        assert_eq!(res.owned_volumes_count, 14);
+        assert_eq!(res.missing_released_count, 0);
+        assert_eq!(res.upcoming_volumes, vec![15.0]);
+        assert_eq!(res.library_status, "up_to_date");
+        assert_eq!(res.progress_percent, Some(100));
+    }
+
+    // 4. Future exact-date volume does not count as missing
+    #[test]
+    fn test_case_4_future_exact_date_not_counted_missing() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::migrate(&mut conn).unwrap();
+
+        seed_test_manga_row(&conn, 1004, "Future Test", 1);
+        let recon = ReconciliationSummary {
+            series_id: "manga:1004".to_string(),
+            manga_id: Some(1004),
+            komga_series_id: Some("k1004".to_string()),
+            mangabaka_id: Some(710),
+            collection_id: Some("col4".to_string()),
+            title: "Future Test".to_string(),
+            edition: "standard".to_string(),
+            status: ReconciliationStatus::UpToDate,
+            is_ongoing: true,
+            total_official_volumes: Some(8),
+            owned_volumes_count: 8,
+            missing_volumes_count: 0,
+            owned_volumes: (1..=8).map(|v| v as f64).collect(),
+            missing_volumes: vec![],
+            future_volumes: vec![9.0],
+            last_reconciled_at: 1000,
+            last_error: None,
+            review_reason: None,
+            display_status: String::new(),
+        };
+        save_reconciliation(&conn, &recon).unwrap();
+
+        let en_line = make_test_market_line(
+            "en",
+            Some(make_test_ot_vol(8.0, Some("2026-08-04"), "released", "day")),
+            Some(make_test_ot_vol(9.0, Some("2026-11-03"), "future", "day")),
+            9,
+        );
+        let ot = make_test_ot_schedule("w_ft", Some(en_line), None);
+
+        // Date is 2026-11-02 (day before release)
+        let res = resolve_canonical_library_state(&conn, 1004, Some(&ot), "en", "2026-11-02").unwrap();
+
+        assert_eq!(res.missing_released_count, 0);
+        assert_eq!(res.upcoming_volumes, vec![9.0]);
+        assert_eq!(res.releases_today, Vec::<f64>::new());
+    }
+
+    // 5. Release-today volume missing from Komga becomes eligible for discovery
+    #[test]
+    fn test_case_5_release_today_missing_from_komga_eligible_discovery() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::migrate(&mut conn).unwrap();
+
+        seed_test_manga_row(&conn, 1005, "Today Test", 1);
+        let recon = ReconciliationSummary {
+            series_id: "manga:1005".to_string(),
+            manga_id: Some(1005),
+            komga_series_id: Some("k1005".to_string()),
+            mangabaka_id: Some(711),
+            collection_id: Some("col5".to_string()),
+            title: "Today Test".to_string(),
+            edition: "standard".to_string(),
+            status: ReconciliationStatus::UpToDate,
+            is_ongoing: true,
+            total_official_volumes: Some(8),
+            owned_volumes_count: 8,
+            missing_volumes_count: 0,
+            owned_volumes: (1..=8).map(|v| v as f64).collect(),
+            missing_volumes: vec![],
+            future_volumes: vec![9.0],
+            last_reconciled_at: 1000,
+            last_error: None,
+            review_reason: None,
+            display_status: String::new(),
+        };
+        save_reconciliation(&conn, &recon).unwrap();
+
+        let en_line = make_test_market_line(
+            "en",
+            Some(make_test_ot_vol(8.0, Some("2026-08-04"), "released", "day")),
+            Some(make_test_ot_vol(9.0, Some("2026-11-03"), "releases_today", "day")),
+            9,
+        );
+        let ot = make_test_ot_schedule("w_tt", Some(en_line), None);
+
+        // Date is 2026-11-03 (exact release date)
+        let res = resolve_canonical_library_state(&conn, 1005, Some(&ot), "en", "2026-11-03").unwrap();
+
+        assert_eq!(res.releases_today, vec![9.0]);
+        assert_eq!(res.released_volumes_count, 9);
+        assert_eq!(res.owned_volumes_count, 8);
+        assert_eq!(res.missing_released_count, 1);
+        assert_eq!(res.missing_released_volumes, vec![9.0]);
+        assert_eq!(res.library_status, "missing_released");
+        assert_eq!(res.primary_action_type, "discover");
+    }
+
+    // 6. Owned release-today volume blocks provider query
+    #[test]
+    fn test_case_6_owned_release_today_blocks_discovery() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::migrate(&mut conn).unwrap();
+
+        seed_test_manga_row(&conn, 1006, "Today Owned Test", 1);
+        let recon = ReconciliationSummary {
+            series_id: "manga:1006".to_string(),
+            manga_id: Some(1006),
+            komga_series_id: Some("k1006".to_string()),
+            mangabaka_id: Some(712),
+            collection_id: Some("col6".to_string()),
+            title: "Today Owned Test".to_string(),
+            edition: "standard".to_string(),
+            status: ReconciliationStatus::UpToDate,
+            is_ongoing: true,
+            total_official_volumes: Some(9),
+            owned_volumes_count: 9,
+            missing_volumes_count: 0,
+            owned_volumes: (1..=9).map(|v| v as f64).collect(), // already owned 9!
+            missing_volumes: vec![],
+            future_volumes: vec![],
+            last_reconciled_at: 1000,
+            last_error: None,
+            review_reason: None,
+            display_status: String::new(),
+        };
+        save_reconciliation(&conn, &recon).unwrap();
+
+        let en_line = make_test_market_line(
+            "en",
+            Some(make_test_ot_vol(8.0, Some("2026-08-04"), "released", "day")),
+            Some(make_test_ot_vol(9.0, Some("2026-11-03"), "releases_today", "day")),
+            9,
+        );
+        let ot = make_test_ot_schedule("w_tot", Some(en_line), None);
+
+        let res = resolve_canonical_library_state(&conn, 1006, Some(&ot), "en", "2026-11-03").unwrap();
+
+        assert_eq!(res.releases_today, vec![9.0]);
+        assert_eq!(res.released_volumes_count, 9);
+        assert_eq!(res.owned_volumes_count, 9);
+        assert_eq!(res.missing_released_count, 0);
+        assert_eq!(res.library_status, "up_to_date");
+        assert_eq!(res.primary_action_type, "none");
+    }
+
+    // 7. MangaBaka ambiguous identity suppresses authoritative counts
+    #[test]
+    fn test_case_7_mangabaka_ambiguous_identity_suppresses_counts() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::migrate(&mut conn).unwrap();
+
+        seed_test_manga_row(&conn, 1007, "Ambiguous Test", 1);
+        let recon = ReconciliationSummary {
+            series_id: "manga:1007".to_string(),
+            manga_id: Some(1007),
+            komga_series_id: Some("k1007".to_string()),
+            mangabaka_id: None,
+            collection_id: None,
+            title: "Ambiguous Test".to_string(),
+            edition: "standard".to_string(),
+            status: ReconciliationStatus::ReviewRequired,
+            is_ongoing: true,
+            total_official_volumes: None,
+            owned_volumes_count: 5,
+            missing_volumes_count: 0,
+            owned_volumes: (1..=5).map(|v| v as f64).collect(),
+            missing_volumes: vec![],
+            future_volumes: vec![],
+            last_reconciled_at: 1000,
+            last_error: None,
+            review_reason: Some("Ambiguous MangaBaka identity: 3 candidates found".to_string()),
+            display_status: String::new(),
+        };
+        save_reconciliation(&conn, &recon).unwrap();
+
+        let res = resolve_canonical_library_state(&conn, 1007, None, "en", "2026-10-30").unwrap();
+
+        assert!(res.is_identity_ambiguous);
+        assert_eq!(res.identity_status, "review_required");
+        assert_eq!(res.released_volumes_count, 0);
+        assert_eq!(res.missing_released_count, 0);
+        assert_eq!(res.progress_percent, None);
+        assert_eq!(res.library_status, "identity_review_required");
+        assert_eq!(res.primary_action_type, "resolve_identity");
+    }
+
+    // 8. OpenTome unavailable does not invent missing/released counts
+    #[test]
+    fn test_case_8_opentome_unavailable_graceful_degradation() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::migrate(&mut conn).unwrap();
+
+        seed_test_manga_row(&conn, 1008, "No OpenTome", 1);
+        let recon = ReconciliationSummary {
+            series_id: "manga:1008".to_string(),
+            manga_id: Some(1008),
+            komga_series_id: Some("k1008".to_string()),
+            mangabaka_id: Some(713),
+            collection_id: Some("col8".to_string()),
+            title: "No OpenTome".to_string(),
+            edition: "standard".to_string(),
+            status: ReconciliationStatus::UpToDate,
+            is_ongoing: true,
+            total_official_volumes: Some(8),
+            owned_volumes_count: 8,
+            missing_volumes_count: 0,
+            owned_volumes: (1..=8).map(|v| v as f64).collect(),
+            missing_volumes: vec![],
+            future_volumes: vec![],
+            last_reconciled_at: 1000,
+            last_error: None,
+            review_reason: None,
+            display_status: String::new(),
+        };
+        save_reconciliation(&conn, &recon).unwrap();
+
+        let res = resolve_canonical_library_state(&conn, 1008, None, "en", "2026-10-30").unwrap();
+
+        assert_eq!(res.released_volumes_count, 8);
+        assert_eq!(res.owned_volumes_count, 8);
+        assert_eq!(res.missing_released_count, 0);
+        assert_eq!(res.progress_percent, Some(100));
+        assert_eq!(res.library_status, "up_to_date");
+    }
+
+    // 9. Month/year precision does not fabricate exact release-day behavior
+    #[test]
+    fn test_case_9_month_year_precision_does_not_fabricate_release_day() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::migrate(&mut conn).unwrap();
+
+        seed_test_manga_row(&conn, 1009, "Month Precision", 1);
+        let recon = ReconciliationSummary {
+            series_id: "manga:1009".to_string(),
+            manga_id: Some(1009),
+            komga_series_id: Some("k1009".to_string()),
+            mangabaka_id: Some(714),
+            collection_id: Some("col9".to_string()),
+            title: "Month Precision".to_string(),
+            edition: "standard".to_string(),
+            status: ReconciliationStatus::UpToDate,
+            is_ongoing: true,
+            total_official_volumes: Some(8),
+            owned_volumes_count: 8,
+            missing_volumes_count: 0,
+            owned_volumes: (1..=8).map(|v| v as f64).collect(),
+            missing_volumes: vec![],
+            future_volumes: vec![9.0],
+            last_reconciled_at: 1000,
+            last_error: None,
+            review_reason: None,
+            display_status: String::new(),
+        };
+        save_reconciliation(&conn, &recon).unwrap();
+
+        let en_line = make_test_market_line(
+            "en",
+            Some(make_test_ot_vol(8.0, Some("2026-08"), "released", "month")),
+            Some(make_test_ot_vol(9.0, Some("2026-11"), "future", "month")),
+            9,
+        );
+        let ot = make_test_ot_schedule("w_mp", Some(en_line), None);
+
+        let res = resolve_canonical_library_state(&conn, 1009, Some(&ot), "en", "2026-11-03").unwrap();
+
+        // Month precision cannot match exact day 'releases_today'
+        assert_eq!(res.releases_today, Vec::<f64>::new());
+        assert_eq!(res.missing_released_count, 0);
+        assert_eq!(res.upcoming_volumes, vec![9.0]);
+    }
+
+    // 10. Source chapter/volume count does not override canonical physical counts
+    #[test]
+    fn test_case_10_source_chapter_count_does_not_override_physical() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::migrate(&mut conn).unwrap();
+
+        seed_test_manga_row(&conn, 1010, "Chapter Source", 1);
+        // Insert 142 chapters in chapters table
+        for i in 1..=142 {
+            conn.execute(
+                "INSERT INTO chapters (id, manga_id, url, name, source_order, fetched_at) VALUES (?1, 1010, ?2, ?3, ?1, 1000)",
+                params![10000 + i, format!("/c/{i}"), format!("Chapter {i}")],
+            ).unwrap();
+        }
+
+        let recon = ReconciliationSummary {
+            series_id: "manga:1010".to_string(),
+            manga_id: Some(1010),
+            komga_series_id: Some("k1010".to_string()),
+            mangabaka_id: Some(715),
+            collection_id: Some("col10".to_string()),
+            title: "Chapter Source".to_string(),
+            edition: "standard".to_string(),
+            status: ReconciliationStatus::UpToDate,
+            is_ongoing: true,
+            total_official_volumes: Some(8),
+            owned_volumes_count: 8,
+            missing_volumes_count: 0,
+            owned_volumes: (1..=8).map(|v| v as f64).collect(),
+            missing_volumes: vec![],
+            future_volumes: vec![],
+            last_reconciled_at: 1000,
+            last_error: None,
+            review_reason: None,
+            display_status: String::new(),
+        };
+        save_reconciliation(&conn, &recon).unwrap();
+
+        let res = resolve_canonical_library_state(&conn, 1010, None, "en", "2026-10-30").unwrap();
+
+        // Physical owned volumes count is 8, NOT 142!
+        assert_eq!(res.owned_volumes_count, 8);
+    }
+
+    // 11. Acquisition history alone does not count as current ownership if Komga lacks media
+    #[test]
+    fn test_case_11_acquisition_history_without_media_not_owned() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::migrate(&mut conn).unwrap();
+
+        seed_test_manga_row(&conn, 1011, "Lost Media", 1);
+        conn.execute(
+            "INSERT INTO chapters (id, manga_id, url, name, source_order, fetched_at) VALUES (20001, 1011, '/c/20001', 'Volume 1', 1, 1000)",
+            [],
+        ).unwrap();
+        // Insert a download record that is failed/uncompleted with no published_path
+        conn.execute(
+            "INSERT INTO downloads (chapter_id, position, state, attempts, added_at) VALUES (20001, 1, 'failed', 0, 1000)",
+            [],
+        ).unwrap();
+
+        let owned = gather_local_owned_volumes(&conn, Some(1011)).unwrap();
+        assert_eq!(owned.len(), 0);
+    }
+
+    // 12. Metadata-review state does not make owned physical media become missing
+    #[test]
+    fn test_case_12_metadata_review_state_preserves_owned_media() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::migrate(&mut conn).unwrap();
+
+        seed_test_manga_row(&conn, 1012, "Metadata Issue", 1);
+        conn.execute(
+            "INSERT INTO chapters (id, manga_id, url, name, source_order, fetched_at) VALUES (20002, 1012, '/c/20002', 'Volume 1', 1, 1000)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO downloads (chapter_id, position, state, attempts, added_at, published_path) VALUES (20002, 1, 'metadata_failed', 0, 1000, '/srv/media/manga/Title/Title v01.cbz')",
+            [],
+        ).unwrap();
+
+        let res = resolve_canonical_library_state(&conn, 1012, None, "en", "2026-10-30").unwrap();
+
+        assert_eq!(res.owned_volumes_count, 1);
+        assert_eq!(res.missing_released_count, 0);
+        assert_eq!(res.primary_action_type, "retry_metadata");
+    }
+
+    // 13. Active acquisition / candidate available gives review_release action
+    #[test]
+    fn test_case_13_active_candidate_gives_review_release_action() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::migrate(&mut conn).unwrap();
+
+        seed_test_manga_row(&conn, 1013, "Candidate Available", 1);
+        let recon = ReconciliationSummary {
+            series_id: "manga:1013".to_string(),
+            manga_id: Some(1013),
+            komga_series_id: Some("k1013".to_string()),
+            mangabaka_id: Some(716),
+            collection_id: Some("col13".to_string()),
+            title: "Candidate Available".to_string(),
+            edition: "standard".to_string(),
+            status: ReconciliationStatus::MissingVolume,
+            is_ongoing: true,
+            total_official_volumes: Some(8),
+            owned_volumes_count: 7,
+            missing_volumes_count: 1,
+            owned_volumes: (1..=7).map(|v| v as f64).collect(),
+            missing_volumes: vec![8.0],
+            future_volumes: vec![],
+            last_reconciled_at: 1000,
+            last_error: None,
+            review_reason: None,
+            display_status: String::new(),
+        };
+        save_reconciliation(&conn, &recon).unwrap();
+
+        // Insert release_discovery_target with candidate_available
+        conn.execute(
+            "INSERT INTO release_discovery_targets (
+                series_id, manga_id, series_title, volume_number, market, edition, release_date,
+                release_date_precision, date_type, status, attempts, max_attempts, next_attempt_at,
+                last_attempt_at, candidates_count, created_at, updated_at
+            ) VALUES ('manga:1013', 1013, 'Candidate Available', 8.0, 'en', 'standard', '2026-08-04',
+                      'day', 'published', 'candidate_available', 1, 7, 0, 1000, 1, 1000, 1000)",
+            [],
+        ).unwrap();
+
+        let res = resolve_canonical_library_state(&conn, 1013, None, "en", "2026-10-30").unwrap();
+
+        assert_eq!(res.missing_released_count, 1);
+        assert_eq!(res.primary_action_type, "review_release");
+    }
+
+    // 14. Completed-vs-ongoing wording derives from authoritative completion state
+    #[test]
+    fn test_case_14_completed_vs_ongoing_authoritative() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::migrate(&mut conn).unwrap();
+
+        // Ongoing title
+        seed_test_manga_row(&conn, 1014, "Ongoing Title", 1);
+        let recon_ongoing = ReconciliationSummary {
+            series_id: "manga:1014".to_string(),
+            manga_id: Some(1014),
+            komga_series_id: Some("k1014".to_string()),
+            mangabaka_id: Some(717),
+            collection_id: Some("col14".to_string()),
+            title: "Ongoing Title".to_string(),
+            edition: "standard".to_string(),
+            status: ReconciliationStatus::UpToDate,
+            is_ongoing: true,
+            total_official_volumes: Some(8),
+            owned_volumes_count: 8,
+            missing_volumes_count: 0,
+            owned_volumes: (1..=8).map(|v| v as f64).collect(),
+            missing_volumes: vec![],
+            future_volumes: vec![9.0],
+            last_reconciled_at: 1000,
+            last_error: None,
+            review_reason: None,
+            display_status: String::new(),
+        };
+        save_reconciliation(&conn, &recon_ongoing).unwrap();
+
+        let res_ongoing = resolve_canonical_library_state(&conn, 1014, None, "en", "2026-10-30").unwrap();
+        assert_eq!(res_ongoing.library_status, "up_to_date");
+        assert!(res_ongoing.is_ongoing);
+        assert!(!res_ongoing.is_completed);
+
+        // Completed title
+        seed_test_manga_row(&conn, 1015, "Completed Title", 2);
+        let recon_completed = ReconciliationSummary {
+            series_id: "manga:1015".to_string(),
+            manga_id: Some(1015),
+            komga_series_id: Some("k1015".to_string()),
+            mangabaka_id: Some(6886),
+            collection_id: Some("col15".to_string()),
+            title: "Completed Title".to_string(),
+            edition: "standard".to_string(),
+            status: ReconciliationStatus::UpToDate,
+            is_ongoing: false, // authoritatively complete
+            total_official_volumes: Some(14),
+            owned_volumes_count: 14,
+            missing_volumes_count: 0,
+            owned_volumes: (1..=14).map(|v| v as f64).collect(),
+            missing_volumes: vec![],
+            future_volumes: vec![],
+            last_reconciled_at: 1000,
+            last_error: None,
+            review_reason: None,
+            display_status: String::new(),
+        };
+        save_reconciliation(&conn, &recon_completed).unwrap();
+
+        let res_completed = resolve_canonical_library_state(&conn, 1015, None, "en", "2026-10-30").unwrap();
+        assert_eq!(res_completed.library_status, "library_complete");
+        assert!(!res_completed.is_ongoing);
+        assert!(res_completed.is_completed);
+    }
+
+    // 15. Release-discovery target remains scheduled for future Volume 9
+    #[test]
+    fn test_case_15_release_discovery_target_future_scheduled() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::migrate(&mut conn).unwrap();
+
+        seed_test_manga_row(&conn, 1016, "Schedule Target", 1);
+        let recon = ReconciliationSummary {
+            series_id: "manga:1016".to_string(),
+            manga_id: Some(1016),
+            komga_series_id: Some("k1016".to_string()),
+            mangabaka_id: Some(718),
+            collection_id: Some("col16".to_string()),
+            title: "Schedule Target".to_string(),
+            edition: "standard".to_string(),
+            status: ReconciliationStatus::UpToDate,
+            is_ongoing: true,
+            total_official_volumes: Some(8),
+            owned_volumes_count: 8,
+            missing_volumes_count: 0,
+            owned_volumes: (1..=8).map(|v| v as f64).collect(),
+            missing_volumes: vec![],
+            future_volumes: vec![9.0],
+            last_reconciled_at: 1000,
+            last_error: None,
+            review_reason: None,
+            display_status: String::new(),
+        };
+        save_reconciliation(&conn, &recon).unwrap();
+
+        let en_line = make_test_market_line(
+            "en",
+            Some(make_test_ot_vol(8.0, Some("2026-08-04"), "released", "day")),
+            Some(make_test_ot_vol(9.0, Some("2026-11-03"), "future", "day")),
+            9,
+        );
+        let ot = make_test_ot_schedule("w_st", Some(en_line), None);
+
+        let targets = crate::acquisition::release_discovery::sync_series_release_targets(
+            &conn,
+            1016,
+            "manga:1016",
+            "Schedule Target",
+            &ot,
+            "2026-10-30",
+            "2026-10-01",
+        ).unwrap();
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].volume_number, 9.0);
+        assert_eq!(targets[0].status, "scheduled");
+    }
+
+    // 16. No automatic acquisition regression
+    #[test]
+    fn test_case_16_read_only_safety_no_acquisition_regression() {
+        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::migrate(&mut conn).unwrap();
+
+        seed_test_manga_row(&conn, 1017, "Safe Title", 1);
+        let count_before: i64 = conn.query_row("SELECT count(*) FROM downloads", [], |r| r.get(0)).unwrap();
+
+        let _ = resolve_canonical_library_state(&conn, 1017, None, "en", "2026-10-30").unwrap();
+
+        let count_after: i64 = conn.query_row("SELECT count(*) FROM downloads", [], |r| r.get(0)).unwrap();
+        assert_eq!(count_before, count_after);
     }
 }
 

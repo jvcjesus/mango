@@ -30,6 +30,8 @@
     unfollowManga,
     getMangaReconciliation,
     reconcileManga,
+    getMangaLibraryState,
+    type CanonicalLibraryReleasesSummary,
     getMangaOpenTome,
     remapMangaOpenTome,
     type OpenTomeSeriesSchedule,
@@ -140,6 +142,7 @@
   let isFollowed = $state(false);
   let togglingFollow = $state(false);
   let reconciliation = $state<ReconciliationSummary | null>(null);
+  let libraryState = $state<CanonicalLibraryReleasesSummary | null>(null);
   let reconciling = $state(false);
   let openTomeSchedule = $state<OpenTomeSeriesSchedule | null>(null);
   let openTomeLoading = $state(false);
@@ -256,6 +259,11 @@
       reconciliation = await getMangaReconciliation(id);
     } catch {
       reconciliation = null;
+    }
+    try {
+      libraryState = await getMangaLibraryState(id);
+    } catch {
+      libraryState = null;
     }
     try {
       openTomeSchedule = await getMangaOpenTome(id);
@@ -455,6 +463,9 @@
     reconciling = true;
     try {
       reconciliation = await reconcileManga(id);
+      try {
+        libraryState = await getMangaLibraryState(id);
+      } catch {}
       toast.success(reconciliation.displayStatus);
     } catch (e) {
       toast.error(`Reconciliation failed: ${message(e)}`);
@@ -467,6 +478,9 @@
     refreshingOwnership = true;
     try {
       ownership = await send<TitleOwnership>('POST', `/manga/${id}/refresh-ownership`);
+      try {
+        libraryState = await getMangaLibraryState(id);
+      } catch {}
       updateCandidateStatusesFromOwnership(ownership);
       loadMissingAndProfile();
       loadTitleAcquisitions();
@@ -877,19 +891,22 @@
   });
 
   const seriesSummary = $derived.by<SeriesSummary | null>(() => {
-    if (!ownership && !missingContent) return null;
+    if (!ownership && !missingContent && !libraryState && !reconciliation) return null;
     const volumes = volumeGroups
       .map((g) => g.presentation)
       .filter((p): p is VolumePresentation => p !== null);
 
     const totalSourceVolumes =
+      libraryState?.releasedVolumesCount ??
+      reconciliation?.totalOfficialVolumes ??
       ownership?.summary?.totalSourceVolumes ??
       missingContent?.totalKnownVolumes ??
       null;
 
     const isIdentityAmbiguous =
-      reconciliation?.status === 'review_required' ||
-      reconciliation?.status === 'sync_error';
+      libraryState?.isIdentityAmbiguous ??
+      (reconciliation?.status === 'review_required' ||
+        reconciliation?.status === 'sync_error');
 
     const hasAvailableRelease =
       (seriesDiscovery.size > 0 && Array.from(seriesDiscovery.values()).some((v) => v.candidateCount > 0)) ||
@@ -900,9 +917,12 @@
       volumes,
       totalExpectedVolumes: totalSourceVolumes,
       isOngoing: title?.status === 1,
+      isCompleted: libraryState?.isCompleted,
       reconciliationStatus: reconciliation?.status,
       isIdentityAmbiguous,
       hasAvailableRelease,
+      libraryState,
+      reconciliation,
     });
   });
   const nothing = $derived(
@@ -1258,179 +1278,73 @@
           <div><span class="display">{saved}</span><span>Saved</span></div>
         </div>
 
-        {#if ownership}
-          <div class="ownership-summary" class:unavailable={!ownership.komgaConnected} class:has-err={!!ownership.error}>
-            <div class="ownership-top">
-              <div class="ownership-badge-title">
-                <Icon name="book" size={16} />
-                <span class="ownership-heading">KOMGA OWNED</span>
-              </div>
-              <div class="ownership-actions">
-                <button
-                  class="btn icon mini"
-                  title="Refresh ownership from Komga"
-                  disabled={refreshingOwnership}
-                  onclick={refreshOwnership}
-                  aria-label="Refresh Komga ownership"
-                >
-                  {#if refreshingOwnership}
-                    <span class="spin"><Icon name="spinner" size={14} stroke={3} /></span>
-                  {:else}
-                    <Icon name="refresh" size={14} />
-                  {/if}
-                </button>
-                {#if ownership.komgaConnected && ownership.seriesId}
-                  <button class="btn mini" onclick={() => (showOwnershipDetails = !showOwnershipDetails)}>
-                    {showOwnershipDetails ? 'Hide details' : 'Details'}
-                  </button>
-                {/if}
-              </div>
-            </div>
+        {#if seriesSummary && (ownership || missingContent || libraryState || reconciliation)}
+          <div class="series-summary-wrapper">
+            <SeriesSummaryCard
+              summary={seriesSummary}
+              libraryState={libraryState}
+              reconciliation={reconciliation}
+              ownership={ownership}
+              ownedVolumeNumbers={ownedVolumeNumbers}
+              missingVolumeNumbers={missingVolumeNumbers}
+              openTomeSchedule={openTomeSchedule}
+              openTomeLoading={openTomeLoading}
+              releaseDiscoveryTargets={releaseDiscoveryTargets}
+              onResolveIdentity={runReconcile}
+              onReviewRelease={handleReviewRelease}
+              onRetryMetadata={handleRetryMetadata}
+              onDiscoverMissing={findAllMissingReleases}
+              discoveringMissing={discoveringAll}
+              onPlanMissing={() => openPlanModal(true)}
+              onRefreshKomga={refreshOwnership}
+              refreshingKomga={refreshingOwnership}
+              onReconcile={runReconcile}
+              reconciling={reconciling}
+              onOpenTomeRemap={handleOpenTomeRemap}
+              onSearchNyaa={() => searchNyaa()}
+              onCheckReleaseDiscovery={handleCheckReleaseDiscovery}
+            />
+          </div>
+        {/if}
 
-            <div class="ownership-body">
-              {#if !ownership.komgaConnected}
-                <div class="ownership-line">
-                  <span class="tag warn">Unavailable</span>
-                  <span class="ownership-expl">{ownership.error ?? 'Komga is offline or unreachable'}</span>
-                </div>
-              {:else if ownership.error}
-                <div class="ownership-line">
-                  <span class="tag error">Unknown</span>
-                  <span class="ownership-expl">{ownership.error}</span>
-                </div>
-              {:else if ownership.summary.ownedVolumesCount === 0 && ownership.summary.ownedChaptersCount === 0}
-                <div class="ownership-line">
-                  <span class="ownership-metric">None owned in Komga</span>
-                  {#if ownership.summary.explanation}
-                    <span class="ownership-expl">{ownership.summary.explanation}</span>
-                  {/if}
-                </div>
-              {:else}
-                <div class="ownership-metrics-row">
-                  {#if ownership.summary.ownedVolumesCount > 0}
-                    <div class="ownership-metric-col">
-                      <span class="ownership-metric">
-                        VOLUMES <strong>{ownership.summary.ownedVolumesCount}{#if ownership.summary.totalSourceVolumes} / {ownership.summary.totalSourceVolumes}{:else if ownership.summary.authoritativeTotalVolumes} / {ownership.summary.authoritativeTotalVolumes}{/if}</strong>
-                      </span>
-                      {#if ownership.summary.explanation}
-                        <span class="ownership-expl">{ownership.summary.explanation}</span>
-                      {/if}
-                    </div>
-                  {/if}
-                  {#if ownership.summary.ownedChaptersCount > 0}
-                    <div class="ownership-metric-col">
-                      <span class="ownership-metric">
-                        CHAPTERS <strong>{ownership.summary.ownedChaptersCount}{#if ownership.summary.totalSourceChapters} / {ownership.summary.totalSourceChapters}{:else if ownership.summary.authoritativeTotalChapters} / {ownership.summary.authoritativeTotalChapters}{/if}</strong>
-                      </span>
-                    </div>
-                  {/if}
-                </div>
-              {/if}
-            </div>
+        <!-- Profile selector dropdown -->
+        {#if availableProfiles.length > 0}
+          <div class="title-profile-row">
+            <span class="detail-k">Acquisition Profile:</span>
+            <select
+              class="input select-compact"
+              value={currentProfile?.id ?? 'default'}
+              onchange={(e) => handleProfileChange((e.target as HTMLSelectElement).value)}
+            >
+              {#each availableProfiles as prof (prof.id)}
+                <option value={prof.id}>{prof.name}{prof.isDefault ? ' (Default)' : ''}</option>
+              {/each}
+            </select>
+          </div>
+        {/if}
 
-            {#if showOwnershipDetails && ownership.komgaConnected}
-              <div class="ownership-details-box">
-                {#if ownership.seriesName}
-                  <div class="detail-row">
-                    <span class="detail-k">Matched Series:</span>
-                    <span class="detail-v"><strong>{ownership.seriesName}</strong> <code class="detail-id">{ownership.seriesId}</code></span>
-                  </div>
-                {/if}
-                {#if ownership.libraryName || ownership.libraryId}
-                  <div class="detail-row">
-                    <span class="detail-k">Komga Library:</span>
-                    <span class="detail-v">{ownership.libraryName ?? ownership.libraryId}</span>
-                  </div>
-                {/if}
-                {#if ownedVolumeNumbers.length > 0}
-                  <div class="detail-row">
-                    <span class="detail-k">Owned Volumes:</span>
-                    <span class="detail-v">{formatVolumeRanges(ownedVolumeNumbers)}</span>
-                  </div>
-                {/if}
-                {#if missingVolumeNumbers.length > 0}
-                  <div class="detail-row">
-                    <span class="detail-k">Missing Volumes:</span>
-                    <span class="detail-v">{formatVolumeRanges(missingVolumeNumbers)}</span>
-                  </div>
-                {/if}
-                <div class="detail-row">
-                  <span class="detail-k">Source Releases:</span>
-                  <span class="detail-v capitalize">{ownership.summary.sourceReleaseType} ({chapters.length} releases)</span>
-                </div>
-                {#if ownership.lastRefreshed}
-                  <div class="detail-row">
-                    <span class="detail-k">Last Checked:</span>
-                    <span class="detail-v">{ago(ownership.lastRefreshed)}</span>
-                  </div>
-                {/if}
-              </div>
-            {/if}
+        <!-- Execution History Section -->
+        {#if titleExecutions.length > 0}
+          <div class="executions-history-section">
+            <button class="btn pill icon-text sm" onclick={() => (showExecutionHistory = !showExecutionHistory)}>
+              <Icon name={showExecutionHistory ? 'up' : 'down'} size={14} />
+              Acquisition Executions ({titleExecutions.length})
+            </button>
 
-            <!-- Series Summary & Missing Content Overview -->
-            {#if seriesSummary && (ownership || missingContent)}
-              <div class="series-summary-wrapper">
-                <SeriesSummaryCard
-                  summary={seriesSummary}
-                  reconciliation={reconciliation}
-                  openTomeSchedule={openTomeSchedule}
-                  openTomeLoading={openTomeLoading}
-                  releaseDiscoveryTargets={releaseDiscoveryTargets}
-                  onResolveIdentity={runReconcile}
-                  onReviewRelease={handleReviewRelease}
-                  onRetryMetadata={handleRetryMetadata}
-                  onDiscoverMissing={findAllMissingReleases}
-                  discoveringMissing={discoveringAll}
-                  onPlanMissing={() => openPlanModal(true)}
-                  onRefreshKomga={refreshOwnership}
-                  refreshingKomga={refreshingOwnership}
-                  onReconcile={runReconcile}
-                  reconciling={reconciling}
-                  onOpenTomeRemap={handleOpenTomeRemap}
-                  onSearchNyaa={() => searchNyaa()}
-                  onCheckReleaseDiscovery={handleCheckReleaseDiscovery}
-                />
-              </div>
-            {/if}
-
-            <!-- Profile selector dropdown -->
-            <div class="title-profile-row">
-              <span class="detail-k">Acquisition Profile:</span>
-              <select
-                class="input select-compact"
-                value={currentProfile?.id ?? 'default'}
-                onchange={(e) => handleProfileChange((e.target as HTMLSelectElement).value)}
-              >
-                {#each availableProfiles as prof (prof.id)}
-                  <option value={prof.id}>{prof.name}{prof.isDefault ? ' (Default)' : ''}</option>
+            {#if showExecutionHistory}
+              <div class="executions-history-list">
+                {#each titleExecutions as exec (exec.id)}
+                  <!-- svelte-ignore a11y_click_events_have_key_events -->
+                  <!-- svelte-ignore a11y_no_static_element_interactions -->
+                  <div class="execution-history-row" onclick={() => { activeExecution = exec; executionModalOpen = true; }}>
+                    <span class="tag {exec.status === 'COMPLETED' ? 'spot' : ['PARTIAL', 'FAILED', 'CANCELLED'].includes(exec.status) ? 'warn' : ''}">
+                      {exec.status === 'NEEDS_REVIEW' ? 'Needs Review' : exec.status === 'IMPORTING' ? 'Importing books' : exec.status}
+                    </span>
+                    <span class="muted">{new Date(exec.approvedAt * 1000).toLocaleString()}</span>
+                    <span>{exec.items.length} acquisitions ({Math.round(exec.expectedTotalBytes / (1024 * 1024))} MiB)</span>
+                    <span class="view-details-arrow">View Details →</span>
+                  </div>
                 {/each}
-              </select>
-            </div>
-
-            <!-- Execution History Section -->
-            {#if titleExecutions.length > 0}
-              <div class="executions-history-section">
-                <button class="btn pill icon-text sm" onclick={() => (showExecutionHistory = !showExecutionHistory)}>
-                  <Icon name={showExecutionHistory ? 'up' : 'down'} size={14} />
-                  Acquisition Executions ({titleExecutions.length})
-                </button>
-
-                {#if showExecutionHistory}
-                  <div class="executions-history-list">
-                    {#each titleExecutions as exec (exec.id)}
-                      <!-- svelte-ignore a11y_click_events_have_key_events -->
-                      <!-- svelte-ignore a11y_no_static_element_interactions -->
-                      <div class="execution-history-row" onclick={() => { activeExecution = exec; executionModalOpen = true; }}>
-                        <span class="tag {exec.status === 'COMPLETED' ? 'spot' : ['PARTIAL', 'FAILED', 'CANCELLED'].includes(exec.status) ? 'warn' : ''}">
-                          {exec.status === 'NEEDS_REVIEW' ? 'Needs Review' : exec.status === 'IMPORTING' ? 'Importing books' : exec.status}
-                        </span>
-                        <span class="muted">{new Date(exec.approvedAt * 1000).toLocaleString()}</span>
-                        <span>{exec.items.length} acquisitions ({Math.round(exec.expectedTotalBytes / (1024 * 1024))} MiB)</span>
-                        <span class="view-details-arrow">View Details →</span>
-                      </div>
-                    {/each}
-                  </div>
-                {/if}
               </div>
             {/if}
           </div>
