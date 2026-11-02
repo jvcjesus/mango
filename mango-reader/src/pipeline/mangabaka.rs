@@ -415,7 +415,7 @@ impl MangaBakaClient {
     /// Per the official MangaBaka OpenAPI specification, catalog endpoints
     /// (`/series/search`, `/series/{id}`, `/collections/{id}/works`, `/source/anilist/{id}`)
     /// are public (`security: none`) and must not carry user authentication tokens.
-    fn public_request(&self, method: reqwest::Method, endpoint: &str) -> reqwest::RequestBuilder {
+    pub(crate) fn public_request(&self, method: reqwest::Method, endpoint: &str) -> reqwest::RequestBuilder {
         let url = self.resolve_url(endpoint);
         self.http
             .request(method, url)

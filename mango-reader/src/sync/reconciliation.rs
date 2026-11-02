@@ -319,82 +319,123 @@ pub async fn reconcile_series(
     // 2. Resolve MangaBaka Identity
     let mut resolved_mb_id: Option<i64> = None;
 
-    if let Some(ref k_id) = target.komga_series_id {
-        let k_id_clone = k_id.clone();
-        let title_clone = target.title.clone();
-        let mb_client_clone = mb_client.clone();
-
-        let resolution = db
+    // Direct exact MangaBaka identity from manga row (catalog-native identity)
+    if let Some(m_id) = target.manga_id {
+        let exact_id = db
             .call(move |conn| {
-                tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(async {
-                        resolve_mangabaka_identity(conn, &mb_client_clone, &k_id_clone, &title_clone)
-                            .await
+                let id_opt = conn
+                    .query_row(
+                        "SELECT mangabaka_id FROM manga WHERE id = ?1",
+                        [m_id],
+                        |r| r.get::<_, Option<i64>>(0),
+                    )
+                    .optional()?
+                    .flatten();
+                Ok(id_opt)
+            })
+            .await
+            .ok()
+            .flatten();
+        if let Some(mb_id) = exact_id {
+            resolved_mb_id = Some(mb_id);
+            if let Some(ref k_id) = target.komga_series_id {
+                let k_id_c = k_id.clone();
+                let _ = db
+                    .call(move |conn| {
+                        conn.execute(
+                            "INSERT INTO tracker_mappings (komga_series_id, tracker, tracker_id, updated_at, mapping_source, confidence)
+                             VALUES (?1, 'mangabaka', ?2, ?3, 'manual', 'resolved')
+                             ON CONFLICT(komga_series_id, tracker) DO UPDATE SET
+                                tracker_id = excluded.tracker_id,
+                                confidence = 'resolved',
+                                updated_at = excluded.updated_at",
+                            rusqlite::params![k_id_c, mb_id.to_string(), now()],
+                        )?;
+                        Ok(())
+                    })
+                    .await;
+            }
+        }
+    }
+
+    if resolved_mb_id.is_none() {
+        if let Some(ref k_id) = target.komga_series_id {
+            let k_id_clone = k_id.clone();
+            let title_clone = target.title.clone();
+            let mb_client_clone = mb_client.clone();
+
+            let resolution = db
+                .call(move |conn| {
+                    tokio::task::block_in_place(|| {
+                        tokio::runtime::Handle::current().block_on(async {
+                            resolve_mangabaka_identity(conn, &mb_client_clone, &k_id_clone, &title_clone)
+                                .await
+                        })
                     })
                 })
-            })
-            .await?;
-
-        match resolution {
-            IdentityResolutionResult::Resolved(mapping) => {
-                if let Ok(parsed_id) = mapping.tracker_id.parse::<i64>() {
-                    resolved_mb_id = Some(parsed_id);
-                }
-            }
-            IdentityResolutionResult::Ambiguous(candidates) => {
-                let reason = format!(
-                    "Ambiguous MangaBaka identity: {} candidates found",
-                    candidates.len()
-                );
-                let title_c = target.title.clone();
-                let reason_c = reason.clone();
-                let mut sum = build_review_required(
-                    &series_id,
-                    target,
-                    &edition,
-                    owned_volumes,
-                    reason,
-                    current_time,
-                );
-                sum.display_status = sum.compute_display_status();
-                let sum_c = sum.clone();
-                db.call(move |conn| {
-                    record_event(conn, &title_c, None, None, "ACTION_REQUIRED", &reason_c)?;
-                    save_reconciliation(conn, &sum_c)
-                })
                 .await?;
-                return Ok(sum);
-            }
-            IdentityResolutionResult::RateLimited => {
-                return handle_sync_error(
-                    db,
-                    &series_id,
-                    target,
-                    &edition,
-                    previous,
-                    owned_volumes,
-                    "Rate limited by MangaBaka (HTTP 429)".to_string(),
-                    current_time,
-                )
-                .await;
-            }
-            IdentityResolutionResult::NetworkError(msg)
-            | IdentityResolutionResult::ApiError(msg)
-            | IdentityResolutionResult::AuthError(msg) => {
-                return handle_sync_error(
-                    db,
-                    &series_id,
-                    target,
-                    &edition,
-                    previous,
-                    owned_volumes,
-                    msg,
-                    current_time,
-                )
-                .await;
-            }
-            IdentityResolutionResult::NotFound => {
-                // Fall through to title search
+
+            match resolution {
+                IdentityResolutionResult::Resolved(mapping) => {
+                    if let Ok(parsed_id) = mapping.tracker_id.parse::<i64>() {
+                        resolved_mb_id = Some(parsed_id);
+                    }
+                }
+                IdentityResolutionResult::Ambiguous(candidates) => {
+                    let reason = format!(
+                        "Ambiguous MangaBaka identity: {} candidates found",
+                        candidates.len()
+                    );
+                    let title_c = target.title.clone();
+                    let reason_c = reason.clone();
+                    let mut sum = build_review_required(
+                        &series_id,
+                        target,
+                        &edition,
+                        owned_volumes,
+                        reason,
+                        current_time,
+                    );
+                    sum.display_status = sum.compute_display_status();
+                    let sum_c = sum.clone();
+                    db.call(move |conn| {
+                        record_event(conn, &title_c, None, None, "ACTION_REQUIRED", &reason_c)?;
+                        save_reconciliation(conn, &sum_c)
+                    })
+                    .await?;
+                    return Ok(sum);
+                }
+                IdentityResolutionResult::RateLimited => {
+                    return handle_sync_error(
+                        db,
+                        &series_id,
+                        target,
+                        &edition,
+                        previous,
+                        owned_volumes,
+                        "Rate limited by MangaBaka (HTTP 429)".to_string(),
+                        current_time,
+                    )
+                    .await;
+                }
+                IdentityResolutionResult::NetworkError(msg)
+                | IdentityResolutionResult::ApiError(msg)
+                | IdentityResolutionResult::AuthError(msg) => {
+                    return handle_sync_error(
+                        db,
+                        &series_id,
+                        target,
+                        &edition,
+                        previous,
+                        owned_volumes,
+                        msg,
+                        current_time,
+                    )
+                    .await;
+                }
+                IdentityResolutionResult::NotFound => {
+                    // Fall through to title search
+                }
             }
         }
     }

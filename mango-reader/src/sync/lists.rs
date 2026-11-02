@@ -124,6 +124,7 @@ pub struct UnifiedTrackedItem {
 
     pub acquisition_status: String, // "Idle", "Queued", "Acquiring", "Failed"
     pub auto_acquire: bool,
+    pub manga_id: Option<i64>,
 
     pub updated_at: i64,
 }
@@ -555,6 +556,35 @@ fn resolve_catalog_info(
     None
 }
 
+/// Looks up an existing local manga ID for a tracked catalog title.
+fn find_local_manga_id(
+    conn: &Connection,
+    tracked_manga_id: Option<i64>,
+    mb_id: Option<i64>,
+    title: &str,
+) -> Option<i64> {
+    if let Some(id) = tracked_manga_id {
+        return Some(id);
+    }
+    if let Some(mb) = mb_id {
+        if let Ok(id) = conn.query_row(
+            "SELECT id FROM manga WHERE mangabaka_id = ?1 ORDER BY (in_library = 1) DESC, (source_id = 0) DESC LIMIT 1",
+            [mb],
+            |r| r.get::<_, i64>(0),
+        ) {
+            return Some(id);
+        }
+    }
+    if let Ok(id) = conn.query_row(
+        "SELECT id FROM manga WHERE title = ?1 ORDER BY (in_library = 1) DESC, (source_id = 0) DESC LIMIT 1",
+        [title],
+        |r| r.get::<_, i64>(0),
+    ) {
+        return Some(id);
+    }
+    None
+}
+
 /// Assembles the unified catalog from cached tracker list entries, DB mappings,
 /// tracked catalog entries, and Komga series ownership.
 pub fn build_unified_catalog(
@@ -892,6 +922,12 @@ pub fn build_unified_catalog(
             .or_else(|| matched_mb.and_then(|m| m.format.clone()));
         let updated_at = al.updated_at.max(matched_mb.map_or(0, |m| m.updated_at));
         let catalog = resolve_catalog_info(conn, matched_mb, &display_title);
+        let manga_id = find_local_manga_id(
+            conn,
+            tracked_entry.and_then(|t| t.manga_id),
+            matched_mb.and_then(|m| m.tracker_id.parse::<i64>().ok()),
+            &display_title,
+        );
 
         unified_items.push(UnifiedTrackedItem {
             id: composite_id,
@@ -909,6 +945,7 @@ pub fn build_unified_catalog(
             komga_series_id: komga_id,
             acquisition_status: "Idle".to_string(),
             auto_acquire,
+            manga_id,
             updated_at,
         });
     }
@@ -1032,6 +1069,12 @@ pub fn build_unified_catalog(
         }
 
         let catalog = resolve_catalog_info(conn, Some(mb), &display_title);
+        let manga_id = find_local_manga_id(
+            conn,
+            tracked_entry.and_then(|t| t.manga_id),
+            mb.tracker_id.parse::<i64>().ok(),
+            &display_title,
+        );
 
         unified_items.push(UnifiedTrackedItem {
             id: format!("mb-{}", mb.tracker_id),
@@ -1049,6 +1092,7 @@ pub fn build_unified_catalog(
             komga_series_id: komga_id,
             acquisition_status: "Idle".to_string(),
             auto_acquire,
+            manga_id,
             updated_at: mb.updated_at,
         });
     }

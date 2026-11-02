@@ -153,6 +153,11 @@ pub fn router(state: Spaces) -> Router {
             "/manga/{id}/release-discovery/targets/{target_id}/retry",
             post(post_manga_release_discovery_retry),
         )
+        .route("/catalog/mangabaka/search", get(get_catalog_mangabaka_search))
+        .route("/catalog/mangabaka/{id}/add", post(post_catalog_mangabaka_add))
+        .route("/manga/{id}/convert-to-catalog", post(post_manga_convert_to_catalog))
+        .route("/manga/{id}/revert-to-source", post(post_manga_revert_to_source))
+        .route("/manga/{id}/detach-source", post(post_manga_detach_source))
         .route("/manga/{id}/cover", get(cover))
         .route("/manga/{id}/library", put(set_library))
         .route("/manga/{id}/reader", put(set_reader))
@@ -3135,5 +3140,62 @@ async fn post_manga_release_discovery_retry(
         target_id,
     )
     .await?;
+    Ok(Json(res))
+}
+
+#[derive(Deserialize)]
+struct CatalogSearchQuery {
+    q: String,
+}
+
+async fn get_catalog_mangabaka_search(
+    Me(app): Me,
+    Query(query): Query<CatalogSearchQuery>,
+) -> Result<Json<Vec<crate::catalog::MangaBakaSearchResult>>> {
+    let (cfg, mb_token, _) = app.pipeline.load_internal_config().await?;
+    let mb_client = crate::pipeline::mangabaka::MangaBakaClient::new(
+        app.trackers.http().clone(),
+        cfg.mangabaka_url,
+        mb_token,
+    );
+    let results = crate::catalog::search_mangabaka_catalog(&mb_client, &app.db, &query.q).await?;
+    Ok(Json(results))
+}
+
+async fn post_catalog_mangabaka_add(
+    Me(app): Me,
+    Path(id): Path<i64>,
+    payload: Option<Json<crate::catalog::AddMangaBakaPayload>>,
+) -> Result<Json<crate::catalog::AddMangaBakaResponse>> {
+    app.me.admin()?;
+    let convert_existing = payload.and_then(|p| p.convert_existing).unwrap_or(false);
+    let res = crate::catalog::add_mangabaka_catalog_title(&app, id, convert_existing).await?;
+    Ok(Json(res))
+}
+
+async fn post_manga_convert_to_catalog(
+    Me(app): Me,
+    Path(id): Path<i64>,
+) -> Result<Json<crate::catalog::ConvertToCatalogResponse>> {
+    app.me.admin()?;
+    let res = crate::catalog::convert_to_catalog_title(&app, id).await?;
+    Ok(Json(res))
+}
+
+async fn post_manga_revert_to_source(
+    Me(app): Me,
+    Path(id): Path<i64>,
+) -> Result<Json<crate::catalog::RevertToSourceResponse>> {
+    app.me.admin()?;
+    let res = crate::catalog::revert_to_source_title(&app, id).await?;
+    Ok(Json(res))
+}
+
+async fn post_manga_detach_source(
+    Me(app): Me,
+    Path(id): Path<i64>,
+) -> Result<Json<crate::catalog::DetachSourceResponse>> {
+    app.me.admin()?;
+    let res = crate::catalog::detach_source_from_catalog(&app, id).await?;
     Ok(Json(res))
 }

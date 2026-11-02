@@ -162,6 +162,11 @@ pub struct TitleView {
     pub categories: Vec<i64>,
     /// In the source's order: the first is usually the newest.
     pub chapters: Vec<ChapterView>,
+    pub is_catalog: bool,
+    pub mangabaka_id: Option<i64>,
+    pub source_manga_id: Option<i64>,
+    pub catalog_manga_id: Option<i64>,
+    pub attached_source_name: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -287,6 +292,9 @@ impl Titles {
                 Ok((source, manga, wire_chapters(conn, id)?))
             })
             .await?;
+        if source == 0 {
+            return Ok(vec![]);
+        }
         if source == local::SOURCE {
             let local = self.local.clone();
             let (found, listed) = local::blocking(move || local.details(&manga.url)).await?;
@@ -604,7 +612,15 @@ pub(crate) fn wire_chapter(conn: &Connection, chapter: i64) -> Result<(i64, Wire
 }
 
 fn read_chapters(conn: &Connection, manga: i64) -> Result<Vec<ChapterView>> {
-    let mut stmt = conn.prepare(&format!("SELECT {CHAPTER_COLUMNS} FROM chapters WHERE manga_id = ?1 ORDER BY source_order"))?;
+    let source_id: i64 = conn
+        .query_row("SELECT source_id FROM manga WHERE id = ?1", [manga], |r| r.get(0))
+        .unwrap_or(0);
+    let sql = if source_id == 0 {
+        format!("SELECT {CHAPTER_COLUMNS} FROM chapters WHERE manga_id = ?1 AND url NOT LIKE 'nyaa:%' AND url NOT LIKE 'torbox:%' AND url NOT LIKE 'torrent:%' ORDER BY source_order")
+    } else {
+        format!("SELECT {CHAPTER_COLUMNS} FROM chapters WHERE manga_id = ?1 ORDER BY source_order")
+    };
+    let mut stmt = conn.prepare(&sql)?;
     let chapters = stmt.query_map([manga], chapter_row)?.collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(chapters)
 }
@@ -614,16 +630,23 @@ pub(crate) fn read_title(conn: &Connection, id: i64) -> Result<TitleView> {
         .query_row(
             "SELECT m.id, m.source_id, s.name, s.lang, s.base_url, m.url, m.title, m.artist, m.author, m.description, m.genre,
                     m.status, m.thumbnail_url, m.in_library, m.added_at, m.initialized, m.reader_mode, m.reader_fit,
-                    m.auto_download, m.chapters_at
-             FROM manga m LEFT JOIN sources s ON s.id = m.source_id WHERE m.id = ?1",
+                    m.auto_download, m.chapters_at, m.mangabaka_id, m.source_manga_id, m.catalog_manga_id,
+                    sm_s.name
+             FROM manga m
+             LEFT JOIN sources s ON s.id = m.source_id
+             LEFT JOIN manga sm ON sm.id = m.source_manga_id
+             LEFT JOIN sources sm_s ON sm_s.id = sm.source_id
+             WHERE m.id = ?1",
             [id],
             |r| {
                 let url: String = r.get(5)?;
                 let genre: Option<String> = r.get(10)?;
                 let thumbnail: Option<String> = r.get(12)?;
+                let raw_source_id: i64 = r.get(1)?;
+                let is_catalog = raw_source_id == 0;
                 Ok(TitleView {
                     id,
-                    source_id: r.get::<_, i64>(1)?.to_string(),
+                    source_id: raw_source_id.to_string(),
                     source_name: r.get(2)?,
                     source_lang: r.get(3)?,
                     web_url: web_url(r.get(4)?, &url),
@@ -644,6 +667,11 @@ pub(crate) fn read_title(conn: &Connection, id: i64) -> Result<TitleView> {
                     release_days: None,
                     categories: Vec::new(),
                     chapters: Vec::new(),
+                    is_catalog,
+                    mangabaka_id: r.get(20)?,
+                    source_manga_id: r.get(21)?,
+                    catalog_manga_id: r.get(22)?,
+                    attached_source_name: r.get(23)?,
                 })
             },
         )

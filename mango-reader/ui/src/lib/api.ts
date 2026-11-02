@@ -119,6 +119,11 @@ export type Title = {
   releaseDays: number | null;
   categories: number[];
   chapters: Chapter[];
+  isCatalog?: boolean;
+  mangabakaId?: number | null;
+  sourceMangaId?: number | null;
+  catalogMangaId?: number | null;
+  attachedSourceName?: string | null;
 };
 
 /** One of the two titles of a migration. */
@@ -717,6 +722,7 @@ export interface UnifiedTrackedItem {
   komgaSeriesId?: string | null;
   acquisitionStatus: string;
   autoAcquire: boolean;
+  mangaId?: number | null;
   updatedAt: number;
 }
 
@@ -1666,7 +1672,71 @@ export interface CanonicalLibraryReleasesSummary {
 export const getMangaLibraryState = (id: number) =>
   get<CanonicalLibraryReleasesSummary>(`/manga/${id}/library-state`);
 
+export interface MangaBakaSearchResult {
+  mangabakaId: number;
+  title: string;
+  englishTitle?: string | null;
+  romajiTitle?: string | null;
+  nativeTitle?: string | null;
+  aliases: string[];
+  coverUrl?: string | null;
+  authors: string[];
+  artists: string[];
+  publisher?: string | null;
+  genres: string[];
+  tags: string[];
+  status?: string | null;
+  totalVolumes?: number | null;
+  description?: string | null;
+  alreadyInMango: boolean;
+  existingMangaId?: number | null;
+  existingIsCatalog?: boolean | null;
+}
 
+export interface AddMangaBakaResponse {
+  mangaId: number;
+  created: boolean;
+  converted: boolean;
+  title: string;
+  message: string;
+}
 
+export interface ConvertToCatalogResponse {
+  catalogMangaId: number;
+  sourceMangaId: number;
+  title: string;
+  success: boolean;
+  message: string;
+}
 
+export interface RevertToSourceResponse {
+  sourceMangaId: number;
+  catalogMangaId: number;
+  title: string;
+  success: boolean;
+  message: string;
+}
 
+export interface DetachSourceResponse {
+  mangaId: number;
+  detachedSourceMangaId: number;
+  success: boolean;
+  message: string;
+}
+
+export const searchMangaBakaCatalog = (q: string, signal?: AbortSignal) => {
+  const params = new URLSearchParams({ q });
+  return get<MangaBakaSearchResult[]>(`/catalog/mangabaka/search?${params}`, signal);
+};
+
+export const addMangaBakaCatalog = (id: number, convertExisting = false) =>
+  send<AddMangaBakaResponse>('POST', `/catalog/mangabaka/${id}/add`, { convertExisting });
+
+export const convertToCatalogTitle = (mangaId: number) =>
+  send<ConvertToCatalogResponse>('POST', `/manga/${mangaId}/convert-to-catalog`);
+
+export const revertToSourceTitle = (mangaId: number) =>
+  send<RevertToSourceResponse>('POST', `/manga/${mangaId}/revert-to-source`);
+
+export const detachReadingSource = (mangaId: number) =>
+  send<DetachSourceResponse>('POST', `/manga/${mangaId}/detach-source`);

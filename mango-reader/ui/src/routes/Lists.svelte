@@ -1,5 +1,6 @@
 <script lang="ts">
- import AcquisitionDialog from "../lib/AcquisitionDialog.svelte";
+  import AcquisitionDialog from "../lib/AcquisitionDialog.svelte";
+  import AddMangaDialog from "../lib/AddMangaDialog.svelte";
   import {
     getLists,
     refreshLists,
@@ -8,6 +9,7 @@
     planByTitle,
     createExecution,
     startExecution,
+    addMangaBakaCatalog,
     message,
     type UnifiedTrackedItem,
     type UnifiedCatalogResponse,
@@ -25,6 +27,7 @@
   import Notice from '../lib/Notice.svelte';
   import { toast } from '../lib/toast.svelte';
   import { keep, recall } from '../lib/keep';
+  import { go } from '../lib/router.svelte';
 
   type StatusFilter = 'all' | 'reading' | 'planning' | 'completed' | 'paused' | 'dropped';
   type OwnershipFilter = 'all' | 'owned' | 'partially_owned' | 'not_owned';
@@ -46,6 +49,31 @@
 
   // Selected title for modal
   let selectedItem = $state<UnifiedTrackedItem | null>(null);
+
+  let addMangaOpen = $state(false);
+  let addingSelectedToMango = $state(false);
+
+  async function handleAddSelectedToMango(item: UnifiedTrackedItem) {
+    const mbTrackerId = item.mangabaka?.trackerId ? parseInt(item.mangabaka.trackerId, 10) : null;
+    if (!mbTrackerId) {
+      addMangaOpen = true;
+      selectedItem = null;
+      return;
+    }
+    addingSelectedToMango = true;
+    try {
+      const resp = await addMangaBakaCatalog(mbTrackerId, false);
+      toast.success(resp.message || `Added ${resp.title} to Mango`);
+      item.mangaId = resp.mangaId;
+      selectedItem = null;
+      handleRefresh();
+      go('/manga/' + resp.mangaId);
+    } catch (e) {
+      toast.error(message(e));
+    } finally {
+      addingSelectedToMango = false;
+    }
+  }
 
   let acquisitionRequest = $state<{item:UnifiedTrackedItem; mode:'missing'|'complete'|'specific'} | null>(null);
   function openPlanningModal(item: UnifiedTrackedItem, mode: 'missing'|'complete'|'specific' = 'complete') { acquisitionRequest = {item,mode}; }
@@ -312,6 +340,14 @@
 
       <div class="actions">
         <button
+          class="btn primary pill icon-text"
+          onclick={() => (addMangaOpen = true)}
+          aria-label="Add Manga to Mango"
+        >
+          <Icon name="plus" size={18} stroke={3} />
+          <span>Add Manga</span>
+        </button>
+        <button
           class="btn pill icon-text"
           onclick={handlePlanAll}
           disabled={planningAll}
@@ -494,7 +530,13 @@
         <button
           type="button"
           class="card-wrap"
-          onclick={() => (selectedItem = item)}
+          onclick={() => {
+            if (item.mangaId) {
+              go('/manga/' + item.mangaId);
+            } else {
+              selectedItem = item;
+            }
+          }}
           aria-label={`View details for ${item.title}`}
         >
           <div class="art">
@@ -814,6 +856,35 @@
       </div>
 
       <div class="modal-footer">
+        {#if selectedItem.mangaId}
+          <button
+            class="btn primary"
+            onclick={() => {
+              const mId = selectedItem?.mangaId;
+              selectedItem = null;
+              if (mId) go('/manga/' + mId);
+            }}
+          >
+            <Icon name="arrow" size={16} stroke={3} />
+            <span>Open Title Page</span>
+          </button>
+        {:else}
+          <button
+            class="btn primary"
+            onclick={() => {
+              if (selectedItem) handleAddSelectedToMango(selectedItem);
+            }}
+            disabled={addingSelectedToMango}
+          >
+            {#if addingSelectedToMango}
+              <span class="spin"><Icon name="spinner" size={16} stroke={3} /></span>
+              <span>Adding...</span>
+            {:else}
+              <Icon name="plus" size={16} stroke={3} />
+              <span>Add to Mango</span>
+            {/if}
+          </button>
+        {/if}
         <button class="btn" onclick={() => (selectedItem = null)}>Close</button>
       </div>
     </div>
@@ -909,6 +980,12 @@
     </div>
   </div>
 {/if}
+
+<AddMangaDialog
+  open={addMangaOpen}
+  onclose={() => (addMangaOpen = false)}
+  onadded={() => handleRefresh()}
+/>
 
 <style>
   .lists-page {

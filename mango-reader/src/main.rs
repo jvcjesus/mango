@@ -6,6 +6,9 @@
 pub(crate) mod acquisition;
 mod api;
 mod auth;
+pub(crate) mod catalog;
+#[cfg(test)]
+mod catalog_tests;
 mod config;
 mod db;
 mod downloads;

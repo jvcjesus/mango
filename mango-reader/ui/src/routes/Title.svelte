@@ -63,6 +63,9 @@
     type OwnershipStatus,
     type Title,
     type TitleOwnership,
+    convertToCatalogTitle,
+    revertToSourceTitle,
+    detachReadingSource,
   } from '../lib/api';
   import { confirm } from '../lib/confirm.svelte';
   import Cover from '../lib/Cover.svelte';
@@ -70,7 +73,7 @@
   import { keep, recall } from '../lib/keep';
   import Notice from '../lib/Notice.svelte';
   import { pref, setPref } from '../lib/prefs.svelte';
-  import { back } from '../lib/router.svelte';
+  import { back, go } from '../lib/router.svelte';
   import { toast } from '../lib/toast.svelte';
   import Tracking from '../lib/Tracking.svelte';
   import { ago, chapterShort, formatBytes, langName, parseVolume, volumeHeading, STATUS } from '../lib/util';
@@ -946,7 +949,7 @@
       loadOwnership();
       loadTitleAcquisitions();
       // A title only seen in a list has no details or chapters yet.
-      if (!title.initialized || title.chapters.length === 0) refresh();
+      if (!title.isCatalog && (!title.initialized || title.chapters.length === 0)) refresh();
     } catch (e) {
       error = message(e);
     }
@@ -958,14 +961,85 @@
   let downloading = $state(false);
   let busyChapter = $state<Record<number, boolean>>({});
 
+  let convertingCatalog = $state(false);
+  async function handleConvertToCatalog() {
+    if (!title) return;
+    const ok = await confirm({
+      title: 'Convert to Catalog Title',
+      message: `Convert "${title.title}" to a catalog-native title? Its 0 extension chapters will clean up chapter bloat while preserving all physical Komga ownership, release intelligence, acquisition history, and scraped chapters for rollback.`,
+      confirmText: 'Convert',
+    });
+    if (!ok) return;
+    convertingCatalog = true;
+    try {
+      const resp = await convertToCatalogTitle(title.id);
+      toast.success(resp.message || 'Converted to catalog title');
+      go('/manga/' + resp.catalogMangaId);
+    } catch (e) {
+      toast.error(message(e));
+    } finally {
+      convertingCatalog = false;
+    }
+  }
+
+  let revertingSource = $state(false);
+  async function handleRevertToSource() {
+    if (!title) return;
+    const ok = await confirm({
+      title: 'Revert to Source Primary',
+      message: `Restore the source-backed manga representation as primary for "${title.title}"?`,
+      confirmText: 'Restore',
+    });
+    if (!ok) return;
+    revertingSource = true;
+    try {
+      const resp = await revertToSourceTitle(title.id);
+      toast.success(resp.message || 'Reverted to source title');
+      go('/manga/' + resp.sourceMangaId);
+    } catch (e) {
+      toast.error(message(e));
+    } finally {
+      revertingSource = false;
+    }
+  }
+
+  let detachingSource = $state(false);
+  async function handleDetachSource() {
+    if (!title) return;
+    const ok = await confirm({
+      title: 'Detach Reading Source',
+      message: `Detach reading source from "${title.title}"? The catalog title will remain standalone with zero reading source attached.`,
+      confirmText: 'Detach',
+    });
+    if (!ok) return;
+    detachingSource = true;
+    try {
+      const resp = await detachReadingSource(title.id);
+      toast.success(resp.message || 'Reading source detached');
+      load();
+    } catch (e) {
+      toast.error(message(e));
+    } finally {
+      detachingSource = false;
+    }
+  }
+
   async function refresh() {
     menu = false;
     refreshing = true;
     refreshError = null;
     try {
-      title = await send<Title>('POST', `/manga/${id}/refresh`);
-      await loadOwnership();
-      toast.success('Updated title from source');
+      if (title?.isCatalog) {
+        const fresh = await get<Title>(`/manga/${id}`);
+        keep('title', fresh);
+        title = fresh;
+        await loadOwnership();
+        toast.success('Refreshed title details');
+      } else {
+        title = await send<Title>('POST', `/manga/${id}/refresh`);
+        await loadOwnership();
+        toast.success('Updated title from source');
+      }
     } catch (e) {
       refreshError = message(e);
       toast.error(refreshError);
@@ -1265,18 +1339,64 @@
               {/if}
             </div>
             <h1 class="display">{title.title}</h1>
-            <strong>{title.sourceName ?? 'Its extension is not installed'}</strong>
+            {#if title.isCatalog}
+              <div class="catalog-header-badge">
+                <span class="catalog-tag">Catalog Title</span>
+                {#if title.mangabakaId}
+                  <a
+                    href={`https://mangabaka.com/series/${title.mangabakaId}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    class="mb-link-tag"
+                    title="View on MangaBaka"
+                  >
+                    MangaBaka #{title.mangabakaId}
+                  </a>
+                {/if}
+              </div>
+            {:else}
+              <strong>{title.sourceName ?? 'Its extension is not installed'}</strong>
+            {/if}
             {#if title.author || title.artist}
               <span>{[...new Set([title.author, title.artist].filter(Boolean))].join(' · ')}</span>
             {/if}
           </div>
         </div>
 
+        {#if title.catalogMangaId}
+          <div class="conversion-banner converted">
+            <Icon name="info" size={20} />
+            <div class="banner-text">
+              <strong>Catalog Version Available</strong>
+              <span>This title has a catalog-native version with clean volume ownership and release tracking.</span>
+            </div>
+            <div class="banner-actions">
+              <a class="btn primary" href={`#/manga/${title.catalogMangaId}`}>Open Catalog Title</a>
+              <button class="btn subtle" onclick={handleRevertToSource} disabled={revertingSource}>
+                {revertingSource ? 'Restoring...' : 'Restore as Primary'}
+              </button>
+            </div>
+          </div>
+        {:else if !title.isCatalog}
+          <div class="conversion-banner convert-prompt">
+            <Icon name="puzzle" size={20} />
+            <div class="banner-text">
+              <strong>Convert to Catalog Title</strong>
+              <span>Manage this work natively with Komga volume ownership, OpenTome release schedules, and Nyaa acquisition without scraper bloat. Chapters and reading progress are preserved.</span>
+            </div>
+            <button class="btn primary" onclick={handleConvertToCatalog} disabled={convertingCatalog}>
+              {convertingCatalog ? 'Converting...' : 'Convert to Catalog Title'}
+            </button>
+          </div>
+        {/if}
+
+        {#if !title.isCatalog || chapters.length > 0}
         <div class="stats">
           <div><span class="display">{chapters.length}</span><span>Chapters</span></div>
           <div class:hot={unread > 0}><span class="display">{unread}</span><span>Unread</span></div>
           <div><span class="display">{saved}</span><span>Saved</span></div>
         </div>
+        {/if}
 
         {#if seriesSummary && (ownership || missingContent || libraryState || reconciliation)}
           <div class="series-summary-wrapper">
@@ -1601,6 +1721,34 @@
         {/if}
       </div>
 
+      {#if title.isCatalog && chapters.length === 0}
+        <div class="reading-section">
+          <div class="section-head">
+            <h2 class="display">READING</h2>
+          </div>
+          <div class="reading-card">
+            {#if title.sourceMangaId}
+              <div class="reading-attached-info">
+                <div class="attached-header">
+                  <span class="reading-status-label">Reading source attached:</span>
+                  <strong>{title.attachedSourceName || 'Extension source'}</strong>
+                </div>
+                <p class="subtext">Scraped chapters and reading state are preserved on the source record.</p>
+                <div class="reading-actions">
+                  <a class="btn" href={`#/manga/${title.sourceMangaId}`}>View Scraped Chapters</a>
+                  <button class="btn subtle" onclick={handleRevertToSource} disabled={revertingSource}>Revert to Source Primary</button>
+                  <button class="btn subtle" onclick={handleDetachSource} disabled={detachingSource}>Detach Reading Source</button>
+                </div>
+              </div>
+            {:else}
+              <div class="reading-empty-state">
+                <p class="reading-state-title">No reading source attached.</p>
+                <p class="subtext">This work is tracked natively in your Mango catalog. Physical ownership is verified via Komga, and releases are tracked via OpenTome. Reading web chapters is optional.</p>
+              </div>
+            {/if}
+          </div>
+        </div>
+      {:else}
       <div class="chapters">
         <div class="section-head">
           <h2 class="display">CHAPTERS</h2>
@@ -2148,17 +2296,18 @@
           <Notice>{nothing}</Notice>
         {/if}
       </div>
+      {/if}
     </div>
 
     <div class="dock">
-      {#if resume}
+      {#if resume && (!title.isCatalog || chapters.length > 0)}
         <a class="btn big spot" href="#/read/{resume.id}">
           {started ? 'Resume' : 'Start'} {chapterShort(resume)}<Icon name="arrow" size={18} stroke={3} />
         </a>
-      {:else if chapters.length}
+      {:else if chapters.length > 0}
         <a class="btn big" href="#/read/{chapters[chapters.length - 1].id}">Read again<Icon name="arrow" size={18} stroke={3} /></a>
       {/if}
-      {#if title.webUrl}
+      {#if title.webUrl && !title.isCatalog}
         <a class="btn big icon" href={title.webUrl} target="_blank" rel="noreferrer noopener" aria-label="Open on the source's site">
           <Icon name="globe" />
         </a>
@@ -3673,6 +3822,137 @@
     color: var(--subtle, #888);
     font-style: italic;
     margin-top: 1px;
+  }
+
+  .catalog-header-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    margin: 4px 0;
+  }
+
+  .catalog-tag {
+    font-size: 11px;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    background: var(--spot);
+    color: var(--on-spot);
+    padding: 2px 8px;
+    border-radius: 3px;
+    border: 1px solid var(--ink);
+  }
+
+  .mb-link-tag {
+    font-size: 11px;
+    font-weight: 700;
+    font-family: monospace;
+    background: var(--paper);
+    color: var(--ink);
+    padding: 2px 8px;
+    border-radius: 3px;
+    border: 1px solid var(--ink);
+    text-decoration: none;
+  }
+
+  .mb-link-tag:hover {
+    background: color-mix(in srgb, var(--spot) 30%, var(--paper));
+  }
+
+  .conversion-banner {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    padding: 14px 18px;
+    border: 2px solid var(--ink);
+    border-radius: 4px;
+    box-shadow: var(--sh-3);
+    margin: 16px 0;
+  }
+
+  .conversion-banner.convert-prompt {
+    background: color-mix(in srgb, var(--spot) 15%, var(--paper));
+  }
+
+  .conversion-banner.converted {
+    background: #e8f4fd;
+  }
+
+  .banner-text {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .banner-text strong {
+    font-size: 14px;
+    font-weight: 800;
+  }
+
+  .banner-text span {
+    font-size: 12px;
+    color: var(--muted);
+    line-height: 1.35;
+  }
+
+  .banner-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .reading-section {
+    margin-top: 24px;
+  }
+
+  .reading-card {
+    background: var(--paper);
+    border: 2px solid var(--ink);
+    box-shadow: var(--sh-3);
+    border-radius: 4px;
+    padding: 20px;
+    margin-top: 12px;
+  }
+
+  .reading-attached-info {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .attached-header {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    font-size: 15px;
+  }
+
+  .reading-status-label {
+    font-weight: 600;
+    color: var(--muted);
+  }
+
+  .reading-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+    margin-top: 8px;
+  }
+
+  .reading-empty-state {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 12px 0;
+  }
+
+  .reading-state-title {
+    font-size: 16px;
+    font-weight: 800;
+    margin: 0;
+    color: var(--ink);
   }
 </style>
 
