@@ -723,11 +723,29 @@ pub async fn convert_to_catalog_title(
                 let old_series_id = format!("manga:{source_manga_id}");
                 let new_series_id = format!("manga:{cat_id}");
 
-                // series_reconciliations
-                conn.execute(
+                // Clear any conflicting destination associations
+                let _ = conn.execute(
                     "DELETE FROM series_reconciliations WHERE series_id = ?1 OR manga_id = ?2",
                     params![new_series_id, cat_id],
-                )?;
+                );
+                let _ = conn.execute(
+                    "DELETE FROM opentome_series_mappings WHERE series_id = ?1 OR manga_id = ?2",
+                    params![new_series_id, cat_id],
+                );
+                let _ = conn.execute(
+                    "DELETE FROM release_discovery_targets WHERE series_id = ?1 OR manga_id = ?2",
+                    params![new_series_id, cat_id],
+                );
+                let _ = conn.execute(
+                    "DELETE FROM discovered_release_candidates WHERE series_id = ?1",
+                    params![new_series_id],
+                );
+                let _ = conn.execute(
+                    "DELETE FROM volume_discovery_status WHERE series_id = ?1",
+                    params![new_series_id],
+                );
+
+                // series_reconciliations
                 conn.execute(
                     "UPDATE series_reconciliations SET manga_id = ?1, series_id = ?2 WHERE manga_id = ?3",
                     params![cat_id, new_series_id, source_manga_id],
@@ -847,11 +865,28 @@ pub async fn revert_to_source_title(
             let old_series_id = format!("manga:{cat}");
             let new_series_id = format!("manga:{src}");
 
-            // Clear any conflicting destination reconciliation
-            conn.execute(
+            // Clear any conflicting destination associations
+            let _ = conn.execute(
                 "DELETE FROM series_reconciliations WHERE series_id = ?1 OR manga_id = ?2",
                 params![new_series_id, src],
-            )?;
+            );
+            let _ = conn.execute(
+                "DELETE FROM opentome_series_mappings WHERE series_id = ?1 OR manga_id = ?2",
+                params![new_series_id, src],
+            );
+            let _ = conn.execute(
+                "DELETE FROM release_discovery_targets WHERE series_id = ?1 OR manga_id = ?2",
+                params![new_series_id, src],
+            );
+            let _ = conn.execute(
+                "DELETE FROM discovered_release_candidates WHERE series_id = ?1",
+                params![new_series_id],
+            );
+            let _ = conn.execute(
+                "DELETE FROM volume_discovery_status WHERE series_id = ?1",
+                params![new_series_id],
+            );
+
             conn.execute(
                 "UPDATE series_reconciliations SET manga_id = ?1, series_id = ?2 WHERE manga_id = ?3",
                 params![src, new_series_id, cat],
