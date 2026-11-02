@@ -7,6 +7,7 @@
 //! 4. Seamless handoff into the existing native Mango downstream acquisition pipeline
 
 pub mod approval;
+pub mod auto_acquire;
 pub mod candidates;
 pub mod discovery;
 pub mod edition;
@@ -24,6 +25,8 @@ pub mod service;
 pub mod source_units;
 #[cfg(test)]
 pub mod approval_tests;
+#[cfg(test)]
+pub mod auto_acquire_tests;
 #[cfg(test)]
 pub mod release_discovery_tests;
 #[cfg(test)]
@@ -325,6 +328,10 @@ pub struct AcquisitionConfig {
     pub has_torbox_token: bool,
     pub torbox_validated: Option<bool>,
     pub torbox_status_message: Option<String>,
+    #[serde(default)]
+    pub auto_acquire_enabled: bool,
+    #[serde(default = "service::default_true")]
+    pub auto_acquire_dry_run: bool,
 }
 
 impl Default for AcquisitionConfig {
@@ -338,6 +345,8 @@ impl Default for AcquisitionConfig {
             has_torbox_token: false,
             torbox_validated: None,
             torbox_status_message: None,
+            auto_acquire_enabled: false,
+            auto_acquire_dry_run: true,
         }
     }
 }

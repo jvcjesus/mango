@@ -14,7 +14,9 @@ mod tests {
                 title TEXT NOT NULL,
                 source_id TEXT NOT NULL DEFAULT '',
                 source_name TEXT NOT NULL DEFAULT '',
-                source_lang TEXT NOT NULL DEFAULT 'en'
+                source_lang TEXT NOT NULL DEFAULT 'en',
+                auto_acquire INTEGER DEFAULT 0,
+                auto_acquire_activated_at INTEGER
             );
             CREATE TABLE IF NOT EXISTS chapters (
                 id INTEGER PRIMARY KEY,
@@ -124,6 +126,9 @@ mod tests {
                 top_candidate_id TEXT,
                 top_candidate_title TEXT,
                 last_error TEXT,
+                auto_decision_code TEXT,
+                auto_decision_reason TEXT,
+                auto_decision_at INTEGER,
                 created_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL,
                 UNIQUE(series_id, volume_number, market, edition, release_date)

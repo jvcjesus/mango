@@ -1522,6 +1522,7 @@ mod discovery_tests {
                 torbox_enabled: None,
                 torbox_url: None,
                 torbox_token: None,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1883,6 +1884,7 @@ mod source_local_tests {
                 torbox_enabled: None,
                 torbox_url: None,
                 torbox_token: None,
+                ..Default::default()
             })
             .await
             .unwrap();
@@ -1969,6 +1971,7 @@ mod source_local_tests {
                 torbox_enabled: Some(true),
                 torbox_url: Some(format!("http://{addr}")),
                 torbox_token: Some("fixture-token".into()),
+                ..Default::default()
             })
             .await
             .unwrap();

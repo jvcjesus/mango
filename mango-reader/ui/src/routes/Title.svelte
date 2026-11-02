@@ -66,6 +66,7 @@
     convertToCatalogTitle,
     revertToSourceTitle,
     detachReadingSource,
+    putMangaAutoAcquire,
   } from '../lib/api';
   import { confirm } from '../lib/confirm.svelte';
   import Cover from '../lib/Cover.svelte';
@@ -541,6 +542,27 @@
       loadDiscovery();
     } catch (e) {
       toast.error(`Release discovery check failed: ${message(e)}`);
+    }
+  }
+
+  async function handleToggleAutoAcquire() {
+    if (!title) return;
+    const nextVal = !title.autoAcquire;
+    if (nextVal) {
+      const ok = await confirm({
+        title: 'Enable Auto-Acquisition for this Title?',
+        message: `Enable automatic acquisition for new physical releases of "${title.title}"? Only future releases published after today will qualify. Existing missing volumes must be acquired manually.`,
+        confirmText: 'Enable Auto-Acquire',
+      });
+      if (!ok) return;
+    }
+    try {
+      const res = await putMangaAutoAcquire(title.id, nextVal);
+      title.autoAcquire = res.autoAcquire;
+      title.autoAcquireActivatedAt = res.activatedAt;
+      toast.success(res.autoAcquire ? 'Auto-acquire enabled for this title' : 'Auto-acquire disabled for this title');
+    } catch (e) {
+      toast.error(`Failed to update auto-acquire: ${message(e)}`);
     }
   }
 
@@ -1410,6 +1432,9 @@
               openTomeSchedule={openTomeSchedule}
               openTomeLoading={openTomeLoading}
               releaseDiscoveryTargets={releaseDiscoveryTargets}
+              autoAcquire={title.autoAcquire}
+              autoAcquireActivatedAt={title.autoAcquireActivatedAt}
+              onToggleAutoAcquire={handleToggleAutoAcquire}
               onResolveIdentity={runReconcile}
               onReviewRelease={handleReviewRelease}
               onRetryMetadata={handleRetryMetadata}

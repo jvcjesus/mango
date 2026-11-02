@@ -48,6 +48,9 @@ pub struct ReleaseDiscoveryTarget {
     pub top_candidate_id: Option<String>,
     pub top_candidate_title: Option<String>,
     pub last_error: Option<String>,
+    pub auto_decision_code: Option<String>,
+    pub auto_decision_reason: Option<String>,
+    pub auto_decision_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -385,7 +388,9 @@ pub fn get_target_by_id(conn: &Connection, id: i64) -> Result<Option<ReleaseDisc
         "SELECT id, series_id, manga_id, series_title, volume_number, market, edition,
                 release_date, release_date_precision, date_type, status, attempts,
                 max_attempts, next_attempt_at, last_attempt_at, candidates_count,
-                top_candidate_id, top_candidate_title, last_error, created_at, updated_at
+                top_candidate_id, top_candidate_title, last_error,
+                auto_decision_code, auto_decision_reason, auto_decision_at,
+                created_at, updated_at
          FROM release_discovery_targets
          WHERE id = ?1",
         params![id],
@@ -410,8 +415,11 @@ pub fn get_target_by_id(conn: &Connection, id: i64) -> Result<Option<ReleaseDisc
                 top_candidate_id: r.get(16)?,
                 top_candidate_title: r.get(17)?,
                 last_error: r.get(18)?,
-                created_at: r.get(19)?,
-                updated_at: r.get(20)?,
+                auto_decision_code: r.get(19)?,
+                auto_decision_reason: r.get(20)?,
+                auto_decision_at: r.get(21)?,
+                created_at: r.get(22)?,
+                updated_at: r.get(23)?,
             })
         },
     )
@@ -424,7 +432,9 @@ pub fn list_targets_for_manga(conn: &Connection, manga_id: i64) -> Result<Vec<Re
         "SELECT id, series_id, manga_id, series_title, volume_number, market, edition,
                 release_date, release_date_precision, date_type, status, attempts,
                 max_attempts, next_attempt_at, last_attempt_at, candidates_count,
-                top_candidate_id, top_candidate_title, last_error, created_at, updated_at
+                top_candidate_id, top_candidate_title, last_error,
+                auto_decision_code, auto_decision_reason, auto_decision_at,
+                created_at, updated_at
          FROM release_discovery_targets
          WHERE manga_id = ?1
          ORDER BY volume_number ASC, market ASC",
@@ -451,8 +461,11 @@ pub fn list_targets_for_manga(conn: &Connection, manga_id: i64) -> Result<Vec<Re
             top_candidate_id: r.get(16)?,
             top_candidate_title: r.get(17)?,
             last_error: r.get(18)?,
-            created_at: r.get(19)?,
-            updated_at: r.get(20)?,
+            auto_decision_code: r.get(19)?,
+            auto_decision_reason: r.get(20)?,
+            auto_decision_at: r.get(21)?,
+            created_at: r.get(22)?,
+            updated_at: r.get(23)?,
         })
     })?;
 

@@ -557,6 +557,11 @@
               <span class="badge ownership-badge {getOwnershipClass(item.ownershipStatus)}">
                 {item.ownershipStatus}
               </span>
+              {#if item.autoAcquire}
+                <span class="badge auto-acquire-badge" title="Guarded auto-acquire enabled">
+                  AUTO
+                </span>
+              {/if}
             </div>
           </div>
 
@@ -566,6 +571,11 @@
             <div class="card-meta">
               <span class="progress-info">{formatProgress(item)}</span>
               <div class="tracker-tags">
+                {#if item.autoAcquire}
+                  <span class="tracker-tag auto-tag" title="Auto-acquire enabled for this title">
+                    AUTO
+                  </span>
+                {/if}
                 <span class="tracker-tag" class:active={!!item.anilist} title="AniList tracking status">
                   AL {item.anilist ? '✓' : '—'}
                 </span>
@@ -1302,6 +1312,17 @@
   .tracker-tag.active {
     background: rgba(47, 111, 222, 0.15);
     color: #2f6fde;
+  }
+
+  .tracker-tag.auto-tag {
+    background: rgba(34, 197, 94, 0.15);
+    color: #16a34a;
+  }
+
+  .auto-acquire-badge {
+    background: rgba(34, 197, 94, 0.9);
+    color: #fff;
+    font-weight: 700;
   }
 
   /* Empty & Loading states */

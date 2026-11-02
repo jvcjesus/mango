@@ -228,7 +228,7 @@ pub fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AcquisitionConfigPatch {
     pub nyaa_enabled: Option<bool>,
@@ -237,6 +237,10 @@ pub struct AcquisitionConfigPatch {
     pub torbox_enabled: Option<bool>,
     pub torbox_url: Option<String>,
     pub torbox_token: Option<String>,
+    #[serde(default)]
+    pub auto_acquire_enabled: Option<bool>,
+    #[serde(default)]
+    pub auto_acquire_dry_run: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -309,6 +313,11 @@ impl AcquisitionService {
                 let torbox_status_message =
                     crate::db::state(conn, "acquisition.torbox_status_message")?;
 
+                let auto_acquire_enabled =
+                    super::auto_acquire::is_global_auto_acquire_enabled(conn);
+                let auto_acquire_dry_run =
+                    super::auto_acquire::is_auto_acquire_dry_run(conn);
+
                 Ok((
                     AcquisitionConfig {
                         nyaa_enabled,
@@ -319,6 +328,8 @@ impl AcquisitionService {
                         has_torbox_token: has_token,
                         torbox_validated,
                         torbox_status_message,
+                        auto_acquire_enabled,
+                        auto_acquire_dry_run,
                     },
                     has_token,
                 ))
@@ -359,6 +370,12 @@ impl AcquisitionService {
                 }
                 if let Some(torbox_url) = patch.torbox_url {
                     crate::db::set_state(conn, "acquisition.torbox_url", torbox_url.trim())?;
+                }
+                if let Some(auto_enabled) = patch.auto_acquire_enabled {
+                    super::auto_acquire::set_global_auto_acquire(conn, auto_enabled)?;
+                }
+                if let Some(dry_run) = patch.auto_acquire_dry_run {
+                    super::auto_acquire::set_auto_acquire_dry_run(conn, dry_run)?;
                 }
                 if let Some(token) = patch.torbox_token {
                     let trimmed = token.trim();

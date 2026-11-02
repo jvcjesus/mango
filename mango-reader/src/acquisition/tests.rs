@@ -485,6 +485,7 @@ async fn test_scenario_u_and_v_secret_storage_and_redaction() {
         torbox_enabled: Some(true),
         torbox_url: None,
         torbox_token: Some("super_secret_torbox_token_12345".to_string()),
+        ..Default::default()
     };
     service.save_config(patch).await.unwrap();
 
@@ -542,6 +543,7 @@ async fn test_scenario_w_duplicate_protection() {
         torbox_enabled: Some(true),
         torbox_url: None,
         torbox_token: Some("dummy-token".to_string()),
+        ..Default::default()
     }).await.unwrap();
 
     // Insert manga
@@ -827,6 +829,7 @@ async fn test_scenario_ah_end_to_end_acquisition_workflow() {
         torbox_enabled: Some(true),
         torbox_url: Some(format!("http://127.0.0.1:{port}/v1/api")),
         torbox_token: Some("test-token".to_string()),
+        ..Default::default()
     }).await.unwrap();
 
     // Insert manga

@@ -153,6 +153,18 @@ pub fn router(state: Spaces) -> Router {
             "/manga/{id}/release-discovery/targets/{target_id}/retry",
             post(post_manga_release_discovery_retry),
         )
+        .route(
+            "/manga/{id}/release-discovery/targets/{target_id}/evaluate-auto",
+            post(post_manga_release_discovery_evaluate_auto),
+        )
+        .route(
+            "/manga/{id}/auto-acquire",
+            get(get_manga_auto_acquire).put(put_manga_auto_acquire),
+        )
+        .route(
+            "/settings/auto-acquire",
+            get(get_auto_acquire_settings).put(put_auto_acquire_settings),
+        )
         .route("/catalog/mangabaka/search", get(get_catalog_mangabaka_search))
         .route("/catalog/mangabaka/{id}/add", post(post_catalog_mangabaka_add))
         .route("/manga/{id}/convert-to-catalog", post(post_manga_convert_to_catalog))
@@ -3112,7 +3124,21 @@ async fn post_manga_release_discovery_check(
 ) -> Result<Json<Vec<crate::acquisition::release_discovery::ReleaseDiscoveryTarget>>> {
     app.me.admin()?;
     let targets = app.opentome.evaluate_manga_release_discovery(id).await?;
-    Ok(Json(targets))
+    for t in &targets {
+        if t.status == "candidate_available" {
+            let _ = crate::acquisition::auto_acquire::evaluate_target_for_auto_acquire(
+                &app.db,
+                &app.acquisition,
+                t.id,
+            )
+            .await;
+        }
+    }
+    let updated_targets = app
+        .db
+        .call(move |conn| crate::acquisition::release_discovery::list_targets_for_manga(conn, id))
+        .await?;
+    Ok(Json(updated_targets))
 }
 
 async fn post_manga_release_discovery_retry(
@@ -3140,7 +3166,140 @@ async fn post_manga_release_discovery_retry(
         target_id,
     )
     .await?;
-    Ok(Json(res))
+
+    if let Some(ref t) = res {
+        if t.status == "candidate_available" {
+            let _ = crate::acquisition::auto_acquire::evaluate_target_for_auto_acquire(
+                &app.db,
+                &app.acquisition,
+                t.id,
+            )
+            .await;
+        }
+    }
+
+    let updated = app
+        .db
+        .call(move |conn| crate::acquisition::release_discovery::get_target_by_id(conn, target_id))
+        .await?;
+    Ok(Json(updated))
+}
+
+async fn post_manga_release_discovery_evaluate_auto(
+    Me(app): Me,
+    Path((_id, target_id)): Path<(i64, i64)>,
+) -> Result<Json<crate::acquisition::auto_acquire::AutoAcquireDecision>> {
+    let decision = crate::acquisition::auto_acquire::evaluate_target_for_auto_acquire(
+        &app.db,
+        &app.acquisition,
+        target_id,
+    )
+    .await?;
+    Ok(Json(decision))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MangaAutoAcquireResponse {
+    enabled: bool,
+    activated_at: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct SetAutoAcquirePayload {
+    enabled: bool,
+}
+
+async fn get_manga_auto_acquire(
+    Me(app): Me,
+    Path(id): Path<i64>,
+) -> Result<Json<MangaAutoAcquireResponse>> {
+    let (enabled, activated_at) = app
+        .db
+        .call(move |conn| crate::acquisition::auto_acquire::get_title_auto_acquire(conn, id))
+        .await?;
+    Ok(Json(MangaAutoAcquireResponse {
+        enabled,
+        activated_at,
+    }))
+}
+
+async fn put_manga_auto_acquire(
+    Me(app): Me,
+    Path(id): Path<i64>,
+    Json(payload): Json<SetAutoAcquirePayload>,
+) -> Result<Json<MangaAutoAcquireResponse>> {
+    app.me.admin()?;
+    app.db
+        .call(move |conn| {
+            crate::acquisition::auto_acquire::set_title_auto_acquire(conn, id, payload.enabled)
+        })
+        .await?;
+
+    let (enabled, activated_at) = app
+        .db
+        .call(move |conn| crate::acquisition::auto_acquire::get_title_auto_acquire(conn, id))
+        .await?;
+    Ok(Json(MangaAutoAcquireResponse {
+        enabled,
+        activated_at,
+    }))
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AutoAcquireSettingsDto {
+    enabled: bool,
+    dry_run: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PatchAutoAcquireSettingsDto {
+    enabled: Option<bool>,
+    dry_run: Option<bool>,
+}
+
+async fn get_auto_acquire_settings(Me(app): Me) -> Result<Json<AutoAcquireSettingsDto>> {
+    let (enabled, dry_run) = app
+        .db
+        .call(|conn| {
+            Ok((
+                crate::acquisition::auto_acquire::is_global_auto_acquire_enabled(conn),
+                crate::acquisition::auto_acquire::is_auto_acquire_dry_run(conn),
+            ))
+        })
+        .await?;
+    Ok(Json(AutoAcquireSettingsDto { enabled, dry_run }))
+}
+
+async fn put_auto_acquire_settings(
+    Me(app): Me,
+    Json(payload): Json<PatchAutoAcquireSettingsDto>,
+) -> Result<Json<AutoAcquireSettingsDto>> {
+    app.me.admin()?;
+    app.db
+        .call(move |conn| {
+            if let Some(en) = payload.enabled {
+                crate::acquisition::auto_acquire::set_global_auto_acquire(conn, en)?;
+            }
+            if let Some(dr) = payload.dry_run {
+                crate::acquisition::auto_acquire::set_auto_acquire_dry_run(conn, dr)?;
+            }
+            Ok(())
+        })
+        .await?;
+
+    let (enabled, dry_run) = app
+        .db
+        .call(|conn| {
+            Ok((
+                crate::acquisition::auto_acquire::is_global_auto_acquire_enabled(conn),
+                crate::acquisition::auto_acquire::is_auto_acquire_dry_run(conn),
+            ))
+        })
+        .await?;
+    Ok(Json(AutoAcquireSettingsDto { enabled, dry_run }))
 }
 
 #[derive(Deserialize)]

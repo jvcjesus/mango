@@ -53,6 +53,9 @@
     openTomeLoading = false,
     onSearchNyaa,
     onCheckReleaseDiscovery,
+    autoAcquire = false,
+    autoAcquireActivatedAt = null,
+    onToggleAutoAcquire,
   }: {
     summary: SeriesSummary;
     libraryState?: CanonicalLibraryReleasesSummary | null;
@@ -62,6 +65,9 @@
     missingVolumeNumbers?: number[];
     openTomeSchedule?: OpenTomeSeriesSchedule | null;
     releaseDiscoveryTargets?: ReleaseDiscoveryTarget[];
+    autoAcquire?: boolean;
+    autoAcquireActivatedAt?: number | null;
+    onToggleAutoAcquire?: () => void;
     onResolveIdentity?: () => void;
     onReviewRelease?: () => void;
     onRetryMetadata?: () => void;
@@ -221,6 +227,44 @@
             <Icon name="clock" size={14} />
             <span>Next release: Vol. {activeReleaseTarget.volumeNumber} on {activeReleaseTarget.releaseDate}</span>
           {/if}
+
+          {#if activeReleaseTarget.autoDecisionCode}
+            <div class="auto-decision-badge-row">
+              {#if activeReleaseTarget.autoDecisionCode === 'WOULD_AUTO_ACQUIRE'}
+                <span class="tag spot" title={activeReleaseTarget.autoDecisionReason ?? 'Passed all policy gates'}>
+                  Would Auto-Acquire (Dry Run)
+                </span>
+              {:else if activeReleaseTarget.autoDecisionCode === 'AUTO_ACQUIRED'}
+                <span class="tag spot" title={activeReleaseTarget.autoDecisionReason ?? 'Auto-acquired successfully'}>
+                  Auto-Acquired
+                </span>
+              {:else if activeReleaseTarget.autoDecisionCode === 'HISTORICAL_BACKLOG_MANUAL_ONLY'}
+                <span class="tag" title={activeReleaseTarget.autoDecisionReason ?? 'Pre-activation release'}>
+                  Manual Review Required (Pre-activation release)
+                </span>
+              {:else if activeReleaseTarget.autoDecisionCode === 'OWNED'}
+                <span class="tag" title={activeReleaseTarget.autoDecisionReason ?? 'Volume already owned'}>
+                  Already Owned
+                </span>
+              {:else if activeReleaseTarget.autoDecisionCode === 'TITLE_AUTO_DISABLED'}
+                <span class="tag" title="Auto-acquire is not enabled for this title">
+                  Auto-Acquire Disabled
+                </span>
+              {:else if activeReleaseTarget.autoDecisionCode === 'GLOBAL_AUTO_DISABLED'}
+                <span class="tag" title="Global auto-acquire master switch is OFF">
+                  Global Auto-Acquire Disabled
+                </span>
+              {:else if activeReleaseTarget.autoDecisionCode === 'NOT_RELEASED'}
+                <span class="tag" title="Release date has not arrived yet">
+                  Scheduled (Release date not reached)
+                </span>
+              {:else}
+                <span class="tag danger" title={activeReleaseTarget.autoDecisionReason ?? activeReleaseTarget.autoDecisionCode}>
+                  Manual Review Required
+                </span>
+              {/if}
+            </div>
+          {/if}
         </div>
       {/if}
     </div>
@@ -325,6 +369,38 @@
           {/if}
         </div>
       </div>
+    </div>
+  {/if}
+
+  <!-- Auto-Acquisition Policy Row -->
+  {#if onToggleAutoAcquire}
+    <div class="auto-acquire-row">
+      <div class="auto-acquire-meta">
+        <div class="auto-acquire-title-line">
+          <Icon name="download" size={14} />
+          <strong>Auto-acquire new physical releases</strong>
+          {#if autoAcquire}
+            <span class="tag spot">ENABLED</span>
+          {:else}
+            <span class="tag">OFF</span>
+          {/if}
+        </div>
+        <span class="auto-acquire-desc">
+          {#if autoAcquire && autoAcquireActivatedAt}
+            Activated {new Date(autoAcquireActivatedAt * 1000).toISOString().slice(0, 10)}. Only future physical releases after this date qualify. Existing unowned volumes require manual acquisition.
+          {:else}
+            Opt-in to automatic acquisition for future physical releases. Existing unowned volumes require manual acquisition.
+          {/if}
+        </span>
+      </div>
+      <button
+        class="btn pill sm icon-text auto-acquire-toggle-btn"
+        class:spot={!autoAcquire}
+        onclick={onToggleAutoAcquire}
+      >
+        <Icon name={autoAcquire ? 'check' : 'plus'} size={12} />
+        {autoAcquire ? 'Disable Auto-Acquire' : 'Enable Auto-Acquire'}
+      </button>
     </div>
   {/if}
 
@@ -694,6 +770,48 @@
     border-color: #137333;
     color: #137333;
     font-weight: 700;
+  }
+
+  .auto-decision-badge-row {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    margin-left: 8px;
+  }
+
+  .auto-acquire-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 10px 14px;
+    border-radius: 6px;
+    border: 1px solid var(--ink);
+    background: var(--paper);
+    margin-top: 4px;
+  }
+
+  .auto-acquire-meta {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+  }
+
+  .auto-acquire-title-line {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+  }
+
+  .auto-acquire-desc {
+    font-size: 12px;
+    color: var(--dim);
+  }
+
+  .auto-acquire-toggle-btn {
+    white-space: nowrap;
+    flex-shrink: 0;
   }
 
   .progress-bar-container {

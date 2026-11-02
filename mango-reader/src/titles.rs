@@ -167,6 +167,8 @@ pub struct TitleView {
     pub source_manga_id: Option<i64>,
     pub catalog_manga_id: Option<i64>,
     pub attached_source_name: Option<String>,
+    pub auto_acquire: bool,
+    pub auto_acquire_activated_at: Option<i64>,
 }
 
 #[derive(Serialize)]
@@ -691,7 +693,7 @@ pub(crate) fn read_title(conn: &Connection, id: i64) -> Result<TitleView> {
             "SELECT m.id, m.source_id, s.name, s.lang, s.base_url, m.url, m.title, m.artist, m.author, m.description, m.genre,
                     m.status, m.thumbnail_url, m.in_library, m.added_at, m.initialized, m.reader_mode, m.reader_fit,
                     m.auto_download, m.chapters_at, m.mangabaka_id, m.source_manga_id, m.catalog_manga_id,
-                    sm_s.name
+                    sm_s.name, m.auto_acquire, m.auto_acquire_activated_at
              FROM manga m
              LEFT JOIN sources s ON s.id = m.source_id
              LEFT JOIN manga sm ON sm.id = m.source_manga_id
@@ -704,6 +706,7 @@ pub(crate) fn read_title(conn: &Connection, id: i64) -> Result<TitleView> {
                 let thumbnail: Option<String> = r.get(12)?;
                 let raw_source_id: i64 = r.get(1)?;
                 let is_catalog = raw_source_id == 0;
+                let auto_acq: i64 = r.get::<_, Option<i64>>(24)?.unwrap_or(0);
                 Ok(TitleView {
                     id,
                     source_id: raw_source_id.to_string(),
@@ -732,6 +735,8 @@ pub(crate) fn read_title(conn: &Connection, id: i64) -> Result<TitleView> {
                     source_manga_id: r.get(21)?,
                     catalog_manga_id: r.get(22)?,
                     attached_source_name: r.get(23)?,
+                    auto_acquire: auto_acq != 0,
+                    auto_acquire_activated_at: r.get(25)?,
                 })
             },
         )

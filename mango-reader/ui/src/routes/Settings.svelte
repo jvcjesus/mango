@@ -54,6 +54,9 @@
     updateOpenTomeCatalogue,
     setOpenTomeConfig,
     type OpenTomeStatus,
+    getAutoAcquireSettings,
+    putAutoAcquireSettings,
+    type AutoAcquireSettings,
   } from '../lib/api';
   import { confirm } from '../lib/confirm.svelte';
   import { COVERS, display, MENUS, setDisplay, SIZES } from '../lib/display.svelte';
@@ -776,10 +779,60 @@
       loadSourceHealth();
       loadNormalizationHistory();
       loadOpenTome();
+      loadAutoAcquireSettings();
     } catch (e) {
       pipelineError = message(e);
     } finally {
       pipelineLoading = false;
+    }
+  }
+
+  // ---------- M6.8: Guarded Auto-Acquisition ----------
+  let autoAcquireSettings = $state<AutoAcquireSettings>({ enabled: false, dryRun: true });
+
+  async function loadAutoAcquireSettings() {
+    try {
+      autoAcquireSettings = await getAutoAcquireSettings();
+    } catch {
+      autoAcquireSettings = { enabled: false, dryRun: true };
+    }
+  }
+
+  async function toggleAutoAcquireGlobal() {
+    const nextVal = !autoAcquireSettings.enabled;
+    if (nextVal && !autoAcquireSettings.dryRun) {
+      const ok = await confirm({
+        title: 'Enable Live Auto-Acquisition?',
+        message: 'Master switch will allow automatic acquisition execution for enabled titles. Dry-run is currently OFF. Ensure profiles and limits are properly configured.',
+        confirmText: 'Enable Live Auto-Acquisition',
+        danger: true,
+      });
+      if (!ok) return;
+    }
+    try {
+      autoAcquireSettings = await putAutoAcquireSettings({ enabled: nextVal });
+      toast.success(nextVal ? 'Global auto-acquisition enabled' : 'Global auto-acquisition disabled (Kill switch engaged)');
+    } catch (e) {
+      toast.error(`Failed to update auto-acquire settings: ${message(e)}`);
+    }
+  }
+
+  async function toggleAutoAcquireDryRun() {
+    const nextVal = !autoAcquireSettings.dryRun;
+    if (!nextVal && autoAcquireSettings.enabled) {
+      const ok = await confirm({
+        title: 'Disable Simulation / Dry-Run Mode?',
+        message: 'Disabling dry-run will allow eligible release targets on enabled titles to submit REAL acquisition jobs to TorBox.',
+        confirmText: 'Disable Dry-Run',
+        danger: true,
+      });
+      if (!ok) return;
+    }
+    try {
+      autoAcquireSettings = await putAutoAcquireSettings({ dryRun: nextVal });
+      toast.success(nextVal ? 'Dry-run simulation mode enabled' : 'Live acquisition mode enabled');
+    } catch (e) {
+      toast.error(`Failed to update dry-run mode: ${message(e)}`);
     }
   }
 
@@ -2310,6 +2363,49 @@
                   <input type="text" bind:value={nyaaCategoryInput} placeholder="3_1" autocomplete="off" />
                 </label>
               </div>
+            </div>
+          </section>
+
+          <section class="card">
+            <h3>Guarded Auto-Acquisition</h3>
+            <span class="muted">
+              Conservative, policy-governed automation for newly released manga volumes. M6.4 Candidate Approval Bridge remains the sole acquisition executor.
+            </span>
+
+            <div class="set">
+              <div class="what">
+                <strong>Global Automatic Acquisition Master Switch</strong>
+                <span>
+                  Master kill switch. When disabled, all automatic acquisition is completely halted across all titles.
+                </span>
+              </div>
+              <div class="how">
+                {@render toggle(autoAcquireSettings.enabled, 'Global auto-acquire', toggleAutoAcquireGlobal)}
+              </div>
+            </div>
+
+            <div class="set">
+              <div class="what">
+                <strong>Simulation / Dry-Run Mode</strong>
+                <span>
+                  When enabled, evaluated releases record <code>WOULD_AUTO_ACQUIRE</code> decisions without submitting any remote download jobs to TorBox.
+                </span>
+              </div>
+              <div class="how">
+                {@render toggle(autoAcquireSettings.dryRun, 'Auto-acquire dry-run', toggleAutoAcquireDryRun)}
+              </div>
+            </div>
+
+            <div class="path-status-row" style="margin-top: 0.75rem;">
+              <span class="status-badge status-{autoAcquireSettings.enabled ? (autoAcquireSettings.dryRun ? 'not_configured' : 'valid') : 'failed'}">
+                {#if !autoAcquireSettings.enabled}
+                  Master Switch: OFF · Safe state
+                {:else if autoAcquireSettings.dryRun}
+                  Master Switch: ON · Dry-Run Simulation Active
+                {:else}
+                  Master Switch: ON · Live Auto-Acquisition Active
+                {/if}
+              </span>
             </div>
           </section>
 

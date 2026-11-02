@@ -236,6 +236,18 @@ impl TorBoxClient {
         &self,
         release: &AcquisitionRelease,
     ) -> std::result::Result<ExternalJobInfo, TorBoxError> {
+        // Idempotency check: if release info_hash is already present on TorBox, reuse existing job!
+        if let Some(ref hash) = release.info_hash {
+            if let Ok(Some(existing_job)) = self.find_existing_torrent_by_hash(hash).await {
+                tracing::info!(
+                    "[TorBox] Reusing existing remote job '{}' for hash '{}'",
+                    existing_job.external_job_id,
+                    hash
+                );
+                return Ok(existing_job);
+            }
+        }
+
         let token = self.auth_token()?;
         let magnet = release.magnet_url.as_deref().ok_or_else(|| {
             TorBoxError::TorrentFailed(
@@ -287,6 +299,13 @@ impl TorBoxClient {
                 .detail
                 .or(body.error)
                 .unwrap_or_else(|| "TorBox submission failed".to_string());
+            if msg.to_ascii_lowercase().contains("already") {
+                if let Some(ref hash) = release.info_hash {
+                    if let Ok(Some(existing_job)) = self.find_existing_torrent_by_hash(hash).await {
+                        return Ok(existing_job);
+                    }
+                }
+            }
             return Err(TorBoxError::TorrentFailed(msg));
         }
 
@@ -307,6 +326,71 @@ impl TorBoxClient {
             torrent_hash: data.hash.or_else(|| release.info_hash.clone()),
             is_cached: false,
         })
+    }
+
+    /// Checks TorBox mylist to find an existing torrent matching the info-hash.
+    /// This prevents duplicate remote submissions across crashes, retries, and network race conditions.
+    pub async fn find_existing_torrent_by_hash(
+        &self,
+        hash: &str,
+    ) -> std::result::Result<Option<ExternalJobInfo>, TorBoxError> {
+        let token = self.auth_token()?;
+        let url = format!("{}/torrents/mylist?bypass_cache=true", self.base_url);
+
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(token)
+            .send()
+            .await
+            .map_err(|e| TorBoxError::NetworkError(e.to_string()))?;
+
+        let status = resp.status();
+        if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
+            return Err(TorBoxError::Unauthorized("Invalid or expired API token".to_string()));
+        }
+        if !status.is_success() {
+            return Ok(None);
+        }
+
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| TorBoxError::NetworkError(e.to_string()))?;
+
+        let mut items = Vec::new();
+        if let Ok(multi) = serde_json::from_str::<TorBoxApiResponse<Vec<TorrentItemData>>>(&text) {
+            if multi.success {
+                if let Some(list) = multi.data {
+                    items = list;
+                }
+            }
+        } else if let Ok(single) = serde_json::from_str::<TorBoxApiResponse<TorrentItemData>>(&text) {
+            if single.success {
+                if let Some(item) = single.data {
+                    items.push(item);
+                }
+            }
+        }
+
+        for item in items {
+            if let Some(ref h) = item.hash {
+                if h.eq_ignore_ascii_case(hash) {
+                    let job_id = match item.id {
+                        serde_json::Value::Number(n) => n.to_string(),
+                        serde_json::Value::String(s) => s,
+                        _ => format!("{}", item.id),
+                    };
+                    return Ok(Some(ExternalJobInfo {
+                        external_job_id: job_id,
+                        torrent_hash: Some(h.clone()),
+                        is_cached: false,
+                    }));
+                }
+            }
+        }
+
+        Ok(None)
     }
 
     /// Queries TorBox for the status and file list of a submitted torrent.

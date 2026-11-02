@@ -124,6 +124,8 @@ export type Title = {
   sourceMangaId?: number | null;
   catalogMangaId?: number | null;
   attachedSourceName?: string | null;
+  autoAcquire?: boolean;
+  autoAcquireActivatedAt?: number | null;
 };
 
 /** One of the two titles of a migration. */
@@ -1621,6 +1623,9 @@ export interface ReleaseDiscoveryTarget {
   topCandidateId?: string | null;
   topCandidateTitle?: string | null;
   lastError?: string | null;
+  autoDecisionCode?: string | null;
+  autoDecisionReason?: string | null;
+  autoDecisionAt?: number | null;
   createdAt: number;
   updatedAt: number;
 }
@@ -1740,3 +1745,44 @@ export const revertToSourceTitle = (mangaId: number) =>
 
 export const detachReadingSource = (mangaId: number) =>
   send<DetachSourceResponse>('POST', `/manga/${mangaId}/detach-source`);
+
+
+// ---------- M6.8: Guarded Auto-Acquisition ----------
+
+export interface AutoAcquireSettings {
+  enabled: boolean;
+  dryRun: boolean;
+}
+
+export interface TitleAutoAcquireResponse {
+  mangaId: number;
+  autoAcquire: boolean;
+  activatedAt?: number | null;
+}
+
+export interface AutoAcquireDecision {
+  targetId: number;
+  seriesId: string;
+  volumeNumber: number;
+  code: string;
+  reason: string;
+  candidateId?: string | null;
+  candidateTitle?: string | null;
+  candidateScore?: number | null;
+  dryRun: boolean;
+  evaluatedAt: number;
+}
+
+export const getAutoAcquireSettings = () => get<AutoAcquireSettings>('/settings/auto-acquire');
+
+export const putAutoAcquireSettings = (settings: Partial<AutoAcquireSettings>) =>
+  send<AutoAcquireSettings>('PUT', '/settings/auto-acquire', settings);
+
+export const getMangaAutoAcquire = (id: number) =>
+  get<TitleAutoAcquireResponse>(`/manga/${id}/auto-acquire`);
+
+export const putMangaAutoAcquire = (id: number, autoAcquire: boolean) =>
+  send<TitleAutoAcquireResponse>('PUT', `/manga/${id}/auto-acquire`, { autoAcquire });
+
+export const evaluateTargetAutoAcquire = (id: number, targetId: number) =>
+  send<AutoAcquireDecision>('POST', `/manga/${id}/release-discovery/targets/${targetId}/evaluate-auto`, {});
