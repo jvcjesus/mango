@@ -8,6 +8,7 @@ use crate::{
     images::Images,
     settings,
 };
+use base64::Engine;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -1073,6 +1074,53 @@ impl Downloads {
                         continue;
                     }
                 }
+            } else if job.backend_type == "madokami" {
+                match self.handle_madokami_job(&job).await {
+                    Ok(Some(res)) => Ok(Some(res)),
+                    Ok(None) => {
+                        self.tracker.release_worker(ch_id);
+                        continue;
+                    }
+                    Err(e) => {
+                        self.tracker.release_worker(ch_id);
+                        let ch_id = job.chapter;
+                        let err_msg = e.to_string();
+                        let err_msg_db = err_msg.clone();
+                        let _ = self
+                            .db
+                            .call(move |conn| {
+                                conn.execute(
+                                    "UPDATE downloads SET state = 'failed', error = ?1 WHERE chapter_id = ?2",
+                                    rusqlite::params![&err_msg_db, ch_id],
+                                )?;
+                                Ok(())
+                            })
+                            .await;
+                        if let Some(p) = &self.pipeline {
+                            p.ownership.invalidate(job.manga_id);
+                        }
+                        if let Some(acq) = &self.acquisition {
+                            let _ = acq
+                                .record_history(
+                                    Some(job.chapter),
+                                    job.manga_id,
+                                    &job.title,
+                                    job.raw_title.as_deref().unwrap_or(&job.name),
+                                    &job.source_type,
+                                    job.uploader.as_deref(),
+                                    job.external_job_id.as_deref(),
+                                    &job.backend_type,
+                                    "failed",
+                                    None,
+                                    job.release_size,
+                                    Some(&err_msg),
+                                )
+                                .await;
+                        }
+                        *self.live_stage.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                        continue;
+                    }
+                }
             } else {
                 self.save(&job).await
             };
@@ -1845,6 +1893,173 @@ impl Downloads {
         }
 
         Ok(Some((rel_str, 1)))
+    }
+
+    /// Handles direct HTTP retrieval of a Madokami candidate archive.
+    async fn handle_madokami_job(&self, job: &Job) -> Result<Option<(String, i64)>> {
+        // 1. If already retrieved, verify staging CBZ (crash recovery window B)
+        if let Some(ref rel) = job.retrieved_path {
+            let path = self.dir.join(rel);
+            if path.is_file() && crate::pipeline::publisher::verify_cbz_integrity(&path).is_ok() {
+                return Ok(Some((rel.clone(), 1)));
+            }
+        }
+
+        // 2. Resolve credentials & config
+        let (username, password) = if let Some(acq) = &self.acquisition {
+            acq.get_madokami_credentials().await.unwrap_or((None, None))
+        } else {
+            self.db
+                .call(|conn| {
+                    let u = crate::db::state(conn, "acquisition.madokami_username")?
+                        .or_else(|| std::env::var("MADOKAMI_USERNAME").ok());
+                    let p = crate::db::state(conn, "acquisition.madokami_password")?
+                        .or_else(|| std::env::var("MADOKAMI_PASSWORD").ok());
+                    Ok((u, p))
+                })
+                .await
+                .unwrap_or((None, None))
+        };
+
+        let auth_header = match (username, password) {
+            (Some(u), Some(p)) if !u.trim().is_empty() && !p.trim().is_empty() => {
+                let creds = format!("{}:{}", u.trim(), p.trim());
+                Some(format!(
+                    "Basic {}",
+                    base64::engine::general_purpose::STANDARD.encode(creds)
+                ))
+            }
+            _ => None,
+        };
+
+        let base_url = if let Some(acq) = &self.acquisition {
+            acq.load_internal_config()
+                .await
+                .ok()
+                .and_then(|(c, _)| c.madokami_url)
+                .unwrap_or_else(|| crate::acquisition::madokami::DEFAULT_MADOKAMI_URL.to_string())
+        } else {
+            crate::acquisition::madokami::DEFAULT_MADOKAMI_URL.to_string()
+        };
+
+        // 3. Resolve remote path from external_job_id or chapter URL
+        let remote_path = if let Some(ref ext_id) = job.external_job_id {
+            ext_id.clone()
+        } else {
+            let ch_id = job.chapter;
+            let url_opt: Option<String> = self
+                .db
+                .call(move |conn| {
+                    Ok(conn
+                        .query_row("SELECT url FROM chapters WHERE id = ?1", [ch_id], |r| r.get(0))
+                        .optional()?)
+                })
+                .await
+                .ok()
+                .flatten();
+
+            let url = url_opt.ok_or_else(|| AppError::bad_request("Madokami remote path missing from chapter url"))?;
+            let path_part = url
+                .strip_prefix("madokami:")
+                .unwrap_or(&url);
+            let raw_path = path_part.rsplit_once(':').map(|(p, _)| p).unwrap_or(path_part);
+            raw_path.to_string()
+        };
+
+        let download_url = if remote_path.starts_with("http://") || remote_path.starts_with("https://") {
+            remote_path.clone()
+        } else {
+            let clean_base = base_url.trim_end_matches('/');
+            let clean_path = if remote_path.starts_with('/') {
+                remote_path.clone()
+            } else {
+                format!("/{remote_path}")
+            };
+            format!("{clean_base}{clean_path}")
+        };
+
+        // 4. Staging destination in workspace/
+        let workspace = self.dir.join("workspace");
+        std::fs::create_dir_all(&workspace)?;
+        let part_file = workspace.join(format!("{}.cbz.part", job.chapter));
+
+        let ch_id = job.chapter;
+        let progress_state = self.progress.clone();
+        let tracker = self.tracker.clone();
+        let transfer_cfg = crate::transfer::TransferConfig::default();
+
+        let http = self
+            .pipeline
+            .as_ref()
+            .map(|p| p.http.clone())
+            .unwrap_or_else(reqwest::Client::new);
+
+        // Update live stage
+        *self.live_stage.lock().unwrap_or_else(|e| e.into_inner()) = Some(AcquisitionLiveState {
+            chapter_id: ch_id,
+            stage: "downloading".to_string(),
+            status_message: format!(
+                "Downloading directly from Madokami ({})",
+                job.raw_title.as_deref().unwrap_or(&job.name)
+            ),
+            destination: None,
+        });
+
+        let on_progress = move |done: u64, total: Option<u64>, _stalled: bool| {
+            if let Ok(mut lock) = progress_state.lock() {
+                *lock = Some((ch_id, done as i64, total.unwrap_or(0) as i64));
+            }
+        };
+
+        // 5. Stream HTTP download directly with Range resume and ETag change detection
+        let _downloaded_bytes = crate::transfer::stream_http_to_file_with_auth(
+            &http,
+            &download_url,
+            auth_header.as_deref(),
+            &part_file,
+            job.release_size,
+            &transfer_cfg,
+            ch_id,
+            &tracker,
+            on_progress,
+        )
+        .await?;
+
+        // 6. Verify CBZ archive integrity on staged .part
+        if let Err(e) = crate::pipeline::publisher::verify_cbz_integrity(&part_file) {
+            let _ = std::fs::remove_file(&part_file);
+            return Err(AppError::bad_request(format!(
+                "Downloaded Madokami candidate archive failed integrity verification: {e}"
+            )));
+        }
+
+        // 7. Atomic rename to final staging path in downloads/
+        let relative = self.place(job);
+        let final_cbz = self.dir.join(&relative);
+        if let Some(parent) = final_cbz.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::rename(&part_file, &final_cbz)?;
+
+        let relative_str = relative.to_string_lossy().replace('\\', "/");
+        let ch_id_save = job.chapter;
+        let rel_clone = relative_str.clone();
+
+        self.db
+            .call(move |conn| {
+                conn.execute(
+                    "UPDATE chapters SET download_path = ?1 WHERE id = ?2",
+                    rusqlite::params![&rel_clone, ch_id_save],
+                )?;
+                conn.execute(
+                    "UPDATE downloads SET retrieved_path = ?1 WHERE chapter_id = ?2",
+                    rusqlite::params![&rel_clone, ch_id_save],
+                )?;
+                Ok(())
+            })
+            .await?;
+
+        Ok(Some((relative_str, 1)))
     }
 
     /// Fetches a chapter and writes its CBZ. None when it was cancelled or paused part way.

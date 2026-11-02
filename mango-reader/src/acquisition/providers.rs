@@ -498,55 +498,10 @@ impl ReleaseProvider for NyaaReleaseProvider {
 }
 
 // -----------------------------------------------------------------------------
-// Madokami Release Provider Implementation (Offline / Seam)
+// Madokami Release Provider Implementation
 // -----------------------------------------------------------------------------
 
-pub struct MadokamiReleaseProvider {
-    _http: Client,
-    _base_url: Option<String>,
-}
-
-impl MadokamiReleaseProvider {
-    pub fn new(http: Client, base_url: Option<String>) -> Self {
-        Self {
-            _http: http,
-            _base_url: base_url,
-        }
-    }
-}
-
-impl ReleaseProvider for MadokamiReleaseProvider {
-    fn id(&self) -> &'static str {
-        "madokami"
-    }
-
-    fn name(&self) -> &'static str {
-        "Madokami"
-    }
-
-    fn check_health<'a>(&'a self) -> BoxFuture<'a, ProviderHealth> {
-        Box::pin(async move {
-            ProviderHealth {
-                provider_id: "madokami".to_string(),
-                name: "Madokami".to_string(),
-                status: ProviderStatus::TemporarilyUnavailable,
-                message: Some("Madokami is currently offline / unavailable".to_string()),
-                last_checked_at: Some(now()),
-            }
-        })
-    }
-
-    fn search_releases<'a>(
-        &'a self,
-        _query: &'a ReleaseQuery,
-    ) -> BoxFuture<'a, Result<Vec<ReleaseCandidate>>> {
-        Box::pin(async move {
-            // Madokami is currently offline; return empty result safely without breaking discovery
-            tracing::warn!("Madokami provider queried while temporarily unavailable; returning empty candidates");
-            Ok(Vec::new())
-        })
-    }
-}
+pub use super::madokami::MadokamiReleaseProvider;
 
 // -----------------------------------------------------------------------------
 // Legacy capabilities model for UI Settings inspection
@@ -637,8 +592,8 @@ impl ProviderCapabilities {
             supports_chapters: false,
             supports_collections: true,
             requires_external_backend: false,
-            status: "unavailable".to_string(),
-            last_error: Some("Madokami is currently offline / unavailable".to_string()),
+            status: "healthy".to_string(),
+            last_error: None,
             last_success_at: None,
         }
     }

@@ -61,6 +61,7 @@ pub enum AutoDecisionCode {
     RangeRequiresManual,
     PackRequiresManual,
     PossibleMatchRequiresManual,
+    PreReleaseRequiresManual,
     AmbiguousTitleTokens,
     LanguageUnknown,
     FormatNotAllowed,
@@ -94,6 +95,7 @@ impl AutoDecisionCode {
             Self::RangeRequiresManual => "RANGE_REQUIRES_MANUAL",
             Self::PackRequiresManual => "PACK_REQUIRES_MANUAL",
             Self::PossibleMatchRequiresManual => "POSSIBLE_MATCH_REQUIRES_MANUAL",
+            Self::PreReleaseRequiresManual => "PRE_RELEASE_REQUIRES_MANUAL",
             Self::AmbiguousTitleTokens => "AMBIGUOUS_TITLE_TOKENS",
             Self::LanguageUnknown => "LANGUAGE_UNKNOWN",
             Self::FormatNotAllowed => "FORMAT_NOT_ALLOWED",
@@ -190,8 +192,8 @@ pub fn is_candidate_auto_eligible(
     cand: &PersistedCandidate,
     profile: &AcquisitionProfile,
 ) -> std::result::Result<(), AutoDecisionCode> {
-    // Gate 1: Provider must be supported for automation (Nyaa only)
-    if cand.provider != "nyaa" {
+    // Gate 1: Provider must be supported for automation (Nyaa or Madokami)
+    if cand.provider != "nyaa" && cand.provider != "madokami" {
         return Err(AutoDecisionCode::ProviderUnavailable);
     }
 
@@ -248,10 +250,21 @@ pub fn is_candidate_auto_eligible(
         return Err(AutoDecisionCode::FormatNotAllowed);
     }
 
-    // Gate 7: Seeders check (seeders must be > 0 and meet profile min_seeders)
-    let seeders = cand.seeders.unwrap_or(0);
-    if seeders == 0 || seeders < profile.min_seeders {
-        return Err(AutoDecisionCode::SeedersBelowPolicy);
+    // Gate 7: Provider-specific availability check
+    if cand.provider == "nyaa" {
+        let seeders = cand.seeders.unwrap_or(0);
+        if seeders == 0 || seeders < profile.min_seeders {
+            return Err(AutoDecisionCode::SeedersBelowPolicy);
+        }
+    } else if cand.provider == "madokami" {
+        // Direct download URL must be present
+        if cand.download_url.as_deref().unwrap_or("").trim().is_empty() {
+            return Err(AutoDecisionCode::ProviderUnavailable);
+        }
+        // PRE releases are strictly ineligible for auto-acquisition
+        if raw_lower.contains("(pre)") || raw_lower.contains("[pre]") || raw_lower.contains(" pre ") {
+            return Err(AutoDecisionCode::PreReleaseRequiresManual);
+        }
     }
 
     // Gate 8: Size bounds check
@@ -727,15 +740,41 @@ pub async fn evaluate_target_for_auto_acquire(
         return Ok(dec);
     }
 
-    // Select top eligible candidate by score, seeders
+    // Select top eligible candidate:
+    // Provider priority (Madokami preferred direct download over Nyaa torrent),
+    // then score, digital marker, and seeders.
+    let provider_priority = |p: &str| match p.to_lowercase().as_str() {
+        "madokami" => 0,
+        "nyaa" => 1,
+        _ => 2,
+    };
+
     eligible_candidates.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
+        provider_priority(&a.provider)
+            .cmp(&provider_priority(&b.provider))
+            .then_with(|| {
+                b.score
+                    .partial_cmp(&a.score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .then_with(|| b.is_digital.cmp(&a.is_digital))
             .then_with(|| b.seeders.unwrap_or(0).cmp(&a.seeders.unwrap_or(0)))
     });
 
     let selected = eligible_candidates[0].clone();
+    let transport_desc = match selected.provider.as_str() {
+        "madokami" => "Direct HTTP",
+        "nyaa" => "TorBox",
+        other => other,
+    };
+    let has_other_provider = eligible_candidates.iter().any(|c| c.provider != selected.provider);
+    let provider_note = if selected.provider == "madokami" && has_other_provider {
+        " (preferred direct provider over torrent)"
+    } else if selected.provider == "nyaa" && has_other_provider {
+        " (fallback provider)"
+    } else {
+        ""
+    };
 
     // Gate 9: Dry-Run Mode
     if dry_run {
@@ -745,8 +784,8 @@ pub async fn evaluate_target_for_auto_acquire(
             volume_number,
             code: AutoDecisionCode::WouldAutoAcquire,
             reason: format!(
-                "Candidate '{}' (score: {:.1}) passed all guarded auto-acquisition gates (dry-run mode active; zero TorBox side effects)",
-                selected.title, selected.score
+                "Candidate '{}' [{} / {}]{} (score: {:.1}) passed all guarded auto-acquisition gates (dry-run mode active; zero external side effects)",
+                selected.title, selected.provider, transport_desc, provider_note, selected.score
             ),
             candidate_id: Some(selected.candidate_id.clone()),
             candidate_title: Some(selected.title.clone()),
@@ -828,7 +867,10 @@ pub async fn evaluate_target_for_auto_acquire(
                 series_id: series_id.clone(),
                 volume_number,
                 code: AutoDecisionCode::AutoAllowed,
-                reason: format!("Candidate '{}' successfully queued via M6.4 executor", selected.title),
+                reason: format!(
+                    "Candidate '{}' [{} / {}]{} successfully queued via M6.4 executor",
+                    selected.title, selected.provider, transport_desc, provider_note
+                ),
                 candidate_id: Some(selected.candidate_id.clone()),
                 candidate_title: Some(selected.title.clone()),
                 candidate_score: Some(selected.score),

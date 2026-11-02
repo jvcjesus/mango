@@ -241,6 +241,11 @@ pub struct AcquisitionConfigPatch {
     pub auto_acquire_enabled: Option<bool>,
     #[serde(default)]
     pub auto_acquire_dry_run: Option<bool>,
+    #[serde(default)]
+    pub madokami_enabled: Option<bool>,
+    pub madokami_url: Option<String>,
+    pub madokami_username: Option<String>,
+    pub madokami_password: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -318,6 +323,18 @@ impl AcquisitionService {
                 let auto_acquire_dry_run =
                     super::auto_acquire::is_auto_acquire_dry_run(conn);
 
+                let madokami_enabled = crate::db::state(conn, "acquisition.madokami_enabled")?
+                    .and_then(|v| v.parse::<bool>().ok())
+                    .unwrap_or(true);
+                let madokami_url = crate::db::state(conn, "acquisition.madokami_url")?
+                    .or_else(|| Some(super::madokami::DEFAULT_MADOKAMI_URL.to_string()));
+
+                let mado_user = crate::db::state(conn, "acquisition.madokami_username")?
+                    .or_else(|| std::env::var("MADOKAMI_USERNAME").ok());
+                let mado_pass = crate::db::state(conn, "acquisition.madokami_password")?
+                    .or_else(|| std::env::var("MADOKAMI_PASSWORD").ok());
+                let has_madokami_credentials = mado_user.is_some() && mado_pass.is_some();
+
                 Ok((
                     AcquisitionConfig {
                         nyaa_enabled,
@@ -330,6 +347,9 @@ impl AcquisitionService {
                         torbox_status_message,
                         auto_acquire_enabled,
                         auto_acquire_dry_run,
+                        madokami_enabled,
+                        madokami_url,
+                        has_madokami_credentials,
                     },
                     has_token,
                 ))
@@ -341,6 +361,19 @@ impl AcquisitionService {
     pub async fn get_torbox_token(&self) -> Result<Option<String>> {
         self.db
             .call(|conn| crate::db::state(conn, "acquisition.torbox_token"))
+            .await
+    }
+
+    /// Fetches Madokami credentials from DB state or environment.
+    pub async fn get_madokami_credentials(&self) -> Result<(Option<String>, Option<String>)> {
+        self.db
+            .call(|conn| {
+                let u = crate::db::state(conn, "acquisition.madokami_username")?
+                    .or_else(|| std::env::var("MADOKAMI_USERNAME").ok());
+                let p = crate::db::state(conn, "acquisition.madokami_password")?
+                    .or_else(|| std::env::var("MADOKAMI_PASSWORD").ok());
+                Ok((u, p))
+            })
             .await
     }
 
@@ -385,6 +418,32 @@ impl AcquisitionService {
                         crate::db::forget_state(conn, "acquisition.torbox_status_message")?;
                     } else {
                         crate::db::set_state(conn, "acquisition.torbox_token", trimmed)?;
+                    }
+                }
+                if let Some(mado_enabled) = patch.madokami_enabled {
+                    crate::db::set_state(
+                        conn,
+                        "acquisition.madokami_enabled",
+                        &mado_enabled.to_string(),
+                    )?;
+                }
+                if let Some(mado_url) = patch.madokami_url {
+                    crate::db::set_state(conn, "acquisition.madokami_url", mado_url.trim())?;
+                }
+                if let Some(user) = patch.madokami_username {
+                    let trimmed = user.trim();
+                    if trimmed.is_empty() {
+                        crate::db::forget_state(conn, "acquisition.madokami_username")?;
+                    } else {
+                        crate::db::set_state(conn, "acquisition.madokami_username", trimmed)?;
+                    }
+                }
+                if let Some(pass) = patch.madokami_password {
+                    let trimmed = pass.trim();
+                    if trimmed.is_empty() {
+                        crate::db::forget_state(conn, "acquisition.madokami_password")?;
+                    } else {
+                        crate::db::set_state(conn, "acquisition.madokami_password", trimmed)?;
                     }
                 }
                 Ok(())
@@ -2259,13 +2318,22 @@ impl AcquisitionService {
             let first_vol = item.expected_units.first().copied().unwrap_or(1.0);
             let src_type = if cand.provider == "nyaa" {
                 "nyaa"
+            } else if cand.provider == "madokami" {
+                "madokami"
             } else {
                 "reader"
             };
             let bk_type = if cand.provider == "nyaa" {
                 "torbox"
+            } else if cand.provider == "madokami" {
+                "madokami"
             } else {
                 "internal"
+            };
+            let ext_job_id = if cand.provider == "madokami" {
+                Some(cand.provider_release_id.clone())
+            } else {
+                None
             };
             let raw_t = cand
                 .provider_metadata
@@ -2339,10 +2407,10 @@ impl AcquisitionService {
                 conn.execute(
                     "INSERT INTO downloads (
                         chapter_id, state, position, attempts, added_at, source_type, backend_type,
-                        raw_title, uploader, release_size, torrent_hash, execution_id, execution_item_id, retrieval_identity_json
+                        raw_title, uploader, release_size, torrent_hash, execution_id, execution_item_id, retrieval_identity_json, external_job_id
                     ) VALUES (
                         ?1, 'queued', (SELECT COALESCE(MAX(position), 0) + 1 FROM downloads), 0, ?2,
-                        ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11
+                        ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12
                     ) ON CONFLICT(chapter_id) DO UPDATE SET
                         state = CASE WHEN downloads.published_path IS NOT NULL OR (SELECT download_path FROM chapters WHERE id = downloads.chapter_id) IS NOT NULL THEN 'verifying' ELSE 'queued' END,
                         attempts = 0, retry_at = NULL, error = NULL,
@@ -2350,10 +2418,11 @@ impl AcquisitionService {
                         raw_title = excluded.raw_title, uploader = excluded.uploader,
                         release_size = excluded.release_size, torrent_hash = excluded.torrent_hash,
                         execution_id = excluded.execution_id, execution_item_id = excluded.execution_item_id,
-                        retrieval_identity_json = excluded.retrieval_identity_json",
+                        retrieval_identity_json = excluded.retrieval_identity_json,
+                        external_job_id = COALESCE(excluded.external_job_id, downloads.external_job_id)",
                     rusqlite::params![
                         id, now, src_type, bk_type, &raw_t, &scanlator, release_size, &thash,
-                        &exec_id, &item_id, &identity_json
+                        &exec_id, &item_id, &identity_json, &ext_job_id
                     ],
                 )?;
 

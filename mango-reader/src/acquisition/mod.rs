@@ -14,6 +14,7 @@ pub mod edition;
 pub mod execution;
 pub mod intelligence;
 pub mod interactive;
+pub mod madokami;
 pub mod missing;
 pub mod nyaa;
 pub mod physical;
@@ -332,6 +333,11 @@ pub struct AcquisitionConfig {
     pub auto_acquire_enabled: bool,
     #[serde(default = "service::default_true")]
     pub auto_acquire_dry_run: bool,
+    #[serde(default = "service::default_true")]
+    pub madokami_enabled: bool,
+    pub madokami_url: Option<String>,
+    #[serde(default)]
+    pub has_madokami_credentials: bool,
 }
 
 impl Default for AcquisitionConfig {
@@ -347,6 +353,9 @@ impl Default for AcquisitionConfig {
             torbox_status_message: None,
             auto_acquire_enabled: false,
             auto_acquire_dry_run: true,
+            madokami_enabled: true,
+            madokami_url: Some(madokami::DEFAULT_MADOKAMI_URL.to_string()),
+            has_madokami_credentials: false,
         }
     }
 }

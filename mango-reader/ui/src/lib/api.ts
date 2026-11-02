@@ -879,6 +879,11 @@ export interface AcquisitionConfig {
   hasTorboxToken: boolean;
   torboxValidated?: boolean | null;
   torboxStatusMessage?: string | null;
+  autoAcquireEnabled?: boolean;
+  autoAcquireDryRun?: boolean;
+  madokamiEnabled?: boolean;
+  madokamiUrl?: string | null;
+  hasMadokamiCredentials?: boolean;
 }
 
 export interface AcquisitionConfigPatch {
@@ -888,6 +893,12 @@ export interface AcquisitionConfigPatch {
   torboxEnabled?: boolean;
   torboxUrl?: string;
   torboxToken?: string;
+  autoAcquireEnabled?: boolean;
+  autoAcquireDryRun?: boolean;
+  madokamiEnabled?: boolean;
+  madokamiUrl?: string;
+  madokamiUsername?: string;
+  madokamiPassword?: string;
 }
 
 export interface AcquisitionHistoryRecord {

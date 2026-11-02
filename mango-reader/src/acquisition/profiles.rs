@@ -45,7 +45,11 @@ impl Default for AcquisitionProfile {
             language: "en".to_string(),
             preferred_release_type: "volume".to_string(),
             source_selection: "smart".to_string(),
-            preferred_sources: vec!["nyaa".to_string(), "mangadot".to_string()],
+            preferred_sources: vec![
+                "madokami".to_string(),
+                "nyaa".to_string(),
+                "mangadot".to_string(),
+            ],
             preferred_uploaders: vec![],
             min_seeders: 1,
             prefer_digital: true,

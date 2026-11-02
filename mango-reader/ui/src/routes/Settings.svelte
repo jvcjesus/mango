@@ -32,6 +32,7 @@
     type AcquisitionProfile,
     type SourceHealthReport,
     type AcquisitionConfig,
+    type AcquisitionConfigPatch,
     type Category,
     type KomgaLibrary,
     type PipelineConfig,
@@ -630,6 +631,11 @@
   let nyaaUrlInput = $state('https://nyaa.si');
   let nyaaCategoryInput = $state('3_1');
 
+  let madokamiEnabledInput = $state(true);
+  let madokamiUrlInput = $state('https://manga.madokami.al');
+  let madokamiUsernameInput = $state('');
+  let madokamiPasswordInput = $state('');
+
   // Notifications tab state
   let ntfyConfig = $state<NtfyConfig | null>(null);
   let ntfyLoading = $state(false);
@@ -773,6 +779,10 @@
         nyaaEnabledInput = acq.nyaaEnabled ?? true;
         nyaaUrlInput = acq.nyaaUrl ?? 'https://nyaa.si';
         nyaaCategoryInput = acq.nyaaCategory ?? '3_1';
+        madokamiEnabledInput = acq.madokamiEnabled ?? true;
+        madokamiUrlInput = acq.madokamiUrl ?? 'https://manga.madokami.al';
+        madokamiUsernameInput = acq.hasMadokamiCredentials ? '********' : '';
+        madokamiPasswordInput = acq.hasMadokamiCredentials ? '********' : '';
       }
 
       loadProfiles();
@@ -1204,6 +1214,10 @@
         nyaaEnabled: nyaaEnabledInput,
         nyaaUrl: nyaaUrlInput.trim() || undefined,
         nyaaCategory: nyaaCategoryInput.trim() || undefined,
+        madokamiEnabled: madokamiEnabledInput,
+        madokamiUrl: madokamiUrlInput.trim() || undefined,
+        madokamiUsername: madokamiUsernameInput === 'CLEAR' ? '' : (madokamiUsernameInput && madokamiUsernameInput !== '********' ? madokamiUsernameInput.trim() : undefined),
+        madokamiPassword: madokamiPasswordInput === 'CLEAR' ? '' : (madokamiPasswordInput && madokamiPasswordInput !== '********' ? madokamiPasswordInput.trim() : undefined),
       };
       await Promise.all([
         send('PUT', '/pipeline/config', patch),
@@ -2361,6 +2375,58 @@
               <div class="how wide">
                 <label class="field grow">
                   <input type="text" bind:value={nyaaCategoryInput} placeholder="3_1" autocomplete="off" />
+                </label>
+              </div>
+            </div>
+          </section>
+
+          <section class="card">
+            <h3>Madokami Direct Acquisition Provider</h3>
+            <span class="muted">
+              First-class direct HTTP download provider for discrete manga volumes with safe Range resume.
+            </span>
+
+            <div class="set">
+              <div class="what">
+                <strong>Enable Madokami Provider</strong>
+                <span>Discover and acquire discrete manga volumes directly via HTTP from Madokami.</span>
+              </div>
+              <div class="how">
+                {@render toggle(madokamiEnabledInput, 'Madokami provider', () => {
+                  madokamiEnabledInput = !madokamiEnabledInput;
+                })}
+              </div>
+            </div>
+            <div class="set stack">
+              <div class="what">
+                <strong>Madokami Base URL</strong>
+                <span>Default: https://manga.madokami.al</span>
+              </div>
+              <div class="how wide">
+                <label class="field grow">
+                  <input type="url" bind:value={madokamiUrlInput} placeholder="https://manga.madokami.al" autocomplete="off" />
+                </label>
+              </div>
+            </div>
+            <div class="set stack">
+              <div class="what">
+                <strong>HTTP Basic Auth Username</strong>
+                <span>Username for Madokami account.</span>
+              </div>
+              <div class="how wide">
+                <label class="field grow">
+                  <input type="text" bind:value={madokamiUsernameInput} placeholder="Username" autocomplete="off" />
+                </label>
+              </div>
+            </div>
+            <div class="set stack">
+              <div class="what">
+                <strong>HTTP Basic Auth Password</strong>
+                <span>Password for Madokami account.</span>
+              </div>
+              <div class="how wide">
+                <label class="field grow">
+                  <input type="password" bind:value={madokamiPasswordInput} placeholder="Password" autocomplete="off" />
                 </label>
               </div>
             </div>

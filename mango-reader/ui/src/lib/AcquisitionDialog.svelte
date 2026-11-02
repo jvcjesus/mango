@@ -179,6 +179,7 @@ onMount(() => { contentMode = initialMode; selectedReleaseId = initialReleaseId;
             >
               {#if sources.length === 0}
                 <option value="auto">Auto (Recommended)</option>
+                <option value="madokami">Madokami (Direct HTTP)</option>
                 <option value="nyaa">Nyaa (BitTorrent / TorBox)</option>
               {:else}
                 {#each sources as src}

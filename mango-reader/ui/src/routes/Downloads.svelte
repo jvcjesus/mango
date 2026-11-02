@@ -660,6 +660,8 @@
                     <span class="tag spot">{stageLabel(entry)}</span>
                     {#if entry.sourceType === 'nyaa'}
                       <span class="tag spot">Nyaa</span>
+                    {:else if entry.sourceType === 'madokami'}
+                      <span class="tag spot">Madokami</span>
                     {/if}
                     {#if entry.uploader}
                       <span class="tag">{entry.uploader}</span>

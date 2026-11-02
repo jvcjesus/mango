@@ -364,6 +364,36 @@ pub async fn stream_http_to_file<F>(
     config: &TransferConfig,
     chapter_id: i64,
     tracker: &TransferTracker,
+    on_progress: F,
+) -> Result<u64>
+where
+    F: FnMut(u64, Option<u64>, bool) + Send + 'static,
+{
+    stream_http_to_file_with_auth(
+        http,
+        url,
+        None,
+        destination_part,
+        expected_size,
+        config,
+        chapter_id,
+        tracker,
+        on_progress,
+    )
+    .await
+}
+
+/// Streams an HTTP file download directly to a `.part` destination with optional Authorization,
+/// stall detection, safe Range resume, remote ETag change protection, and bounded retries.
+pub async fn stream_http_to_file_with_auth<F>(
+    http: &reqwest::Client,
+    url: &str,
+    auth_header: Option<&str>,
+    destination_part: &Path,
+    expected_size: Option<u64>,
+    config: &TransferConfig,
+    chapter_id: i64,
+    tracker: &TransferTracker,
     mut on_progress: F,
 ) -> Result<u64>
 where
@@ -375,6 +405,7 @@ where
 
     let mut attempt = 1;
     let max_attempts = config.max_attempts;
+    let etag_file = destination_part.with_extension("part.etag");
 
     loop {
         tracing::info!(
@@ -386,7 +417,7 @@ where
         );
 
         // Check if destination .part exists for safe Range resume probe
-        let existing_len = if destination_part.is_file() {
+        let mut existing_len = if destination_part.is_file() {
             std::fs::metadata(destination_part).map(|m| m.len()).unwrap_or(0)
         } else {
             0
@@ -395,6 +426,10 @@ where
         let mut req = http
             .get(url)
             .header("User-Agent", "Mango/1.0 (Native Acquisition Retrieval)");
+
+        if let Some(auth) = auth_header {
+            req = req.header("Authorization", auth);
+        }
 
         if existing_len > 0 {
             tracing::info!(
@@ -420,6 +455,50 @@ where
                     .get("Retry-After")
                     .and_then(|h| h.to_str().ok())
                     .and_then(parse_retry_after);
+
+                // HTML / Error body protection: reject text/html error payloads disguised as successful response
+                if status.is_success() {
+                    if let Some(ct) = resp.headers().get("Content-Type").and_then(|h| h.to_str().ok()) {
+                        let ct_lower = ct.to_ascii_lowercase();
+                        if ct_lower.contains("text/html") || ct_lower.contains("text/plain") {
+                            let err = AppError::new(
+                                502,
+                                "invalid_content_type",
+                                format!("Expected binary manga archive but server returned Content-Type: {ct}"),
+                            );
+                            return Err(err);
+                        }
+                    }
+                }
+
+                // Check for remote ETag change on existing partial file
+                let resp_etag = resp
+                    .headers()
+                    .get("ETag")
+                    .and_then(|h| h.to_str().ok())
+                    .map(|s| s.trim().to_string());
+
+                if existing_len > 0 {
+                    if let Some(ref current_etag) = resp_etag {
+                        if let Ok(saved_etag) = std::fs::read_to_string(&etag_file) {
+                            if !saved_etag.trim().is_empty() && saved_etag.trim() != current_etag {
+                                tracing::warn!(
+                                    "[Transfer] Remote ETag changed ({} != {}) — discarding stale partial download for chapter {}",
+                                    saved_etag.trim(),
+                                    current_etag,
+                                    chapter_id
+                                );
+                                let _ = std::fs::remove_file(destination_part);
+                                let _ = std::fs::remove_file(&etag_file);
+                                existing_len = 0;
+                            }
+                        }
+                    }
+                }
+
+                if let Some(ref et) = resp_etag {
+                    let _ = std::fs::write(&etag_file, et);
+                }
 
                 if status == StatusCode::PARTIAL_CONTENT && existing_len > 0 {
                     // Safe Range resume accepted! Append to existing .part
@@ -448,6 +527,7 @@ where
                                 bytes,
                                 chapter_id
                             );
+                            let _ = std::fs::remove_file(&etag_file);
                             return Ok(bytes);
                         }
                         Err(e) => (is_recoverable_error(&e), retry_after_duration, e.message),
@@ -481,6 +561,7 @@ where
                                 bytes,
                                 chapter_id
                             );
+                            let _ = std::fs::remove_file(&etag_file);
                             return Ok(bytes);
                         }
                         Err(e) => (is_recoverable_error(&e), retry_after_duration, e.message),
@@ -496,6 +577,7 @@ where
                             "[Transfer] Existing .part file is already complete and valid for chapter {}",
                             chapter_id
                         );
+                        let _ = std::fs::remove_file(&etag_file);
                         return Ok(existing_len);
                     }
                     tracing::info!(
@@ -503,6 +585,7 @@ where
                         chapter_id
                     );
                     let _ = std::fs::remove_file(destination_part);
+                    let _ = std::fs::remove_file(&etag_file);
                     (true, None, "Range not satisfiable — resetting partial file".to_string())
                 } else {
                     let err = AppError::new(
@@ -1298,6 +1381,94 @@ mod tests {
         }
 
         assert!(!stale_part.exists(), "Rejected stale .part must be removed");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 15. stream_http_to_file_with_auth: validates Authorization header, HTML error rejection, and remote ETag change reset.
+    #[tokio::test]
+    async fn test_transfer_15_stream_http_to_file_with_auth_and_etag_detection() {
+        let app = Router::new()
+            .route(
+                "/protected_file",
+                get(|headers: axum::http::HeaderMap| async move {
+                    let auth = headers.get("authorization").and_then(|h| h.to_str().ok());
+                    if auth == Some("Basic dGVzdDp0ZXN0") {
+                        (
+                            StatusCode::OK,
+                            [
+                                (header::CONTENT_TYPE, "application/zip"),
+                                (header::ETAG, "\"etag-1\""),
+                            ],
+                            vec![0x50, 0x4B, 0x05, 0x06], // minimal zip end of central dir
+                        )
+                            .into_response()
+                    } else {
+                        (StatusCode::UNAUTHORIZED, "Unauthorized").into_response()
+                    }
+                }),
+            )
+            .route(
+                "/html_page",
+                get(|| async {
+                    (
+                        StatusCode::OK,
+                        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                        "<html><body>Login form</body></html>",
+                    )
+                        .into_response()
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let dir = temp_test_dir("t15");
+        let dest = dir.join("archive.cbz.part");
+        let config = TransferConfig::fast_for_testing();
+        let tracker = TransferTracker::new(config.clone());
+        let http = reqwest::Client::new();
+
+        // 1. Successful download with Authorization header
+        let url = format!("http://127.0.0.1:{port}/protected_file");
+        let res = stream_http_to_file_with_auth(
+            &http,
+            &url,
+            Some("Basic dGVzdDp0ZXN0"),
+            &dest,
+            None,
+            &config,
+            1501,
+            &tracker,
+            |_, _, _| {},
+        )
+        .await;
+
+        assert!(res.is_ok(), "Download with correct auth must succeed: {:?}", res);
+        assert_eq!(std::fs::read(&dest).unwrap(), vec![0x50, 0x4B, 0x05, 0x06]);
+
+        // 2. Reject text/html error page
+        let html_url = format!("http://127.0.0.1:{port}/html_page");
+        let html_dest = dir.join("error.cbz.part");
+        let res_html = stream_http_to_file_with_auth(
+            &http,
+            &html_url,
+            None,
+            &html_dest,
+            None,
+            &config,
+            1502,
+            &tracker,
+            |_, _, _| {},
+        )
+        .await;
+
+        assert!(res_html.is_err(), "HTML page must be rejected");
+        let err = res_html.err().unwrap();
+        assert_eq!(err.code, "invalid_content_type");
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -160,12 +160,7 @@ impl AcquisitionService {
         })?;
 
         // 3. Verify provider capability
-        if candidate.provider != "nyaa" {
-            if candidate.provider == "madokami" {
-                return Err(AppError::bad_request(
-                    "Madokami provider is currently unavailable for acquisition",
-                ));
-            }
+        if candidate.provider != "nyaa" && candidate.provider != "madokami" {
             return Err(AppError::bad_request(format!(
                 "Provider '{}' does not support automated acquisition in Mango",
                 candidate.provider
@@ -173,15 +168,28 @@ impl AcquisitionService {
         }
 
         let (cfg, has_token) = self.load_internal_config().await?;
-        if !cfg.torbox_enabled {
-            return Err(AppError::bad_request(
-                "TorBox download backend is disabled in Settings",
-            ));
-        }
-        if !has_token {
-            return Err(AppError::bad_request(
-                "TorBox API token is not configured. Add it in Settings.",
-            ));
+        if candidate.provider == "nyaa" {
+            if !cfg.torbox_enabled {
+                return Err(AppError::bad_request(
+                    "TorBox download backend is disabled in Settings",
+                ));
+            }
+            if !has_token {
+                return Err(AppError::bad_request(
+                    "TorBox API token is not configured. Add it in Settings.",
+                ));
+            }
+        } else if candidate.provider == "madokami" {
+            if !cfg.madokami_enabled {
+                return Err(AppError::bad_request(
+                    "Madokami download backend is disabled in Settings",
+                ));
+            }
+            if !cfg.has_madokami_credentials {
+                return Err(AppError::bad_request(
+                    "Madokami credentials are not configured. Add them in Settings.",
+                ));
+            }
         }
 
         // 4. Candidate revalidation & Match Confidence Policy
@@ -408,7 +416,18 @@ impl AcquisitionService {
         }
 
         // 8. Bridge candidate into existing acquisition planner & execution pipeline
-        let (classified_unit, _, _) = crate::acquisition::nyaa::classify_release(&candidate.raw_title);
+        let (classified_unit, _, _) = if candidate.provider == "madokami" {
+            let (_, v, _, _, _) = crate::acquisition::madokami::classify_madokami_file(
+                &candidate.raw_title,
+                Some(volume),
+            );
+            match v {
+                Some(vol) => (AcquisitionReleaseUnit::Volume(vol), None, None),
+                None => (AcquisitionReleaseUnit::Volume(volume), None, None),
+            }
+        } else {
+            crate::acquisition::nyaa::classify_release(&candidate.raw_title)
+        };
         let unit = match classified_unit {
             AcquisitionReleaseUnit::Unknown => AcquisitionReleaseUnit::Volume(volume),
             other => other,
@@ -518,7 +537,8 @@ impl AcquisitionService {
         let p_eid = started.id.clone();
         let p_ch_id = chapter_ids.first().copied();
 
-        self.db
+        let insert_res = self
+            .db
             .call(move |conn| {
                 conn.execute(
                     "INSERT INTO candidate_approvals (
@@ -541,7 +561,24 @@ impl AcquisitionService {
                 )?;
                 Ok(())
             })
-            .await?;
+            .await;
+
+        if let Err(ref e) = insert_res {
+            let msg = e.to_string();
+            if msg.contains("UNIQUE constraint failed") || msg.contains("constraint failed") {
+                return Ok(ApproveCandidateResponse {
+                    status: "already_acquiring".to_string(),
+                    message: format!(
+                        "Volume {volume} is already being acquired concurrently under an active candidate approval"
+                    ),
+                    execution_id: None,
+                    chapter_ids: vec![],
+                    already_owned: false,
+                    already_acquiring: true,
+                });
+            }
+            return Err(insert_res.unwrap_err());
+        }
 
         Ok(ApproveCandidateResponse {
             status: "queued".to_string(),

@@ -397,3 +397,224 @@ async fn test_concurrency_atomic_claim() {
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
+
+fn sample_madokami_candidate(
+    match_type: &str,
+    score: f64,
+    raw_title: &str,
+    download_url: Option<&str>,
+) -> PersistedCandidate {
+    PersistedCandidate {
+        series_id: "manga:18".to_string(),
+        volume_number: 9.0,
+        candidate_id: format!("madokami:{}", raw_title.replace(' ', "_")),
+        provider: "madokami".to_string(),
+        provider_item_id: format!("/Manga/K/KA/KAGURABACHI/{raw_title}"),
+        title: raw_title.to_string(),
+        raw_title: raw_title.to_string(),
+        match_type: match_type.to_string(),
+        size_bytes: Some(180 * 1024 * 1024),
+        uploader: Some("Rillant".to_string()),
+        is_trusted: true,
+        is_digital: true,
+        score,
+        score_explanation: "Direct Madokami volume release".to_string(),
+        download_url: download_url.map(|s| s.to_string()),
+        magnet_url: None,
+        info_hash: None,
+        seeders: None,
+        leechers: None,
+        published_at: Some(now()),
+    }
+}
+
+// Case 1: Madokami exact + Nyaa exact -> Madokami preferred!
+#[tokio::test]
+async fn test_provider_preference_case1_madokami_exact_preferred_over_nyaa_exact() {
+    let (db, temp_dir) = create_test_db();
+    let cur_time = now();
+
+    db.call(move |conn| {
+        conn.execute("INSERT INTO manga (id, source_id, url, title, auto_acquire, auto_acquire_activated_at) VALUES (18, 0, 'catalog:18', 'Kagurabachi', 1, ?1)", [cur_time])?;
+        conn.execute("INSERT INTO series_reconciliations (series_id, manga_id, title, status, total_official_volumes, owned_volumes_count, missing_volumes_count, owned_volumes_json, missing_volumes_json, future_volumes_json, last_reconciled_at, updated_at) VALUES ('manga:18', 18, 'Kagurabachi', 'up_to_date', 8, 8, 0, '[1,2,3,4,5,6,7,8]', '[]', '[9]', ?1, ?1)", [cur_time])?;
+        conn.execute("INSERT INTO release_discovery_targets (id, series_id, manga_id, series_title, volume_number, market, edition, release_date, release_date_precision, date_type, status, created_at, updated_at) VALUES (1, 'manga:18', 18, 'Kagurabachi', 9.0, 'en', 'standard', date('now', 'localtime'), 'day', 'published', 'candidate_available', ?1, ?1)", [cur_time])?;
+
+        // Nyaa candidate (even with slightly higher score and high seeders)
+        conn.execute("INSERT INTO discovered_release_candidates (id, series_id, volume_number, candidate_id, provider, provider_item_id, title, raw_title, match_type, size_bytes, is_digital, score, score_explanation, download_url, magnet_url, info_hash, seeders, published_at, discovered_at) VALUES (1, 'manga:18', 9.0, 'nyaa:kagura_v9', 'nyaa', '1', 'Kagurabachi v09 (Digital)', 'Kagurabachi v09 (Digital)', 'exact_volume', 150000000, 1, 90.0, 'score', 'https://nyaa.si', 'magnet:?xt=urn:btih:abc', 'abc', 50, ?1, ?1)", [cur_time])?;
+
+        // Madokami candidate (score 85.0)
+        conn.execute("INSERT INTO discovered_release_candidates (id, series_id, volume_number, candidate_id, provider, provider_item_id, title, raw_title, match_type, size_bytes, is_digital, score, score_explanation, download_url, magnet_url, info_hash, seeders, published_at, discovered_at) VALUES (2, 'manga:18', 9.0, 'madokami:kagura_v9', 'madokami', '2', 'Kagurabachi v09.cbz', 'Kagurabachi v09.cbz', 'exact_volume', 180000000, 1, 85.0, 'score', 'https://manga.madokami.al/dl/1', NULL, NULL, NULL, ?1, ?1)", [cur_time])?;
+
+        set_global_auto_acquire(conn, true)?;
+        set_auto_acquire_dry_run(conn, true)?;
+        Ok(())
+    }).await.unwrap();
+
+    let acq = crate::acquisition::service::AcquisitionService::new(db.clone(), reqwest::Client::new(), None, None);
+    let dec = evaluate_target_for_auto_acquire(&db, &acq, 1).await.unwrap();
+
+    assert_eq!(dec.code, AutoDecisionCode::WouldAutoAcquire);
+    assert_eq!(dec.candidate_id.as_deref(), Some("madokami:kagura_v9"));
+    assert!(dec.reason.contains("Direct HTTP"));
+    assert!(dec.reason.contains("preferred direct provider over torrent"));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+// Case 2: Madokami PRE + Nyaa exact -> Nyaa chosen (PRE requires manual review)
+#[tokio::test]
+async fn test_provider_preference_case2_madokami_pre_falls_back_to_nyaa_exact() {
+    let (db, temp_dir) = create_test_db();
+    let cur_time = now();
+
+    db.call(move |conn| {
+        conn.execute("INSERT INTO manga (id, source_id, url, title, auto_acquire, auto_acquire_activated_at) VALUES (18, 0, 'catalog:18', 'Kagurabachi', 1, ?1)", [cur_time])?;
+        conn.execute("INSERT INTO series_reconciliations (series_id, manga_id, title, status, total_official_volumes, owned_volumes_count, missing_volumes_count, owned_volumes_json, missing_volumes_json, future_volumes_json, last_reconciled_at, updated_at) VALUES ('manga:18', 18, 'Kagurabachi', 'up_to_date', 8, 8, 0, '[1,2,3,4,5,6,7,8]', '[]', '[9]', ?1, ?1)", [cur_time])?;
+        conn.execute("INSERT INTO release_discovery_targets (id, series_id, manga_id, series_title, volume_number, market, edition, release_date, release_date_precision, date_type, status, created_at, updated_at) VALUES (1, 'manga:18', 18, 'Kagurabachi', 9.0, 'en', 'standard', date('now', 'localtime'), 'day', 'published', 'candidate_available', ?1, ?1)", [cur_time])?;
+
+        // Nyaa exact volume
+        conn.execute("INSERT INTO discovered_release_candidates (id, series_id, volume_number, candidate_id, provider, provider_item_id, title, raw_title, match_type, size_bytes, is_digital, score, score_explanation, download_url, magnet_url, info_hash, seeders, published_at, discovered_at) VALUES (1, 'manga:18', 9.0, 'nyaa:kagura_v9', 'nyaa', '1', 'Kagurabachi v09 (Digital)', 'Kagurabachi v09 (Digital)', 'exact_volume', 150000000, 1, 80.0, 'score', 'https://nyaa.si', 'magnet:?xt=urn:btih:abc', 'abc', 30, ?1, ?1)", [cur_time])?;
+
+        // Madokami PRE release
+        conn.execute("INSERT INTO discovered_release_candidates (id, series_id, volume_number, candidate_id, provider, provider_item_id, title, raw_title, match_type, size_bytes, is_digital, score, score_explanation, download_url, magnet_url, info_hash, seeders, published_at, discovered_at) VALUES (2, 'manga:18', 9.0, 'madokami:kagura_v9_pre', 'madokami', '2', 'Kagurabachi v09 (PRE).cbz', 'Kagurabachi v09 (PRE).cbz', 'possible_match', 180000000, 1, 95.0, 'score', 'https://manga.madokami.al/dl/1', NULL, NULL, NULL, ?1, ?1)", [cur_time])?;
+
+        set_global_auto_acquire(conn, true)?;
+        set_auto_acquire_dry_run(conn, true)?;
+        Ok(())
+    }).await.unwrap();
+
+    let acq = crate::acquisition::service::AcquisitionService::new(db.clone(), reqwest::Client::new(), None, None);
+    let dec = evaluate_target_for_auto_acquire(&db, &acq, 1).await.unwrap();
+
+    assert_eq!(dec.code, AutoDecisionCode::WouldAutoAcquire);
+    assert_eq!(dec.candidate_id.as_deref(), Some("nyaa:kagura_v9"));
+    assert!(dec.reason.contains("TorBox"));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+// Case 3: Madokami chapter + Nyaa exact -> Nyaa chosen
+#[test]
+fn test_provider_preference_case3_madokami_chapter_rejected() {
+    let profile = AcquisitionProfile::default();
+    let mado_chap = sample_madokami_candidate(
+        "rejected",
+        70.0,
+        "Kagurabachi c137.cbz",
+        Some("https://manga.madokami.al/dl/1"),
+    );
+    assert_eq!(
+        is_candidate_auto_eligible(&mado_chap, &profile),
+        Err(AutoDecisionCode::CandidateNotExact)
+    );
+}
+
+// Case 4: Madokami pack + Nyaa exact -> Nyaa chosen
+#[test]
+fn test_provider_preference_case4_madokami_pack_rejected() {
+    let profile = AcquisitionProfile::default();
+    let mado_pack = sample_madokami_candidate(
+        "series_pack",
+        85.0,
+        "Kagurabachi v01-08.cbz",
+        Some("https://manga.madokami.al/dl/1"),
+    );
+    assert_eq!(
+        is_candidate_auto_eligible(&mado_pack, &profile),
+        Err(AutoDecisionCode::PackRequiresManual)
+    );
+}
+
+// Case 5: Madokami exact + Nyaa pack -> Madokami wins
+#[tokio::test]
+async fn test_provider_preference_case5_madokami_exact_wins_over_nyaa_pack() {
+    let (db, temp_dir) = create_test_db();
+    let cur_time = now();
+
+    db.call(move |conn| {
+        conn.execute("INSERT INTO manga (id, source_id, url, title, auto_acquire, auto_acquire_activated_at) VALUES (18, 0, 'catalog:18', 'Kagurabachi', 1, ?1)", [cur_time])?;
+        conn.execute("INSERT INTO series_reconciliations (series_id, manga_id, title, status, total_official_volumes, owned_volumes_count, missing_volumes_count, owned_volumes_json, missing_volumes_json, future_volumes_json, last_reconciled_at, updated_at) VALUES ('manga:18', 18, 'Kagurabachi', 'up_to_date', 8, 8, 0, '[1,2,3,4,5,6,7,8]', '[]', '[9]', ?1, ?1)", [cur_time])?;
+        conn.execute("INSERT INTO release_discovery_targets (id, series_id, manga_id, series_title, volume_number, market, edition, release_date, release_date_precision, date_type, status, created_at, updated_at) VALUES (1, 'manga:18', 18, 'Kagurabachi', 9.0, 'en', 'standard', date('now', 'localtime'), 'day', 'published', 'candidate_available', ?1, ?1)", [cur_time])?;
+
+        // Nyaa pack
+        conn.execute("INSERT INTO discovered_release_candidates (id, series_id, volume_number, candidate_id, provider, provider_item_id, title, raw_title, match_type, size_bytes, is_digital, score, score_explanation, download_url, magnet_url, info_hash, seeders, published_at, discovered_at) VALUES (1, 'manga:18', 9.0, 'nyaa:kagura_pack', 'nyaa', '1', 'Kagurabachi v01-09', 'Kagurabachi v01-09', 'series_pack', 900000000, 1, 95.0, 'score', 'https://nyaa.si', 'magnet:?xt=urn:btih:abc', 'abc', 30, ?1, ?1)", [cur_time])?;
+
+        // Madokami exact volume
+        conn.execute("INSERT INTO discovered_release_candidates (id, series_id, volume_number, candidate_id, provider, provider_item_id, title, raw_title, match_type, size_bytes, is_digital, score, score_explanation, download_url, magnet_url, info_hash, seeders, published_at, discovered_at) VALUES (2, 'manga:18', 9.0, 'madokami:kagura_v9', 'madokami', '2', 'Kagurabachi v09.cbz', 'Kagurabachi v09.cbz', 'exact_volume', 180000000, 1, 80.0, 'score', 'https://manga.madokami.al/dl/1', NULL, NULL, NULL, ?1, ?1)", [cur_time])?;
+
+        set_global_auto_acquire(conn, true)?;
+        set_auto_acquire_dry_run(conn, true)?;
+        Ok(())
+    }).await.unwrap();
+
+    let acq = crate::acquisition::service::AcquisitionService::new(db.clone(), reqwest::Client::new(), None, None);
+    let dec = evaluate_target_for_auto_acquire(&db, &acq, 1).await.unwrap();
+
+    assert_eq!(dec.code, AutoDecisionCode::WouldAutoAcquire);
+    assert_eq!(dec.candidate_id.as_deref(), Some("madokami:kagura_v9"));
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+// Case 6: Madokami exact does not require TorBox
+#[test]
+fn test_provider_preference_case6_madokami_exact_independent_of_torbox() {
+    let profile = AcquisitionProfile::default();
+    let mado_cand = sample_madokami_candidate(
+        "exact_volume",
+        80.0,
+        "Kagurabachi v09 (Digital).cbz",
+        Some("https://manga.madokami.al/dl/1"),
+    );
+    assert_eq!(is_candidate_auto_eligible(&mado_cand, &profile), Ok(()));
+}
+
+// Case 7: Madokami down/missing URL -> Nyaa exact chosen
+#[test]
+fn test_provider_preference_case7_madokami_missing_url_rejected() {
+    let profile = AcquisitionProfile::default();
+    let mado_cand = sample_madokami_candidate(
+        "exact_volume",
+        80.0,
+        "Kagurabachi v09 (Digital).cbz",
+        None, // No download URL
+    );
+    assert_eq!(
+        is_candidate_auto_eligible(&mado_cand, &profile),
+        Err(AutoDecisionCode::ProviderUnavailable)
+    );
+}
+
+// Migration 037: Cross-provider unique index prevents competing active acquisitions
+#[tokio::test]
+async fn test_cross_provider_concurrency_race_unique_index_protection() {
+    let (db, temp_dir) = create_test_db();
+    let cur_time = now();
+
+    db.call(move |conn| {
+        conn.execute("INSERT INTO manga (id, source_id, url, title) VALUES (18, 0, 'catalog:18', 'Kagurabachi')", [])?;
+
+        // First approval for Volume 9 (e.g. from Madokami) is acquiring
+        conn.execute(
+            "INSERT INTO candidate_approvals (
+                manga_id, series_id, volume_number, candidate_id, provider, provider_release_id,
+                match_type, approved_at, status
+            ) VALUES (18, 'manga:18', 9.0, 'madokami:kagura_v9', 'madokami', 'file1', 'exact_volume', ?1, 'acquiring')",
+            [cur_time],
+        )?;
+
+        // A second concurrent attempt (e.g. from Nyaa or manual) for the same volume MUST violate the partial unique index
+        let res = conn.execute(
+            "INSERT INTO candidate_approvals (
+                manga_id, series_id, volume_number, candidate_id, provider, provider_release_id,
+                match_type, approved_at, status
+            ) VALUES (18, 'manga:18', 9.0, 'nyaa:kagura_v9', 'nyaa', 'file2', 'exact_volume', ?1, 'queued')",
+            [cur_time],
+        );
+
+        assert!(res.is_err(), "Concurrent active approval for same (series_id, volume_number) must fail unique index");
+        Ok(())
+    }).await.unwrap();
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}

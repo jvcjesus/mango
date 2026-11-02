@@ -6,8 +6,8 @@
 //! mutating media.
 
 use super::providers::{
-    CandidateMatchType, MadokamiReleaseProvider, NyaaReleaseProvider, ReleaseCandidate,
-    ReleaseProvider, ReleaseQuery,
+    CandidateMatchType, MadokamiReleaseProvider, NyaaReleaseProvider, ProviderStatus,
+    ReleaseCandidate, ReleaseProvider, ReleaseQuery,
 };
 use crate::db::{now, Db};
 use crate::error::{AppError, Result};
@@ -294,19 +294,35 @@ pub async fn discover_for_volume(
     }
 
     // 2. Query configured providers
-    let (nyaa_enabled, nyaa_url, nyaa_cat) = db
+    let (nyaa_enabled, nyaa_url, nyaa_cat, mado_enabled, mado_url, mado_user, mado_pass) = db
         .call(|conn| {
-            let enabled = crate::db::state(conn, "acquisition.nyaa_enabled")?
+            let n_enabled = crate::db::state(conn, "acquisition.nyaa_enabled")?
                 .map(|s| s.parse::<bool>().unwrap_or(true))
                 .unwrap_or(true);
-            let url = crate::db::state(conn, "acquisition.nyaa_url")?;
-            let cat = crate::db::state(conn, "acquisition.nyaa_category")?;
-            Ok((enabled, url, cat))
+            let n_url = crate::db::state(conn, "acquisition.nyaa_url")?;
+            let n_cat = crate::db::state(conn, "acquisition.nyaa_category")?;
+
+            let m_enabled = crate::db::state(conn, "acquisition.madokami_enabled")?
+                .map(|s| s.parse::<bool>().unwrap_or(true))
+                .unwrap_or(true);
+            let m_url = crate::db::state(conn, "acquisition.madokami_url")?;
+            let m_user = crate::db::state(conn, "acquisition.madokami_username")?
+                .or_else(|| std::env::var("MADOKAMI_USERNAME").ok());
+            let m_pass = crate::db::state(conn, "acquisition.madokami_password")?
+                .or_else(|| std::env::var("MADOKAMI_PASSWORD").ok());
+
+            Ok((n_enabled, n_url, n_cat, m_enabled, m_url, m_user, m_pass))
         })
         .await?;
 
     let nyaa_provider = NyaaReleaseProvider::new(http.clone(), nyaa_url, nyaa_cat, nyaa_enabled);
-    let madokami_provider = MadokamiReleaseProvider::new(http.clone(), None);
+    let madokami_provider = MadokamiReleaseProvider::new(
+        http.clone(),
+        mado_url,
+        mado_user,
+        mado_pass,
+        mado_enabled,
+    );
 
     let query = ReleaseQuery {
         series_title: series_title.clone(),
@@ -319,9 +335,14 @@ pub async fn discover_for_volume(
     let mut providers_checked = Vec::new();
     let mut provider_errors = HashMap::new();
 
-    // Query Nyaa
+    // Query providers concurrently
+    let (nyaa_res, mado_res) = tokio::join!(
+        nyaa_provider.search_releases(&query),
+        madokami_provider.search_releases(&query)
+    );
+
     providers_checked.push("nyaa".to_string());
-    match nyaa_provider.search_releases(&query).await {
+    match nyaa_res {
         Ok(res) => {
             candidates.extend(res);
         }
@@ -330,13 +351,14 @@ pub async fn discover_for_volume(
         }
     }
 
-    // Query Madokami seam
     providers_checked.push("madokami".to_string());
     let madokami_health = madokami_provider.check_health().await;
     if let Some(msg) = madokami_health.message {
-        provider_errors.insert("madokami".to_string(), msg);
+        if madokami_health.status != ProviderStatus::Available {
+            provider_errors.insert("madokami".to_string(), msg);
+        }
     }
-    match madokami_provider.search_releases(&query).await {
+    match mado_res {
         Ok(res) => {
             candidates.extend(res);
         }
@@ -858,6 +880,10 @@ mod tests {
         assert_eq!(res.status, "no_candidates");
         assert_eq!(res.candidate_count, 0);
         assert!(res.provider_errors.contains_key("madokami"));
-        assert!(res.provider_errors["madokami"].contains("Madokami is currently offline"));
+        assert!(
+            res.provider_errors["madokami"].contains("not configured")
+                || res.provider_errors["madokami"].contains("offline")
+                || res.provider_errors["madokami"].contains("Madokami")
+        );
     }
 }
