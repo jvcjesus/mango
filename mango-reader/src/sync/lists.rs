@@ -21,6 +21,7 @@ use crate::{
         catalog::list_tracked,
         mapping::list_mappings,
         model::{KomgaSeriesProgress, MappingConfidence},
+        reconciliation::{list_reconciliations, ReconciliationStatus, ReconciliationSummary},
     },
     trackers::{Kind, Trackers, anilist},
 };
@@ -585,6 +586,90 @@ fn find_local_manga_id(
     None
 }
 
+/// Derives canonical ownership status and units, prioritizing authoritative series_reconciliations.
+fn resolve_ownership(
+    reconciliations: &[ReconciliationSummary],
+    manga_id: Option<i64>,
+    komga_id: Option<&str>,
+    mangabaka_id: Option<i64>,
+    title: &str,
+    komga_prog: Option<&KomgaSeriesProgress>,
+    fallback_total_units: Option<i64>,
+) -> (String, Option<usize>, Option<i64>) {
+    let norm = normalize_title(title);
+    let matched_recon = reconciliations.iter().find(|r| {
+        if let (Some(m1), Some(m2)) = (manga_id, r.manga_id) {
+            if m1 == m2 {
+                return true;
+            }
+        }
+        if let (Some(k1), Some(ref k2)) = (komga_id, &r.komga_series_id) {
+            if k1 == k2.as_str() {
+                return true;
+            }
+        }
+        if let (Some(mb1), Some(mb2)) = (mangabaka_id, r.mangabaka_id) {
+            if mb1 == mb2 {
+                return true;
+            }
+        }
+        normalize_title(&r.title) == norm
+    });
+
+    if let Some(r) = matched_recon {
+        let owned_cnt = r.owned_volumes_count;
+        let tot_cnt = r.total_official_volumes.map(|v| v as i64).or(fallback_total_units);
+        let status = match r.status {
+            ReconciliationStatus::UpToDate => {
+                if r.is_ongoing {
+                    "Up to date"
+                } else {
+                    "Complete"
+                }
+            }
+            ReconciliationStatus::MissingVolume => {
+                if r.owned_volumes_count > 0 {
+                    "Partially Owned"
+                } else {
+                    "Not Owned"
+                }
+            }
+            _ => {
+                if r.missing_volumes_count == 0 && r.owned_volumes_count > 0 {
+                    if r.is_ongoing {
+                        "Up to date"
+                    } else {
+                        "Complete"
+                    }
+                } else if r.missing_volumes_count > 0 && r.owned_volumes_count > 0 {
+                    "Partially Owned"
+                } else if r.owned_volumes_count == 0 {
+                    "Not Owned"
+                } else {
+                    "Owned"
+                }
+            }
+        };
+        (status.to_string(), Some(owned_cnt), tot_cnt)
+    } else if let Some(kp) = komga_prog {
+        let owned_count = kp.total_books;
+        let status = if owned_count == 0 {
+            "Not Owned"
+        } else if let Some(tot) = fallback_total_units {
+            if tot > 0 && owned_count >= tot as usize {
+                "Owned"
+            } else {
+                "Partially Owned"
+            }
+        } else {
+            "Owned"
+        };
+        (status.to_string(), Some(owned_count), fallback_total_units)
+    } else {
+        ("Not Owned".to_string(), None, fallback_total_units)
+    }
+}
+
 /// Assembles the unified catalog from cached tracker list entries, DB mappings,
 /// tracked catalog entries, and Komga series ownership.
 pub fn build_unified_catalog(
@@ -596,6 +681,7 @@ pub fn build_unified_catalog(
     let refresh_statuses = get_refresh_statuses(conn)?;
     let mappings = list_mappings(conn, None)?;
     let tracked_rows = list_tracked(conn).unwrap_or_default();
+    let reconciliations = list_reconciliations(conn).unwrap_or_default();
 
     // Map komga_series_id -> KomgaSeriesProgress
     let komga_map: HashMap<&str, &KomgaSeriesProgress> = komga_series_list
@@ -743,29 +829,53 @@ pub fn build_unified_catalog(
 
         let komga_id = komga_prog.map(|p| p.series_id.clone());
 
-        let total_units = al
+        let display_title = resolve_display_title(
+            al.english_title.as_deref(),
+            None,
+            al.romaji_title.as_deref(),
+            al.native_title.as_deref(),
+            matched_mb.and_then(|m| m.english_title.as_deref()),
+            matched_mb.and_then(|m| m.romaji_title.as_deref()),
+            matched_mb.map(|m| m.title.as_str()),
+            matched_mb.and_then(|m| m.native_title.as_deref()),
+            &al.title,
+        );
+
+        // Tracked catalog entry
+        let tracked_entry = tracked_rows.iter().find(|t| {
+            if let (Some(k1), Some(k2)) = (&komga_id, &t.komga_series_id) {
+                if k1 == k2 {
+                    return true;
+                }
+            }
+            normalize_title(&t.title) == al_norm
+        });
+
+        let auto_acquire = tracked_entry.map_or(false, |t| t.auto_acquire);
+
+        let mb_numeric_id = matched_mb.and_then(|m| m.tracker_id.parse::<i64>().ok());
+        let manga_id = find_local_manga_id(
+            conn,
+            tracked_entry.and_then(|t| t.manga_id),
+            mb_numeric_id,
+            &display_title,
+        );
+
+        let fallback_total_units = al
             .total_volumes
             .or(al.total_chapters)
             .or_else(|| matched_mb.and_then(|m| m.total_volumes.or(m.total_chapters)));
 
-        // Ownership calculation
-        let (ownership_status, owned_units) = if let Some(kp) = komga_prog {
-            let owned_count = kp.total_books;
-            let status = if owned_count == 0 {
-                "Not Owned"
-            } else if let Some(tot) = total_units {
-                if tot > 0 && owned_count >= tot as usize {
-                    "Owned"
-                } else {
-                    "Partially Owned"
-                }
-            } else {
-                "Owned"
-            };
-            (status.to_string(), Some(owned_count))
-        } else {
-            ("Not Owned".to_string(), None)
-        };
+        // Ownership calculation prioritizing authoritative series_reconciliations
+        let (ownership_status, owned_units, total_units) = resolve_ownership(
+            &reconciliations,
+            manga_id,
+            komga_id.as_deref(),
+            mb_numeric_id,
+            &display_title,
+            komga_prog,
+            fallback_total_units,
+        );
 
         // Normalized status determination
         let norm_status = if let Some(kp) = komga_prog {
@@ -801,18 +911,6 @@ pub fn build_unified_catalog(
                 matched_mb.map(|m| m.normalized_status.as_str()),
             )
         };
-
-        // Tracked catalog entry
-        let tracked_entry = tracked_rows.iter().find(|t| {
-            if let (Some(k1), Some(k2)) = (&komga_id, &t.komga_series_id) {
-                if k1 == k2 {
-                    return true;
-                }
-            }
-            normalize_title(&t.title) == al_norm
-        });
-
-        let auto_acquire = tracked_entry.map_or(false, |t| t.auto_acquire);
 
         let al_detail = TrackerItemDetail {
             tracker_id: al.tracker_id.clone(),
@@ -852,18 +950,6 @@ pub fn build_unified_catalog(
             al.cover_url.as_deref(),
             al.medium_cover_url.as_deref(),
             matched_mb.and_then(|m| m.cover_url.as_deref()),
-        );
-
-        let display_title = resolve_display_title(
-            al.english_title.as_deref(),
-            None,
-            al.romaji_title.as_deref(),
-            al.native_title.as_deref(),
-            matched_mb.and_then(|m| m.english_title.as_deref()),
-            matched_mb.and_then(|m| m.romaji_title.as_deref()),
-            matched_mb.map(|m| m.title.as_str()),
-            matched_mb.and_then(|m| m.native_title.as_deref()),
-            &al.title,
         );
 
         let mut unified_aliases: Vec<String> = Vec::new();
@@ -922,12 +1008,6 @@ pub fn build_unified_catalog(
             .or_else(|| matched_mb.and_then(|m| m.format.clone()));
         let updated_at = al.updated_at.max(matched_mb.map_or(0, |m| m.updated_at));
         let catalog = resolve_catalog_info(conn, matched_mb, &display_title);
-        let manga_id = find_local_manga_id(
-            conn,
-            tracked_entry.and_then(|t| t.manga_id),
-            matched_mb.and_then(|m| m.tracker_id.parse::<i64>().ok()),
-            &display_title,
-        );
 
         unified_items.push(UnifiedTrackedItem {
             id: composite_id,
@@ -964,25 +1044,49 @@ pub fn build_unified_catalog(
             .or_else(|| komga_by_norm_title.get(&mb_norm).copied());
 
         let komga_id = komga_prog.map(|p| p.series_id.clone());
-        let total_units = mb.total_volumes.or(mb.total_chapters);
 
-        let (ownership_status, owned_units) = if let Some(kp) = komga_prog {
-            let owned_count = kp.total_books;
-            let status = if owned_count == 0 {
-                "Not Owned"
-            } else if let Some(tot) = total_units {
-                if tot > 0 && owned_count >= tot as usize {
-                    "Owned"
-                } else {
-                    "Partially Owned"
+        let display_title = resolve_display_title(
+            None,
+            None,
+            None,
+            None,
+            mb.english_title.as_deref(),
+            mb.romaji_title.as_deref(),
+            Some(&mb.title),
+            mb.native_title.as_deref(),
+            &mb.title,
+        );
+
+        let tracked_entry = tracked_rows.iter().find(|t| {
+            if let (Some(k1), Some(k2)) = (&komga_id, &t.komga_series_id) {
+                if k1 == k2 {
+                    return true;
                 }
-            } else {
-                "Owned"
-            };
-            (status.to_string(), Some(owned_count))
-        } else {
-            ("Not Owned".to_string(), None)
-        };
+            }
+            normalize_title(&t.title) == mb_norm
+        });
+
+        let auto_acquire = tracked_entry.map_or(false, |t| t.auto_acquire);
+        let mb_numeric_id = mb.tracker_id.parse::<i64>().ok();
+
+        let manga_id = find_local_manga_id(
+            conn,
+            tracked_entry.and_then(|t| t.manga_id),
+            mb_numeric_id,
+            &display_title,
+        );
+
+        let fallback_total_units = mb.total_volumes.or(mb.total_chapters);
+
+        let (ownership_status, owned_units, total_units) = resolve_ownership(
+            &reconciliations,
+            manga_id,
+            komga_id.as_deref(),
+            mb_numeric_id,
+            &display_title,
+            komga_prog,
+            fallback_total_units,
+        );
 
         let norm_status = if let Some(kp) = komga_prog {
             if kp.completed_books > 0
@@ -1005,17 +1109,6 @@ pub fn build_unified_catalog(
             mb.normalized_status.clone()
         };
 
-        let tracked_entry = tracked_rows.iter().find(|t| {
-            if let (Some(k1), Some(k2)) = (&komga_id, &t.komga_series_id) {
-                if k1 == k2 {
-                    return true;
-                }
-            }
-            normalize_title(&t.title) == mb_norm
-        });
-
-        let auto_acquire = tracked_entry.map_or(false, |t| t.auto_acquire);
-
         let mb_detail = TrackerItemDetail {
             tracker_id: mb.tracker_id.clone(),
             title: Some(mb.title.clone()),
@@ -1028,18 +1121,6 @@ pub fn build_unified_catalog(
             total_volumes: mb.total_volumes,
             updated_at: mb.updated_at,
         };
-
-        let display_title = resolve_display_title(
-            None,
-            None,
-            None,
-            None,
-            mb.english_title.as_deref(),
-            mb.romaji_title.as_deref(),
-            Some(&mb.title),
-            mb.native_title.as_deref(),
-            &mb.title,
-        );
 
         let cover_url = resolve_cover_url(None, None, None, None, mb.cover_url.as_deref());
 
@@ -1069,12 +1150,6 @@ pub fn build_unified_catalog(
         }
 
         let catalog = resolve_catalog_info(conn, Some(mb), &display_title);
-        let manga_id = find_local_manga_id(
-            conn,
-            tracked_entry.and_then(|t| t.manga_id),
-            mb.tracker_id.parse::<i64>().ok(),
-            &display_title,
-        );
 
         unified_items.push(UnifiedTrackedItem {
             id: format!("mb-{}", mb.tracker_id),
@@ -1114,7 +1189,7 @@ pub fn build_unified_catalog(
         }
 
         match item.ownership_status.as_str() {
-            "Owned" => summary.owned += 1,
+            "Owned" | "Up to date" | "Complete" => summary.owned += 1,
             "Partially Owned" => summary.partially_owned += 1,
             _ => summary.not_owned += 1,
         }
@@ -1132,11 +1207,15 @@ pub fn build_unified_catalog(
             }
             if let Some(ref ow) = query.ownership {
                 let ow_norm = ow.to_lowercase().replace('_', " ");
-                if !ow.is_empty()
-                    && ow != "all"
-                    && !item.ownership_status.to_lowercase().eq(&ow_norm)
-                {
-                    return false;
+                if !ow.is_empty() && ow != "all" {
+                    if ow_norm == "owned" {
+                        let s = item.ownership_status.to_lowercase();
+                        if s != "owned" && s != "up to date" && s != "complete" {
+                            return false;
+                        }
+                    } else if !item.ownership_status.to_lowercase().eq(&ow_norm) {
+                        return false;
+                    }
                 }
             }
             if let Some(ref tr) = query.tracker {

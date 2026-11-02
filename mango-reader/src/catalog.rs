@@ -13,6 +13,7 @@ use crate::{
     pipeline::metadata::{get_cached_series, upsert_cached_series, CachedMangaBakaSeries},
     sync::catalog::add_or_update_tracked,
     sync::reconciliation::ReconciliationTarget,
+    titles::clean_description,
 };
 use reqwest::Method;
 use rusqlite::{params, OptionalExtension};
@@ -674,18 +675,99 @@ pub async fn convert_to_catalog_title(
         None => format!("catalog:{source_manga_id}"),
     };
 
+    // If mb_id is known, attempt to load or fetch MangaBaka series metadata
+    let mb_series_meta = if let Some(id) = mb_id {
+        let cached = app.db.call(move |conn| get_cached_series(conn, id)).await.ok().flatten();
+        if cached.is_some() {
+            cached
+        } else {
+            let config_res = app.pipeline.load_internal_config().await;
+            if let Ok((cfg, mb_token, _)) = config_res {
+                let client = MangaBakaClient::new(app.trackers.http().clone(), cfg.mangabaka_url, mb_token);
+                let endpoint = format!("/series/{id}");
+                if let Ok(resp) = client.public_request(Method::GET, &endpoint).send().await {
+                    if resp.status().is_success() {
+                        if let Ok(raw) = resp.json::<serde_json::Value>().await {
+                            let item = raw.get("data").unwrap_or(&raw).clone();
+                            let (display_title, english_title, romaji_title, native_title, aliases) =
+                                extract_mb_series_title_info(&item);
+                            let cover_url = extract_mb_series_cover(&item);
+                            let s = CachedMangaBakaSeries {
+                                series_id: id,
+                                title: display_title,
+                                english_title,
+                                romaji_title,
+                                native_title,
+                                aliases,
+                                cover_url,
+                                authors: Vec::new(),
+                                artists: Vec::new(),
+                                publisher: item.get("publisher").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                                genres: Vec::new(),
+                                tags: Vec::new(),
+                                summary: item.get("description").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                                total_volumes: item.get("total_volumes").and_then(|v| v.as_i64()),
+                                status: item.get("status").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                                web_url: Some(format!("https://mangabaka.org/series/{id}")),
+                                raw_json: Some(item.to_string()),
+                                updated_at: now(),
+                            };
+                            let s_c = s.clone();
+                            let _ = app.db.call(move |conn| upsert_cached_series(conn, &s_c)).await;
+                            Some(s)
+                        } else { None }
+                    } else { None }
+                } else { None }
+            } else { None }
+        }
+    } else {
+        None
+    };
+
+    // Query source manga's actual thumbnail_url and description from database
+    let (source_db_thumb, source_db_desc): (Option<String>, Option<String>) = app
+        .db
+        .call(move |conn| {
+            let row = conn.query_row(
+                "SELECT thumbnail_url, description FROM manga WHERE id = ?1",
+                [source_manga_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            ).optional()?;
+            Ok(row.unwrap_or((None, None)))
+        })
+        .await?;
+
+    let thumb_c = mb_series_meta.as_ref().and_then(|s| s.cover_url.clone())
+        .or_else(|| source_db_thumb.filter(|u| !u.is_empty() && !u.starts_with("api/")));
+    let desc_c = mb_series_meta.as_ref().and_then(|s| s.summary.clone().filter(|d| !d.is_empty()))
+        .or_else(|| source_db_desc.map(|d| clean_description(&d)))
+        .or_else(|| source_manga.description.clone().map(|d| clean_description(&d)));
+    let author_c = if let Some(ref s) = mb_series_meta {
+        if !s.authors.is_empty() { Some(s.authors.join(", ")) } else { source_manga.author.clone() }
+    } else {
+        source_manga.author.clone()
+    };
+    let artist_c = if let Some(ref s) = mb_series_meta {
+        if !s.artists.is_empty() { Some(s.artists.join(", ")) } else { source_manga.artist.clone() }
+    } else {
+        source_manga.artist.clone()
+    };
+    let genre_c = if let Some(ref s) = mb_series_meta {
+        if !s.genres.is_empty() { Some(s.genres.join(", ")) } else if !source_manga.genres.is_empty() { Some(source_manga.genres.join(", ")) } else { None }
+    } else if !source_manga.genres.is_empty() {
+        Some(source_manga.genres.join(", "))
+    } else {
+        None
+    };
+
     // 3. Find or create the catalog manga row
     let catalog_manga_id: i64 = app
         .db
         .call({
             let url_c = catalog_url.clone();
             let title_c = title_str.clone();
-            let author_c = source_manga.author.clone();
-            let artist_c = source_manga.artist.clone();
-            let desc_c = source_manga.description.clone();
-            let genre_c = if source_manga.genres.is_empty() { None } else { Some(source_manga.genres.join(", ")) };
-            let thumb_c = source_manga.cover.clone();
             let status_c = source_manga.status;
+            let thumb_for_db = thumb_c.clone();
             let now_ts = now();
 
             move |conn| {
@@ -700,15 +782,15 @@ pub async fn convert_to_catalog_title(
 
                 let cat_id = if let Some(id) = existing {
                     conn.execute(
-                        "UPDATE manga SET in_library = 1, source_manga_id = ?1, mangabaka_id = COALESCE(?2, mangabaka_id) WHERE id = ?3",
-                        params![source_manga_id, mb_id, id],
+                        "UPDATE manga SET in_library = 1, source_manga_id = ?1, mangabaka_id = COALESCE(?2, mangabaka_id), thumbnail_url = COALESCE(?3, thumbnail_url), description = COALESCE(?4, description) WHERE id = ?5",
+                        params![source_manga_id, mb_id, thumb_for_db, desc_c, id],
                     )?;
                     id
                 } else {
                     conn.execute(
                         "INSERT INTO manga (source_id, url, title, author, artist, description, genre, thumbnail_url, status, in_library, mangabaka_id, source_manga_id, added_at, initialized)
                          VALUES (0, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 1, ?9, ?10, ?11, 1)",
-                        params![url_c, title_c, author_c, artist_c, desc_c, genre_c, thumb_c, status_c, mb_id, source_manga_id, now_ts],
+                        params![url_c, title_c, author_c, artist_c, desc_c, genre_c, thumb_for_db, status_c, mb_id, source_manga_id, now_ts],
                     )?;
                     conn.last_insert_rowid()
                 };
@@ -797,6 +879,17 @@ pub async fn convert_to_catalog_title(
             }
         })
         .await?;
+
+    // Copy any kept cover from source manga to catalog manga for instant offline display
+    if let Some(bytes) = app.images.find_any_kept_cover(source_manga_id).await {
+        if let Some(ref thumb) = thumb_c {
+            let kept_path = app.images.kept_cover(catalog_manga_id, thumb);
+            if let Some(parent) = kept_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(&kept_path, &bytes);
+        }
+    }
 
     // Invalidate ownership cache for both IDs
     app.pipeline.ownership.invalidate(source_manga_id);

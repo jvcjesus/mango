@@ -397,6 +397,66 @@ impl Titles {
 
 // ---------- helpers ----------
 
+/// Cleans raw scraped pseudo-metadata, stars/ratings headers, and trailing link spam from manga descriptions.
+pub fn clean_description(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    // 1. Strip scraper header (e.g. "★★★★☆ 8.6\n\n**Year:** 2018 ... \n\n---\n\n")
+    let after_header = if let Some(pos) = trimmed.find("\n---\n") {
+        let prefix = &trimmed[..pos];
+        if prefix.contains('★') || prefix.contains("**Year:**") || prefix.contains("**Chapters:**") || prefix.contains("Rating:") {
+            trimmed[pos + 5..].trim_start()
+        } else {
+            trimmed
+        }
+    } else if let Some(pos) = trimmed.find("\n\n---\n\n") {
+        let prefix = &trimmed[..pos];
+        if prefix.contains('★') || prefix.contains("**Year:**") || prefix.contains("**Chapters:**") || prefix.contains("Rating:") {
+            trimmed[pos + 7..].trim_start()
+        } else {
+            trimmed
+        }
+    } else if let Some(pos) = trimmed.find("---\n\n") {
+        let prefix = &trimmed[..pos];
+        if prefix.contains('★') || prefix.contains("**Year:**") || prefix.contains("**Chapters:**") || prefix.contains("Rating:") {
+            trimmed[pos + 5..].trim_start()
+        } else {
+            trimmed
+        }
+    } else {
+        trimmed
+    };
+
+    // 2. Strip trailing links block (e.g. "\n\n**Links:**\n- [AniList]..." or "\n\n**Alternative Names:**\n- ...")
+    let before_links = if let Some(pos) = after_header.find("\n\n**Links:**") {
+        after_header[..pos].trim_end()
+    } else if let Some(pos) = after_header.find("\n**Links:**") {
+        after_header[..pos].trim_end()
+    } else if let Some(pos) = after_header.find("\n\nLinks:\n") {
+        after_header[..pos].trim_end()
+    } else {
+        after_header
+    };
+
+    let before_alt_names = if let Some(pos) = before_links.find("\n\n**Alternative Names:**") {
+        before_links[..pos].trim_end()
+    } else if let Some(pos) = before_links.find("\n**Alternative Names:**") {
+        before_links[..pos].trim_end()
+    } else {
+        before_links
+    };
+
+    let result = before_alt_names.trim();
+    if result.is_empty() {
+        trimmed.to_string()
+    } else {
+        result.to_string()
+    }
+}
+
 /// Address of a title's cover. It changes with the source's image, so it can be cached for good.
 pub fn cover_url(id: i64, thumbnail: Option<&str>) -> Option<String> {
     thumbnail.filter(|t| !t.is_empty()).map(|t| format!("api/manga/{id}/cover?v={:08x}", fnv(t)))
@@ -653,7 +713,7 @@ pub(crate) fn read_title(conn: &Connection, id: i64) -> Result<TitleView> {
                     title: r.get(6)?,
                     artist: r.get(7)?,
                     author: r.get(8)?,
-                    description: r.get(9)?,
+                    description: r.get::<_, Option<String>>(9)?.map(|d| clean_description(&d)),
                     genres: genre.iter().flat_map(|g| g.split(',')).map(str::trim).filter(|g| !g.is_empty()).map(str::to_owned).collect(),
                     status: r.get(11)?,
                     cover: cover_url(id, thumbnail.as_deref()),
@@ -1009,5 +1069,17 @@ mod tests {
         assert_eq!(web_url(Some("javascript:alert(1)".into()), "/t/1"), None);
         assert_eq!(web_url(Some("https://example.org".into()), "opaque-key"), None);
         assert_eq!(cover_url(3, Some("")), None);
+    }
+
+    #[test]
+    fn clean_description_strips_scraped_header_and_links() {
+        let raw = "★★★★☆ 8.6\n\n**Year:** 2018 · **Chapters:** 384 · **Volumes:** 39 · **Tracked:** 1850 · **Content Rating:** Safe · 183 ratings\n\n---\n\nAfter a disastrous defeat at the 2018 World Cup, Japan’s team struggles to regroup. But what’s missing?\n\n*Source: Kodansha USA, Vol. 1*\n\n\n**Links:**\n- [AniList](https://anilist.co/manga/106130)\n- [MangaUpdates](https://www.mangaupdates.com/series/joxc7wz)\n\n**Alternative Names:**\n- 블루 록\n- BLUELOCK";
+        let cleaned = clean_description(raw);
+        assert!(!cleaned.contains("★★★★☆"), "Stars must be stripped");
+        assert!(!cleaned.contains("**Year:**"), "Year header must be stripped");
+        assert!(!cleaned.contains("**Links:**"), "Links block must be stripped");
+        assert!(!cleaned.contains("**Alternative Names:**"), "Alternative names block must be stripped");
+        assert!(cleaned.starts_with("After a disastrous defeat"));
+        assert!(cleaned.ends_with("*Source: Kodansha USA, Vol. 1*"));
     }
 }

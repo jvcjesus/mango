@@ -97,6 +97,7 @@ pub struct Images {
     db: Db,
     host: Arc<Host>,
     local: Local,
+    http: reqwest::Client,
     cache: PathBuf,
     covers: PathBuf,
     downloads: PathBuf,
@@ -114,6 +115,10 @@ impl Images {
             db,
             host,
             local,
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(30))
+                .build()
+                .unwrap_or_default(),
             cache: data_dir.join("cache"),
             covers: data_dir.join("covers"),
             downloads: data_dir.join("downloads"),
@@ -125,40 +130,186 @@ impl Images {
         }
     }
 
+    /// Checks if any kept cover file exists on disk for this manga ID (matching "{manga_id}-*").
+    pub async fn find_any_kept_cover(&self, manga_id: i64) -> Option<Vec<u8>> {
+        let covers_dir = self.covers.clone();
+        tokio::task::spawn_blocking(move || {
+            let prefix = format!("{manga_id}-");
+            if let Ok(entries) = std::fs::read_dir(&covers_dir) {
+                for entry in entries.flatten() {
+                    let file_name = entry.file_name();
+                    let name_str = file_name.to_string_lossy();
+                    if name_str.starts_with(&prefix) {
+                        if let Ok(bytes) = std::fs::read(entry.path()) {
+                            if !bytes.is_empty() {
+                                return Some(bytes);
+                            }
+                        }
+                    }
+                }
+            }
+            None
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
     pub async fn cover(&self, manga: i64) -> Result<Image> {
         let row = self
             .db
             .call(move |conn| {
                 Ok(conn
-                    .query_row("SELECT source_id, thumbnail_url, in_library, url FROM manga WHERE id = ?1", [manga], |r| {
-                        Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, bool>(2)?, r.get::<_, String>(3)?))
-                    })
+                    .query_row(
+                        "SELECT source_id, thumbnail_url, in_library, url, source_manga_id, mangabaka_id
+                         FROM manga WHERE id = ?1",
+                        [manga],
+                        |r| {
+                            Ok((
+                                r.get::<_, i64>(0)?,
+                                r.get::<_, Option<String>>(1)?,
+                                r.get::<_, bool>(2)?,
+                                r.get::<_, String>(3)?,
+                                r.get::<_, Option<i64>>(4)?,
+                                r.get::<_, Option<i64>>(5)?,
+                            ))
+                        },
+                    )
                     .optional()?)
             })
             .await?;
-        let Some((source, Some(url), in_library, key)) = row else {
+        let Some((source, thumb_url_opt, in_library, key, source_manga_id, mangabaka_id)) = row else {
             return Err(AppError::not_found("This title has no cover"));
         };
+
         // A local title's cover is read from its folder each time; there is nothing to fetch or keep.
-        if source == local::SOURCE {
+        // Catalog titles have source_id == 0, but their key starts with "catalog:" or they have mangabaka_id/source_manga_id.
+        // Only true local files on disk (where key is a folder name in <data>/local) should use local.cover.
+        if source == local::SOURCE && !key.starts_with("catalog:") && mangabaka_id.is_none() && source_manga_id.is_none() {
             let local = self.local.clone();
             return Image::checked(local::blocking(move || local.cover(&key)).await?);
         }
+
+        // 1. If we already have a kept cover on disk for this title, return it immediately.
+        if let Some(ref thumb_url) = thumb_url_opt {
+            let kept = self.kept_cover(manga, thumb_url);
+            if let Some(bytes) = read(kept).await {
+                return Image::checked(bytes);
+            }
+        }
+        // Also check if any kept cover exists on disk with prefix "{manga}-"
+        if let Some(bytes) = self.find_any_kept_cover(manga).await {
+            return Image::checked(bytes);
+        }
+
+        // 2. If this is a catalog title with a source_manga_id, check if the source manga has a kept cover on disk.
+        if let Some(src_id) = source_manga_id {
+            if let Some(bytes) = self.find_any_kept_cover(src_id).await {
+                // Copy/persist to this catalog manga's kept cover path if we have a thumb_url
+                if let Some(ref thumb_url) = thumb_url_opt {
+                    let kept = self.kept_cover(manga, thumb_url);
+                    write(kept, bytes.clone()).await;
+                }
+                return Image::checked(bytes);
+            }
+        }
+
+        // 3. Resolve the actual external cover URL if missing, invalid, or an internal API path.
+        let mut resolved_url = thumb_url_opt.clone();
+        if resolved_url.as_deref().map_or(true, |u| u.is_empty() || u.starts_with("api/")) {
+            let db = self.db.clone();
+            let mb_id = mangabaka_id;
+            let src_id = source_manga_id;
+            let found_url: Option<String> = db
+                .call(move |conn| {
+                    if let Some(mb) = mb_id {
+                        if let Ok(Some(cached)) = crate::pipeline::metadata::get_cached_series(conn, mb) {
+                            if let Some(u) = cached.cover_url {
+                                if !u.is_empty() && !u.starts_with("api/") {
+                                    return Ok(Some(u));
+                                }
+                            }
+                        }
+                        if let Ok(u) = conn.query_row(
+                            "SELECT cover_url FROM tracker_list_entries WHERE tracker = 'mangabaka' AND tracker_id = ?1 AND cover_url IS NOT NULL",
+                            [mb.to_string()],
+                            |r| r.get::<_, String>(0),
+                        ) {
+                            if !u.is_empty() && !u.starts_with("api/") {
+                                return Ok(Some(u));
+                            }
+                        }
+                    }
+                    if let Some(src) = src_id {
+                        if let Ok(u) = conn.query_row(
+                            "SELECT thumbnail_url FROM manga WHERE id = ?1",
+                            [src],
+                            |r| r.get::<_, Option<String>>(0),
+                        ) {
+                            if let Some(u) = u {
+                                if !u.is_empty() && !u.starts_with("api/") {
+                                    return Ok(Some(u));
+                                }
+                            }
+                        }
+                    }
+                    Ok(None)
+                })
+                .await?;
+
+            if let Some(u) = found_url {
+                let u_c = u.clone();
+                let _ = self
+                    .db
+                    .call(move |conn| {
+                        conn.execute("UPDATE manga SET thumbnail_url = ?1 WHERE id = ?2", params![u_c, manga])?;
+                        Ok(())
+                    })
+                    .await;
+                resolved_url = Some(u);
+            }
+        }
+
+        let Some(url) = resolved_url else {
+            return Err(AppError::not_found("This title has no cover"));
+        };
+
         let name = format!("{manga}-{:08x}", fnv(&url));
         let kept = self.kept_cover(manga, &url);
         let cached = self.cache.join("covers").join(&name);
+
         if let Some(bytes) = read(kept.clone()).await {
             return Image::checked(bytes);
         }
 
         let _once = self.locks.lock(format!("cover:{name}")).await;
+        if let Some(bytes) = read(kept.clone()).await {
+            return Image::checked(bytes);
+        }
+
         let (bytes, fetched) = match read(cached.clone()).await {
             Some(bytes) => (bytes, false),
             None => {
-                let opts = Call { source: Some(source), ..Call::default() };
-                (self.host.bytes(&format!("/sources/{source}/image"), &json!({ "cover": url }), opts).await?, true)
+                // If source == 0 or URL starts with http:// or https://, fetch directly via HTTP Client!
+                if source == 0 || url.starts_with("http://") || url.starts_with("https://") {
+                    let resp = self.http.get(&url).send().await
+                        .map_err(|e| AppError::internal(format!("Could not fetch cover from {url}: {e}")))?;
+                    if !resp.status().is_success() {
+                        return Err(AppError::new(
+                            resp.status().as_u16(),
+                            "cover_fetch_error",
+                            format!("Failed to fetch cover from {url}"),
+                        ));
+                    }
+                    let b = resp.bytes().await.map_err(|e| AppError::internal(e.to_string()))?.to_vec();
+                    (b, true)
+                } else {
+                    let opts = Call { source: Some(source), ..Call::default() };
+                    (self.host.bytes(&format!("/sources/{source}/image"), &json!({ "cover": url }), opts).await?, true)
+                }
             }
         };
+
         let mut image = Image::checked(bytes)?;
         if fetched || in_library {
             let bytes = std::mem::take(&mut image.bytes);

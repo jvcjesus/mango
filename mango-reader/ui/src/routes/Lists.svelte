@@ -122,7 +122,12 @@
       // Ownership filter
       if (ownershipFilter !== 'all') {
         const owNorm = ownershipFilter.replace('_', ' ').toLowerCase();
-        if (item.ownershipStatus.toLowerCase() !== owNorm) {
+        if (ownershipFilter === 'owned') {
+          const s = item.ownershipStatus.toLowerCase();
+          if (s !== 'owned' && s !== 'up to date' && s !== 'complete') {
+            return false;
+          }
+        } else if (item.ownershipStatus.toLowerCase() !== owNorm) {
           return false;
         }
       }
@@ -210,6 +215,8 @@
     for (const item of ownershipFacetedItems) {
       switch (item.ownershipStatus.toLowerCase()) {
         case 'owned':
+        case 'up to date':
+        case 'complete':
           counts.owned++;
           break;
         case 'partially owned':
@@ -311,6 +318,8 @@
   function getOwnershipClass(status: string): string {
     switch (status.toLowerCase()) {
       case 'owned':
+      case 'up to date':
+      case 'complete':
         return 'ownership-owned';
       case 'partially owned':
         return 'ownership-partial';
@@ -725,6 +734,9 @@
                 <span>
                   {selectedItem.ownedUnits ?? 0}
                   {selectedItem.totalUnits ? `/ ${selectedItem.totalUnits} volumes owned` : 'volumes owned'}
+                  {#if selectedItem.ownershipStatus === 'Up to date'}
+                    <span class="up-to-date-text"> · All released official volumes owned</span>
+                  {/if}
                 </span>
               </div>
               {#if selectedItem.komgaSeriesId}

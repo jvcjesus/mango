@@ -295,7 +295,7 @@
               {:else if isComplete}
                 {en.totalVolumes} released · Complete
               {:else}
-                {en.totalVolumes} released
+                {en.totalVolumes} released{#if ownedVolumeNumbers.length > en.totalVolumes} <span class="verified-komga-note">({ownedVolumeNumbers.length} verified in Komga)</span>{/if}
               {/if}
             </span>
           {:else}
@@ -876,6 +876,12 @@
     padding: 1px 4px;
     border-radius: 3px;
     margin-left: 4px;
+  }
+
+  .verified-komga-note {
+    font-size: 0.8rem;
+    color: var(--accent, #3b82f6);
+    font-weight: 500;
   }
 
   /* Advanced disclosure */

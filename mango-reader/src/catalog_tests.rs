@@ -459,3 +459,113 @@ async fn test_candidate_approval_and_acquisition_history_compatibility() {
     ).unwrap();
     assert_eq!(history_manga, catalog_id, "Acquisition history must attach directly to catalog manga ID");
 }
+
+#[tokio::test]
+async fn test_description_cleaning_in_read_title() {
+    let (db, _dir) = setup_test_db();
+    let conn = db.second().expect("conn");
+
+    let raw_desc = "★★★★☆ 8.6\n\n**Year:** 2018 · **Chapters:** 384 · **Volumes:** 39 · **Tracked:** 1850 · **Content Rating:** Safe · 183 ratings\n\n---\n\nAfter a disastrous defeat at the 2018 World Cup, Japan’s team struggles to regroup.\n\n*Source: Kodansha USA, Vol. 1*\n\n\n**Links:**\n- [AniList](https://anilist.co/manga/106130)\n- [MangaUpdates](https://www.mangaupdates.com/series/joxc7wz)\n\n**Alternative Names:**\n- 블루 록\n- BLUELOCK";
+
+    conn.execute(
+        "INSERT INTO manga (source_id, url, title, description, in_library, added_at, initialized, mangabaka_id)
+         VALUES (0, 'catalog:83', 'Blue Lock', ?1, 1, 1700000000, 1, 83)",
+        [raw_desc],
+    ).unwrap();
+    let manga_id = conn.last_insert_rowid();
+
+    let view = read_title(&conn, manga_id).unwrap();
+    let desc = view.description.expect("description present");
+
+    assert!(!desc.contains("★★★★☆"), "Stars must be stripped");
+    assert!(!desc.contains("**Year:**"), "Year pseudo-metadata must be stripped");
+    assert!(!desc.contains("**Links:**"), "Links section must be stripped");
+    assert!(!desc.contains("**Alternative Names:**"), "Alternative names must be stripped");
+    assert!(desc.starts_with("After a disastrous defeat"));
+    assert!(desc.ends_with("*Source: Kodansha USA, Vol. 1*"));
+}
+
+#[tokio::test]
+async fn test_unified_catalog_ownership_uses_reconciliation() {
+    let (db, _dir) = setup_test_db();
+    let conn = db.second().expect("conn");
+
+    // 1. Insert tracker list entries (simulating MangaBaka and AniList tracking with 40 Japanese volumes)
+    conn.execute(
+        "INSERT INTO tracker_list_entries (tracker, tracker_id, title, status, normalized_status, total_volumes, updated_at)
+         VALUES ('mangabaka', '83', 'Blue Lock', 'Reading', 'Reading', 40, 1700000000)",
+        [],
+    ).unwrap();
+    conn.execute(
+        "INSERT INTO tracker_list_entries (tracker, tracker_id, title, status, normalized_status, total_volumes, updated_at)
+         VALUES ('anilist', '106130', 'Blue Lock', 'CURRENT', 'Reading', 40, 1700000000)",
+        [],
+    ).unwrap();
+
+    // 2. Insert tracker mapping
+    conn.execute(
+        "INSERT INTO tracker_mappings (komga_series_id, tracker, tracker_id, confidence, mapping_source, updated_at)
+         VALUES ('0RN3Z9FSAPX0G', 'mangabaka', '83', 'resolved', 'manual', 1700000000)",
+        [],
+    ).unwrap();
+    conn.execute(
+        "INSERT INTO tracker_mappings (komga_series_id, tracker, tracker_id, confidence, mapping_source, updated_at)
+         VALUES ('0RN3Z9FSAPX0G', 'anilist', '106130', 'resolved', 'manual', 1700000000)",
+        [],
+    ).unwrap();
+
+    // 3. Insert catalog manga
+    conn.execute(
+        "INSERT INTO manga (source_id, url, title, in_library, added_at, initialized, mangabaka_id)
+         VALUES (0, 'catalog:83', 'Blue Lock', 1, 1700000000, 1, 83)",
+        [],
+    ).unwrap();
+    let catalog_id = conn.last_insert_rowid();
+
+    // 4. Insert canonical reconciliation: 39 owned, 39 total official volumes, 0 missing, status = 'up_to_date', is_ongoing = 1
+    conn.execute(
+        "INSERT INTO series_reconciliations (
+            series_id, manga_id, komga_series_id, mangabaka_id, title, edition, status, is_ongoing,
+            total_official_volumes, owned_volumes_count, missing_volumes_count,
+            owned_volumes_json, missing_volumes_json, future_volumes_json, last_reconciled_at, updated_at
+         ) VALUES (
+            ?1, ?2, '0RN3Z9FSAPX0G', 83, 'Blue Lock', 'standard', 'up_to_date', 1,
+            39, 39, 0,
+            '[]', '[]', '[]', 1700000000, 1700000000
+         )",
+        params![format!("manga:{catalog_id}"), catalog_id],
+    ).unwrap();
+
+    // 5. Simulate Komga reporting 39 total books
+    let komga_series = vec![crate::sync::model::KomgaSeriesProgress {
+        series_id: "0RN3Z9FSAPX0G".to_string(),
+        series_title: "Blue Lock".to_string(),
+        library_id: "0RMWEXC3T10TY".to_string(),
+        total_books: 39,
+        completed_books: 30,
+        highest_completed_book: Some(30.0),
+        highest_completed_volume: Some(30.0),
+        highest_completed_chapter: None,
+        is_series_completed: false,
+        last_read_date: None,
+        books: Vec::new(),
+    }];
+
+    let query = crate::sync::lists::ListsQuery::default();
+    let response = crate::sync::lists::build_unified_catalog(&conn, &komga_series, &query).unwrap();
+
+    assert_eq!(response.items.len(), 1);
+    let item = &response.items[0];
+
+    // Assert that reconciliation overrides raw tracker counts:
+    // Denominator is 39 (not 40), owned is 39, status is "Up to date" (not "Partially Owned")
+    assert_eq!(item.total_units, Some(39), "Canonical total units must come from reconciliation (39, not raw tracker 40)");
+    assert_eq!(item.owned_units, Some(39), "Owned units must be 39");
+    assert_eq!(item.ownership_status, "Up to date", "Ownership status must be Up to date");
+
+    // Filter by ownership=owned should include "Up to date"
+    let mut owned_query = crate::sync::lists::ListsQuery::default();
+    owned_query.ownership = Some("owned".to_string());
+    let owned_response = crate::sync::lists::build_unified_catalog(&conn, &komga_series, &owned_query).unwrap();
+    assert_eq!(owned_response.items.len(), 1, "ownership=owned filter must include Up to date");
+}
