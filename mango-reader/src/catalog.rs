@@ -737,9 +737,9 @@ pub async fn convert_to_catalog_title(
                     params![new_series_id, old_series_id],
                 )?;
 
-                // release_discovery_candidates
+                // discovered_release_candidates
                 conn.execute(
-                    "UPDATE release_discovery_candidates SET series_id = ?1 WHERE series_id = ?2",
+                    "UPDATE discovered_release_candidates SET series_id = ?1 WHERE series_id = ?2",
                     params![new_series_id, old_series_id],
                 )?;
 
@@ -850,7 +850,7 @@ pub async fn revert_to_source_title(
                 params![new_series_id, old_series_id],
             )?;
             conn.execute(
-                "UPDATE release_discovery_candidates SET series_id = ?1 WHERE series_id = ?2",
+                "UPDATE discovered_release_candidates SET series_id = ?1 WHERE series_id = ?2",
                 params![new_series_id, old_series_id],
             )?;
             conn.execute(
