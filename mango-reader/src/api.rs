@@ -2167,9 +2167,10 @@ async fn get_acquisition_sources(Me(app): Me) -> Result<Json<Vec<AcquisitionSour
         AcquisitionSourceOption {
             id: "madokami".to_string(),
             name: "Madokami".to_string(),
-            description: "Digital manga provider (read-only archive index)".to_string(),
+            description: "Direct HTTP acquisition provider for discrete manga volumes with safe Range resume"
+                .to_string(),
             is_default: false,
-            available: false,
+            available: cfg.madokami_enabled && cfg.has_madokami_credentials,
             supports_volumes: true,
             supports_chapters: false,
         },
