@@ -133,7 +133,10 @@ pub fn router(state: Spaces) -> Router {
         .route("/manga/{id}/library-state", get(get_manga_library_state))
         .route("/manga/{id}/reconcile", post(post_manga_reconcile))
         .route("/manga/{id}/retry-metadata", post(post_manga_retry_metadata))
-        .route("/reconciliation/followed", get(get_followed_reconciliations))
+        .route(
+            "/reconciliation/followed",
+            get(get_followed_reconciliations).post(post_run_followed_reconciliations),
+        )
         .route("/manga/{id}/volumes/{volume}/candidates", get(get_manga_volume_candidates))
         .route("/manga/{id}/volumes/{volume}/candidates/{candidate_id}/acquire", post(post_manga_volume_candidate_acquire))
         .route("/manga/{id}/volumes/{volume}/discover", post(post_manga_volume_discover))
@@ -1095,6 +1098,14 @@ async fn get_followed_reconciliations(
         .db
         .call(|conn| crate::sync::reconciliation::list_reconciliations(conn))
         .await?;
+    Ok(Json(list))
+}
+
+async fn post_run_followed_reconciliations(
+    Me(app): Me,
+) -> Result<Json<Vec<crate::sync::reconciliation::ReconciliationSummary>>> {
+    app.me.admin()?;
+    let list = app.sync.run_reconciliation_all_followed().await?;
     Ok(Json(list))
 }
 
