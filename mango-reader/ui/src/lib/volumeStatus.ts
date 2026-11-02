@@ -614,6 +614,25 @@ export function resolveSeriesSummary(inputs: SeriesSummaryInputs): SeriesSummary
     };
   }
 
+  if (reconciliationStatus === 'collection_unavailable') {
+    return {
+      title,
+      ownedCount,
+      totalExpectedVolumes: null,
+      missingCount: 0,
+      activeCount,
+      attentionCount,
+      progressPercent: null,
+      isOngoing,
+      isCompleted,
+      libraryStatus: 'collection_unavailable',
+      statusExplanation: `${ownedCount} volume${ownedCount === 1 ? '' : 's'} owned · MangaBaka edition data unavailable`,
+      isIdentityAmbiguous: false,
+      primaryActionType: 'none',
+      primaryActionLabel: '',
+    };
+  }
+
   const effectiveTotal =
     totalExpectedVolumes != null && totalExpectedVolumes > 0
       ? totalExpectedVolumes

@@ -39,6 +39,7 @@ pub enum ReconciliationStatus {
     MissingVolume,
     ReviewRequired,
     SyncError,
+    CollectionUnavailable,
 }
 
 impl std::fmt::Display for ReconciliationStatus {
@@ -48,6 +49,7 @@ impl std::fmt::Display for ReconciliationStatus {
             Self::MissingVolume => write!(f, "missing_volume"),
             Self::ReviewRequired => write!(f, "review_required"),
             Self::SyncError => write!(f, "sync_error"),
+            Self::CollectionUnavailable => write!(f, "collection_unavailable"),
         }
     }
 }
@@ -61,6 +63,7 @@ impl std::str::FromStr for ReconciliationStatus {
             "missing_volume" => Ok(Self::MissingVolume),
             "review_required" => Ok(Self::ReviewRequired),
             "sync_error" => Ok(Self::SyncError),
+            "collection_unavailable" => Ok(Self::CollectionUnavailable),
             other => Err(AppError::bad_request(format!(
                 "Invalid reconciliation status: {other}"
             ))),
@@ -119,6 +122,13 @@ impl ReconciliationSummary {
                 format!(
                     "Sync error: {}",
                     self.last_error.as_deref().unwrap_or("Communication failure")
+                )
+            }
+            ReconciliationStatus::CollectionUnavailable => {
+                format!(
+                    "{} volume{} owned · MangaBaka edition data unavailable",
+                    self.owned_volumes_count,
+                    if self.owned_volumes_count == 1 { "" } else { "s" }
                 )
             }
         }
@@ -199,19 +209,116 @@ pub fn is_future_release(release_date: Option<&str>, today: &str) -> bool {
     false
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct AuthoritativeTrackerInfo {
+    pub mangabaka_id: Option<i64>,
+    pub anilist_id: Option<i64>,
+}
+
+/// Discovers authoritative MangaBaka or AniList tracker IDs associated with a title in the tracker list cache.
+/// Requires normalized title/alias correspondence and excludes non-comic formats (novels).
+pub fn find_authoritative_tracker_info(
+    conn: &Connection,
+    title: &str,
+) -> Result<AuthoritativeTrackerInfo> {
+    let norm = normalize_title(title);
+    let mut stmt = conn.prepare(
+        "SELECT tracker, tracker_id, title, english_title, romaji_title, format, aliases
+         FROM tracker_list_entries",
+    )?;
+
+    let mut mb_ids: Vec<i64> = Vec::new();
+    let mut al_ids: Vec<i64> = Vec::new();
+
+    let rows = stmt.query_map([], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, Option<String>>(3)?,
+            r.get::<_, Option<String>>(4)?,
+            r.get::<_, Option<String>>(5)?,
+            r.get::<_, Option<String>>(6)?,
+        ))
+    })?;
+
+    for row in rows.flatten() {
+        let (tracker, tracker_id, t_title, en_title, romaji, format, aliases) = row;
+        // Verify format is not prose (novel / light novel)
+        if let Some(ref fmt) = format {
+            if crate::pipeline::mangabaka::is_prose_media_type(fmt) {
+                continue;
+            }
+        }
+
+        let mut matches = false;
+        if normalize_title(&t_title) == norm {
+            matches = true;
+        } else if let Some(ref en) = en_title {
+            if normalize_title(en) == norm {
+                matches = true;
+            }
+        } else if let Some(ref ro) = romaji {
+            if normalize_title(ro) == norm {
+                matches = true;
+            }
+        }
+
+        if !matches {
+            if let Some(ref a_json) = aliases {
+                if let Ok(alias_list) = serde_json::from_str::<Vec<String>>(a_json) {
+                    if alias_list.iter().any(|a| normalize_title(a) == norm) {
+                        matches = true;
+                    }
+                }
+            }
+        }
+
+        if matches {
+            if tracker == "mangabaka" {
+                if let Ok(id) = tracker_id.parse::<i64>() {
+                    if !mb_ids.contains(&id) {
+                        mb_ids.push(id);
+                    }
+                }
+            } else if tracker == "anilist" {
+                if let Ok(id) = tracker_id.parse::<i64>() {
+                    if !al_ids.contains(&id) {
+                        al_ids.push(id);
+                    }
+                }
+            }
+        }
+    }
+
+    let mb_id = if mb_ids.len() == 1 { Some(mb_ids[0]) } else { None };
+    let al_id = if al_ids.len() == 1 { Some(al_ids[0]) } else { None };
+
+    Ok(AuthoritativeTrackerInfo {
+        mangabaka_id: mb_id,
+        anilist_id: al_id,
+    })
+}
+
 /// Gathers local physically owned volume numbers from downloads and chapters tables.
 pub fn gather_local_owned_volumes(conn: &Connection, manga_id: Option<i64>) -> Result<Vec<f64>> {
+    // Cross-title ownership protection: if manga_id is None, never query downloads or chapters
+    // without an explicit manga identifier.
+    let Some(m_id) = manga_id else {
+        return Ok(Vec::new());
+    };
+
     let mut owned = Vec::new();
 
     // Canonical media published locally in downloads table
     let sql = "SELECT d.published_path, c.name, d.raw_title
                FROM downloads d
                JOIN chapters c ON c.id = d.chapter_id
-               WHERE (c.manga_id = ?1 OR ?1 IS NULL)
+               WHERE c.manga_id = ?1
                  AND (d.published_path IS NOT NULL OR d.state = 'completed')";
 
     if let Ok(mut stmt) = conn.prepare(sql) {
-        if let Ok(rows) = stmt.query_map([manga_id], |r| {
+        if let Ok(rows) = stmt.query_map([m_id], |r| {
             Ok((
                 r.get::<_, Option<String>>(0)?,
                 r.get::<_, String>(1)?,
@@ -235,20 +342,18 @@ pub fn gather_local_owned_volumes(conn: &Connection, manga_id: Option<i64>) -> R
     }
 
     // Existing chapter downloads
-    if let Some(m_id) = manga_id {
-        if let Ok(mut stmt) = conn.prepare(
-            "SELECT name, download_path FROM chapters WHERE manga_id = ?1 AND download_path IS NOT NULL",
-        ) {
-            if let Ok(rows) = stmt.query_map([m_id], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
-            }) {
-                for (name, dl_path) in rows.flatten() {
-                    let vol_opt = crate::release::parse_volume(&name)
-                        .or_else(|| dl_path.as_deref().and_then(crate::release::parse_volume));
-                    if let Some(v) = vol_opt {
-                        if !owned.iter().any(|&ov: &f64| (ov - v).abs() < 0.001) {
-                            owned.push(v);
-                        }
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT name, download_path FROM chapters WHERE manga_id = ?1 AND download_path IS NOT NULL",
+    ) {
+        if let Ok(rows) = stmt.query_map([m_id], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        }) {
+            for (name, dl_path) in rows.flatten() {
+                let vol_opt = crate::release::parse_volume(&name)
+                    .or_else(|| dl_path.as_deref().and_then(crate::release::parse_volume));
+                if let Some(v) = vol_opt {
+                    if !owned.iter().any(|&ov: &f64| (ov - v).abs() < 0.001) {
+                        owned.push(v);
                     }
                 }
             }
@@ -318,8 +423,9 @@ pub async fn reconcile_series(
 
     // 2. Resolve MangaBaka Identity
     let mut resolved_mb_id: Option<i64> = None;
+    let mut explicit_mb_id: Option<i64> = None;
 
-    // Direct exact MangaBaka identity from manga row (catalog-native identity)
+    // 2a. Direct exact MangaBaka identity from manga row (catalog-native identity)
     if let Some(m_id) = target.manga_id {
         let exact_id = db
             .call(move |conn| {
@@ -337,6 +443,7 @@ pub async fn reconcile_series(
             .ok()
             .flatten();
         if let Some(mb_id) = exact_id {
+            explicit_mb_id = Some(mb_id);
             resolved_mb_id = Some(mb_id);
             if let Some(ref k_id) = target.komga_series_id {
                 let k_id_c = k_id.clone();
@@ -354,6 +461,191 @@ pub async fn reconcile_series(
                         Ok(())
                     })
                     .await;
+            }
+        }
+    }
+
+    // 2b. Direct exact MangaBaka identity from tracker_mappings
+    if let Some(ref k_id) = target.komga_series_id {
+        let k_id_c = k_id.clone();
+        if let Ok(Some(mapping)) = db
+            .call(move |conn| get_mapping(conn, &k_id_c, SyncTarget::MangaBaka))
+            .await
+        {
+            if let Ok(id) = mapping.tracker_id.parse::<i64>() {
+                if let Some(exp) = explicit_mb_id {
+                    if exp != id {
+                        let reason = format!(
+                            "Conflicting MangaBaka identity: recorded manga ID {exp} vs tracker mapping ID {id}"
+                        );
+                        let title_c = target.title.clone();
+                        let reason_c = reason.clone();
+                        let mut sum = build_review_required(
+                            &series_id,
+                            target,
+                            &edition,
+                            owned_volumes,
+                            reason,
+                            current_time,
+                        );
+                        sum.display_status = sum.compute_display_status();
+                        let sum_c = sum.clone();
+                        db.call(move |conn| {
+                            record_event(conn, &title_c, None, None, "ACTION_REQUIRED", &reason_c)?;
+                            save_reconciliation(conn, &sum_c)
+                        })
+                        .await?;
+                        return Ok(sum);
+                    }
+                } else {
+                    explicit_mb_id = Some(id);
+                    resolved_mb_id = Some(id);
+                }
+            }
+        }
+    }
+
+    // 2c. Authoritative MangaBaka or AniList identity from tracker list cache
+    if resolved_mb_id.is_none() {
+        let title_for_tracker = target.title.clone();
+        let tracker_info = db
+            .call(move |conn| find_authoritative_tracker_info(conn, &title_for_tracker))
+            .await
+            .unwrap_or_default();
+
+        if let Some(t_mb_id) = tracker_info.mangabaka_id {
+            if let Some(exp) = explicit_mb_id {
+                if exp != t_mb_id {
+                    let reason = format!(
+                        "Conflicting MangaBaka identity: recorded ID {exp} vs tracker list ID {t_mb_id}"
+                    );
+                    let title_c = target.title.clone();
+                    let reason_c = reason.clone();
+                    let mut sum = build_review_required(
+                        &series_id,
+                        target,
+                        &edition,
+                        owned_volumes,
+                        reason,
+                        current_time,
+                    );
+                    sum.display_status = sum.compute_display_status();
+                    let sum_c = sum.clone();
+                    db.call(move |conn| {
+                        record_event(conn, &title_c, None, None, "ACTION_REQUIRED", &reason_c)?;
+                        save_reconciliation(conn, &sum_c)
+                    })
+                    .await?;
+                    return Ok(sum);
+                }
+            } else {
+                tracing::info!(
+                    "Discovered authoritative MangaBaka ID {} from tracker list cache for '{}'",
+                    t_mb_id,
+                    target.title
+                );
+                resolved_mb_id = Some(t_mb_id);
+            }
+        } else if let Some(t_al_id) = tracker_info.anilist_id {
+            match mb_client.resolve_from_anilist(t_al_id).await {
+                Ok(Some(xref)) => {
+                    let xref_mb_id = xref.mangabaka_id;
+                    if let Some(exp) = explicit_mb_id {
+                        if exp != xref_mb_id {
+                            let reason = format!(
+                                "Conflicting MangaBaka identity: recorded ID {exp} vs AniList xref ID {xref_mb_id}"
+                            );
+                            let title_c = target.title.clone();
+                            let reason_c = reason.clone();
+                            let mut sum = build_review_required(
+                                &series_id,
+                                target,
+                                &edition,
+                                owned_volumes,
+                                reason,
+                                current_time,
+                            );
+                            sum.display_status = sum.compute_display_status();
+                            let sum_c = sum.clone();
+                            db.call(move |conn| {
+                                record_event(conn, &title_c, None, None, "ACTION_REQUIRED", &reason_c)?;
+                                save_reconciliation(conn, &sum_c)
+                            })
+                            .await?;
+                            return Ok(sum);
+                        }
+                    } else {
+                        tracing::info!(
+                            "Discovered authoritative MangaBaka ID {} via AniList {} cross-reference for '{}'",
+                            xref_mb_id,
+                            t_al_id,
+                            target.title
+                        );
+                        resolved_mb_id = Some(xref_mb_id);
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to query MangaBaka AniList cross-reference for {t_al_id}: {e}"
+                    );
+                }
+            }
+        }
+    }
+
+    // 2d. AniList cross-reference from tracker_mappings
+    if resolved_mb_id.is_none() {
+        if let Some(ref k_id) = target.komga_series_id {
+            let k_id_c = k_id.clone();
+            if let Ok(Some(al_mapping)) = db
+                .call(move |conn| get_mapping(conn, &k_id_c, SyncTarget::AniList))
+                .await
+            {
+                if let Ok(al_id) = al_mapping.tracker_id.parse::<i64>() {
+                    match mb_client.resolve_from_anilist(al_id).await {
+                        Ok(Some(xref)) => {
+                            let xref_mb_id = xref.mangabaka_id;
+                            if let Some(exp) = explicit_mb_id {
+                                if exp != xref_mb_id {
+                                    let reason = format!(
+                                        "Conflicting MangaBaka identity: recorded ID {exp} vs AniList mapping xref ID {xref_mb_id}"
+                                    );
+                                    let title_c = target.title.clone();
+                                    let reason_c = reason.clone();
+                                    let mut sum = build_review_required(
+                                        &series_id,
+                                        target,
+                                        &edition,
+                                        owned_volumes,
+                                        reason,
+                                        current_time,
+                                    );
+                                    sum.display_status = sum.compute_display_status();
+                                    let sum_c = sum.clone();
+                                    db.call(move |conn| {
+                                        record_event(conn, &title_c, None, None, "ACTION_REQUIRED", &reason_c)?;
+                                        save_reconciliation(conn, &sum_c)
+                                    })
+                                    .await?;
+                                    return Ok(sum);
+                                }
+                            } else {
+                                tracing::info!(
+                                    "Discovered authoritative MangaBaka ID {} via Komga AniList {} mapping for '{}'",
+                                    xref_mb_id,
+                                    al_id,
+                                    target.title
+                                );
+                                resolved_mb_id = Some(xref_mb_id);
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::warn!("Failed to query MangaBaka AniList cross-reference for Komga mapping {al_id}: {e}");
+                        }
+                    }
+                }
             }
         }
     }
@@ -435,20 +727,6 @@ pub async fn reconcile_series(
                 }
                 IdentityResolutionResult::NotFound => {
                     // Fall through to title search
-                }
-            }
-        }
-    }
-
-    if resolved_mb_id.is_none() {
-        if let Some(ref k_id) = target.komga_series_id {
-            let k_id_c = k_id.clone();
-            if let Ok(Some(mapping)) = db
-                .call(move |conn| get_mapping(conn, &k_id_c, SyncTarget::MangaBaka))
-                .await
-            {
-                if let Ok(id) = mapping.tracker_id.parse::<i64>() {
-                    resolved_mb_id = Some(id);
                 }
             }
         }
@@ -549,7 +827,22 @@ pub async fn reconcile_series(
     }
 
     let mb_series_id = match resolved_mb_id {
-        Some(id) => id,
+        Some(id) => {
+            // Persist to manga.mangabaka_id if this is a catalog title and mangabaka_id is currently NULL
+            if let Some(m_id) = target.manga_id {
+                let id_to_save = id;
+                let _ = db
+                    .call(move |conn| {
+                        conn.execute(
+                            "UPDATE manga SET mangabaka_id = ?1 WHERE id = ?2 AND mangabaka_id IS NULL",
+                            rusqlite::params![id_to_save, m_id],
+                        )?;
+                        Ok(())
+                    })
+                    .await;
+            }
+            id
+        }
         None => {
             let reason = "Could not resolve MangaBaka series identity".to_string();
             let mut sum = build_review_required(
@@ -601,21 +894,21 @@ pub async fn reconcile_series(
                 "No collection found on MangaBaka for edition '{}'",
                 edition
             );
-            let title_c = target.title.clone();
-            let reason_c = reason.clone();
-            let mut sum = build_review_required(
+            let mut sum = build_collection_unavailable(
                 &series_id,
                 target,
                 &edition,
+                mb_series_id,
                 owned_volumes,
                 reason,
                 current_time,
             );
-            sum.mangabaka_id = Some(mb_series_id);
             sum.display_status = sum.compute_display_status();
             let sum_c = sum.clone();
+            let series_id_c = series_id.clone();
+            let title_c = target.title.clone();
             db.call(move |conn| {
-                record_event(conn, &title_c, Some(mb_series_id), None, "ACTION_REQUIRED", &reason_c)?;
+                resolve_active_series_events(conn, &series_id_c, &title_c)?;
                 save_reconciliation(conn, &sum_c)
             })
             .await?;
@@ -762,7 +1055,7 @@ pub async fn reconcile_series(
     };
 
     let mut summary = ReconciliationSummary {
-        series_id,
+        series_id: series_id.clone(),
         manga_id: target.manga_id,
         komga_series_id: target.komga_series_id.clone(),
         mangabaka_id: Some(mb_series_id),
@@ -788,10 +1081,13 @@ pub async fn reconcile_series(
     // 8. Log Events for Notifications (M6.3 Foundation) and save summary
     let sum_clone = summary.clone();
     let title_c = target.title.clone();
+    let series_id_c = series_id.clone();
     let prev_c = previous;
     let released_vols_c = released_vols.clone();
 
     db.call(move |conn| {
+        resolve_active_series_events(conn, &series_id_c, &title_c)?;
+
         for &mv in &missing_vols {
             record_event(
                 conn,
@@ -846,6 +1142,39 @@ fn build_review_required(
         title: target.title.clone(),
         edition: edition.to_string(),
         status: ReconciliationStatus::ReviewRequired,
+        is_ongoing: true,
+        total_official_volumes: None,
+        owned_volumes_count: owned_count,
+        missing_volumes_count: 0,
+        owned_volumes,
+        missing_volumes: vec![],
+        future_volumes: vec![],
+        last_reconciled_at: current_time,
+        last_error: None,
+        review_reason: Some(reason),
+        display_status: String::new(),
+    }
+}
+
+pub fn build_collection_unavailable(
+    series_id: &str,
+    target: &ReconciliationTarget,
+    edition: &str,
+    mangabaka_id: i64,
+    owned_volumes: Vec<f64>,
+    reason: String,
+    current_time: i64,
+) -> ReconciliationSummary {
+    let owned_count = owned_volumes.len();
+    ReconciliationSummary {
+        series_id: series_id.to_string(),
+        manga_id: target.manga_id,
+        komga_series_id: target.komga_series_id.clone(),
+        mangabaka_id: Some(mangabaka_id),
+        collection_id: None,
+        title: target.title.clone(),
+        edition: edition.to_string(),
+        status: ReconciliationStatus::CollectionUnavailable,
         is_ongoing: true,
         total_official_volumes: None,
         owned_volumes_count: owned_count,
@@ -1125,6 +1454,23 @@ pub fn list_reconciliations(conn: &Connection) -> Result<Vec<ReconciliationSumma
     rows.map_err(|e| AppError::internal(format!("Failed to list reconciliations: {e}")))
 }
 
+pub fn resolve_active_series_events(
+    conn: &Connection,
+    series_id: &str,
+    series_title: &str,
+) -> Result<()> {
+    let title_series_id = format!("title:{}", normalize_title(series_title));
+    let now_ts = now();
+    conn.execute(
+        "UPDATE reconciliation_events SET resolved_at = ?1
+         WHERE (series_id = ?2 OR series_id = ?3)
+           AND volume_number IS NULL
+           AND resolved_at IS NULL",
+        params![now_ts, series_id, title_series_id],
+    )?;
+    Ok(())
+}
+
 pub fn record_event_full(
     conn: &Connection,
     series_id: &str,
@@ -1138,34 +1484,35 @@ pub fn record_event_full(
     candidate_count: i64,
     message: &str,
 ) -> Result<()> {
-    conn.execute(
-        "INSERT INTO reconciliation_events (
-            series_id, series_title, mangabaka_id, mangabaka_volume_id, edition,
-            volume_number, event_type, top_candidate_id, candidate_count, message, created_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
-        ON CONFLICT(series_id, volume_number, event_type) DO UPDATE SET
-            top_candidate_id = excluded.top_candidate_id,
-            candidate_count = excluded.candidate_count,
-            message = excluded.message,
-            created_at = excluded.created_at",
-        params![
-            series_id,
-            series_title,
-            mangabaka_id,
-            mangabaka_volume_id,
-            edition,
-            volume_number,
-            event_type,
-            top_candidate_id,
-            candidate_count,
-            message,
-            now(),
-        ],
-    )
-    .map_err(|e| AppError::internal(format!("Failed to record reconciliation event: {e}")))?;
+    let (event_id, should_enqueue): (Option<i64>, bool) = if let Some(v) = volume_number {
+        // Volume-level event: unique on (series_id, volume_number, event_type)
+        conn.execute(
+            "INSERT INTO reconciliation_events (
+                series_id, series_title, mangabaka_id, mangabaka_volume_id, edition,
+                volume_number, event_type, top_candidate_id, candidate_count, message, created_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+            ON CONFLICT(series_id, volume_number, event_type) DO UPDATE SET
+                top_candidate_id = excluded.top_candidate_id,
+                candidate_count = excluded.candidate_count,
+                message = excluded.message,
+                created_at = excluded.created_at",
+            params![
+                series_id,
+                series_title,
+                mangabaka_id,
+                mangabaka_volume_id,
+                edition,
+                volume_number,
+                event_type,
+                top_candidate_id,
+                candidate_count,
+                message,
+                now(),
+            ],
+        )
+        .map_err(|e| AppError::internal(format!("Failed to record volume reconciliation event: {e}")))?;
 
-    let event_id: Option<i64> = if let Some(v) = volume_number {
-        conn.query_row(
+        let id = conn.query_row(
             "SELECT id FROM reconciliation_events
              WHERE series_id = ?1 AND event_type = ?2 AND ABS(volume_number - ?3) < 0.001
              ORDER BY id DESC LIMIT 1",
@@ -1173,29 +1520,92 @@ pub fn record_event_full(
             |r| r.get(0),
         )
         .optional()
-        .unwrap_or(None)
+        .unwrap_or(None);
+
+        (id, true)
     } else {
-        conn.query_row(
-            "SELECT id FROM reconciliation_events
-             WHERE series_id = ?1 AND event_type = ?2 AND volume_number IS NULL
-             ORDER BY id DESC LIMIT 1",
-            params![series_id, event_type],
-            |r| r.get(0),
-        )
-        .optional()
-        .unwrap_or(None)
+        // Series-level event: deduplicate based on active event (resolved_at IS NULL).
+        let title_series_id = format!("title:{}", normalize_title(series_title));
+        let existing: Option<(i64, String)> = conn
+            .query_row(
+                "SELECT id, message FROM reconciliation_events
+                 WHERE (series_id = ?1 OR series_id = ?2) AND event_type = ?3 AND volume_number IS NULL AND resolved_at IS NULL
+                 ORDER BY id DESC LIMIT 1",
+                params![series_id, title_series_id, event_type],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+
+        match existing {
+            Some((existing_id, old_msg)) if old_msg == message => {
+                // Condition is unchanged. Retain the existing active event without re-triggering outbox
+                (Some(existing_id), false)
+            }
+            Some((old_id, _)) => {
+                // Condition changed materially: mark old event resolved/superseded and create new active event
+                let now_ts = now();
+                conn.execute(
+                    "UPDATE reconciliation_events SET resolved_at = ?1 WHERE id = ?2",
+                    params![now_ts, old_id],
+                )?;
+                conn.execute(
+                    "INSERT INTO reconciliation_events (
+                        series_id, series_title, mangabaka_id, mangabaka_volume_id, edition,
+                        volume_number, event_type, top_candidate_id, candidate_count, message, created_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9, ?10)",
+                    params![
+                        series_id,
+                        series_title,
+                        mangabaka_id,
+                        mangabaka_volume_id,
+                        edition,
+                        event_type,
+                        top_candidate_id,
+                        candidate_count,
+                        message,
+                        now_ts,
+                    ],
+                )?;
+                (Some(conn.last_insert_rowid()), true)
+            }
+            None => {
+                // First occurrence or newly broken condition
+                let now_ts = now();
+                conn.execute(
+                    "INSERT INTO reconciliation_events (
+                        series_id, series_title, mangabaka_id, mangabaka_volume_id, edition,
+                        volume_number, event_type, top_candidate_id, candidate_count, message, created_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, ?9, ?10)",
+                    params![
+                        series_id,
+                        series_title,
+                        mangabaka_id,
+                        mangabaka_volume_id,
+                        edition,
+                        event_type,
+                        top_candidate_id,
+                        candidate_count,
+                        message,
+                        now_ts,
+                    ],
+                )?;
+                (Some(conn.last_insert_rowid()), true)
+            }
+        }
     };
 
-    if let Some(id) = event_id {
-        let _ = crate::notification::outbox::enqueue_from_event(
-            conn,
-            id,
-            series_id,
-            series_title,
-            volume_number,
-            event_type,
-            message,
-        );
+    if should_enqueue {
+        if let Some(id) = event_id {
+            let _ = crate::notification::outbox::enqueue_from_event(
+                conn,
+                id,
+                series_id,
+                series_title,
+                volume_number,
+                event_type,
+                message,
+            );
+        }
     }
 
     Ok(())
@@ -3005,6 +3415,172 @@ mod tests {
 
         let count_after: i64 = conn.query_row("SELECT count(*) FROM downloads", [], |r| r.get(0)).unwrap();
         assert_eq!(count_before, count_after);
+    }
+
+    #[test]
+    fn test_case_17_local_owned_volumes_none_does_not_leak_other_titles() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::migrate(&mut conn).unwrap();
+
+        // Insert manga, chapter, and completed download for Delicious in Dungeon (manga_id = 42)
+        conn.execute(
+            "INSERT INTO manga (id, source_id, url, title) VALUES (42, 0, '/catalog/42', 'Delicious in Dungeon')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO chapters (id, manga_id, url, name, chapter_number, source_order, fetched_at)
+             VALUES (901, 42, '/v01', 'Volume 01', 1.0, 0, 0)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO downloads (chapter_id, state, position, added_at, published_path)
+             VALUES (901, 'completed', 0, 0, '/srv/media/manga/Delicious in Dungeon/Delicious in Dungeon v01.cbz')",
+            [],
+        ).unwrap();
+
+        // 1. When manga_id is None (e.g. unlinked Komga title like Blade of the Immortal)
+        let owned_none = gather_local_owned_volumes(&conn, None).unwrap();
+        assert!(owned_none.is_empty(), "None manga_id must return empty vec and never leak other downloads");
+
+        // 2. When manga_id is a different title (manga_id = 99)
+        let owned_diff = gather_local_owned_volumes(&conn, Some(99)).unwrap();
+        assert!(owned_diff.is_empty(), "Different manga_id must not see manga 42 downloads");
+
+        // 3. When manga_id is 42
+        let owned_match = gather_local_owned_volumes(&conn, Some(42)).unwrap();
+        assert_eq!(owned_match, vec![1.0], "Matching manga_id correctly discovers its own volume 1");
+    }
+
+    #[test]
+    fn test_case_18_reconciliation_events_series_level_deduplication() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::migrate(&mut conn).unwrap();
+
+        // Enable ntfy transport for test
+        crate::notification::set_ntfy_config(&conn, &crate::notification::NtfyConfig {
+            enabled: true,
+            topic: "test-topic".to_string(),
+            ..Default::default()
+        }).unwrap();
+
+        let series_id = "title:blade of the immortal";
+        let title = "Blade of the Immortal";
+        let msg = "No collection found on MangaBaka for edition 'standard'";
+
+        // 1. First record event: should insert active event and outbox entry
+        record_event_full(&conn, series_id, title, Some(5246), None, "standard", None, "ACTION_REQUIRED", None, 0, msg).unwrap();
+
+        let active_count: i64 = conn.query_row(
+            "SELECT count(*) FROM reconciliation_events WHERE series_id = ?1 AND resolved_at IS NULL",
+            [series_id],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(active_count, 1, "Exactly one active event should exist");
+
+        let outbox_count_1: i64 = conn.query_row(
+            "SELECT count(*) FROM notification_outbox",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(outbox_count_1, 1, "Outbox should receive initial notification task");
+
+        // 2. Second record event with IDENTICAL message: should deduplicate (no new event, no new outbox entry)
+        record_event_full(&conn, series_id, title, Some(5246), None, "standard", None, "ACTION_REQUIRED", None, 0, msg).unwrap();
+
+        let active_count_2: i64 = conn.query_row(
+            "SELECT count(*) FROM reconciliation_events WHERE series_id = ?1 AND resolved_at IS NULL",
+            [series_id],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(active_count_2, 1, "Active event count remains 1");
+
+        let outbox_count_2: i64 = conn.query_row(
+            "SELECT count(*) FROM notification_outbox",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(outbox_count_2, 1, "Outbox should NOT enqueue duplicate task for unchanged condition");
+
+        // 3. Third record event with CHANGED message: should mark old event resolved and insert new active event + outbox entry
+        let changed_msg = "MangaBaka title match ambiguous: 2 candidates found";
+        record_event_full(&conn, series_id, title, None, None, "standard", None, "ACTION_REQUIRED", None, 0, changed_msg).unwrap();
+
+        let active_count_3: i64 = conn.query_row(
+            "SELECT count(*) FROM reconciliation_events WHERE series_id = ?1 AND resolved_at IS NULL",
+            [series_id],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(active_count_3, 1, "Still exactly 1 active event");
+
+        let resolved_count: i64 = conn.query_row(
+            "SELECT count(*) FROM reconciliation_events WHERE series_id = ?1 AND resolved_at IS NOT NULL",
+            [series_id],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(resolved_count, 1, "Old event was marked resolved");
+
+        let outbox_count_3: i64 = conn.query_row(
+            "SELECT count(*) FROM notification_outbox",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(outbox_count_3, 2, "Outbox enqueues task for materially changed condition");
+
+        // 4. Resolve series events
+        resolve_active_series_events(&conn, series_id, title).unwrap();
+        let remaining_active: i64 = conn.query_row(
+            "SELECT count(*) FROM reconciliation_events WHERE series_id = ?1 AND resolved_at IS NULL",
+            [series_id],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(remaining_active, 0, "All events resolved after resolve_active_series_events");
+    }
+
+    #[test]
+    fn test_case_19_collection_unavailable_and_authoritative_tracker_discovery() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::migrate(&mut conn).unwrap();
+
+        // Insert tracker_list_entries:
+        // 1. Bungo Stray Dogs - Manga (comic format) -> MangaBaka 3251
+        conn.execute(
+            "INSERT INTO tracker_list_entries (tracker, tracker_id, title, status, normalized_status, format, updated_at)
+             VALUES ('mangabaka', '3251', 'Bungo Stray Dogs', 'reading', 'reading', 'manga', 1000)",
+            [],
+        ).unwrap();
+
+        // 2. Bungo Stray Dogs - Novel (prose format) -> MangaBaka 83053 (should be ignored)
+        conn.execute(
+            "INSERT INTO tracker_list_entries (tracker, tracker_id, title, status, normalized_status, format, updated_at)
+             VALUES ('mangabaka', '83053', 'Bungo Stray Dogs', 'reading', 'reading', 'novel', 1000)",
+            [],
+        ).unwrap();
+
+        let info = find_authoritative_tracker_info(&conn, "Bungo Stray Dogs").unwrap();
+        assert_eq!(info.mangabaka_id, Some(3251), "Finds comic format 3251 and filters out novel format 83053");
+
+        // Test CollectionUnavailable construction
+        let target = ReconciliationTarget {
+            manga_id: None,
+            komga_series_id: Some("k_blade".to_string()),
+            title: "Blade of the Immortal".to_string(),
+            edition: Some("standard".to_string()),
+        };
+        let summary = build_collection_unavailable(
+            "komga:k_blade",
+            &target,
+            "standard",
+            5246,
+            vec![],
+            "No collection found on MangaBaka for edition 'standard'".to_string(),
+            1000,
+        );
+
+        assert_eq!(summary.status, ReconciliationStatus::CollectionUnavailable);
+        assert_eq!(summary.mangabaka_id, Some(5246));
+        assert_eq!(summary.total_official_volumes, None);
+        assert_eq!(summary.missing_volumes_count, 0);
+        assert_eq!(summary.owned_volumes_count, 0);
     }
 }
 

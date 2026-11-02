@@ -384,6 +384,24 @@ pub struct MangaBakaClient {
     token: Option<String>,
 }
 
+/// Returns true if the media type string corresponds to a comic or sequential art format.
+pub fn is_comic_media_type(media_type: &str) -> bool {
+    let lower = media_type.trim().to_lowercase();
+    matches!(
+        lower.as_str(),
+        "manga" | "manhwa" | "manhua" | "comic" | "webtoon" | "doujinshi" | "one_shot" | "one-shot" | "oel"
+    )
+}
+
+/// Returns true if the media type string corresponds to prose, novel, or text literature.
+pub fn is_prose_media_type(media_type: &str) -> bool {
+    let lower = media_type.trim().to_lowercase();
+    matches!(
+        lower.as_str(),
+        "novel" | "light_novel" | "light novel" | "web_novel" | "web novel" | "book" | "prose"
+    )
+}
+
 impl MangaBakaClient {
     pub fn new(http: Client, base_url: Option<String>, token: Option<String>) -> Self {
         Self {
@@ -1183,6 +1201,12 @@ impl MangaBakaClient {
                 .unwrap_or("")
                 .to_string();
 
+            let item_type = item
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_lowercase();
+
             let mut titles = Vec::new();
             for key in [
                 "title",
@@ -1214,6 +1238,7 @@ impl MangaBakaClient {
                     } else {
                         primary_title
                     },
+                    item_type,
                 ));
             }
         }
@@ -1223,23 +1248,42 @@ impl MangaBakaClient {
         }
 
         if exact_matches.len() > 1 {
-            // If multiple candidates matched on aliases/alternative titles, but exactly one
-            // candidate matches on the canonical/primary series title, prefer that exact primary title.
-            let primary_matches: Vec<_> = exact_matches
-                .iter()
-                .filter(|(_, title)| normalize_title(title) == wanted_norm)
-                .cloned()
-                .collect();
-            if primary_matches.len() == 1 {
-                let (id, title) = primary_matches.into_iter().next().unwrap();
+            // First pass: Media-type aware filter.
+            // If candidates include comic formats (manga, manhwa, manhua, webtoon),
+            // eliminate competing prose formats (novels, light novels).
+            let has_comic = exact_matches.iter().any(|(_, _, t)| is_comic_media_type(t));
+            let type_filtered: Vec<_> = if has_comic {
+                exact_matches
+                    .into_iter()
+                    .filter(|(_, _, t)| !is_prose_media_type(t))
+                    .collect()
+            } else {
+                exact_matches
+            };
+
+            if type_filtered.len() == 1 {
+                let (id, title, _) = type_filtered.into_iter().next().unwrap();
                 return Ok(MangaBakaSeriesMatch::Found { id, title });
             }
 
-            let candidate_names: Vec<String> = exact_matches.into_iter().map(|(_, t)| t).collect();
+            // Second pass: Primary title filter.
+            // If multiple candidates matched on aliases/alternative titles, but exactly one
+            // candidate matches on the canonical/primary series title, prefer that exact primary title.
+            let primary_matches: Vec<_> = type_filtered
+                .iter()
+                .filter(|(_, title, _)| normalize_title(title) == wanted_norm)
+                .cloned()
+                .collect();
+            if primary_matches.len() == 1 {
+                let (id, title, _) = primary_matches.into_iter().next().unwrap();
+                return Ok(MangaBakaSeriesMatch::Found { id, title });
+            }
+
+            let candidate_names: Vec<String> = type_filtered.into_iter().map(|(_, t, _)| t).collect();
             return Ok(MangaBakaSeriesMatch::Ambiguous(candidate_names));
         }
 
-        let (id, title) = exact_matches.remove(0);
+        let (id, title, _) = exact_matches.remove(0);
         Ok(MangaBakaSeriesMatch::Found { id, title })
     }
 
@@ -2577,6 +2621,23 @@ mod tests {
     fn title_normalization() {
         assert_eq!(normalize_title("  Blue   Lock  "), "blue lock");
         assert_eq!(normalize_title("ONE PIECE"), "one piece");
+    }
+
+    #[test]
+    fn test_media_type_comic_vs_prose_classification() {
+        assert!(is_comic_media_type("manga"));
+        assert!(is_comic_media_type("manhwa"));
+        assert!(is_comic_media_type("manhua"));
+        assert!(is_comic_media_type("comic"));
+        assert!(is_comic_media_type("webtoon"));
+        assert!(!is_comic_media_type("novel"));
+        assert!(!is_comic_media_type("light_novel"));
+
+        assert!(is_prose_media_type("novel"));
+        assert!(is_prose_media_type("light_novel"));
+        assert!(is_prose_media_type("light novel"));
+        assert!(is_prose_media_type("web novel"));
+        assert!(!is_prose_media_type("manga"));
     }
 
     #[test]

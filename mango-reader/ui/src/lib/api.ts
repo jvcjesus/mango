@@ -1377,7 +1377,7 @@ export const getNormalizationHistory = (limit: number = 50) =>
 export const rollbackNormalizationRecord = (id: string) =>
   send<NormalizationHistoryRecord>('POST', `/pipeline/maintenance/rollback/${encodeURIComponent(id)}`, {});
 
-export type ReconciliationStatus = 'up_to_date' | 'missing_volume' | 'review_required' | 'sync_error';
+export type ReconciliationStatus = 'up_to_date' | 'missing_volume' | 'review_required' | 'sync_error' | 'collection_unavailable';
 
 export interface ReconciliationSummary {
   seriesId: string;
@@ -1415,6 +1415,9 @@ export const getMangaReconciliation = (id: number) =>
 
 export const reconcileManga = (id: number) =>
   send<ReconciliationSummary>('POST', `/manga/${id}/reconcile`, {});
+
+export const linkMangaBaka = (id: number, input: string | number) =>
+  send<ReconciliationSummary>('PUT', `/manga/${id}/mangabaka`, typeof input === 'number' ? { mangabakaId: input } : { input });
 
 export const getFollowedReconciliations = () =>
   get<ReconciliationSummary[]>('/reconciliation/followed');

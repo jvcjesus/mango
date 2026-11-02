@@ -40,6 +40,7 @@
     openTomeSchedule = null,
     releaseDiscoveryTargets = [],
     onResolveIdentity,
+    onLinkMangaBaka,
     onReviewRelease,
     onRetryMetadata,
     onDiscoverMissing,
@@ -69,6 +70,7 @@
     autoAcquireActivatedAt?: number | null;
     onToggleAutoAcquire?: () => void;
     onResolveIdentity?: () => void;
+    onLinkMangaBaka?: () => void;
     onReviewRelease?: () => void;
     onRetryMetadata?: () => void;
     onDiscoverMissing?: () => void;
@@ -187,6 +189,24 @@
         <strong>Series identity needs review</strong>
         <p class="banner-text">
           Canonical MangaBaka reconciliation is unresolved. Ownership metrics are paused until identity is confirmed.
+        </p>
+        {#if onLinkMangaBaka}
+          <div class="banner-actions" style="margin-top: 0.5rem;">
+            <button class="btn pill outline icon-text" onclick={onLinkMangaBaka}>
+              <Icon name="link" size={14} /> Link MangaBaka Series
+            </button>
+          </div>
+        {/if}
+      </div>
+    </div>
+  {:else if reconciliation?.status === 'collection_unavailable'}
+    <!-- Collection Unavailable Banner -->
+    <div class="state-banner alert-info">
+      <div class="banner-icon"><Icon name="info" size={20} /></div>
+      <div class="banner-body">
+        <strong>MangaBaka series verified · Edition data unavailable in MangaBaka</strong>
+        <p class="banner-text">
+          MangaBaka series identity is verified{#if reconciliation.mangabakaId} (ID {reconciliation.mangabakaId}){/if}, but official volume/edition indexing is not yet available in MangaBaka. Physical ownership ({summary.ownedCount} volume{summary.ownedCount === 1 ? '' : 's'}) is preserved.
         </p>
       </div>
     </div>

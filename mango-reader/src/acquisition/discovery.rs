@@ -220,12 +220,26 @@ pub async fn discover_for_volume(
     let series_title = reconciliation.title.clone();
     let current_time = now();
 
-    // Pre-flight check A: Review required
+    // Pre-flight check A: Review required or collection unavailable
     if reconciliation.status == ReconciliationStatus::ReviewRequired {
         return Ok(VolumeDiscoveryResult {
             series_id: series_id.to_string(),
             volume_number,
             status: "review_required".to_string(),
+            candidate_count: 0,
+            top_candidate: None,
+            candidates: Vec::new(),
+            providers_checked: Vec::new(),
+            provider_errors: HashMap::new(),
+            last_discovered_at: current_time,
+        });
+    }
+
+    if reconciliation.status == ReconciliationStatus::CollectionUnavailable {
+        return Ok(VolumeDiscoveryResult {
+            series_id: series_id.to_string(),
+            volume_number,
+            status: "collection_unavailable".to_string(),
             candidate_count: 0,
             top_candidate: None,
             candidates: Vec::new(),

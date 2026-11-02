@@ -170,6 +170,7 @@ pub fn router(state: Spaces) -> Router {
         .route("/manga/{id}/convert-to-catalog", post(post_manga_convert_to_catalog))
         .route("/manga/{id}/revert-to-source", post(post_manga_revert_to_source))
         .route("/manga/{id}/detach-source", post(post_manga_detach_source))
+        .route("/manga/{id}/mangabaka", put(put_manga_mangabaka))
         .route("/manga/{id}/cover", get(cover))
         .route("/manga/{id}/library", put(set_library))
         .route("/manga/{id}/reader", put(set_reader))
@@ -3359,4 +3360,79 @@ async fn post_manga_detach_source(
     app.me.admin()?;
     let res = crate::catalog::detach_source_from_catalog(&app, id).await?;
     Ok(Json(res))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MangaBakaLinkPayload {
+    pub mangabaka_id: Option<i64>,
+    pub input: Option<String>,
+}
+
+async fn put_manga_mangabaka(
+    Me(app): Me,
+    Path(id): Path<i64>,
+    Json(payload): Json<MangaBakaLinkPayload>,
+) -> Result<Json<crate::sync::reconciliation::ReconciliationSummary>> {
+    use rusqlite::OptionalExtension;
+    app.me.admin()?;
+    let mb_id = if let Some(mid) = payload.mangabaka_id {
+        Some(mid)
+    } else if let Some(ref inp) = payload.input {
+        crate::catalog::parse_mangabaka_id_input(inp)
+    } else {
+        None
+    };
+
+    let mb_id = mb_id.ok_or_else(|| AppError::bad_request("Valid MangaBaka ID or URL is required"))?;
+
+    let (title, komga_series_id) = app
+        .db
+        .call(move |conn| {
+            conn.execute(
+                "UPDATE manga SET mangabaka_id = ?1 WHERE id = ?2",
+                rusqlite::params![mb_id, id],
+            )?;
+
+            let title: Option<String> = conn
+                .query_row(
+                    "SELECT title FROM manga WHERE id = ?1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+
+            let k_id: Option<String> = conn
+                .query_row(
+                    "SELECT komga_series_id FROM tracked_catalog WHERE manga_id = ?1 LIMIT 1",
+                    [id],
+                    |r| r.get(0),
+                )
+                .optional()
+                .unwrap_or(None);
+
+            if let Some(ref kid) = k_id {
+                conn.execute(
+                    "INSERT INTO tracker_mappings (komga_series_id, tracker, tracker_id, updated_at, mapping_source, confidence)
+                     VALUES (?1, 'mangabaka', ?2, ?3, 'manual', 'resolved')
+                     ON CONFLICT(komga_series_id, tracker) DO UPDATE SET
+                        tracker_id = excluded.tracker_id,
+                        confidence = 'resolved',
+                        updated_at = excluded.updated_at",
+                    rusqlite::params![kid, mb_id.to_string(), crate::db::now()],
+                )?;
+            }
+
+            Ok((title.unwrap_or_default(), k_id))
+        })
+        .await?;
+
+    let target = crate::sync::reconciliation::ReconciliationTarget {
+        manga_id: Some(id),
+        komga_series_id,
+        title,
+        edition: None,
+    };
+    let summary = app.sync.run_reconciliation(target).await?;
+    Ok(Json(summary))
 }

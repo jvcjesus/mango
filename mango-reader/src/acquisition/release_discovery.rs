@@ -509,7 +509,10 @@ pub fn check_volume_correspondence(
         return Ok(false);
     };
 
-    if recon.status == ReconciliationStatus::ReviewRequired || recon.status == ReconciliationStatus::SyncError {
+    if recon.status == ReconciliationStatus::ReviewRequired
+        || recon.status == ReconciliationStatus::SyncError
+        || recon.status == ReconciliationStatus::CollectionUnavailable
+    {
         return Ok(false);
     }
 

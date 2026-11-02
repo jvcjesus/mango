@@ -67,6 +67,7 @@
     revertToSourceTitle,
     detachReadingSource,
     putMangaAutoAcquire,
+    linkMangaBaka,
   } from '../lib/api';
   import { confirm } from '../lib/confirm.svelte';
   import Cover from '../lib/Cover.svelte';
@@ -473,6 +474,23 @@
       toast.success(reconciliation.displayStatus);
     } catch (e) {
       toast.error(`Reconciliation failed: ${message(e)}`);
+    } finally {
+      reconciling = false;
+    }
+  }
+
+  async function promptLinkMangaBaka() {
+    const input = window.prompt('Enter MangaBaka Series ID or URL (e.g. 3251 or https://mangabaka.com/series/3251):');
+    if (!input || !input.trim()) return;
+    reconciling = true;
+    try {
+      reconciliation = await linkMangaBaka(id, input.trim());
+      try {
+        libraryState = await getMangaLibraryState(id);
+      } catch {}
+      toast.success(reconciliation.displayStatus || 'Linked to MangaBaka series');
+    } catch (e) {
+      toast.error(`Failed to link MangaBaka: ${message(e)}`);
     } finally {
       reconciling = false;
     }
@@ -1436,6 +1454,7 @@
               autoAcquireActivatedAt={title.autoAcquireActivatedAt}
               onToggleAutoAcquire={handleToggleAutoAcquire}
               onResolveIdentity={runReconcile}
+              onLinkMangaBaka={promptLinkMangaBaka}
               onReviewRelease={handleReviewRelease}
               onRetryMetadata={handleRetryMetadata}
               onDiscoverMissing={findAllMissingReleases}
