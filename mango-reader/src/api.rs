@@ -3207,6 +3207,7 @@ struct MangaAutoAcquireResponse {
 
 #[derive(Deserialize)]
 struct SetAutoAcquirePayload {
+    #[serde(alias = "autoAcquire", alias = "auto_acquire")]
     enabled: bool,
 }
 

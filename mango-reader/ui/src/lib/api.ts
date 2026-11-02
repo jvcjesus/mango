@@ -1755,8 +1755,7 @@ export interface AutoAcquireSettings {
 }
 
 export interface TitleAutoAcquireResponse {
-  mangaId: number;
-  autoAcquire: boolean;
+  enabled: boolean;
   activatedAt?: number | null;
 }
 
@@ -1781,8 +1780,8 @@ export const putAutoAcquireSettings = (settings: Partial<AutoAcquireSettings>) =
 export const getMangaAutoAcquire = (id: number) =>
   get<TitleAutoAcquireResponse>(`/manga/${id}/auto-acquire`);
 
-export const putMangaAutoAcquire = (id: number, autoAcquire: boolean) =>
-  send<TitleAutoAcquireResponse>('PUT', `/manga/${id}/auto-acquire`, { autoAcquire });
+export const putMangaAutoAcquire = (id: number, enabled: boolean) =>
+  send<TitleAutoAcquireResponse>('PUT', `/manga/${id}/auto-acquire`, { enabled });
 
 export const evaluateTargetAutoAcquire = (id: number, targetId: number) =>
   send<AutoAcquireDecision>('POST', `/manga/${id}/release-discovery/targets/${targetId}/evaluate-auto`, {});

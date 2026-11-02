@@ -558,9 +558,9 @@
     }
     try {
       const res = await putMangaAutoAcquire(title.id, nextVal);
-      title.autoAcquire = res.autoAcquire;
+      title.autoAcquire = res.enabled;
       title.autoAcquireActivatedAt = res.activatedAt;
-      toast.success(res.autoAcquire ? 'Auto-acquire enabled for this title' : 'Auto-acquire disabled for this title');
+      toast.success(res.enabled ? 'Auto-acquire enabled for this title' : 'Auto-acquire disabled for this title');
     } catch (e) {
       toast.error(`Failed to update auto-acquire: ${message(e)}`);
     }
