@@ -586,6 +586,16 @@ pub async fn convert_to_catalog_title(
         });
     }
 
+    if let Some(existing_cat_id) = source_manga.catalog_manga_id {
+        return Ok(ConvertToCatalogResponse {
+            catalog_manga_id: existing_cat_id,
+            source_manga_id,
+            title: source_manga.title,
+            success: true,
+            message: "Title is already linked to catalog title".to_string(),
+        });
+    }
+
     let title_str = source_manga.title.clone();
 
     // 2. Resolve MangaBaka ID from multiple authoritative sources
@@ -610,8 +620,8 @@ pub async fn convert_to_catalog_title(
                 // Check series_reconciliations
                 let rec_id: Option<i64> = conn
                     .query_row(
-                        "SELECT mangabaka_id FROM series_reconciliations WHERE manga_id = ?1 AND mangabaka_id IS NOT NULL",
-                        [source_manga_id],
+                        "SELECT mangabaka_id FROM series_reconciliations WHERE (manga_id = ?1 OR series_id = ?2) AND mangabaka_id IS NOT NULL",
+                        params![source_manga_id, format!("manga:{source_manga_id}")],
                         |r| r.get(0),
                     )
                     .optional()?
@@ -682,8 +692,8 @@ pub async fn convert_to_catalog_title(
                 // Check if catalog manga already exists
                 let existing: Option<i64> = conn
                     .query_row(
-                        "SELECT id FROM manga WHERE (mangabaka_id = ?1 OR url = ?2) AND source_id = 0",
-                        params![mb_id, url_c],
+                        "SELECT id FROM manga WHERE (source_manga_id = ?1 OR (mangabaka_id IS NOT NULL AND mangabaka_id = ?2) OR url = ?3) AND source_id = 0",
+                        params![source_manga_id, mb_id, url_c],
                         |r| r.get(0),
                     )
                     .optional()?;
@@ -714,6 +724,10 @@ pub async fn convert_to_catalog_title(
                 let new_series_id = format!("manga:{cat_id}");
 
                 // series_reconciliations
+                conn.execute(
+                    "DELETE FROM series_reconciliations WHERE series_id = ?1 OR manga_id = ?2",
+                    params![new_series_id, cat_id],
+                )?;
                 conn.execute(
                     "UPDATE series_reconciliations SET manga_id = ?1, series_id = ?2 WHERE manga_id = ?3",
                     params![cat_id, new_series_id, source_manga_id],
@@ -833,6 +847,11 @@ pub async fn revert_to_source_title(
             let old_series_id = format!("manga:{cat}");
             let new_series_id = format!("manga:{src}");
 
+            // Clear any conflicting destination reconciliation
+            conn.execute(
+                "DELETE FROM series_reconciliations WHERE series_id = ?1 OR manga_id = ?2",
+                params![new_series_id, src],
+            )?;
             conn.execute(
                 "UPDATE series_reconciliations SET manga_id = ?1, series_id = ?2 WHERE manga_id = ?3",
                 params![src, new_series_id, cat],
