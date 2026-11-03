@@ -71,7 +71,7 @@ pub struct LibraryIntegrityReport {
 /// Runs a complete, read-only audit across all library tables and storage references.
 pub fn audit_library_integrity(
     conn: &Connection,
-    _downloads_dir: Option<&Path>,
+    downloads_dir: Option<&Path>,
 ) -> Result<LibraryIntegrityReport> {
     let checked_at = now();
     let mut issues = Vec::new();
@@ -153,13 +153,18 @@ pub fn audit_library_integrity(
     // ---------------------------------------------------------
     // Audit Check 2: Komga Ownership Anomalies
     // ---------------------------------------------------------
+    // Only primary catalog titles (source_id = 0 and not converted from an external source)
+    // are expected to have a linked Komga series. External reading extension chapters
+    // (source_id > 0) are reader caches and not Komga canonical library entities.
     let mut anomaly_stmt = conn.prepare(
         "SELECT m.id, m.title, COUNT(c.id) AS chapter_count
          FROM manga m
          JOIN chapters c ON c.manga_id = m.id AND c.download_path IS NOT NULL
          LEFT JOIN tracked_catalog tc ON tc.manga_id = m.id
          LEFT JOIN series_reconciliations sr ON sr.manga_id = m.id
-         WHERE tc.komga_series_id IS NULL AND (sr.komga_series_id IS NULL OR sr.komga_series_id = '')
+         WHERE m.source_id = 0 AND m.catalog_manga_id IS NULL
+           AND (tc.komga_series_id IS NULL OR tc.komga_series_id = '')
+           AND (sr.komga_series_id IS NULL OR sr.komga_series_id = '')
          GROUP BY m.id, m.title",
     ).map_err(|e| AppError::internal(format!("Prepare anomaly stmt error: {e}")))?;
 
@@ -189,26 +194,49 @@ pub fn audit_library_integrity(
     // ---------------------------------------------------------
     // Audit Check 3: Duplicate Volume Records
     // ---------------------------------------------------------
+    // Verify duplicate volume records on disk rather than counting stale staging/payload paths
+    // whose files were moved into canonical storage.
     let mut dup_stmt = conn.prepare(
-        "SELECT m.id, m.title, c.chapter_number, COUNT(*) as cnt
+        "SELECT m.id, m.title, c.chapter_number, c.download_path
          FROM chapters c
          JOIN manga m ON m.id = c.manga_id
-         WHERE c.download_path IS NOT NULL AND c.chapter_number > 0
-         GROUP BY m.id, m.title, c.chapter_number
-         HAVING COUNT(*) > 1",
+         WHERE c.download_path IS NOT NULL AND c.chapter_number > 0",
     ).map_err(|e| AppError::internal(format!("Prepare dup stmt error: {e}")))?;
+
+    let mut vol_counts: HashMap<(i64, String, u32), usize> = HashMap::new();
 
     let rows = dup_stmt.query_map([], |r| {
         Ok((
             r.get::<_, i64>(0)?,
             r.get::<_, String>(1)?,
             r.get::<_, f64>(2)?,
-            r.get::<_, i64>(3)?,
+            r.get::<_, String>(3)?,
         ))
     }).map_err(|e| AppError::internal(format!("Query dup error: {e}")))?;
 
     for r in rows.flatten() {
-        let (mid, m_title, vol_num, cnt) = r;
+        let (mid, m_title, vol_num, dl_path) = r;
+        let p = Path::new(&dl_path);
+        let exists = if p.is_absolute() {
+            p.exists()
+        } else if let Some(dir) = downloads_dir {
+            dir.join(p).exists()
+        } else {
+            // When no downloads directory context is provided (e.g. mock DB in unit tests),
+            // assume existence.
+            true
+        };
+        if exists {
+            let key = (mid, m_title, (vol_num * 1000.0).round() as u32);
+            *vol_counts.entry(key).or_insert(0) += 1;
+        }
+    }
+
+    let mut sorted_vols: Vec<_> = vol_counts.into_iter().filter(|(_, cnt)| *cnt > 1).collect();
+    sorted_vols.sort_by(|a, b| a.0.0.cmp(&b.0.0).then_with(|| a.0.2.cmp(&b.0.2)));
+
+    for ((mid, m_title, vol_key), cnt) in sorted_vols {
+        let vol_num = (vol_key as f64) / 1000.0;
         issues.push(IntegrityIssue {
             id: format!("duplicate-vol-{mid}-{vol_num}"),
             category: "storage".to_string(),

@@ -3679,9 +3679,24 @@ fn test_m6_8_3_manual_mapping_and_library_integrity() {
         [],
     ).unwrap();
 
-    let report = crate::sync::integrity::audit_library_integrity(&conn, None).unwrap();
+    // Verify source-backed manga (source_id > 0) with downloaded chapter is NOT an anomaly
+    conn.execute(
+        "INSERT INTO manga (id, title, source_id, url) VALUES (99901, 'Source Reading Manga', 12345, 'ext:test')",
+        [],
+    ).unwrap();
+    conn.execute(
+        "INSERT INTO chapters (id, manga_id, url, name, chapter_number, source_order, fetched_at, download_path)
+         VALUES (99901, 99901, 'url:1', 'Ch 1', 1.0, 0, 1700000000, 'nonexistent/path.cbz')",
+        [],
+    ).unwrap();
+
+    // With a downloads dir provided, nonexistent files are filtered out for duplicate volume checks
+    let test_dl_dir = dir.join("downloads");
+    std::fs::create_dir_all(&test_dl_dir).unwrap();
+    let report = crate::sync::integrity::audit_library_integrity(&conn, Some(&test_dl_dir)).unwrap();
     assert!(report.total_issues > 0);
     assert!(report.issues.iter().any(|i| i.code == "ORPHAN_TRACKER_MAPPING"));
+    assert!(!report.issues.iter().any(|i| i.manga_id == Some(99901)));
 
     // 4. Test Notification History
     let events = crate::sync::reconciliation::list_notification_events(&conn, 10, false).unwrap();
