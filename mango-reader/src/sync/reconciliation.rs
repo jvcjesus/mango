@@ -2047,7 +2047,7 @@ pub fn get_release_calendar(
                           rdt.market, rdt.edition, rdt.release_date, rdt.release_date_precision,
                           rdt.date_type, rdt.status, rdt.candidates_count, rdt.top_candidate_title,
                           sr.status AS reconciliation_status,
-                          COALESCE(m.auto_acquire_enabled, 0) AS auto_acquire_enabled
+                          COALESCE(m.auto_acquire, 0) AS auto_acquire_enabled
                    FROM release_discovery_targets rdt
                    LEFT JOIN manga m ON m.id = rdt.manga_id
                    LEFT JOIN series_reconciliations sr ON sr.series_id = rdt.series_id
