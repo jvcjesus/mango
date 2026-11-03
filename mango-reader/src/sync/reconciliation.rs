@@ -2055,7 +2055,7 @@ pub fn get_release_calendar(
 
     if let Some(m) = market_filter {
         if !m.is_empty() {
-            sql.push_str(&format!(" AND rdt.market = '{}'", m.replace('\'', "''")));
+            sql.push_str(&format!(" AND LOWER(rdt.market) = LOWER('{}')", m.replace('\'', "''")));
         }
     }
 
