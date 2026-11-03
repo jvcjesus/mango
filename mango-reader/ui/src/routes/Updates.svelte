@@ -1,12 +1,24 @@
 <script lang="ts">
-  import { get, message, send, type UpdateItem, type Updates } from '../lib/api';
+  import {
+    get,
+    getReleaseCalendar,
+    message,
+    send,
+    type ReleaseCalendarItem,
+    type UpdateItem,
+    type Updates,
+  } from '../lib/api';
+  import CandidateInspectorModal from '../lib/CandidateInspectorModal.svelte';
   import Icon from '../lib/Icon.svelte';
   import { keep, recall } from '../lib/keep';
   import Notice from '../lib/Notice.svelte';
   import { toast } from '../lib/toast.svelte';
   import { ago, dayKey, dayLabel } from '../lib/util';
 
-  // What was here last time shows at once; the list is then asked for again.
+  // Navigation mode
+  let activeTab = $state<'chapters' | 'calendar'>('chapters');
+
+  // Chapters tab state
   const kept = recall<Updates>('updates');
   let data = $state<Updates | null>(kept);
   let loading = $state(!kept);
@@ -15,6 +27,13 @@
   let showErrors = $state(false);
   let starting = $state(false);
   let downloadingItems = $state<Record<number, boolean>>({});
+
+  // Release Calendar state
+  let calendarItems = $state<ReleaseCalendarItem[]>([]);
+  let calendarLoading = $state(false);
+  let calendarError = $state<string | null>(null);
+  let marketFilter = $state<string>('EN');
+  let inspectingVolumeTarget = $state<{ mangaId: number; volume: number } | null>(null);
 
   const running = $derived(data?.status.running ?? false);
   const days = $derived.by(() => {
@@ -25,6 +44,13 @@
       else groups.push({ day, items: [item] });
     }
     return groups;
+  });
+
+  const calendarGroups = $derived.by(() => {
+    const today = calendarItems.filter((i) => i.status === 'ReleasedToday');
+    const upcoming = calendarItems.filter((i) => i.status === 'Pending');
+    const past = calendarItems.filter((i) => i.status === 'Past');
+    return { today, upcoming, past };
   });
 
   async function load() {
@@ -80,89 +106,323 @@
       downloadingItems[item.chapterId] = false;
     }
   }
+
+  async function loadCalendar() {
+    calendarLoading = true;
+    calendarError = null;
+    try {
+      const market = marketFilter === 'ALL' ? undefined : marketFilter;
+      calendarItems = await getReleaseCalendar(market);
+    } catch (e) {
+      calendarError = message(e);
+    } finally {
+      calendarLoading = false;
+    }
+  }
+
+  function handleMarketChange(m: string) {
+    marketFilter = m;
+    loadCalendar();
+  }
+
+  function getDaysUntil(dateStr: string): number {
+    const target = new Date(dateStr).getTime();
+    const now = new Date().setHours(0, 0, 0, 0);
+    return Math.round((target - now) / 86400000);
+  }
+
+  function formatRelativeDays(days: number): string {
+    if (days === 0) return 'Today';
+    if (days === 1) return 'Tomorrow';
+    if (days > 1) return `in ${days} days`;
+    if (days === -1) return 'Yesterday';
+    return `${Math.abs(days)} days ago`;
+  }
 </script>
 
 <div class="page">
   <div class="page-head">
-    <h1 class="display">UPDATES</h1>
-    <div class="tools">
-      {#if data?.status.finishedAt && !running}
-        <strong>Checked {ago(data.status.finishedAt)}: {data.status.found} new{data.status.failed ? `, ${data.status.failed} failed` : ''}{data.status.waiting ? `, ${data.status.waiting} not due yet` : ''}</strong>
-      {/if}
-      <button class="btn big spot" disabled={running || starting} onclick={run}>
-        {#if running || starting}
-          <span class="spin"><Icon name="spinner" size={18} stroke={3} /></span>
-        {:else}
-          <Icon name="refresh" size={18} stroke={3} />
-        {/if}
-        {running && data ? `Checking ${data.status.done} / ${data.status.total}` : starting ? 'Starting…' : 'Update now'}
-      </button>
+    <div class="head-left">
+      <h1 class="display">UPDATES</h1>
+      <div class="pill-group view-switcher" role="tablist" aria-label="Updates view">
+        <button
+          class="pill"
+          class:active={activeTab === 'chapters'}
+          onclick={() => (activeTab = 'chapters')}
+          role="tab"
+          aria-selected={activeTab === 'chapters'}
+        >
+          <Icon name="book" size={14} /> Chapter Updates
+        </button>
+        <button
+          class="pill"
+          class:active={activeTab === 'calendar'}
+          onclick={() => {
+            activeTab = 'calendar';
+            if (calendarItems.length === 0) loadCalendar();
+          }}
+          role="tab"
+          aria-selected={activeTab === 'calendar'}
+        >
+          <Icon name="clock" size={14} /> Release Calendar
+        </button>
+      </div>
     </div>
+
+    {#if activeTab === 'chapters'}
+      <div class="tools">
+        {#if data?.status.finishedAt && !running}
+          <strong>Checked {ago(data.status.finishedAt)}: {data.status.found} new{data.status.failed ? `, ${data.status.failed} failed` : ''}{data.status.waiting ? `, ${data.status.waiting} not due yet` : ''}</strong>
+        {/if}
+        <button class="btn big spot" disabled={running || starting} onclick={run}>
+          {#if running || starting}
+            <span class="spin"><Icon name="spinner" size={18} stroke={3} /></span>
+          {:else}
+            <Icon name="refresh" size={18} stroke={3} />
+          {/if}
+          {running && data ? `Checking ${data.status.done} / ${data.status.total}` : starting ? 'Starting…' : 'Update now'}
+        </button>
+      </div>
+    {:else}
+      <div class="tools">
+        <div class="pill-group" role="radiogroup" aria-label="Market Filter">
+          <button
+            class="pill"
+            class:active={marketFilter === 'EN'}
+            onclick={() => handleMarketChange('EN')}
+          >
+            EN
+          </button>
+          <button
+            class="pill"
+            class:active={marketFilter === 'JA'}
+            onclick={() => handleMarketChange('JA')}
+          >
+            JA
+          </button>
+          <button
+            class="pill"
+            class:active={marketFilter === 'ALL'}
+            onclick={() => handleMarketChange('ALL')}
+          >
+            All
+          </button>
+        </div>
+        <button class="btn big" disabled={calendarLoading} onclick={loadCalendar}>
+          {#if calendarLoading}
+            <span class="spin"><Icon name="spinner" size={18} stroke={3} /></span>
+          {:else}
+            <Icon name="refresh" size={18} stroke={3} />
+          {/if}
+          Refresh
+        </button>
+      </div>
+    {/if}
   </div>
 
-  <Notice {loading} {error} retry={load} />
-  {#if note}<p role="status"><strong>{note}</strong> <a class="link" href="#/downloads">See downloads</a></p>{/if}
+  {#if activeTab === 'chapters'}
+    <Notice {loading} {error} retry={load} />
+    {#if note}<p role="status"><strong>{note}</strong> <a class="link" href="#/downloads">See downloads</a></p>{/if}
 
-  {#if data?.errors.length}
-    <section class="panel problems">
-      <button class="btn" aria-expanded={showErrors} onclick={() => (showErrors = !showErrors)}>
-        {data.errors.length} {data.errors.length === 1 ? 'title' : 'titles'} could not be checked<Icon name={showErrors ? 'up' : 'down'} size={18} />
-      </button>
-      {#if showErrors}
+    {#if data?.errors.length}
+      <section class="panel problems">
+        <button class="btn" aria-expanded={showErrors} onclick={() => (showErrors = !showErrors)}>
+          {data.errors.length} {data.errors.length === 1 ? 'title' : 'titles'} could not be checked<Icon name={showErrors ? 'up' : 'down'} size={18} />
+        </button>
+        {#if showErrors}
+          <ul class="rows">
+            {#each data.errors as failure (failure.mangaId)}
+              <li>
+                <a class="main" href="#/title/{failure.mangaId}"><strong>{failure.title}</strong><span>{failure.error} · {ago(failure.at)}</span></a>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+      </section>
+    {/if}
+
+    {#each days as group (group.day)}
+      <section>
+        <div class="section-head"><h2 class="display">{dayLabel(group.day)}</h2></div>
         <ul class="rows">
-          {#each data.errors as failure (failure.mangaId)}
-            <li>
-              <a class="main" href="#/title/{failure.mangaId}"><strong>{failure.title}</strong><span>{failure.error} · {ago(failure.at)}</span></a>
+          {#each group.items as item (item.chapterId)}
+            <li class:done={item.read}>
+              <a class="main" href="#/title/{item.mangaId}">
+                <strong>{item.title}</strong>
+                <span>{item.chapterName}{item.sourceName ? ` · ${item.sourceName}` : ''}{item.read ? ' · read' : ''}{item.downloaded ? ' · saved' : ''}</span>
+              </a>
+              <span class="tools">
+                {#if !item.downloaded}
+                  <button
+                    class="btn icon"
+                    aria-label="Download {item.chapterName} of {item.title}"
+                    disabled={downloadingItems[item.chapterId]}
+                    onclick={() => download(item)}
+                  >
+                    {#if downloadingItems[item.chapterId]}
+                      <span class="spin"><Icon name="spinner" size={16} stroke={3} /></span>
+                    {:else}
+                      <Icon name="download" />
+                    {/if}
+                  </button>
+                {/if}
+                <a class="btn" href="#/read/{item.chapterId}">Read<Icon name="arrow" size={18} stroke={3} /></a>
+              </span>
             </li>
           {/each}
         </ul>
+      </section>
+    {/each}
+
+    {#if data && data.items.length === 0 && !loading}
+      <Notice>No new chapters yet. Titles in the library are checked on a schedule; “Update now” checks them right away.</Notice>
+    {/if}
+
+  {:else}
+    <!-- RELEASE CALENDAR VIEW -->
+    <Notice loading={calendarLoading} error={calendarError} retry={loadCalendar} />
+
+    {#if !calendarLoading && !calendarError}
+      {#if calendarItems.length === 0}
+        <div class="panel empty-calendar-panel">
+          <h3>No Scheduled Volume Releases Found</h3>
+          <p class="muted">
+            OpenTome release intelligence tracks upcoming physical volume dates from publisher metadata.
+            Make sure your titles are reconciled with MangaBaka and your OpenTome database dump is up to date in Settings → Pipeline.
+          </p>
+        </div>
+      {:else}
+        <!-- Releases Today -->
+        {#if calendarGroups.today.length > 0}
+          <section class="calendar-section releases-today-section">
+            <div class="section-head">
+              <h2 class="display today-headline">
+                <span class="pulse-indicator"></span>
+                RELEASES TODAY ({calendarGroups.today.length})
+              </h2>
+            </div>
+            <div class="calendar-grid">
+              {#each calendarGroups.today as item}
+                {@render calendarCard(item)}
+              {/each}
+            </div>
+          </section>
+        {/if}
+
+        <!-- Upcoming Releases -->
+        {#if calendarGroups.upcoming.length > 0}
+          <section class="calendar-section">
+            <div class="section-head">
+              <h2 class="display">SCHEDULED & UPCOMING ({calendarGroups.upcoming.length})</h2>
+            </div>
+            <div class="calendar-grid">
+              {#each calendarGroups.upcoming as item}
+                {@render calendarCard(item)}
+              {/each}
+            </div>
+          </section>
+        {/if}
+
+        <!-- Past Releases -->
+        {#if calendarGroups.past.length > 0}
+          <section class="calendar-section">
+            <div class="section-head">
+              <h2 class="display muted-headline">PAST RELEASES ({calendarGroups.past.length})</h2>
+            </div>
+            <div class="calendar-grid">
+              {#each calendarGroups.past as item}
+                {@render calendarCard(item)}
+              {/each}
+            </div>
+          </section>
+        {/if}
       {/if}
-    </section>
-  {/if}
-
-  {#each days as group (group.day)}
-    <section>
-      <div class="section-head"><h2 class="display">{dayLabel(group.day)}</h2></div>
-      <ul class="rows">
-        {#each group.items as item (item.chapterId)}
-          <li class:done={item.read}>
-            <a class="main" href="#/title/{item.mangaId}">
-              <strong>{item.title}</strong>
-              <span>{item.chapterName}{item.sourceName ? ` · ${item.sourceName}` : ''}{item.read ? ' · read' : ''}{item.downloaded ? ' · saved' : ''}</span>
-            </a>
-            <span class="tools">
-              {#if !item.downloaded}
-                <button
-                  class="btn icon"
-                  aria-label="Download {item.chapterName} of {item.title}"
-                  disabled={downloadingItems[item.chapterId]}
-                  onclick={() => download(item)}
-                >
-                  {#if downloadingItems[item.chapterId]}
-                    <span class="spin"><Icon name="spinner" size={16} stroke={3} /></span>
-                  {:else}
-                    <Icon name="download" />
-                  {/if}
-                </button>
-              {/if}
-              <a class="btn" href="#/read/{item.chapterId}">Read<Icon name="arrow" size={18} stroke={3} /></a>
-            </span>
-          </li>
-        {/each}
-      </ul>
-    </section>
-  {/each}
-
-  {#if data && data.items.length === 0 && !loading}
-    <Notice>No new chapters yet. Titles in the library are checked on a schedule; “Update now” checks them right away.</Notice>
+    {/if}
   {/if}
 </div>
+
+{#snippet calendarCard(item: ReleaseCalendarItem)}
+  {@const daysUntil = getDaysUntil(item.releaseDate)}
+  {@const autoMode = item.autoAcquireEnabled ? (item.autoAcquireDryRun ? 'Dry-Run' : 'Active') : 'Disabled'}
+  <div class="cal-card" class:card-owned={item.isOwned} class:card-today={item.status === 'ReleasedToday'}>
+    <div class="cal-card-head">
+      <div class="cal-badges">
+        <span class="badge badge-market">{item.market}</span>
+        {#if item.status === 'ReleasedToday'}
+          <span class="badge badge-today">Today</span>
+        {:else if item.status === 'Pending'}
+          <span class="badge badge-pending">{formatRelativeDays(daysUntil)}</span>
+        {:else}
+          <span class="badge badge-past">{formatRelativeDays(daysUntil)}</span>
+        {/if}
+        <span class="badge badge-own {item.isOwned ? 'owned' : 'missing'}">
+          {item.isOwned ? 'Owned' : 'Missing'}
+        </span>
+      </div>
+      <span class="cal-date">{item.releaseDate}</span>
+    </div>
+
+    <div class="cal-card-body">
+      <h3 class="cal-title">
+        {#if item.mangaId}
+          <a href="#/title/{item.mangaId}" class="cal-link">{item.seriesTitle}</a>
+        {:else}
+          <span>{item.seriesTitle}</span>
+        {/if}
+      </h3>
+      <div class="cal-sub">
+        <strong>Vol. {item.volumeNumber}</strong>
+        {#if item.edition && item.edition !== 'standard'}
+          <span class="cal-edition">({item.edition})</span>
+        {/if}
+        {#if item.candidatesCount > 0}
+          <span class="cal-candidates font-small muted">{item.candidatesCount} candidate{item.candidatesCount === 1 ? '' : 's'}</span>
+        {/if}
+      </div>
+    </div>
+
+    <div class="cal-card-foot">
+      <div class="cal-policy">
+        <span class="policy-label">Policy:</span>
+        <span class="policy-val policy-{autoMode.toLowerCase().replace(/[^a-z]/g, '')}">{autoMode}</span>
+      </div>
+      <div class="cal-actions">
+        {#if item.mangaId}
+          <button
+            class="btn mini flat"
+            onclick={() => {
+              inspectingVolumeTarget = { mangaId: item.mangaId!, volume: item.volumeNumber };
+            }}
+            title="Inspect candidate transports and gate evaluation for Volume {item.volumeNumber}"
+          >
+            <Icon name="eye" size={13} /> Inspect
+          </button>
+          <a class="btn mini" href="#/title/{item.mangaId}">
+            Title <Icon name="arrow" size={13} />
+          </a>
+        {:else}
+          <span class="muted font-small">Target #{item.targetId}</span>
+        {/if}
+      </div>
+    </div>
+  </div>
+{/snippet}
+
+{#if inspectingVolumeTarget}
+  <CandidateInspectorModal
+    open={true}
+    mangaId={inspectingVolumeTarget.mangaId}
+    volume={inspectingVolumeTarget.volume}
+    onClose={() => { inspectingVolumeTarget = null; }}
+  />
+{/if}
 
 <style>
   section {
     display: flex;
     flex-direction: column;
-    gap: 6px;
+    gap: 8px;
+    margin-top: 16px;
   }
 
   .section-head h2 {
@@ -195,5 +455,263 @@
 
   .link {
     text-decoration: underline;
+  }
+
+  .head-left {
+    display: flex;
+    align-items: baseline;
+    gap: 20px;
+    flex-wrap: wrap;
+  }
+
+  .view-switcher {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .pill-group {
+    display: flex;
+    gap: 4px;
+    background: var(--shade);
+    padding: 3px;
+    border-radius: 9999px;
+  }
+
+  .pill {
+    border: none;
+    background: transparent;
+    color: var(--dim);
+    padding: 5px 12px;
+    border-radius: 9999px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    transition: all 0.15s ease;
+  }
+
+  .pill:hover {
+    color: var(--ink);
+  }
+
+  .pill.active {
+    background: var(--ink);
+    color: var(--paper);
+    box-shadow: var(--sh-1);
+  }
+
+  /* Release Calendar Grid & Cards */
+  .calendar-section {
+    margin-top: 24px;
+  }
+
+  .calendar-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+    gap: 14px;
+  }
+
+  .cal-card {
+    background: var(--paper);
+    border: 2px solid var(--shade);
+    border-radius: 8px;
+    padding: 14px 16px;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    gap: 12px;
+    box-shadow: var(--sh-1);
+    transition: transform 0.15s ease, border-color 0.15s ease;
+  }
+
+  .cal-card:hover {
+    border-color: var(--dim);
+  }
+
+  .card-today {
+    border-color: var(--spot, #d9534f);
+    background: color-mix(in srgb, var(--spot, #d9534f) 4%, var(--paper));
+  }
+
+  .cal-card-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .cal-badges {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+
+  .badge {
+    font-size: 11px;
+    font-weight: 700;
+    padding: 2px 7px;
+    border-radius: 4px;
+    text-transform: uppercase;
+  }
+
+  .badge-market {
+    background: var(--shade);
+    color: var(--ink);
+  }
+
+  .badge-today {
+    background: var(--spot, #d9534f);
+    color: #fff;
+  }
+
+  .badge-pending {
+    background: #0284c7;
+    color: #fff;
+  }
+
+  .badge-past {
+    background: var(--shade);
+    color: var(--dim);
+  }
+
+  .badge-own.owned {
+    background: #16a34a;
+    color: #fff;
+  }
+
+  .badge-own.missing {
+    background: var(--dim);
+    color: var(--paper);
+  }
+
+  .cal-date {
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--dim);
+    font-variant-numeric: tabular-nums;
+  }
+
+  .cal-card-body {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .cal-title {
+    font-size: 16px;
+    font-weight: 700;
+    margin: 0;
+    line-height: 1.3;
+  }
+
+  .cal-link {
+    color: var(--ink);
+    text-decoration: none;
+  }
+
+  .cal-link:hover {
+    text-decoration: underline;
+  }
+
+  .cal-sub {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    font-size: 13px;
+    color: var(--muted);
+    flex-wrap: wrap;
+  }
+
+  .cal-isbn {
+    font-size: 11px;
+  }
+
+  .cal-card-foot {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    border-top: 1px solid var(--shade);
+    padding-top: 10px;
+    gap: 8px;
+  }
+
+  .cal-policy {
+    display: flex;
+    gap: 4px;
+    align-items: center;
+    font-size: 12px;
+  }
+
+  .policy-label {
+    color: var(--muted);
+  }
+
+  .policy-val {
+    font-weight: 600;
+  }
+
+  .policy-val.policy-enabled {
+    color: #16a34a;
+  }
+
+  .policy-val.policy-dryrun {
+    color: #eab308;
+  }
+
+  .policy-val.policy-disabled {
+    color: var(--dim);
+  }
+
+  .cal-actions {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .today-headline {
+    color: var(--spot, #d9534f);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .muted-headline {
+    color: var(--muted);
+  }
+
+  .pulse-indicator {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: var(--spot, #d9534f);
+    display: inline-block;
+    animation: pulse 1.8s infinite;
+  }
+
+  @keyframes pulse {
+    0% { transform: scale(0.95); opacity: 0.8; }
+    50% { transform: scale(1.3); opacity: 1; }
+    100% { transform: scale(0.95); opacity: 0.8; }
+  }
+
+  .empty-calendar-panel {
+    padding: 32px 24px;
+    text-align: center;
+    background: var(--paper);
+    border: 2px dashed var(--shade);
+    border-radius: 8px;
+    margin-top: 20px;
+  }
+
+  .monospace {
+    font-family: monospace;
+  }
+
+  .font-small {
+    font-size: 12px;
   }
 </style>

@@ -41,6 +41,17 @@ pub enum MangaBakaCollectionMatch {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MangaBakaCollectionInfo {
+    pub id: String,
+    pub name: String,
+    pub language: String,
+    pub edition: String,
+    pub medium: String,
+    pub total_works: Option<u32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MangaBakaCrossReference {
     pub mangabaka_id: i64,
     pub title: Option<String>,
@@ -1456,6 +1467,95 @@ impl MangaBakaClient {
             edition,
             total_works,
         })
+    }
+
+    /// Lists all edition collections available for a MangaBaka series.
+    pub async fn list_series_collections(&self, series_id: i64) -> Result<Vec<MangaBakaCollectionInfo>> {
+        let collections_url = format!("/series/{series_id}/collections");
+        let resp = match self.public_request(reqwest::Method::GET, &collections_url).send().await {
+            Ok(r) if r.status().is_success() => r,
+            _ => return Ok(Vec::new()),
+        };
+
+        let body: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(_) => return Ok(Vec::new()),
+        };
+
+        let collections = body
+            .get("data")
+            .and_then(|d| d.as_array())
+            .cloned()
+            .unwrap_or_default();
+
+        let mut out = Vec::new();
+        for col in &collections {
+            let id = col
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if id.is_empty() {
+                continue;
+            }
+            let name = col
+                .get("name")
+                .or_else(|| col.get("title"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let language = col
+                .get("language")
+                .and_then(|l| {
+                    l.get("iso")
+                        .or_else(|| l.get("code"))
+                        .or_else(|| l.get("language"))
+                        .and_then(|v| v.as_str())
+                })
+                .or_else(|| col.get("language").and_then(|v| v.as_str()))
+                .unwrap_or("")
+                .to_string();
+            let edition = col
+                .get("edition")
+                .and_then(|e| {
+                    e.get("name")
+                        .or_else(|| e.get("title"))
+                        .and_then(|v| v.as_str())
+                        .or_else(|| e.as_str())
+                })
+                .or_else(|| col.get("edition").and_then(|v| v.as_str()))
+                .unwrap_or("")
+                .to_string();
+            let medium = col
+                .get("medium")
+                .and_then(|m| m.as_str())
+                .unwrap_or("")
+                .to_string();
+            let total_works = col
+                .get("total_works")
+                .or_else(|| col.get("works_count"))
+                .or_else(|| col.get("count"))
+                .and_then(|v| v.as_u64())
+                .map(|u| u as u32);
+
+            let display_name = if !name.is_empty() {
+                name
+            } else if !edition.is_empty() {
+                format!("{edition} ({language})")
+            } else {
+                format!("Collection {id}")
+            };
+
+            out.push(MangaBakaCollectionInfo {
+                id,
+                name: display_name,
+                language,
+                edition,
+                medium,
+                total_works,
+            });
+        }
+        Ok(out)
     }
 
     /// Fetches the authoritative total works/volumes count for a MangaBaka collection.

@@ -138,6 +138,10 @@ pub fn router(state: Spaces) -> Router {
             get(get_followed_reconciliations).post(post_run_followed_reconciliations),
         )
         .route("/manga/{id}/volumes/{volume}/candidates", get(get_manga_volume_candidates))
+        .route(
+            "/manga/{id}/volumes/{volume}/candidates/inspect",
+            get(get_manga_volume_candidates_inspect),
+        )
         .route("/manga/{id}/volumes/{volume}/candidates/{candidate_id}/acquire", post(post_manga_volume_candidate_acquire))
         .route("/manga/{id}/volumes/{volume}/discover", post(post_manga_volume_discover))
         .route("/manga/{id}/discover-missing", post(post_manga_discover_missing))
@@ -174,6 +178,22 @@ pub fn router(state: Spaces) -> Router {
         .route("/manga/{id}/revert-to-source", post(post_manga_revert_to_source))
         .route("/manga/{id}/detach-source", post(post_manga_detach_source))
         .route("/manga/{id}/mangabaka", put(put_manga_mangabaka))
+        .route("/manga/{id}/diagnostics", get(get_manga_diagnostics))
+        .route(
+            "/manga/{id}/mapping/manual",
+            post(post_manga_mapping_manual).delete(delete_manga_mapping_manual),
+        )
+        .route(
+            "/catalog/mangabaka/{id}/collections",
+            get(get_catalog_mangabaka_collections),
+        )
+        .route("/releases/calendar", get(get_releases_calendar))
+        .route("/system/integrity", get(get_system_integrity))
+        .route("/notifications/history", get(get_notifications_history))
+        .route(
+            "/notifications/events/{id}/resolve",
+            post(post_notification_event_resolve),
+        )
         .route("/manga/{id}/cover", get(cover))
         .route("/manga/{id}/library", put(set_library))
         .route("/manga/{id}/reader", put(set_reader))
@@ -3446,4 +3466,195 @@ async fn put_manga_mangabaka(
     };
     let summary = app.sync.run_reconciliation(target).await?;
     Ok(Json(summary))
+}
+
+// -------------------------------------------------------------
+// M6.8.3 Observability, Diagnostics & Control UX Handlers
+// -------------------------------------------------------------
+
+async fn get_manga_diagnostics(
+    Me(app): Me,
+    Path(id): Path<i64>,
+) -> Result<Json<crate::sync::diagnostics::TitleDiagnostics>> {
+    let diag = app
+        .db
+        .call(move |conn| crate::sync::diagnostics::get_title_diagnostics(conn, id))
+        .await?;
+    Ok(Json(diag))
+}
+
+async fn get_manga_volume_candidates_inspect(
+    Me(app): Me,
+    Path((id, volume)): Path<(i64, f64)>,
+) -> Result<Json<crate::sync::diagnostics::VolumeCandidateInspectionResult>> {
+    use rusqlite::OptionalExtension;
+    let series_id = app
+        .db
+        .call(move |conn| {
+            if let Some(sum) = crate::sync::reconciliation::get_reconciliation_for_manga(conn, id)? {
+                Ok(Some(sum.series_id))
+            } else {
+                let title: Option<String> = conn
+                    .query_row("SELECT title FROM manga WHERE id = ?1", [id], |r| r.get(0))
+                    .optional()?;
+                Ok(title.as_deref().map(|t| format!("title:{}", crate::pipeline::mangabaka::normalize_title(t))))
+            }
+        })
+        .await?;
+
+    let Some(s_id) = series_id else {
+        return Err(AppError::not_found(format!("Manga {id} not found")));
+    };
+
+    let profile = app.acquisition.get_manga_profile(id).await.unwrap_or_default();
+
+    let res = app
+        .db
+        .call(move |conn| {
+            crate::sync::diagnostics::inspect_volume_candidates(conn, &s_id, volume, &profile)
+        })
+        .await?;
+
+    Ok(Json(res))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TitleManualMappingPayload {
+    mangabaka_id: Option<i64>,
+    collection_id: Option<String>,
+    edition: Option<String>,
+}
+
+async fn post_manga_mapping_manual(
+    Me(app): Me,
+    Path(id): Path<i64>,
+    Json(payload): Json<TitleManualMappingPayload>,
+) -> Result<Json<crate::sync::reconciliation::ReconciliationSummary>> {
+    app.me.admin()?;
+
+    let (title, komga_series_id) = app
+        .db
+        .call(move |conn| {
+            crate::sync::reconciliation::set_manual_series_and_collection(
+                conn,
+                id,
+                payload.mangabaka_id,
+                payload.collection_id.as_deref(),
+                payload.edition.as_deref(),
+            )
+        })
+        .await?;
+
+    let target = crate::sync::reconciliation::ReconciliationTarget {
+        manga_id: Some(id),
+        komga_series_id,
+        title,
+        edition: None,
+    };
+    let summary = app.sync.run_reconciliation(target).await?;
+    Ok(Json(summary))
+}
+
+async fn delete_manga_mapping_manual(
+    Me(app): Me,
+    Path(id): Path<i64>,
+) -> Result<Json<crate::sync::reconciliation::ReconciliationSummary>> {
+    app.me.admin()?;
+
+    let (title, komga_series_id) = app
+        .db
+        .call(move |conn| {
+            crate::sync::reconciliation::clear_manual_series_and_collection(conn, id)
+        })
+        .await?;
+
+    let target = crate::sync::reconciliation::ReconciliationTarget {
+        manga_id: Some(id),
+        komga_series_id,
+        title,
+        edition: None,
+    };
+    let summary = app.sync.run_reconciliation(target).await?;
+    Ok(Json(summary))
+}
+
+async fn get_catalog_mangabaka_collections(
+    Me(app): Me,
+    Path(id): Path<i64>,
+) -> Result<Json<Vec<crate::pipeline::mangabaka::MangaBakaCollectionInfo>>> {
+    let (cfg, mb_token, _) = app.pipeline.load_internal_config().await?;
+    let mb_client = crate::pipeline::mangabaka::MangaBakaClient::new(
+        app.trackers.http().clone(),
+        cfg.mangabaka_url,
+        mb_token,
+    );
+    let collections = mb_client.list_series_collections(id).await?;
+    Ok(Json(collections))
+}
+
+#[derive(Deserialize)]
+struct ReleaseCalendarQuery {
+    market: Option<String>,
+}
+
+async fn get_releases_calendar(
+    Me(app): Me,
+    Query(query): Query<ReleaseCalendarQuery>,
+) -> Result<Json<Vec<crate::sync::reconciliation::ReleaseCalendarEntryDto>>> {
+    let items = app
+        .db
+        .call(move |conn| {
+            crate::sync::reconciliation::get_release_calendar(conn, query.market.as_deref())
+        })
+        .await?;
+    Ok(Json(items))
+}
+
+async fn get_system_integrity(
+    Me(app): Me,
+) -> Result<Json<crate::sync::integrity::LibraryIntegrityReport>> {
+    app.me.admin()?;
+    let downloads_dir = app.downloads.dir().to_path_buf();
+    let report = app
+        .db
+        .call(move |conn| {
+            crate::sync::integrity::audit_library_integrity(conn, Some(&downloads_dir))
+        })
+        .await?;
+    Ok(Json(report))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct NotificationsHistoryQuery {
+    limit: Option<usize>,
+    active_only: Option<bool>,
+}
+
+async fn get_notifications_history(
+    Me(app): Me,
+    Query(query): Query<NotificationsHistoryQuery>,
+) -> Result<Json<Vec<crate::sync::reconciliation::NotificationEventHistoryDto>>> {
+    let limit = query.limit.unwrap_or(50);
+    let active_only = query.active_only.unwrap_or(false);
+    let events = app
+        .db
+        .call(move |conn| {
+            crate::sync::reconciliation::list_notification_events(conn, limit, active_only)
+        })
+        .await?;
+    Ok(Json(events))
+}
+
+async fn post_notification_event_resolve(
+    Me(app): Me,
+    Path(id): Path<i64>,
+) -> Result<Json<bool>> {
+    app.me.admin()?;
+    let resolved = app
+        .db
+        .call(move |conn| crate::sync::reconciliation::resolve_notification_event(conn, id))
+        .await?;
+    Ok(Json(resolved))
 }

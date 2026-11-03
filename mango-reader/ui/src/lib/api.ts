@@ -1799,3 +1799,247 @@ export const putMangaAutoAcquire = (id: number, enabled: boolean) =>
 
 export const evaluateTargetAutoAcquire = (id: number, targetId: number) =>
   send<AutoAcquireDecision>('POST', `/manga/${id}/release-discovery/targets/${targetId}/evaluate-auto`, {});
+
+
+// ---------- M6.8.3: Observability, Diagnostics & Control UX ----------
+
+export interface TitleIdentityDiagnostics {
+  mangaId: number;
+  title: string;
+  sourceId: number;
+  sourceMangaId?: number | null;
+  catalogMangaId?: number | null;
+  komgaSeriesId?: string | null;
+  anilistId?: number | null;
+  mangabakaId?: number | null;
+  mangabakaTitle?: string | null;
+  identitySource: string;
+  manualOverride: boolean;
+  conflicts: string[];
+}
+
+export interface TitleCollectionDiagnostics {
+  resolvedCollectionId?: string | null;
+  market: string;
+  edition: string;
+  totalVolumes?: number | null;
+  collectionStatus: string;
+  reason?: string | null;
+}
+
+export interface TitleOwnershipDiagnostics {
+  komgaOwnedVolumes: number[];
+  mangoLocalOwnedVolumes: number[];
+  localQuerySkipped: boolean;
+  totalOwnedCount: number;
+  missingVolumes: number[];
+  futureVolumes: number[];
+}
+
+export interface ReleaseTargetSummaryDto {
+  targetId: number;
+  volumeNumber: number;
+  releaseDate: string;
+  releaseDatePrecision: string;
+  dateType: string;
+  status: string;
+  isOwned: boolean;
+  candidatesCount: number;
+  topCandidateTitle?: string | null;
+}
+
+export interface TitleReleaseIntelligenceDiagnostics {
+  opentomeTracked: boolean;
+  workId?: string | null;
+  mappingConfidence?: string | null;
+  mappingSource?: string | null;
+  market: string;
+  edition: string;
+  nextReleaseDate?: string | null;
+  nextReleaseVolume?: number | null;
+  totalReleaseTargets: number;
+  targets: ReleaseTargetSummaryDto[];
+}
+
+export interface ReconciliationEventDto {
+  id: number;
+  eventType: string;
+  message: string;
+  volumeNumber?: number | null;
+  severity: string;
+  createdAt: number;
+  resolvedAt?: number | null;
+  outboxStatus?: string | null;
+  outboxAttempts?: number | null;
+  outboxLastError?: string | null;
+}
+
+export interface TitleReconciliationDiagnostics {
+  seriesId: string;
+  status: string;
+  displayStatus: string;
+  totalOfficialVolumes?: number | null;
+  lastReconciledAt?: number | null;
+  lastError?: string | null;
+  reviewReason?: string | null;
+  activeEvent?: ReconciliationEventDto | null;
+}
+
+export interface TitleAutoAcquireGateEvaluation {
+  globalEnabled: boolean;
+  titleOptIn: boolean;
+  activatedAt?: number | null;
+  dryRun: boolean;
+  ownershipGatePassed: boolean;
+  ownershipGateReason: string;
+  releaseGatePassed: boolean;
+  releaseGateReason: string;
+  correspondenceGatePassed: boolean;
+  correspondenceGateReason: string;
+  finalCode: string;
+  finalReason: string;
+}
+
+export interface TitleDiagnostics {
+  identity: TitleIdentityDiagnostics;
+  collection: TitleCollectionDiagnostics;
+  ownership: TitleOwnershipDiagnostics;
+  releaseIntelligence: TitleReleaseIntelligenceDiagnostics;
+  reconciliation: TitleReconciliationDiagnostics;
+  autoAcquireGates: TitleAutoAcquireGateEvaluation;
+}
+
+export interface CandidateInspectionDto {
+  candidateId: string;
+  provider: string;
+  transport: string;
+  title: string;
+  rawTitle: string;
+  matchType: string;
+  isPre: boolean;
+  sizeBytes?: number | null;
+  uploader?: string | null;
+  isTrusted: boolean;
+  isDigital: boolean;
+  score: number;
+  scoreExplanation: string;
+  seeders?: number | null;
+  leechers?: number | null;
+  publishedAt?: number | null;
+  autoAcquireEligible: boolean;
+  rejectionCode?: string | null;
+  rejectionReason?: string | null;
+  sanitizedReference?: string | null;
+}
+
+export interface VolumeCandidateInspectionResult {
+  seriesId: string;
+  volumeNumber: number;
+  targetStatus?: string | null;
+  targetReleaseDate?: string | null;
+  candidatesCount: number;
+  topCandidate?: CandidateInspectionDto | null;
+  candidates: CandidateInspectionDto[];
+}
+
+export interface MangaBakaCollectionInfo {
+  id: string;
+  name: string;
+  language: string;
+  edition: string;
+  medium: string;
+  totalWorks?: number | null;
+}
+
+export interface ReleaseCalendarEntryDto {
+  targetId: number;
+  seriesId: string;
+  mangaId?: number | null;
+  seriesTitle: string;
+  volumeNumber: number;
+  market: string;
+  edition: string;
+  releaseDate: string;
+  releaseDatePrecision: string;
+  dateType: string;
+  status: string;
+  isOwned: boolean;
+  isReleased: boolean;
+  candidatesCount: number;
+  topCandidateTitle?: string | null;
+  reconciliationStatus?: string | null;
+  autoAcquireEnabled: boolean;
+  autoAcquireDryRun: boolean;
+}
+
+export interface IntegrityIssue {
+  id: string;
+  category: string;
+  severity: 'HEALTHY' | 'INFO' | 'WARNING' | 'ACTION_REQUIRED' | 'CRITICAL';
+  code: string;
+  message: string;
+  details?: string | null;
+  mangaId?: number | null;
+  seriesTitle?: string | null;
+  resolutionHint?: string | null;
+}
+
+export interface LibraryIntegrityReport {
+  checkedAt: number;
+  status: string;
+  totalIssues: number;
+  issuesBySeverity: Record<string, number>;
+  issues: IntegrityIssue[];
+}
+
+export interface NotificationEventHistoryDto {
+  id: number;
+  seriesId: string;
+  seriesTitle: string;
+  mangabakaId?: number | null;
+  edition: string;
+  volumeNumber?: number | null;
+  eventType: string;
+  message: string;
+  severity: string;
+  createdAt: number;
+  notifiedAt?: number | null;
+  resolvedAt?: number | null;
+  isActive: boolean;
+  outboxStatus?: string | null;
+  outboxAttempts?: number | null;
+  outboxLastError?: string | null;
+  outboxDeliveredAt?: number | null;
+}
+
+export type ReleaseCalendarItem = ReleaseCalendarEntryDto;
+export type NotificationEventItem = NotificationEventHistoryDto;
+
+export const getTitleDiagnostics = (mangaId: number) =>
+  get<TitleDiagnostics>(`/manga/${mangaId}/diagnostics`);
+
+export const inspectVolumeCandidates = (mangaId: number, volume: number) =>
+  get<VolumeCandidateInspectionResult>(`/manga/${mangaId}/volumes/${volume}/candidates/inspect`);
+
+export const listMangaBakaCollections = (seriesId: number) =>
+  get<MangaBakaCollectionInfo[]>(`/catalog/mangabaka/${seriesId}/collections`);
+
+export const setManualTitleMapping = (
+  mangaId: number,
+  payload: { mangabakaId?: number; collectionId?: string; edition?: string }
+) => send<ReconciliationSummary>('POST', `/manga/${mangaId}/mapping/manual`, payload);
+
+export const clearManualTitleMapping = (mangaId: number) =>
+  send<ReconciliationSummary>('DELETE', `/manga/${mangaId}/mapping/manual`);
+
+export const getReleaseCalendar = (market?: string) =>
+  get<ReleaseCalendarEntryDto[]>(`/releases/calendar${market ? `?market=${encodeURIComponent(market)}` : ''}`);
+
+export const getLibraryIntegrity = () =>
+  get<LibraryIntegrityReport>('/system/integrity');
+
+export const getNotificationsHistory = (limit = 50, activeOnly = false) =>
+  get<NotificationEventHistoryDto[]>(`/notifications/history?limit=${limit}&activeOnly=${activeOnly}`);
+
+export const resolveNotificationEvent = (eventId: number) =>
+  send<boolean>('POST', `/notifications/events/${eventId}/resolve`);

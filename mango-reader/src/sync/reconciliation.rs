@@ -2008,6 +2008,346 @@ pub fn resolve_canonical_library_state(
     })
 }
 
+/// Release calendar entry representing a scheduled or published physical volume release.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReleaseCalendarEntryDto {
+    pub target_id: i64,
+    pub series_id: String,
+    pub manga_id: Option<i64>,
+    pub series_title: String,
+    pub volume_number: f64,
+    pub market: String,
+    pub edition: String,
+    pub release_date: String,
+    pub release_date_precision: String,
+    pub date_type: String,
+    pub status: String,
+    pub is_owned: bool,
+    pub is_released: bool,
+    pub candidates_count: usize,
+    pub top_candidate_title: Option<String>,
+    pub reconciliation_status: Option<String>,
+    pub auto_acquire_enabled: bool,
+    pub auto_acquire_dry_run: bool,
+}
+
+/// Retrieves release calendar items across all physical release targets.
+pub fn get_release_calendar(
+    conn: &Connection,
+    market_filter: Option<&str>,
+) -> Result<Vec<ReleaseCalendarEntryDto>> {
+    let today_str: String = conn
+        .query_row("SELECT date('now', 'localtime')", [], |r| r.get(0))
+        .unwrap_or_else(|_| "1970-01-01".to_string());
+
+    let dry_run = crate::acquisition::auto_acquire::is_auto_acquire_dry_run(conn);
+
+    let mut sql = "SELECT rdt.id, rdt.series_id, rdt.manga_id, rdt.series_title, rdt.volume_number,
+                          rdt.market, rdt.edition, rdt.release_date, rdt.release_date_precision,
+                          rdt.date_type, rdt.status, rdt.candidates_count, rdt.top_candidate_title,
+                          sr.status AS reconciliation_status,
+                          COALESCE(m.auto_acquire_enabled, 0) AS auto_acquire_enabled
+                   FROM release_discovery_targets rdt
+                   LEFT JOIN manga m ON m.id = rdt.manga_id
+                   LEFT JOIN series_reconciliations sr ON sr.series_id = rdt.series_id
+                   WHERE 1=1".to_string();
+
+    if let Some(m) = market_filter {
+        if !m.is_empty() {
+            sql.push_str(&format!(" AND rdt.market = '{}'", m.replace('\'', "''")));
+        }
+    }
+
+    sql.push_str(" ORDER BY rdt.release_date ASC, rdt.volume_number ASC");
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| AppError::internal(format!("Prepare release calendar error: {e}")))?;
+
+    let rows = stmt
+        .query_map([], |r| {
+            let tid: i64 = r.get(0)?;
+            let sid: String = r.get(1)?;
+            let mid: Option<i64> = r.get(2)?;
+            let stitle: String = r.get(3)?;
+            let vnum: f64 = r.get(4)?;
+            let market: String = r.get(5)?;
+            let edition: String = r.get(6)?;
+            let rdate: String = r.get(7)?;
+            let rprec: String = r.get(8)?;
+            let dtype: String = r.get(9)?;
+            let status: String = r.get(10)?;
+            let c_count: usize = r.get(11)?;
+            let top_c: Option<String> = r.get(12)?;
+            let recon_stat: Option<String> = r.get(13)?;
+            let auto_en: i64 = r.get(14)?;
+
+            let is_rel = rdate <= today_str;
+            let is_owned = crate::acquisition::release_discovery::is_volume_owned(
+                conn,
+                mid.unwrap_or(0),
+                &sid,
+                vnum,
+            )
+            .unwrap_or(false);
+
+            Ok(ReleaseCalendarEntryDto {
+                target_id: tid,
+                series_id: sid,
+                manga_id: mid,
+                series_title: stitle,
+                volume_number: vnum,
+                market,
+                edition,
+                release_date: rdate,
+                release_date_precision: rprec,
+                date_type: dtype,
+                status,
+                is_owned,
+                is_released: is_rel,
+                candidates_count: c_count,
+                top_candidate_title: top_c,
+                reconciliation_status: recon_stat,
+                auto_acquire_enabled: auto_en != 0,
+                auto_acquire_dry_run: dry_run,
+            })
+        })
+        .map_err(|e| AppError::internal(format!("Query release calendar error: {e}")))?;
+
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r.map_err(|e| AppError::internal(format!("Row error in release calendar: {e}")))?);
+    }
+    Ok(out)
+}
+
+/// Notification event history record.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NotificationEventHistoryDto {
+    pub id: i64,
+    pub series_id: String,
+    pub series_title: String,
+    pub mangabaka_id: Option<i64>,
+    pub edition: String,
+    pub volume_number: Option<f64>,
+    pub event_type: String,
+    pub message: String,
+    pub severity: String,
+    pub created_at: i64,
+    pub notified_at: Option<i64>,
+    pub resolved_at: Option<i64>,
+    pub is_active: bool,
+    pub outbox_status: Option<String>,
+    pub outbox_attempts: Option<i64>,
+    pub outbox_last_error: Option<String>,
+    pub outbox_delivered_at: Option<i64>,
+}
+
+/// Lists recent reconciliation notification events with outbox state.
+pub fn list_notification_events(
+    conn: &Connection,
+    limit: usize,
+    active_only: bool,
+) -> Result<Vec<NotificationEventHistoryDto>> {
+    let mut sql = "SELECT re.id, re.series_id, re.series_title, re.mangabaka_id, re.edition,
+                          re.volume_number, re.event_type, re.message, re.created_at, re.notified_at,
+                          re.resolved_at,
+                          no.status, no.attempts, no.last_error, no.delivered_at
+                   FROM reconciliation_events re
+                   LEFT JOIN notification_outbox no ON no.event_id = re.id".to_string();
+
+    if active_only {
+        sql.push_str(" WHERE re.resolved_at IS NULL");
+    }
+
+    sql.push_str(" ORDER BY re.created_at DESC LIMIT ?1");
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| AppError::internal(format!("Prepare list events error: {e}")))?;
+
+    let rows = stmt
+        .query_map([limit as i64], |r| {
+            let id: i64 = r.get(0)?;
+            let series_id: String = r.get(1)?;
+            let series_title: String = r.get(2)?;
+            let mangabaka_id: Option<i64> = r.get(3)?;
+            let edition: String = r.get(4)?;
+            let volume_number: Option<f64> = r.get(5)?;
+            let event_type: String = r.get(6)?;
+            let message: String = r.get(7)?;
+            let created_at: i64 = r.get(8)?;
+            let notified_at: Option<i64> = r.get(9)?;
+            let resolved_at: Option<i64> = r.get(10)?;
+            let outbox_status: Option<String> = r.get(11)?;
+            let outbox_attempts: Option<i64> = r.get(12)?;
+            let outbox_last_error: Option<String> = r.get(13)?;
+            let outbox_delivered_at: Option<i64> = r.get(14)?;
+
+            let severity = match event_type.as_str() {
+                "ACTION_REQUIRED" => "action_required",
+                "ACQUISITION_FAILED" => "warning",
+                "CANDIDATE_FOUND" | "AUTO_ACQUIRED" | "VOLUME_RELEASED" => "info",
+                _ => "info",
+            }
+            .to_string();
+
+            let is_active = resolved_at.is_none();
+
+            Ok(NotificationEventHistoryDto {
+                id,
+                series_id,
+                series_title,
+                mangabaka_id,
+                edition,
+                volume_number,
+                event_type,
+                message,
+                severity,
+                created_at,
+                notified_at,
+                resolved_at,
+                is_active,
+                outbox_status,
+                outbox_attempts,
+                outbox_last_error,
+                outbox_delivered_at,
+            })
+        })
+        .map_err(|e| AppError::internal(format!("Query list events error: {e}")))?;
+
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r.map_err(|e| AppError::internal(format!("Row error in list events: {e}")))?);
+    }
+    Ok(out)
+}
+
+/// Marks a reconciliation notification event as resolved.
+pub fn resolve_notification_event(conn: &Connection, event_id: i64) -> Result<bool> {
+    let count = conn.execute(
+        "UPDATE reconciliation_events SET resolved_at = ?1 WHERE id = ?2 AND resolved_at IS NULL",
+        params![now(), event_id],
+    )?;
+    Ok(count > 0)
+}
+
+/// Sets an explicit manual series identity and/or edition collection for a manga title.
+pub fn set_manual_series_and_collection(
+    conn: &Connection,
+    manga_id: i64,
+    mangabaka_id: Option<i64>,
+    collection_id: Option<&str>,
+    edition: Option<&str>,
+) -> Result<(String, Option<String>)> {
+    let now_ts = now();
+
+    let title: String = conn
+        .query_row("SELECT title FROM manga WHERE id = ?1", [manga_id], |r| r.get(0))
+        .map_err(|e| AppError::not_found(format!("Manga {manga_id} not found: {e}")))?;
+
+    let k_id: Option<String> = conn
+        .query_row(
+            "SELECT komga_series_id FROM tracked_catalog WHERE manga_id = ?1 LIMIT 1",
+            [manga_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap_or(None)
+        .or_else(|| {
+            conn.query_row(
+                "SELECT komga_series_id FROM series_reconciliations WHERE manga_id = ?1 LIMIT 1",
+                [manga_id],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap_or(None)
+        });
+
+    if let Some(mb_id) = mangabaka_id {
+        conn.execute(
+            "UPDATE manga SET mangabaka_id = ?1 WHERE id = ?2",
+            params![mb_id, manga_id],
+        )?;
+
+        if let Some(ref kid) = k_id {
+            conn.execute(
+                "INSERT INTO tracker_mappings (komga_series_id, tracker, tracker_id, updated_at, mapping_source, manual_override, confidence, edition_id)
+                 VALUES (?1, 'mangabaka', ?2, ?3, 'manual', 1, 'resolved', ?4)
+                 ON CONFLICT(komga_series_id, tracker) DO UPDATE SET
+                    tracker_id = excluded.tracker_id,
+                    manual_override = 1,
+                    mapping_source = 'manual',
+                    confidence = 'resolved',
+                    edition_id = COALESCE(excluded.edition_id, tracker_mappings.edition_id),
+                    updated_at = excluded.updated_at",
+                params![kid, mb_id.to_string(), now_ts, collection_id],
+            )?;
+        }
+    }
+
+    if let Some(c_id) = collection_id {
+        let ed_str = edition.unwrap_or("standard");
+        conn.execute(
+            "UPDATE series_reconciliations SET collection_id = ?1, edition = ?2, updated_at = ?3
+             WHERE manga_id = ?4",
+            params![c_id, ed_str, now_ts, manga_id],
+        )?;
+
+        if let Some(ref kid) = k_id {
+            conn.execute(
+                "UPDATE tracker_mappings SET edition_id = ?1, updated_at = ?2
+                 WHERE komga_series_id = ?3 AND tracker = 'mangabaka'",
+                params![c_id, now_ts, kid],
+            )?;
+        }
+    }
+
+    let series_id = format!("title:{}", normalize_title(&title));
+    resolve_active_series_events(conn, &series_id, &title)?;
+
+    Ok((title, k_id))
+}
+
+/// Clears manual override for a title, returning it to automatic reconciliation.
+pub fn clear_manual_series_and_collection(
+    conn: &Connection,
+    manga_id: i64,
+) -> Result<(String, Option<String>)> {
+    let (title, source_id): (String, i64) = conn
+        .query_row(
+            "SELECT title, source_id FROM manga WHERE id = ?1",
+            [manga_id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .map_err(|e| AppError::not_found(format!("Manga {manga_id} not found: {e}")))?;
+
+    if source_id != 0 {
+        conn.execute("UPDATE manga SET mangabaka_id = NULL WHERE id = ?1", [manga_id])?;
+    }
+
+    let k_id: Option<String> = conn
+        .query_row(
+            "SELECT komga_series_id FROM tracked_catalog WHERE manga_id = ?1 LIMIT 1",
+            [manga_id],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap_or(None);
+
+    if let Some(ref kid) = k_id {
+        conn.execute(
+            "UPDATE tracker_mappings SET manual_override = 0, mapping_source = 'auto', updated_at = ?1
+             WHERE komga_series_id = ?2 AND tracker = 'mangabaka'",
+            params![now(), kid],
+        )?;
+    }
+
+    Ok((title, k_id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

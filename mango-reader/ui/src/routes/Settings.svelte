@@ -58,6 +58,12 @@
     getAutoAcquireSettings,
     putAutoAcquireSettings,
     type AutoAcquireSettings,
+    getNotificationsHistory,
+    resolveNotificationEvent,
+    type NotificationEventItem,
+    getLibraryIntegrity,
+    type LibraryIntegrityReport,
+    type IntegrityIssue,
   } from '../lib/api';
   import { confirm } from '../lib/confirm.svelte';
   import { COVERS, display, MENUS, setDisplay, SIZES } from '../lib/display.svelte';
@@ -612,6 +618,25 @@
   let bundledOptimizerPresent = $state(false);
   let resolvedOptimizerBin = $state<string | null>(null);
 
+  let integrityReport = $state<LibraryIntegrityReport | null>(null);
+  let integrityLoading = $state(false);
+
+  async function runIntegrityAudit() {
+    integrityLoading = true;
+    try {
+      integrityReport = await getLibraryIntegrity();
+      if (integrityReport.totalIssues === 0) {
+        toast.success('Library integrity audit complete: System healthy');
+      } else {
+        toast.info(`Library integrity audit: ${integrityReport.totalIssues} issues detected`);
+      }
+    } catch (e: any) {
+      toast.error(message(e));
+    } finally {
+      integrityLoading = false;
+    }
+  }
+
   // ---------- acquisition providers (Nyaa / TorBox) ----------
   let acquisition = $state<AcquisitionConfig>({
     torboxEnabled: false,
@@ -648,6 +673,12 @@
   let ntfyTopic = $state('');
   let ntfyToken = $state('');
 
+  // Deduplicated Notification Events
+  let notificationEvents = $state<NotificationEventItem[]>([]);
+  let notificationEventsLoading = $state(false);
+  let notificationEventsActiveOnly = $state(true);
+  let resolvingEventId = $state<number | null>(null);
+
   let askedNotifications = false;
   $effect(() => {
     if (tab.id !== 'notifications' || askedNotifications || !session.admin) return;
@@ -663,10 +694,35 @@
       ntfyTopic = ntfyConfig.topic || '';
       ntfyToken = ntfyConfig.hasToken ? '****' : '';
       loadOutbox();
+      loadNotificationEvents();
     } catch (e: any) {
       toast.error(e?.message || 'Failed to load notification settings');
     } finally {
       ntfyLoading = false;
+    }
+  }
+
+  async function loadNotificationEvents() {
+    notificationEventsLoading = true;
+    try {
+      notificationEvents = await getNotificationsHistory(50, notificationEventsActiveOnly);
+    } catch (e: any) {
+      toast.error(message(e));
+    } finally {
+      notificationEventsLoading = false;
+    }
+  }
+
+  async function handleResolveNotificationEvent(id: number) {
+    resolvingEventId = id;
+    try {
+      await resolveNotificationEvent(id);
+      toast.success(`Notification event #${id} resolved`);
+      await loadNotificationEvents();
+    } catch (e: any) {
+      toast.error(message(e));
+    } finally {
+      resolvingEventId = null;
     }
   }
 
@@ -790,6 +846,7 @@
       loadNormalizationHistory();
       loadOpenTome();
       loadAutoAcquireSettings();
+      runIntegrityAudit();
     } catch (e) {
       pipelineError = message(e);
     } finally {
@@ -2833,6 +2890,91 @@
           </section>
 
           <section class="card">
+            <div class="card-header-row">
+              <div>
+                <h3>Library Integrity & Diagnostics Audit</h3>
+                <p class="muted font-small">Comprehensive sanity audit across tracker mappings, MangaBaka identities, Komga physical ownership, duplicate records, outbox queue, and auto-acquire states.</p>
+              </div>
+              <button class="btn small" onclick={runIntegrityAudit} disabled={integrityLoading}>
+                <Icon name="refresh" size={16} />
+                {integrityLoading ? 'Auditing…' : 'Run Audit'}
+              </button>
+            </div>
+
+            {#if !integrityReport && !integrityLoading}
+              <div class="empty-state">
+                Click "Run Audit" to inspect library mappings, metadata consistency, and queue integrity.
+              </div>
+            {:else if integrityReport}
+              {@const isHealthy = integrityReport.status === 'healthy' || integrityReport.totalIssues === 0}
+              <div class="integrity-summary-banner {isHealthy ? 'banner-healthy' : 'banner-warning'}">
+                <div class="banner-main">
+                  <strong>{isHealthy ? '✓ Library Integrity Healthy' : `⚠️ ${integrityReport.totalIssues} Integrity Anomalies Detected`}</strong>
+                  <span>Audited {ago(integrityReport.checkedAt * 1000)}</span>
+                </div>
+              </div>
+
+              <div class="integrity-metrics-grid">
+                <div class="metric-box">
+                  <span class="metric-val">{integrityReport.issues.filter(i => i.category === 'orphan_tracker_mapping').length}</span>
+                  <span class="metric-label">Orphan Tracker Mappings</span>
+                </div>
+                <div class="metric-box">
+                  <span class="metric-val">{integrityReport.issues.filter(i => i.category === 'mangabaka_conflict').length}</span>
+                  <span class="metric-label">MangaBaka Conflicts</span>
+                </div>
+                <div class="metric-box">
+                  <span class="metric-val">{integrityReport.issues.filter(i => i.category === 'komga_ownership_anomaly').length}</span>
+                  <span class="metric-label">Komga Ownership Anomalies</span>
+                </div>
+                <div class="metric-box">
+                  <span class="metric-val">{integrityReport.issues.filter(i => i.category === 'duplicate_volume_record').length}</span>
+                  <span class="metric-label">Duplicate Volume Records</span>
+                </div>
+                <div class="metric-box">
+                  <span class="metric-val">{integrityReport.issues.filter(i => i.category === 'stuck_outbox_notification').length}</span>
+                  <span class="metric-label">Stuck Outbox Items</span>
+                </div>
+                <div class="metric-box">
+                  <span class="metric-val">{integrityReport.issues.filter(i => i.category === 'impossible_auto_acquire_state').length}</span>
+                  <span class="metric-label">Auto-Acquire State Issues</span>
+                </div>
+              </div>
+
+              {#if integrityReport.issues.length > 0}
+                <div class="integrity-issues-list">
+                  <h4>Detected Issues ({integrityReport.issues.length})</h4>
+                  {#each integrityReport.issues as issue}
+                    <div class="issue-item issue-sev-{issue.severity.toLowerCase()}">
+                      <div class="issue-header">
+                        <span class="badge badge-sev badge-sev-{issue.severity.toLowerCase()}">{issue.severity}</span>
+                        <span class="issue-cat">{issue.category.replace(/_/g, ' ')}</span>
+                        {#if issue.mangaId}
+                          <a href="#/title/{issue.mangaId}" class="issue-title-link">
+                            {issue.seriesTitle ? `${issue.seriesTitle} (ID #${issue.mangaId})` : `Manga #${issue.mangaId}`}
+                          </a>
+                        {:else if issue.seriesTitle}
+                          <span class="issue-title">{issue.seriesTitle}</span>
+                        {/if}
+                      </div>
+                      <div class="issue-desc">{issue.message}</div>
+                      {#if issue.details}
+                        <div class="issue-desc font-small muted monospace">{issue.details}</div>
+                      {/if}
+                      {#if issue.resolutionHint}
+                        <div class="issue-hint">
+                          <Icon name="info" size={13} />
+                          <span><strong>Resolution:</strong> {issue.resolutionHint}</span>
+                        </div>
+                      {/if}
+                    </div>
+                  {/each}
+                </div>
+              {/if}
+            {/if}
+          </section>
+
+          <section class="card">
             <h3>Recent Pipeline Activity</h3>
             {#if pipelineEvents.length === 0}
               <p class="muted">No recent pipeline executions recorded. When downloads complete, their processing and publication will appear here.</p>
@@ -2999,6 +3141,116 @@
               {/if}
             </div>
           </div>
+        </section>
+
+        <section class="card">
+          <div class="card-header-row">
+            <div>
+              <h3>Notification Event History & Deduplication</h3>
+              <p class="muted font-small">Recorded high-level system notification events. Active events can be acknowledged or marked resolved.</p>
+            </div>
+            <div class="card-actions">
+              <div class="pill-group" role="radiogroup" aria-label="Notification events filter">
+                <button
+                  class="pill"
+                  class:active={notificationEventsActiveOnly}
+                  onclick={() => {
+                    notificationEventsActiveOnly = true;
+                    loadNotificationEvents();
+                  }}
+                >
+                  Active Only
+                </button>
+                <button
+                  class="pill"
+                  class:active={!notificationEventsActiveOnly}
+                  onclick={() => {
+                    notificationEventsActiveOnly = false;
+                    loadNotificationEvents();
+                  }}
+                >
+                  All Events
+                </button>
+              </div>
+              <button class="btn small" onclick={loadNotificationEvents} disabled={notificationEventsLoading}>
+                <Icon name="refresh" size={16} />
+                {notificationEventsLoading ? 'Loading…' : 'Refresh'}
+              </button>
+            </div>
+          </div>
+
+          {#if notificationEvents.length === 0}
+            <div class="empty-state">
+              {notificationEventsActiveOnly ? 'No active notification events requiring attention.' : 'No notification events recorded.'}
+            </div>
+          {:else}
+            <div class="events-audit-list">
+              {#each notificationEvents as evt (evt.id)}
+                {@const isResolved = !evt.isActive}
+                {@const statusStr = evt.isActive ? (evt.outboxStatus ?? 'Active') : 'Resolved'}
+                <div class="event-audit-card" class:resolved={isResolved} class:action-required={evt.eventType === 'ACTION_REQUIRED'}>
+                  <div class="event-audit-head">
+                    <div class="event-audit-badges">
+                      <span class="badge badge-sev badge-sev-{evt.severity.toLowerCase()}">{evt.severity}</span>
+                      <span class="badge badge-type">{evt.eventType}</span>
+                      <span class="badge badge-stat badge-stat-{statusStr.toLowerCase()}">{statusStr}</span>
+                      <span class="monospace font-small event-key">#{evt.id}: {evt.seriesId}</span>
+                    </div>
+                    <div class="event-audit-time">
+                      <span>Created {ago(evt.createdAt * 1000)}</span>
+                    </div>
+                  </div>
+
+                  <div class="event-audit-body">
+                    <div class="event-audit-subj">
+                      <strong>{evt.seriesTitle}</strong>
+                      {#if evt.volumeNumber !== null && evt.volumeNumber !== undefined}
+                        <span>Vol. {evt.volumeNumber}</span>
+                      {/if}
+                      {#if evt.edition && evt.edition !== 'standard'}
+                        <span class="muted font-small">({evt.edition})</span>
+                      {/if}
+                      {#if evt.mangabakaId}
+                        <span class="muted font-small">[MB #{evt.mangabakaId}]</span>
+                      {/if}
+                    </div>
+                    <div class="event-audit-msg">{evt.message}</div>
+                    {#if evt.outboxLastError}
+                      <div class="suppression-note">
+                        <Icon name="info" size={13} />
+                        <span>Outbox Error: {evt.outboxLastError}</span>
+                      </div>
+                    {/if}
+                  </div>
+
+                  <div class="event-audit-foot">
+                    <div class="event-audit-timestamps font-small muted">
+                      {#if evt.outboxDeliveredAt}
+                        <span>Delivered {ago(evt.outboxDeliveredAt * 1000)}</span>
+                      {/if}
+                      {#if evt.resolvedAt}
+                        <span>Resolved {ago(evt.resolvedAt * 1000)}</span>
+                      {/if}
+                    </div>
+                    {#if evt.isActive}
+                      <button
+                        class="btn mini spot"
+                        disabled={resolvingEventId === evt.id}
+                        onclick={() => handleResolveNotificationEvent(evt.id)}
+                        title="Mark event as resolved / dismiss notice"
+                      >
+                        {#if resolvingEventId === evt.id}
+                          <span class="spin"><Icon name="spinner" size={13} stroke={2.5} /></span> Resolving…
+                        {:else}
+                          <Icon name="check" size={13} /> Resolve
+                        {/if}
+                      </button>
+                    {/if}
+                  </div>
+                </div>
+              {/each}
+            </div>
+          {/if}
         </section>
 
         <section class="card">
@@ -4984,5 +5236,278 @@
     display: flex;
     gap: 8px;
     flex-wrap: wrap;
+  }
+
+  /* Library Integrity Audit Styles */
+  .integrity-summary-banner {
+    border-radius: 6px;
+    padding: 12px 16px;
+    margin-bottom: 14px;
+    border: 1px solid var(--border-color, rgba(255, 255, 255, 0.1));
+  }
+
+  .integrity-summary-banner.banner-healthy {
+    background: rgba(34, 197, 94, 0.1);
+    border-color: rgba(34, 197, 94, 0.3);
+    color: #22c55e;
+  }
+
+  .integrity-summary-banner.banner-warning {
+    background: rgba(234, 179, 8, 0.1);
+    border-color: rgba(234, 179, 8, 0.3);
+    color: #eab308;
+  }
+
+  .banner-main {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    font-size: 0.9rem;
+  }
+
+  .integrity-metrics-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 10px;
+    margin-bottom: 16px;
+  }
+
+  .metric-box {
+    background: var(--surface-2, rgba(255, 255, 255, 0.03));
+    border: 1px solid var(--edge, rgba(255, 255, 255, 0.08));
+    border-radius: 6px;
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .metric-val {
+    font-size: 1.4rem;
+    font-weight: 800;
+    line-height: 1;
+  }
+
+  .metric-label {
+    font-size: 0.75rem;
+    color: var(--muted, #888);
+  }
+
+  .integrity-issues-list {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .issue-item {
+    border: 1px solid var(--edge, rgba(255, 255, 255, 0.08));
+    border-radius: 6px;
+    padding: 10px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    background: var(--surface-1, rgba(255, 255, 255, 0.015));
+  }
+
+  .issue-item.issue-sev-critical {
+    border-color: rgba(239, 68, 68, 0.35);
+    background: rgba(239, 68, 68, 0.04);
+  }
+
+  .issue-item.issue-sev-warning {
+    border-color: rgba(234, 179, 8, 0.35);
+    background: rgba(234, 179, 8, 0.04);
+  }
+
+  .issue-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .issue-cat {
+    font-size: 0.8rem;
+    font-weight: 600;
+    text-transform: capitalize;
+  }
+
+  .issue-title-link, .issue-title {
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: var(--ink);
+  }
+
+  .issue-desc {
+    font-size: 0.85rem;
+    color: var(--dim, #ccc);
+  }
+
+  .issue-hint {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.78rem;
+    color: var(--muted, #888);
+    background: var(--surface-2, rgba(255, 255, 255, 0.03));
+    padding: 4px 8px;
+    border-radius: 4px;
+  }
+
+  /* Notification Events Audit Styles */
+  .events-audit-list {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin-top: 10px;
+  }
+
+  .event-audit-card {
+    border: 1px solid var(--border-color, rgba(255, 255, 255, 0.08));
+    border-radius: 6px;
+    padding: 10px 14px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    background: var(--surface-1, rgba(255, 255, 255, 0.02));
+  }
+
+  .event-audit-card.action-required {
+    border-color: rgba(234, 179, 8, 0.35);
+  }
+
+  .event-audit-card.resolved {
+    opacity: 0.65;
+  }
+
+  .event-audit-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+  }
+
+  .event-audit-badges {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+
+  .badge-sev {
+    font-size: 10px;
+    font-weight: 700;
+    padding: 1px 6px;
+    border-radius: 3px;
+    text-transform: uppercase;
+  }
+
+  .badge-sev-critical {
+    background: #ef4444;
+    color: #fff;
+  }
+
+  .badge-sev-warning {
+    background: #eab308;
+    color: #000;
+  }
+
+  .badge-sev-info {
+    background: #0284c7;
+    color: #fff;
+  }
+
+  .badge-type {
+    background: var(--shade, rgba(255, 255, 255, 0.1));
+    font-size: 11px;
+    font-weight: 600;
+    padding: 1px 6px;
+    border-radius: 3px;
+  }
+
+  .badge-stat {
+    font-size: 10px;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-weight: 600;
+  }
+
+  .badge-stat-pending {
+    background: rgba(59, 130, 246, 0.15);
+    color: #3b82f6;
+  }
+
+  .badge-stat-delivered {
+    background: rgba(34, 197, 94, 0.15);
+    color: #22c55e;
+  }
+
+  .badge-stat-resolved {
+    background: rgba(255, 255, 255, 0.1);
+    color: var(--dim, #aaa);
+  }
+
+  .event-key {
+    color: var(--muted, #888);
+  }
+
+  .event-audit-body {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .event-audit-subj {
+    font-size: 0.9rem;
+    display: flex;
+    align-items: baseline;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+
+  .event-manga-link {
+    color: var(--spot, #0284c7);
+    font-weight: 600;
+    text-decoration: none;
+  }
+
+  .event-manga-link:hover {
+    text-decoration: underline;
+  }
+
+  .event-audit-msg {
+    font-size: 0.82rem;
+    color: var(--dim, #ccc);
+  }
+
+  .suppression-note {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.78rem;
+    color: var(--muted, #888);
+    background: var(--surface-2, rgba(255, 255, 255, 0.03));
+    padding: 3px 6px;
+    border-radius: 4px;
+    margin-top: 2px;
+  }
+
+  .event-audit-foot {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 8px;
+    border-top: 1px solid var(--border-color, rgba(255, 255, 255, 0.05));
+    padding-top: 6px;
+    margin-top: 2px;
+  }
+
+  .event-audit-timestamps {
+    display: flex;
+    gap: 12px;
+    align-items: center;
   }
 </style>

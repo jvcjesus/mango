@@ -3473,3 +3473,221 @@ fn test_unified_catalog_alias_search_and_ambiguity_protection() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_m6_8_3_title_diagnostics_and_candidate_inspector() {
+    let dir = std::env::temp_dir().join("mango-test-m683-diag");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = Db::open(&dir.join("test.db")).expect("test db");
+    let conn = db.second().expect("conn");
+
+    // Insert manga record
+    conn.execute(
+        "INSERT INTO manga (id, url, title, source_id, mangabaka_id, auto_acquire, auto_acquire_activated_at)
+         VALUES (101, 'url_kb', 'Kagurabachi', 0, 708, 1, 1700000000)",
+        [],
+    ).unwrap();
+
+    // Insert tracked_catalog
+    conn.execute(
+        "INSERT INTO tracked_catalog (manga_id, komga_series_id, title, created_at, updated_at)
+         VALUES (101, 'k_kb', 'Kagurabachi', 1700000000, 1700000000)",
+        [],
+    ).unwrap();
+
+    // Insert tracker_mappings
+    conn.execute(
+        "INSERT INTO tracker_mappings (komga_series_id, tracker, tracker_id, tracker_title, manual_override, mapping_source, edition_id, updated_at)
+         VALUES ('k_kb', 'mangabaka', '708', 'Kagurabachi', 1, 'manual', 'col_kb_en', 1700000000)",
+        [],
+    ).unwrap();
+
+    // Insert series_reconciliations
+    conn.execute(
+        "INSERT INTO series_reconciliations (
+            series_id, manga_id, komga_series_id, mangabaka_id, collection_id, title, edition,
+            status, total_official_volumes, owned_volumes_count, missing_volumes_count,
+            owned_volumes_json, missing_volumes_json, future_volumes_json, last_reconciled_at, updated_at
+        ) VALUES (
+            'title:kagurabachi', 101, 'k_kb', 708, 'col_kb_en', 'Kagurabachi', 'standard',
+            'missing_volume', 8, 7, 1,
+            '[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]', '[8.0]', '[9.0]', 1700000000, 1700000000
+        )",
+        [],
+    ).unwrap();
+
+    // Insert release_discovery_targets
+    conn.execute(
+        "INSERT INTO release_discovery_targets (
+            series_id, manga_id, series_title, volume_number, market, edition, release_date,
+            release_date_precision, date_type, status, created_at, updated_at
+        ) VALUES (
+            'title:kagurabachi', 101, 'Kagurabachi', 8.0, 'en', 'standard', '2026-10-01',
+            'day', 'published', 'candidate_available', 1700000000, 1700000000
+        )",
+        [],
+    ).unwrap();
+
+    // Test Diagnostics Query
+    let diag = crate::sync::diagnostics::get_title_diagnostics(&conn, 101).unwrap();
+    assert_eq!(diag.identity.manga_id, 101);
+    assert_eq!(diag.identity.title, "Kagurabachi");
+    assert_eq!(diag.identity.mangabaka_id, Some(708));
+    assert!(diag.identity.manual_override);
+    assert!(diag.identity.conflicts.is_empty());
+    assert_eq!(diag.collection.resolved_collection_id.as_deref(), Some("col_kb_en"));
+    assert_eq!(diag.collection.collection_status, "resolved");
+    assert_eq!(diag.ownership.total_owned_count, 7);
+    assert_eq!(diag.ownership.missing_volumes, vec![8.0]);
+    assert_eq!(diag.ownership.future_volumes, vec![9.0]);
+    assert_eq!(diag.release_intelligence.total_release_targets, 1);
+    assert!(diag.auto_acquire_gates.dry_run);
+
+    // Insert candidates for volume 8: one Madokami exact, one Nyaa range, one rejected
+    conn.execute(
+        "INSERT INTO discovered_release_candidates (
+            series_id, volume_number, candidate_id, provider, provider_item_id, title, raw_title,
+            match_type, size_bytes, uploader, is_trusted, is_digital, score, score_explanation,
+            download_url, magnet_url, seeders, discovered_at
+        ) VALUES (
+            'title:kagurabachi', 8.0, 'cand_mado_8', 'madokami', 'mado_item_8',
+            'Kagurabachi v08 [Digital]', 'Kagurabachi v08 [Digital].cbz', 'exact_volume',
+            150000000, 'uploader1', 1, 1, 95.0, 'Exact volume digital release',
+            'https://user:pass@manga.madokami.al/Manga/Kagurabachi/v08.cbz', NULL, NULL, 1700000000
+        )",
+        [],
+    ).unwrap();
+
+    conn.execute(
+        "INSERT INTO discovered_release_candidates (
+            series_id, volume_number, candidate_id, provider, provider_item_id, title, raw_title,
+            match_type, size_bytes, uploader, is_trusted, is_digital, score, score_explanation,
+            download_url, magnet_url, info_hash, seeders, discovered_at
+        ) VALUES (
+            'title:kagurabachi', 8.0, 'cand_nyaa_range', 'nyaa', 'nyaa_item_8',
+            'Kagurabachi v01-v08 [Digital]', 'Kagurabachi v01-v08 [Digital]', 'volume_range',
+            1200000000, 'nyaa_up', 1, 1, 80.0, 'Multi-volume range',
+            NULL, 'magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567&tr=http://tracker',
+            '0123456789abcdef0123456789abcdef01234567', 25, 1700000000
+        )",
+        [],
+    ).unwrap();
+
+    // Inspect candidates
+    let profile = crate::acquisition::profiles::AcquisitionProfile::default();
+    let inspection = crate::sync::diagnostics::inspect_volume_candidates(&conn, "title:kagurabachi", 8.0, &profile).unwrap();
+    assert_eq!(inspection.candidates_count, 2);
+
+    let mado_cand = inspection.candidates.iter().find(|c| c.provider == "madokami").unwrap();
+    assert_eq!(mado_cand.transport, "Direct HTTP (Range resume)");
+    assert!(mado_cand.auto_acquire_eligible);
+    assert_eq!(mado_cand.rejection_code, None);
+    // Verify credential stripping in sanitized reference
+    assert_eq!(mado_cand.sanitized_reference.as_deref(), Some("https://manga.madokami.al/Manga/Kagurabachi/v08.cbz"));
+
+    let nyaa_cand = inspection.candidates.iter().find(|c| c.provider == "nyaa").unwrap();
+    assert_eq!(nyaa_cand.transport, "TorBox BitTorrent (Debrid)");
+    assert!(!nyaa_cand.auto_acquire_eligible);
+    assert_eq!(nyaa_cand.rejection_code.as_deref(), Some("RANGE_REQUIRES_MANUAL"));
+    assert_eq!(nyaa_cand.sanitized_reference.as_deref(), Some("urn:btih:0123456789abcdef0123456789abcdef01234567"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn test_m6_8_3_manual_mapping_and_library_integrity() {
+    let dir = std::env::temp_dir().join("mango-test-m683-manual-integrity");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = Db::open(&dir.join("test.db")).expect("test db");
+    let conn = db.second().expect("conn");
+
+    // Insert test manga
+    conn.execute(
+        "INSERT INTO manga (id, url, title, source_id, mangabaka_id)
+         VALUES (201, 'url_holy', 'Holyland', 1, NULL)",
+        [],
+    ).unwrap();
+
+    conn.execute(
+        "INSERT INTO tracked_catalog (manga_id, komga_series_id, title, created_at, updated_at)
+         VALUES (201, 'k_holy', 'Holyland', 1700000000, 1700000000)",
+        [],
+    ).unwrap();
+
+    // Insert an active ACTION_REQUIRED event for Holyland
+    conn.execute(
+        "INSERT INTO reconciliation_events (
+            series_id, series_title, mangabaka_id, event_type, message, created_at
+        ) VALUES (
+            'title:holyland', 'Holyland', NULL, 'ACTION_REQUIRED', 'Ambiguous MangaBaka series', 1700000000
+        )",
+        [],
+    ).unwrap();
+
+    // 1. Test set_manual_series_and_collection
+    let (title, k_id) = crate::sync::reconciliation::set_manual_series_and_collection(
+        &conn,
+        201,
+        Some(2409),
+        Some("col_holy_tank"),
+        Some("standard"),
+    ).unwrap();
+    assert_eq!(title, "Holyland");
+    assert_eq!(k_id.as_deref(), Some("k_holy"));
+
+    // Verify manga was updated
+    let mb_id: Option<i64> = conn.query_row("SELECT mangabaka_id FROM manga WHERE id = 201", [], |r| r.get(0)).unwrap();
+    assert_eq!(mb_id, Some(2409));
+
+    // Verify tracker_mappings was updated with manual_override = 1
+    let (t_id, m_over, m_src): (String, i64, String) = conn.query_row(
+        "SELECT tracker_id, manual_override, mapping_source FROM tracker_mappings WHERE komga_series_id = 'k_holy' AND tracker = 'mangabaka'",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    ).unwrap();
+    assert_eq!(t_id, "2409");
+    assert_eq!(m_over, 1);
+    assert_eq!(m_src, "manual");
+
+    // Verify active ACTION_REQUIRED event was marked resolved
+    let resolved_at: Option<i64> = conn.query_row(
+        "SELECT resolved_at FROM reconciliation_events WHERE series_id = 'title:holyland' AND event_type = 'ACTION_REQUIRED'",
+        [],
+        |r| r.get(0),
+    ).unwrap();
+    assert!(resolved_at.is_some(), "Active event must be marked resolved upon manual mapping");
+
+    // 2. Test clear_manual_series_and_collection
+    crate::sync::reconciliation::clear_manual_series_and_collection(&conn, 201).unwrap();
+    let mb_after: Option<i64> = conn.query_row("SELECT mangabaka_id FROM manga WHERE id = 201", [], |r| r.get(0)).unwrap();
+    assert_eq!(mb_after, None, "Source-backed manga should clear mangabaka_id when manual mapping is deleted");
+
+    let m_over_after: i64 = conn.query_row(
+        "SELECT manual_override FROM tracker_mappings WHERE komga_series_id = 'k_holy' AND tracker = 'mangabaka'",
+        [],
+        |r| r.get(0),
+    ).unwrap();
+    assert_eq!(m_over_after, 0);
+
+    // 3. Test Library Integrity Audit
+    // Insert orphan tracker mapping
+    conn.execute(
+        "INSERT INTO tracker_mappings (komga_series_id, tracker, tracker_id, updated_at)
+         VALUES ('k_orphan_series', 'mangabaka', '99999', 1700000000)",
+        [],
+    ).unwrap();
+
+    let report = crate::sync::integrity::audit_library_integrity(&conn, None).unwrap();
+    assert!(report.total_issues > 0);
+    assert!(report.issues.iter().any(|i| i.code == "ORPHAN_TRACKER_MAPPING"));
+
+    // 4. Test Notification History
+    let events = crate::sync::reconciliation::list_notification_events(&conn, 10, false).unwrap();
+    assert_eq!(events.len(), 1);
+    assert!(!events[0].is_active); // Was marked resolved earlier
+    assert_eq!(events[0].event_type, "ACTION_REQUIRED");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

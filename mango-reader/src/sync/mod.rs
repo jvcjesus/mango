@@ -7,8 +7,10 @@
 pub mod anilist;
 pub mod audit;
 pub mod catalog;
+pub mod diagnostics;
 pub mod eligibility;
 pub mod identity;
+pub mod integrity;
 pub mod komga_reader;
 pub mod lists;
 pub mod mangabaka;

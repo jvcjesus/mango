@@ -57,6 +57,7 @@
     autoAcquire = false,
     autoAcquireActivatedAt = null,
     onToggleAutoAcquire,
+    onOpenDiagnostics,
   }: {
     summary: SeriesSummary;
     libraryState?: CanonicalLibraryReleasesSummary | null;
@@ -84,6 +85,7 @@
     openTomeLoading?: boolean;
     onSearchNyaa?: () => void;
     onCheckReleaseDiscovery?: () => void;
+    onOpenDiagnostics?: () => void;
   } = $props();
 
   let showAdvanced = $state(false);
@@ -175,6 +177,16 @@
             <Icon name="search" size={14} />
           {/if}
           Discover Releases
+        </button>
+      {/if}
+      {#if onOpenDiagnostics}
+        <button
+          class="btn pill icon-text"
+          onclick={onOpenDiagnostics}
+          title="Inspect title diagnostics, authority resolution, ownership, and auto-acquire policy gates"
+        >
+          <Icon name="info" size={14} />
+          Diagnostics
         </button>
       {/if}
     </div>

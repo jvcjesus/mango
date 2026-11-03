@@ -2,6 +2,8 @@
   import AcquisitionDialog from "../lib/AcquisitionDialog.svelte";
   import SeriesSummaryCard from "../lib/SeriesSummaryCard.svelte";
   import VolumeRow from "../lib/VolumeRow.svelte";
+  import TitleDiagnosticsModal from "../lib/TitleDiagnosticsModal.svelte";
+  import CandidateInspectorModal from "../lib/CandidateInspectorModal.svelte";
   import {
     resolveSeriesSummary,
     resolveVolumePresentation,
@@ -157,6 +159,8 @@
   let discoveringAll = $state(false);
   let expandedCandidates = $state<Set<number>>(new Set());
   let acquiringCandidates = $state<Set<string>>(new Set());
+  let showDiagnosticsModal = $state(false);
+  let inspectingCandidateVolume = $state<number | null>(null);
 
   const chapters = $derived(title?.chapters ?? []);
   const unread = $derived(chapters.filter((c) => !c.read).length);
@@ -1453,8 +1457,9 @@
               autoAcquire={title.autoAcquire}
               autoAcquireActivatedAt={title.autoAcquireActivatedAt}
               onToggleAutoAcquire={handleToggleAutoAcquire}
-              onResolveIdentity={runReconcile}
-              onLinkMangaBaka={promptLinkMangaBaka}
+              onResolveIdentity={() => { showDiagnosticsModal = true; }}
+              onLinkMangaBaka={() => { showDiagnosticsModal = true; }}
+              onOpenDiagnostics={() => { showDiagnosticsModal = true; }}
               onReviewRelease={handleReviewRelease}
               onRetryMetadata={handleRetryMetadata}
               onDiscoverMissing={findAllMissingReleases}
@@ -2072,6 +2077,14 @@
                       {/if}
                       Find Releases
                     </button>
+                    <button
+                      class="btn mini flat inspect-cand-btn"
+                      onclick={() => grp.volume !== null && (inspectingCandidateVolume = grp.volume)}
+                      title="Inspect candidates and auto-acquire policy evaluation for {grp.label}"
+                    >
+                      <Icon name="eye" size={14} />
+                      Inspect
+                    </button>
                   {/if}
                 </div>
               {/if}
@@ -2084,7 +2097,17 @@
                 <div class="discovered-candidates-box">
                   <div class="candidates-header">
                     <span class="cand-heading">Discovered Releases ({disc.candidates.length})</span>
-                    <span class="cand-providers">Checked: {disc.providersChecked.join(', ')}</span>
+                    <div style="display: flex; align-items: center; gap: 8px;">
+                      <span class="cand-providers">Checked: {disc.providersChecked.join(', ')}</span>
+                      <button
+                        class="btn mini flat"
+                        style="padding: 2px 6px; font-size: 11px;"
+                        onclick={() => { inspectingCandidateVolume = grp.volume; }}
+                        title="Open candidate transport & gate inspection"
+                      >
+                        <Icon name="eye" size={12} /> Inspect
+                      </button>
+                    </div>
                   </div>
                   <div class="candidates-list">
                     {#each disc.candidates as cand (cand.candidateId)}
@@ -4002,4 +4025,24 @@
 
 {#if unifiedAcquisition && title}
 <AcquisitionDialog title={title.title} initialReleaseId={unifiedAcquisition.release} initialMode={unifiedAcquisition.mode} onclose={() => unifiedAcquisition = null} onacquired={() => { refreshOwnership(); loadTitleExecutions(); }} />
+{/if}
+
+{#if title}
+  <TitleDiagnosticsModal
+    open={showDiagnosticsModal}
+    mangaId={title.id}
+    mangaTitle={title.title}
+    onClose={() => { showDiagnosticsModal = false; }}
+    onReconciled={() => {
+      load();
+      runReconcile();
+    }}
+  />
+
+  <CandidateInspectorModal
+    open={inspectingCandidateVolume !== null}
+    mangaId={title.id}
+    volume={inspectingCandidateVolume ?? 0}
+    onClose={() => { inspectingCandidateVolume = null; }}
+  />
 {/if}
