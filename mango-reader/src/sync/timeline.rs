@@ -173,42 +173,34 @@ pub fn get_series_timeline(conn: &Connection, manga_id: i64) -> Result<SeriesTim
     };
 
     let effective_mb_id = mb_id_from_recon.or(manga_mb_id);
+    let series_id_manga = format!("manga:{m_id}");
+    let series_id_num = m_id.to_string();
 
-    // 3. Query OpenTome release targets
+    // 3. Query OpenTome release discovery targets
     // Map volume_number -> (release_date, status)
     let mut opentome_targets: HashMap<u32, (String, String)> = HashMap::new();
-    let opentome_work_id: Option<String> = conn
-        .query_row(
-            "SELECT work_id FROM opentome_mappings WHERE manga_id = ?1",
-            [m_id],
-            |r| r.get::<_, String>(0),
+    let mut target_stmt = conn
+        .prepare(
+            "SELECT volume_number, release_date, status
+             FROM release_discovery_targets
+             WHERE manga_id = ?1 OR series_id = ?2",
         )
-        .optional()
-        .unwrap_or(None);
+        .map_err(|e| AppError::internal(format!("Prepare release targets failed: {e}")))?;
 
-    if let Some(ref work_id) = opentome_work_id {
-        let mut target_stmt = conn
-            .prepare(
-                "SELECT volume_number, release_date, status
-                 FROM release_targets WHERE work_id = ?1",
-            )
-            .map_err(|e| AppError::internal(format!("Prepare release targets failed: {e}")))?;
+    let target_rows = target_stmt
+        .query_map(rusqlite::params![m_id, series_id_manga], |r| {
+            Ok((
+                r.get::<_, f64>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        })
+        .map_err(|e| AppError::internal(format!("Query release targets failed: {e}")))?;
 
-        let rows = target_stmt
-            .query_map([work_id], |r| {
-                Ok((
-                    r.get::<_, f64>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, String>(2)?,
-                ))
-            })
-            .map_err(|e| AppError::internal(format!("Query release targets failed: {e}")))?;
-
-        for r in rows.flatten() {
-            let (vol, date, stat) = r;
-            let key = (vol * 1000.0).round() as u32;
-            opentome_targets.insert(key, (date, stat));
-        }
+    for r in target_rows.flatten() {
+        let (vol, date, stat) = r;
+        let key = (vol * 1000.0).round() as u32;
+        opentome_targets.insert(key, (date, stat));
     }
 
     // 4. Query Chapters (canonical storage vs local staging vs reader caches)
@@ -318,26 +310,27 @@ pub fn get_series_timeline(conn: &Connection, manga_id: i64) -> Result<SeriesTim
     let mut candidate_map: HashMap<u32, CandidateSummary> = HashMap::new();
     let mut cand_stmt = conn
         .prepare(
-            "SELECT volume_number, provider, title, raw_title, score, auto_acquire_eligible
-             FROM discovered_release_candidates WHERE manga_id = ?1 ORDER BY score DESC",
+            "SELECT volume_number, provider, title, raw_title, score
+             FROM discovered_release_candidates
+             WHERE series_id = ?1 OR series_id = ?2
+             ORDER BY score DESC",
         )
         .map_err(|e| AppError::internal(format!("Prepare candidates failed: {e}")))?;
 
     let cand_rows = cand_stmt
-        .query_map([m_id], |r| {
+        .query_map(rusqlite::params![series_id_manga, series_id_num], |r| {
             Ok((
                 r.get::<_, f64>(0)?,
                 r.get::<_, String>(1)?,
-                r.get::<_, Option<String>>(2)?,
+                r.get::<_, String>(2)?,
                 r.get::<_, String>(3)?,
                 r.get::<_, f64>(4)?,
-                r.get::<_, i64>(5)? != 0,
             ))
         })
         .map_err(|e| AppError::internal(format!("Query candidates failed: {e}")))?;
 
     for r in cand_rows.flatten() {
-        let (vol, prov, title_opt, raw_title, score, auto_elig) = r;
+        let (vol, prov, title_val, raw_title, score) = r;
         let key = (vol * 1000.0).round() as u32;
         let entry = candidate_map.entry(key).or_insert_with(|| CandidateSummary {
             count: 0,
@@ -349,10 +342,10 @@ pub fn get_series_timeline(conn: &Connection, manga_id: i64) -> Result<SeriesTim
 
         entry.count += 1;
         if entry.top_score.is_none() || score > entry.top_score.unwrap() {
-            entry.top_title = Some(title_opt.unwrap_or(raw_title));
+            entry.top_title = Some(if title_val.is_empty() { raw_title } else { title_val });
             entry.top_source = Some(prov);
             entry.top_score = Some(score);
-            entry.top_auto_eligible = Some(auto_elig);
+            entry.top_auto_eligible = Some(score >= 80.0);
         }
     }
 

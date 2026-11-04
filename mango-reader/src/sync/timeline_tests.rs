@@ -30,9 +30,10 @@ mod tests {
                 manga_id INTEGER PRIMARY KEY,
                 work_id TEXT NOT NULL
             );
-            CREATE TABLE release_targets (
+            CREATE TABLE release_discovery_targets (
                 id INTEGER PRIMARY KEY,
-                work_id TEXT NOT NULL,
+                manga_id INTEGER,
+                series_id TEXT,
                 volume_number REAL NOT NULL,
                 release_date TEXT NOT NULL,
                 status TEXT NOT NULL
@@ -55,13 +56,12 @@ mod tests {
             );
             CREATE TABLE discovered_release_candidates (
                 id TEXT PRIMARY KEY,
-                manga_id INTEGER NOT NULL,
+                series_id TEXT NOT NULL,
                 volume_number REAL NOT NULL,
                 provider TEXT NOT NULL,
                 raw_title TEXT NOT NULL,
                 title TEXT,
                 score REAL NOT NULL,
-                auto_acquire_eligible INTEGER NOT NULL DEFAULT 0,
                 discovered_at INTEGER NOT NULL
             );
             CREATE TABLE downloads (
@@ -281,8 +281,8 @@ mod tests {
         // Candidate discovered for volume 1
         conn.execute(
             "INSERT INTO discovered_release_candidates
-             (id, manga_id, volume_number, provider, raw_title, title, score, auto_acquire_eligible, discovered_at)
-             VALUES ('cand-1', 6, 1.0, 'Madokami', 'Kagurabachi v01.cbz', 'Kagurabachi Vol. 1', 95.0, 1, 1000)",
+             (id, series_id, volume_number, provider, raw_title, title, score, discovered_at)
+             VALUES ('cand-1', 'manga:6', 1.0, 'Madokami', 'Kagurabachi v01.cbz', 'Kagurabachi Vol. 1', 95.0, 1000)",
             [],
         ).unwrap();
 
