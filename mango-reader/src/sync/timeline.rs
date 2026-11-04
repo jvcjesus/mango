@@ -139,20 +139,30 @@ pub fn get_series_timeline(conn: &Connection, manga_id: i64) -> Result<SeriesTim
     ) = manga_row;
 
     // 2. Fetch series reconciliation data
-    let recon_row: Option<(String, Option<i64>, Option<String>, Option<String>, Option<String>, Option<u32>, Option<String>)> = conn
+    let recon_row: Option<(
+        String,
+        Option<i64>,
+        Option<String>,
+        Option<String>,
+        Option<u32>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    )> = conn
         .query_row(
-            "SELECT status, mangabaka_id, collection_id, market, edition, total_volumes, review_reason
-             FROM series_reconciliations WHERE manga_id = ?1",
-            [m_id],
+            "SELECT status, mangabaka_id, collection_id, edition, total_official_volumes, review_reason, owned_volumes_json, missing_volumes_json
+             FROM series_reconciliations WHERE manga_id = ?1 OR series_id = ?2",
+            rusqlite::params![m_id, format!("manga:{m_id}")],
             |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, Option<i64>>(1)?,
                     r.get::<_, Option<String>>(2)?,
                     r.get::<_, Option<String>>(3)?,
-                    r.get::<_, Option<String>>(4)?,
-                    r.get::<_, Option<u32>>(5)?,
+                    r.get::<_, Option<u32>>(4)?,
+                    r.get::<_, Option<String>>(5)?,
                     r.get::<_, Option<String>>(6)?,
+                    r.get::<_, Option<String>>(7)?,
                 ))
             },
         )
@@ -163,14 +173,16 @@ pub fn get_series_timeline(conn: &Connection, manga_id: i64) -> Result<SeriesTim
         reconciliation_status,
         mb_id_from_recon,
         collection_id,
-        collection_market,
         collection_edition,
         total_official_volumes,
         review_reason,
+        recon_owned_json,
+        _recon_missing_json,
     ) = match recon_row {
-        Some((st, mb, col, mkt, ed, tot, rev)) => (st, mb, col, mkt, ed, tot, rev),
-        None => ("unreconciled".to_string(), None, None, None, None, None, None),
+        Some((st, mb, col, ed, tot, rev, ow, mi)) => (st, mb, col, ed, tot, rev, ow, mi),
+        None => ("unreconciled".to_string(), None, None, None, None, None, None, None),
     };
+    let collection_market: Option<String> = None;
 
     let effective_mb_id = mb_id_from_recon.or(manga_mb_id);
     let series_id_manga = format!("manga:{m_id}");
@@ -265,6 +277,16 @@ pub fn get_series_timeline(conn: &Connection, manga_id: i64) -> Result<SeriesTim
                         max_reader_chapter = Some(num);
                     }
                 }
+            }
+        }
+    }
+
+    // Also include owned volumes recorded in series_reconciliations (synced from Komga)
+    if let Some(ref json_str) = recon_owned_json {
+        if let Ok(vols) = serde_json::from_str::<Vec<f64>>(json_str) {
+            for v in vols {
+                let key = (v * 1000.0).round() as u32;
+                canonical_volumes_set.insert(key);
             }
         }
     }
