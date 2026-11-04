@@ -395,3 +395,59 @@ fn test_interval_calculation_and_jitter() {
     let interval_recent = calculate_watcher_interval_secs(Some("2026-11-03"), 0, today);
     assert!(interval_recent >= 12000 && interval_recent <= 17000); // ~14400s with jitter
 }
+
+#[tokio::test]
+async fn test_run_watcher_tick_atomic_lease() {
+    let temp_dir = std::env::temp_dir().join(format!("mango_wtick_test_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let db = crate::db::Db::open(&temp_dir.join("test.db")).unwrap();
+
+    let cur_time = crate::db::now();
+
+    // Insert title and a due watcher
+    db.call(move |conn| {
+        conn.execute(
+            "INSERT INTO manga (id, source_id, url, title, update_strategy)
+             VALUES (401, 1, 'url:401', 'Watch Manga', 'ALWAYS_UPDATE')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO release_availability_watchers (
+                series_id, manga_id, series_title, volume_number, edition,
+                is_released, is_owned, monitoring_enabled, notify_on_available,
+                state, last_attempt_at, last_checked_at, next_check_at,
+                check_interval_secs, consecutive_failures, created_at, updated_at
+             ) VALUES (
+                'manga:401', 401, 'Watch Manga', 1.0, 'standard',
+                1, 0, 1, 1,
+                'RELEASED_AWAITING_PROVIDER', 0, 0, ?1,
+                3600, 0, ?1, ?1
+             )",
+            [cur_time - 10], // Due 10 seconds ago
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    // Call run_watcher_tick
+    let http = reqwest::Client::new();
+    let _ = run_watcher_tick(&db, http).await;
+
+    // Check that the watcher was leased: next_check_at must be leased forward
+    db.call(move |conn| {
+        let (last_attempt, next_check): (i64, i64) = conn.query_row(
+            "SELECT last_attempt_at, next_check_at FROM release_availability_watchers WHERE manga_id = 401",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?;
+        assert!(last_attempt >= cur_time);
+        assert!(next_check >= cur_time + 290);
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}

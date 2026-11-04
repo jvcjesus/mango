@@ -33,6 +33,10 @@ impl AppError {
         Self::new(404, "not_found", message)
     }
 
+    pub fn conflict(message: impl Into<String>) -> Self {
+        Self::new(409, "conflict", message)
+    }
+
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(500, "internal", message)
     }

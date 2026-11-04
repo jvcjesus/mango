@@ -1397,8 +1397,14 @@ impl Pipeline {
         let mb_stat_val = mangabaka_status.clone();
         let pub_series_title = publication_title.clone();
         let pub_manga_id = job.manga_id;
-        let (pub_size, pub_sha256) = receipts::compute_file_sha256(&canonical_dest)
-            .unwrap_or((0, String::new()));
+        let (pub_size, pub_sha256) = match receipts::compute_file_sha256(&canonical_dest) {
+            Ok((size, hash)) if size > 0 && !hash.trim().is_empty() => (size, hash),
+            Ok(_) => (0, String::new()),
+            Err(e) => {
+                tracing::warn!("Failed to hash published canonical file at {canonical_dest_str}: {e}; preserving file protection and recording recovery state");
+                (0, String::new())
+            }
+        };
 
         self.db.call(move |conn| {
             let transaction = conn.transaction()?;
@@ -1411,21 +1417,35 @@ impl Pipeline {
                 "UPDATE downloads SET published_path = ?2, published_at = ?3, target_library_id = ?4, state = 'verifying', error = 'Published — waiting for Komga' WHERE chapter_id = ?1",
                 rusqlite::params![chapter_id, p_str, now as i64, t_lib],
             )?;
-            let _ = receipts::record_publication_receipt(
-                conn,
-                chapter_id,
-                Some(pub_manga_id),
-                &pub_series_title,
-                is_volume,
-                release_num,
-                &p_str,
-                pub_size,
-                &pub_sha256,
-                false,
-                t_lib.as_deref(),
-                &mb_stat_val,
-                None,
-            );
+            if pub_size > 0 && !pub_sha256.is_empty() {
+                if let Err(e) = receipts::record_publication_receipt(
+                    conn,
+                    chapter_id,
+                    Some(pub_manga_id),
+                    &pub_series_title,
+                    is_volume,
+                    release_num,
+                    &p_str,
+                    pub_size,
+                    &pub_sha256,
+                    false,
+                    t_lib.as_deref(),
+                    &mb_stat_val,
+                    None,
+                ) {
+                    tracing::error!("Failed to record publication receipt for {p_str}: {e}; preserving durable recovery state in downloads");
+                    conn.execute(
+                        "UPDATE downloads SET error = ?2 WHERE chapter_id = ?1",
+                        rusqlite::params![chapter_id, format!("Published — receipt persistence pending: {e}")],
+                    )?;
+                }
+            } else {
+                tracing::error!("Published canonical file at {p_str} returned invalid hash/size; preserving download verification state without recording invalid receipt");
+                conn.execute(
+                    "UPDATE downloads SET error = 'Published — receipt hashing pending' WHERE chapter_id = ?1",
+                    rusqlite::params![chapter_id],
+                )?;
+            }
             crate::acquisition::service::persist_publication_provenance(conn, chapter_id)?;
             conn.execute(
                 "UPDATE acquisition_history

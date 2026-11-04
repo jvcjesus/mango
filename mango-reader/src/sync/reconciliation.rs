@@ -1305,7 +1305,7 @@ pub fn save_reconciliation(conn: &Connection, s: &ReconciliationSummary) -> Resu
     });
 
     if let Some(m_id) = resolved_manga_id {
-        let _ = crate::acquisition::watcher::sync_watchers_for_series(
+        if let Err(e) = crate::acquisition::watcher::sync_watchers_for_series(
             conn,
             m_id,
             &s.series_id,
@@ -1315,7 +1315,17 @@ pub fn save_reconciliation(conn: &Connection, s: &ReconciliationSummary) -> Resu
             &s.missing_volumes,
             &s.future_volumes,
             &s.owned_volumes,
-        );
+        ) {
+            tracing::warn!(
+                "Failed to synchronize availability watchers for series '{}' ({}): {e}",
+                s.title,
+                s.series_id
+            );
+            let _ = conn.execute(
+                "UPDATE series_reconciliations SET last_error = ?1 WHERE series_id = ?2",
+                rusqlite::params![format!("Watcher sync failed: {e}"), &s.series_id],
+            );
+        }
     }
 
     Ok(())

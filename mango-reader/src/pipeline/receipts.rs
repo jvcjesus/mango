@@ -96,6 +96,11 @@ pub struct PublicationReceiptVerificationResult {
 }
 
 /// Atomically creates or updates a durable publication receipt upon successful publication.
+///
+/// Safety guarantees:
+/// - Fails closed on zero file size or empty SHA256.
+/// - Does not overwrite immutable provenance on `canonical_path` conflict unless the
+///   stored receipt represents the identical verified publication (matching size and sha256).
 pub fn record_publication_receipt(
     conn: &Connection,
     chapter_id: i64,
@@ -111,33 +116,69 @@ pub fn record_publication_receipt(
     metadata_status: &str,
     metadata_error: Option<&str>,
 ) -> Result<PublicationReceipt> {
+    if file_size_bytes == 0 || file_sha256.trim().is_empty() {
+        return Err(AppError::bad_request(
+            "Cannot record publication receipt with zero file size or empty SHA256 hash",
+        ));
+    }
+
     let current_time = now();
-    let receipt_id = new_receipt_id();
     let vol_num = if is_volume { Some(release_number) } else { None };
     let ch_num = if !is_volume { Some(release_number) } else { None };
 
+    // Check if a receipt already exists for this canonical path
+    if let Some(existing) = get_publication_receipt_by_path(conn, canonical_path)? {
+        // Prove that the stored receipt represents the identical publication
+        if existing.file_sha256 != file_sha256 || (existing.file_size_bytes as u64) != file_size_bytes {
+            return Err(AppError::conflict(format!(
+                "Conflicting publication receipt for canonical path '{}': existing receipt {} has sha256={}, size={} bytes; cannot overwrite with new publication sha256={}, size={} bytes",
+                canonical_path, existing.id, existing.file_sha256, existing.file_size_bytes, file_sha256, file_size_bytes
+            )));
+        }
+
+        // Identical publication: safely update operational metadata while preserving immutable provenance
+        conn.execute(
+            "UPDATE publication_receipts SET
+                chapter_id = ?1,
+                manga_id = COALESCE(?2, manga_id),
+                series_title = ?3,
+                volume_number = ?4,
+                chapter_number = ?5,
+                is_volume = ?6,
+                komga_notified = CASE WHEN ?7 = 1 THEN 1 ELSE komga_notified END,
+                komga_library_id = COALESCE(?8, komga_library_id),
+                metadata_status = ?9,
+                metadata_error = ?10,
+                updated_at = ?11
+             WHERE canonical_path = ?12",
+            params![
+                chapter_id,
+                manga_id,
+                series_title,
+                vol_num,
+                ch_num,
+                if is_volume { 1 } else { 0 },
+                if komga_notified { 1 } else { 0 },
+                komga_library_id,
+                metadata_status,
+                metadata_error,
+                current_time,
+                canonical_path,
+            ],
+        )?;
+
+        return get_publication_receipt_by_path(conn, canonical_path)?
+            .ok_or_else(|| AppError::internal("Failed to retrieve updated publication receipt"));
+    }
+
+    let receipt_id = new_receipt_id();
     conn.execute(
         "INSERT INTO publication_receipts (
             id, chapter_id, manga_id, series_title, volume_number, chapter_number,
             is_volume, canonical_path, file_size_bytes, file_sha256, published_at,
             komga_notified, komga_library_id, metadata_status, metadata_error,
             verified_ownership, verified_at, created_at, updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 0, NULL, ?11, ?11)
-        ON CONFLICT(canonical_path) DO UPDATE SET
-            chapter_id = excluded.chapter_id,
-            manga_id = COALESCE(excluded.manga_id, publication_receipts.manga_id),
-            series_title = excluded.series_title,
-            volume_number = excluded.volume_number,
-            chapter_number = excluded.chapter_number,
-            is_volume = excluded.is_volume,
-            file_size_bytes = excluded.file_size_bytes,
-            file_sha256 = excluded.file_sha256,
-            published_at = excluded.published_at,
-            komga_notified = CASE WHEN excluded.komga_notified = 1 THEN 1 ELSE publication_receipts.komga_notified END,
-            komga_library_id = COALESCE(excluded.komga_library_id, publication_receipts.komga_library_id),
-            metadata_status = excluded.metadata_status,
-            metadata_error = excluded.metadata_error,
-            updated_at = excluded.updated_at",
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, 0, NULL, ?11, ?11)",
         params![
             receipt_id,
             chapter_id,

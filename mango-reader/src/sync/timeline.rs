@@ -17,6 +17,9 @@ use std::collections::{HashMap, HashSet};
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
+use crate::acquisition::approval::PersistedCandidate;
+use crate::acquisition::auto_acquire::{is_candidate_auto_eligible, AutoDecisionCode};
+use crate::acquisition::profiles::AcquisitionProfile;
 use crate::error::{AppError, Result};
 
 /// A single volume's unified timeline state.
@@ -38,6 +41,7 @@ pub struct SeriesTimelineVolumeDto {
     pub top_candidate_source: Option<String>,
     pub top_candidate_score: Option<f64>,
     pub top_candidate_auto_eligible: Option<bool>,
+    pub top_candidate_decision_code: Option<String>,
     pub receipt_id: Option<String>,
     pub canonical_path: Option<String>,
     pub download_job_id: Option<String>,
@@ -327,12 +331,21 @@ pub fn get_series_timeline(conn: &Connection, manga_id: i64) -> Result<SeriesTim
         top_source: Option<String>,
         top_score: Option<f64>,
         top_auto_eligible: Option<bool>,
+        top_decision_code: Option<String>,
     }
 
     let mut candidate_map: HashMap<u32, CandidateSummary> = HashMap::new();
+    let profile = AcquisitionProfile::default();
+    let today_date_str: String = conn
+        .query_row("SELECT date('now', 'localtime')", [], |r| r.get(0))
+        .unwrap_or_else(|_| crate::sync::reconciliation::today_ymd());
+
     let mut cand_stmt = conn
         .prepare(
-            "SELECT volume_number, provider, title, raw_title, score
+            "SELECT series_id, volume_number, candidate_id, provider, provider_item_id,
+                    title, raw_title, match_type, size_bytes, uploader, is_trusted,
+                    is_digital, score, score_explanation, download_url, magnet_url,
+                    info_hash, seeders, leechers, published_at
              FROM discovered_release_candidates
              WHERE series_id = ?1 OR series_id = ?2
              ORDER BY score DESC",
@@ -341,33 +354,71 @@ pub fn get_series_timeline(conn: &Connection, manga_id: i64) -> Result<SeriesTim
 
     let cand_rows = cand_stmt
         .query_map(rusqlite::params![series_id_manga, series_id_num], |r| {
-            Ok((
-                r.get::<_, f64>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, f64>(4)?,
-            ))
+            Ok(PersistedCandidate {
+                series_id: r.get(0)?,
+                volume_number: r.get(1)?,
+                candidate_id: r.get(2)?,
+                provider: r.get(3)?,
+                provider_item_id: r.get(4)?,
+                title: r.get(5)?,
+                raw_title: r.get(6)?,
+                match_type: r.get(7)?,
+                size_bytes: r.get::<_, Option<i64>>(8)?.map(|s| s as u64),
+                uploader: r.get(9)?,
+                is_trusted: r.get::<_, i64>(10)? != 0,
+                is_digital: r.get::<_, i64>(11)? != 0,
+                score: r.get(12)?,
+                score_explanation: r.get(13)?,
+                download_url: r.get(14)?,
+                magnet_url: r.get(15)?,
+                info_hash: r.get(16)?,
+                seeders: r.get::<_, Option<i64>>(17)?.map(|s| s as u32),
+                leechers: r.get::<_, Option<i64>>(18)?.map(|s| s as u32),
+                published_at: r.get(19)?,
+            })
         })
         .map_err(|e| AppError::internal(format!("Query candidates failed: {e}")))?;
 
     for r in cand_rows.flatten() {
-        let (vol, prov, title_val, raw_title, score) = r;
-        let key = (vol * 1000.0).round() as u32;
+        let cand = r;
+        let key = (cand.volume_number * 1000.0).round() as u32;
         let entry = candidate_map.entry(key).or_insert_with(|| CandidateSummary {
             count: 0,
             top_title: None,
             top_source: None,
             top_score: None,
             top_auto_eligible: None,
+            top_decision_code: None,
         });
 
         entry.count += 1;
-        if entry.top_score.is_none() || score > entry.top_score.unwrap() {
-            entry.top_title = Some(if title_val.is_empty() { raw_title } else { title_val });
-            entry.top_source = Some(prov);
-            entry.top_score = Some(score);
-            entry.top_auto_eligible = Some(score >= 80.0);
+        if entry.top_score.map_or(true, |cur| cand.score > cur) {
+            entry.top_title = Some(if cand.title.is_empty() { cand.raw_title.clone() } else { cand.title.clone() });
+            entry.top_source = Some(cand.provider.clone());
+            entry.top_score = Some(cand.score);
+
+            // Check if volume is future/pre-release in OpenTome
+            let is_future = if let Some((target_date, target_stat)) = opentome_targets.get(&key) {
+                target_stat == "pre" || target_date > &today_date_str
+            } else {
+                false
+            };
+
+            if is_future {
+                entry.top_auto_eligible = Some(false);
+                entry.top_decision_code = Some(AutoDecisionCode::PreReleaseRequiresManual.as_str().to_string());
+            } else {
+                match is_candidate_auto_eligible(&cand, &profile) {
+                    Ok(()) => {
+                        entry.top_auto_eligible = Some(true);
+                        entry.top_decision_code = Some(AutoDecisionCode::AutoAllowed.as_str().to_string());
+                    }
+                    Err(code) => {
+                        entry.top_auto_eligible = Some(false);
+                        entry.top_decision_code = Some(code.as_str().to_string());
+                    }
+                }
+            }
         }
     }
 
@@ -467,6 +518,7 @@ pub fn get_series_timeline(conn: &Connection, manga_id: i64) -> Result<SeriesTim
         let top_candidate_source = cand_info.and_then(|c| c.top_source.clone());
         let top_candidate_score = cand_info.and_then(|c| c.top_score);
         let top_candidate_auto_eligible = cand_info.and_then(|c| c.top_auto_eligible);
+        let top_candidate_decision_code = cand_info.and_then(|c| c.top_decision_code.clone());
 
         let receipt_entry = receipts_map.get(key);
         let receipt_id = receipt_entry.map(|r| r.0.clone());
@@ -543,6 +595,7 @@ pub fn get_series_timeline(conn: &Connection, manga_id: i64) -> Result<SeriesTim
             top_candidate_source,
             top_candidate_score,
             top_candidate_auto_eligible,
+            top_candidate_decision_code,
             receipt_id,
             canonical_path,
             download_job_id,

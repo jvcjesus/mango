@@ -318,4 +318,136 @@ mod tests {
         assert!(r2.komga_notified);
         assert_eq!(r2.komga_library_id.as_deref(), Some("lib-2"));
     }
+
+    #[tokio::test]
+    async fn test_record_publication_receipt_rejects_zero_size_and_empty_hash() {
+        let db_dir = TempDir::new();
+        let db = Db::open(&db_dir.path().join("test.db")).unwrap();
+
+        // 1. Zero file size must be rejected
+        let res_zero_size = db
+            .call(|conn| {
+                insert_test_manga(conn, 5, "Zero Size Series");
+                record_publication_receipt(
+                    conn, 501, Some(5), "Zero Size Series", true, 1.0,
+                    "/srv/media/manga/Zero Size Series/v01.cbz", 0, "abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234abcd1234",
+                    false, None, "complete", None,
+                )
+            })
+            .await;
+        assert!(res_zero_size.is_err(), "Zero size receipt must be rejected");
+
+        // 2. Empty hash must be rejected
+        let res_empty_hash = db
+            .call(|conn| {
+                record_publication_receipt(
+                    conn, 502, Some(5), "Zero Size Series", true, 2.0,
+                    "/srv/media/manga/Zero Size Series/v02.cbz", 1024, "",
+                    false, None, "complete", None,
+                )
+            })
+            .await;
+        assert!(res_empty_hash.is_err(), "Empty SHA256 receipt must be rejected");
+
+        // 3. Whitespace-only hash must be rejected
+        let res_whitespace_hash = db
+            .call(|conn| {
+                record_publication_receipt(
+                    conn, 503, Some(5), "Zero Size Series", true, 3.0,
+                    "/srv/media/manga/Zero Size Series/v03.cbz", 1024, "   ",
+                    false, None, "complete", None,
+                )
+            })
+            .await;
+        assert!(res_whitespace_hash.is_err(), "Whitespace SHA256 receipt must be rejected");
+    }
+
+    #[tokio::test]
+    async fn test_record_publication_receipt_rejects_conflicting_canonical_path() {
+        let db_dir = TempDir::new();
+        let db = Db::open(&db_dir.path().join("test.db")).unwrap();
+        let p = "/srv/media/manga/Conflict Series/Conflict Series v01.cbz";
+
+        // Initial publication
+        let r1 = db
+            .call(move |conn| {
+                insert_test_manga(conn, 6, "Conflict Series");
+                record_publication_receipt(
+                    conn, 601, Some(6), "Conflict Series", true, 1.0,
+                    p, 1000000, "1111111111111111111111111111111111111111111111111111111111111111",
+                    false, None, "complete", None,
+                )
+            })
+            .await
+            .unwrap();
+
+        // Attempt to record a DIFFERENT file (different sha256) at the same canonical path
+        let res_conflict_sha = db
+            .call(move |conn| {
+                record_publication_receipt(
+                    conn, 602, Some(6), "Conflict Series", true, 1.0,
+                    p, 1000000, "2222222222222222222222222222222222222222222222222222222222222222",
+                    false, None, "complete", None,
+                )
+            })
+            .await;
+        assert!(res_conflict_sha.is_err(), "Must reject conflicting sha256 on same canonical path");
+
+        // Attempt to record a DIFFERENT file (different size) at the same canonical path
+        let res_conflict_size = db
+            .call(move |conn| {
+                record_publication_receipt(
+                    conn, 603, Some(6), "Conflict Series", true, 1.0,
+                    p, 2000000, "1111111111111111111111111111111111111111111111111111111111111111",
+                    false, None, "complete", None,
+                )
+            })
+            .await;
+        assert!(res_conflict_size.is_err(), "Must reject conflicting size on same canonical path");
+
+        // Original receipt remains untouched
+        let existing = db
+            .call(move |conn| get_publication_receipt_by_path(conn, p))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(existing.id, r1.id);
+        assert_eq!(existing.file_sha256, "1111111111111111111111111111111111111111111111111111111111111111");
+        assert_eq!(existing.file_size_bytes, 1000000);
+    }
+
+    #[tokio::test]
+    async fn test_post_publication_metadata_failure_recorded_on_receipt() {
+        let db_dir = TempDir::new();
+        let db = Db::open(&db_dir.path().join("test.db")).unwrap();
+        let p = "/srv/media/manga/Meta Series/Meta Series v01.cbz";
+
+        let _r = db
+            .call(move |conn| {
+                insert_test_manga(conn, 7, "Meta Series");
+                record_publication_receipt(
+                    conn, 701, Some(7), "Meta Series", true, 1.0,
+                    p, 500000, "3333333333333333333333333333333333333333333333333333333333333333",
+                    false, None, "pending", None,
+                )
+            })
+            .await
+            .unwrap();
+
+        // Update metadata status after post-publication failure
+        db.call(move |conn| {
+            update_receipt_metadata_status(conn, p, "failed", Some("KOMF metadata handoff timed out"))
+        })
+        .await
+        .unwrap();
+
+        let updated = db
+            .call(move |conn| get_publication_receipt_by_path(conn, p))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(updated.metadata_status, "failed");
+        assert_eq!(updated.metadata_error.as_deref(), Some("KOMF metadata handoff timed out"));
+        assert_eq!(updated.file_sha256, "3333333333333333333333333333333333333333333333333333333333333333");
+    }
 }

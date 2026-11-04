@@ -50,8 +50,8 @@ async fn insert_test_manga_with_meta(
 
         conn.execute(
             "INSERT INTO series_reconciliations (
-                series_id, manga_id, title, status, total_official_volumes, future_volumes_json, last_reconciled_at, updated_at
-             ) VALUES (?1, ?2, ?3, 'MATCHED', ?4, ?5, ?6, ?6)",
+                series_id, manga_id, title, status, collection_id, total_official_volumes, future_volumes_json, last_reconciled_at, updated_at
+             ) VALUES (?1, ?2, ?3, 'up_to_date', 'col_123', ?4, ?5, ?6, ?6)",
             rusqlite::params![sid, manga_id, t_clone, total_official, future_json, now()],
         )?;
         Ok(())
@@ -79,7 +79,7 @@ async fn insert_test_candidate(
                 title, raw_title, match_type, size_bytes, uploader, is_trusted,
                 is_digital, score, score_explanation, download_url, magnet_url,
                 info_hash, seeders, leechers, published_at, discovered_at
-             ) VALUES (?1, ?2, ?3, ?4, 'item_1', ?5, ?5, 'exact_match', 1000000,
+             ) VALUES (?1, ?2, ?3, ?4, 'item_1', ?5, ?5, 'exact_volume', 25000000,
                        'TestUploader', 1, 1, ?6, 'Valid test candidate',
                        'https://example.com/dl', 'magnet:?xt=urn:btih:test', 'test_hash',
                        10, 2, ?7, ?7)",
@@ -350,4 +350,230 @@ async fn test_backlog_job_cancellation() {
     // Second cancel returns false
     let cancelled_again = svc.cancel_backlog_job(&plan.id).await.unwrap();
     assert!(!cancelled_again);
+}
+
+#[tokio::test]
+async fn test_backlog_plan_blocks_when_collection_unavailable() {
+    let (db, _dir) = create_test_db();
+    let svc = AcquisitionService::new(db.clone(), reqwest::Client::new(), None, None);
+
+    // Holy Land pattern: series exists in manga and reconciled, but status is collection_unavailable
+    db.call(|conn| {
+        conn.execute(
+            "INSERT INTO manga (id, source_id, url, title, update_strategy)
+             VALUES (201, 1, 'url:201', 'Holyland', 'ALWAYS_UPDATE')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO series_reconciliations (
+                series_id, manga_id, title, status, collection_id, total_official_volumes,
+                future_volumes_json, last_reconciled_at, updated_at
+             ) VALUES ('title:holyland', 201, 'Holyland', 'collection_unavailable', NULL, NULL, '[]', ?1, ?1)",
+            [now()],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let plan = svc
+        .plan_backlog_acquisition(
+            201,
+            PlanBacklogRequest {
+                scope: BacklogScope::AllMissing,
+                range_start: None,
+                range_end: None,
+                explicit_volumes: None,
+                batch_size: Some(5),
+                is_dry_run: Some(true),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(plan.state, "BLOCKED");
+    assert_eq!(plan.total_requested, 0);
+    assert!(plan.items.is_empty());
+    assert!(plan.error.as_deref().unwrap().contains("collection is unavailable"));
+}
+
+#[tokio::test]
+async fn test_backlog_plan_blocks_when_review_required() {
+    let (db, _dir) = create_test_db();
+    let svc = AcquisitionService::new(db.clone(), reqwest::Client::new(), None, None);
+
+    // Bungo Stray Dogs pattern: review_required
+    db.call(|conn| {
+        conn.execute(
+            "INSERT INTO manga (id, source_id, url, title, update_strategy)
+             VALUES (202, 1, 'url:202', 'Bungo Stray Dogs', 'ALWAYS_UPDATE')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO series_reconciliations (
+                series_id, manga_id, title, status, collection_id, review_reason,
+                total_official_volumes, future_volumes_json, last_reconciled_at, updated_at
+             ) VALUES ('title:bungo-stray-dogs', 202, 'Bungo Stray Dogs', 'review_required', NULL,
+                       'Disambiguation required: multiple potential works', NULL, '[]', ?1, ?1)",
+            [now()],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let plan = svc
+        .plan_backlog_acquisition(
+            202,
+            PlanBacklogRequest {
+                scope: BacklogScope::AllMissing,
+                range_start: None,
+                range_end: None,
+                explicit_volumes: None,
+                batch_size: Some(5),
+                is_dry_run: Some(true),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(plan.state, "REVIEW_REQUIRED");
+    assert_eq!(plan.total_requested, 0);
+    assert!(plan.items.is_empty());
+    assert!(plan.error.as_deref().unwrap().contains("Disambiguation required"));
+}
+
+#[tokio::test]
+async fn test_backlog_plan_marks_nonexistent_volume() {
+    let (db, _dir) = create_test_db();
+    let svc = AcquisitionService::new(db.clone(), reqwest::Client::new(), None, None);
+
+    // Title has 10 official volumes
+    insert_test_manga_with_meta(&db, 203, "Claymore", Some(10), &[]).await;
+
+    let plan = svc
+        .plan_backlog_acquisition(
+            203,
+            PlanBacklogRequest {
+                scope: BacklogScope::ExplicitVolumes,
+                range_start: None,
+                range_end: None,
+                explicit_volumes: Some(vec![99.0]),
+                batch_size: Some(5),
+                is_dry_run: Some(true),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(plan.total_requested, 1);
+    let v99 = plan.items.iter().find(|i| (i.volume_number - 99.0).abs() < 0.001).unwrap();
+    assert_eq!(v99.status, "NON_EXISTENT_VOLUME");
+    assert!(v99.reason.contains("does not exist in authoritative MangaBaka collection"));
+    assert_eq!(plan.total_eligible, 0);
+}
+
+#[tokio::test]
+async fn test_backlog_plan_ineligible_candidates_not_eligible() {
+    let (db, _dir) = create_test_db();
+    let svc = AcquisitionService::new(db.clone(), reqwest::Client::new(), None, None);
+
+    insert_test_manga_with_meta(&db, 204, "Naruto", Some(72), &[]).await;
+
+    // Insert candidate with series_pack match_type (must be rejected by hard gates)
+    let sid = "title:naruto".to_string();
+    db.call(move |conn| {
+        conn.execute(
+            "INSERT INTO discovered_release_candidates (
+                series_id, volume_number, candidate_id, provider, provider_item_id,
+                title, raw_title, match_type, size_bytes, uploader, is_trusted,
+                is_digital, score, score_explanation, download_url, magnet_url,
+                info_hash, seeders, leechers, published_at, discovered_at
+             ) VALUES (?1, 1.0, 'naruto-pack-1', 'nyaa', 'item_pack',
+                       'Naruto Vol 1-72 Complete Pack', 'Naruto Vol 1-72 Complete Pack', 'series_pack',
+                       50000000, 'PackUploader', 1, 1, 95.0, 'Batch pack',
+                       'https://example.com/dl', 'magnet:?xt=urn:btih:pack', 'pack_hash',
+                       20, 5, ?2, ?2)",
+            rusqlite::params![sid, now()],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let plan = svc
+        .plan_backlog_acquisition(
+            204,
+            PlanBacklogRequest {
+                scope: BacklogScope::ExplicitVolumes,
+                range_start: None,
+                range_end: None,
+                explicit_volumes: Some(vec![1.0]),
+                batch_size: Some(5),
+                is_dry_run: Some(true),
+            },
+        )
+        .await
+        .unwrap();
+
+    let v1 = plan.items.iter().find(|i| (i.volume_number - 1.0).abs() < 0.001).unwrap();
+    assert_eq!(v1.status, "UNAVAILABLE");
+    assert!(v1.reason.contains("satisfied eligibility gates"));
+    assert_eq!(plan.total_eligible, 0);
+}
+
+#[tokio::test]
+async fn test_backlog_execution_atomic_claim_conflict() {
+    let (db, _dir) = create_test_db();
+    let svc = AcquisitionService::new(db.clone(), reqwest::Client::new(), None, None);
+
+    insert_test_manga_with_meta(&db, 205, "Bleach", Some(74), &[]).await;
+    insert_test_candidate(&db, "Bleach", 1.0, "madokami", "bleach-v1", 90.0).await;
+
+    let plan = svc
+        .plan_backlog_acquisition(
+            205,
+            PlanBacklogRequest {
+                scope: BacklogScope::ExplicitVolumes,
+                range_start: None,
+                range_end: None,
+                explicit_volumes: Some(vec![1.0]),
+                batch_size: Some(5),
+                is_dry_run: Some(true),
+            },
+        )
+        .await
+        .unwrap();
+
+    // First execution succeeds (dry run)
+    let res1 = svc
+        .execute_backlog_job(
+            &plan.id,
+            ExecuteBacklogRequest {
+                job_id: Some(plan.id.clone()),
+                confirm: true,
+                confirm_multiple: None,
+                is_dry_run: Some(true),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(res1.state, "COMPLETED");
+
+    // Second execution must fail with conflict (already COMPLETED / no longer PLANNED)
+    let err2 = svc
+        .execute_backlog_job(
+            &plan.id,
+            ExecuteBacklogRequest {
+                job_id: Some(plan.id.clone()),
+                confirm: true,
+                confirm_multiple: None,
+                is_dry_run: Some(true),
+            },
+        )
+        .await
+        .unwrap_err();
+
+    assert_eq!(err2.status.as_u16(), 409);
+    assert!(err2.message.contains("is not in PLANNED state"));
 }

@@ -16,6 +16,7 @@ mod tests {
                 auto_acquire INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE series_reconciliations (
+                series_id TEXT,
                 manga_id INTEGER PRIMARY KEY,
                 title TEXT NOT NULL,
                 status TEXT NOT NULL,
@@ -23,7 +24,11 @@ mod tests {
                 collection_id TEXT,
                 market TEXT,
                 edition TEXT,
+                total_official_volumes INTEGER,
                 total_volumes INTEGER,
+                owned_volumes_json TEXT DEFAULT '[]',
+                missing_volumes_json TEXT DEFAULT '[]',
+                future_volumes_json TEXT DEFAULT '[]',
                 review_reason TEXT
             );
             CREATE TABLE opentome_mappings (
@@ -58,10 +63,24 @@ mod tests {
                 id TEXT PRIMARY KEY,
                 series_id TEXT NOT NULL,
                 volume_number REAL NOT NULL,
+                candidate_id TEXT NOT NULL DEFAULT 'cand-1',
                 provider TEXT NOT NULL,
+                provider_item_id TEXT NOT NULL DEFAULT 'item-1',
                 raw_title TEXT NOT NULL,
                 title TEXT,
+                match_type TEXT NOT NULL DEFAULT 'exact_volume',
+                size_bytes INTEGER NULL DEFAULT 25000000,
+                uploader TEXT NULL DEFAULT 'TrustedUploader',
+                is_trusted INTEGER NOT NULL DEFAULT 1,
+                is_digital INTEGER NOT NULL DEFAULT 1,
                 score REAL NOT NULL,
+                score_explanation TEXT NOT NULL DEFAULT 'Score',
+                download_url TEXT NULL DEFAULT 'https://example.com/dl',
+                magnet_url TEXT NULL DEFAULT 'magnet:?xt=urn:btih:test',
+                info_hash TEXT NULL DEFAULT 'test_hash',
+                seeders INTEGER NULL DEFAULT 10,
+                leechers INTEGER NULL DEFAULT 2,
+                published_at INTEGER NULL,
                 discovered_at INTEGER NOT NULL
             );
             CREATE TABLE downloads (
@@ -98,7 +117,7 @@ mod tests {
             [],
         ).unwrap();
         conn.execute(
-            "INSERT INTO series_reconciliations (manga_id, title, status, mangabaka_id, collection_id, total_volumes)
+            "INSERT INTO series_reconciliations (manga_id, title, status, mangabaka_id, collection_id, total_official_volumes)
              VALUES (1, 'Continuous Manga', 'up_to_date', 101, 'col-1', 5)",
             [],
         ).unwrap();
@@ -128,7 +147,7 @@ mod tests {
             [],
         ).unwrap();
         conn.execute(
-            "INSERT INTO series_reconciliations (manga_id, title, status, mangabaka_id, collection_id, total_volumes)
+            "INSERT INTO series_reconciliations (manga_id, title, status, mangabaka_id, collection_id, total_official_volumes)
              VALUES (2, 'Gap Manga', 'missing_volume', 102, 'col-2', 5)",
             [],
         ).unwrap();
@@ -165,7 +184,7 @@ mod tests {
             [],
         ).unwrap();
         conn.execute(
-            "INSERT INTO series_reconciliations (manga_id, title, status, mangabaka_id, collection_id, total_volumes)
+            "INSERT INTO series_reconciliations (manga_id, title, status, mangabaka_id, collection_id, total_official_volumes)
              VALUES (3, 'Edges Manga', 'missing_volume', 103, 'col-3', 6)",
             [],
         ).unwrap();
@@ -203,7 +222,7 @@ mod tests {
             [],
         ).unwrap();
         conn.execute(
-            "INSERT INTO series_reconciliations (manga_id, title, status, mangabaka_id, collection_id, total_volumes)
+            "INSERT INTO series_reconciliations (manga_id, title, status, mangabaka_id, collection_id, total_official_volumes)
              VALUES (4, 'Blood on the Tracks', 'up_to_date', 25283, 'col-4', 2)",
             [],
         ).unwrap();
@@ -245,7 +264,7 @@ mod tests {
             [],
         ).unwrap();
         conn.execute(
-            "INSERT INTO series_reconciliations (manga_id, title, status, mangabaka_id, collection_id, total_volumes)
+            "INSERT INTO series_reconciliations (manga_id, title, status, mangabaka_id, collection_id, total_official_volumes)
              VALUES (5, 'Blade of the Immortal', 'collection_unavailable', 5246, NULL, NULL)",
             [],
         ).unwrap();
@@ -273,7 +292,7 @@ mod tests {
             [],
         ).unwrap();
         conn.execute(
-            "INSERT INTO series_reconciliations (manga_id, title, status, mangabaka_id, collection_id, total_volumes)
+            "INSERT INTO series_reconciliations (manga_id, title, status, mangabaka_id, collection_id, total_official_volumes)
              VALUES (6, 'Kagurabachi', 'missing_volume', 708, 'col-6', 1)",
             [],
         ).unwrap();
@@ -282,7 +301,7 @@ mod tests {
         conn.execute(
             "INSERT INTO discovered_release_candidates
              (id, series_id, volume_number, provider, raw_title, title, score, discovered_at)
-             VALUES ('cand-1', 'manga:6', 1.0, 'Madokami', 'Kagurabachi v01.cbz', 'Kagurabachi Vol. 1', 95.0, 1000)",
+             VALUES ('cand-1', 'manga:6', 1.0, 'madokami', 'Kagurabachi v01.cbz', 'Kagurabachi Vol. 1', 95.0, 1000)",
             [],
         ).unwrap();
 
@@ -291,8 +310,73 @@ mod tests {
         let vol1 = &timeline.volumes[0];
         assert_eq!(vol1.status, "CANDIDATE_AVAILABLE");
         assert_eq!(vol1.candidate_count, 1);
-        assert_eq!(vol1.top_candidate_source.as_deref(), Some("Madokami"));
+        assert_eq!(vol1.top_candidate_source.as_deref(), Some("madokami"));
         assert_eq!(vol1.top_candidate_score, Some(95.0));
         assert_eq!(vol1.top_candidate_auto_eligible, Some(true));
+        assert_eq!(vol1.top_candidate_decision_code.as_deref(), Some("AUTO_ALLOWED"));
+    }
+
+    #[test]
+    fn test_timeline_rejects_pre_release_candidate_from_auto_eligibility() {
+        let conn = setup_test_db();
+        conn.execute(
+            "INSERT INTO manga (id, title, mangabaka_id) VALUES (7, 'Kagurabachi', 708)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO series_reconciliations (manga_id, title, status, mangabaka_id, collection_id, total_official_volumes)
+             VALUES (7, 'Kagurabachi', 'missing_volume', 708, 'col-7', 9)",
+            [],
+        ).unwrap();
+
+        // Volume 9 is an unreleased future target (pre or date in future)
+        conn.execute(
+            "INSERT INTO release_discovery_targets (id, manga_id, series_id, volume_number, release_date, status)
+             VALUES (101, 7, 'manga:7', 9.0, '2099-01-01', 'pre')",
+            [],
+        ).unwrap();
+
+        // Candidate discovered for volume 9
+        conn.execute(
+            "INSERT INTO discovered_release_candidates
+             (id, series_id, volume_number, provider, raw_title, title, score, discovered_at)
+             VALUES ('cand-9', 'manga:7', 9.0, 'madokami', 'Kagurabachi v09.cbz', 'Kagurabachi Vol. 9', 95.0, 1000)",
+            [],
+        ).unwrap();
+
+        let timeline = get_series_timeline(&conn, 7).unwrap();
+        let vol9 = timeline.volumes.iter().find(|v| (v.volume_number - 9.0).abs() < 0.001).unwrap();
+        // Candidate count is 1, but auto-eligible MUST be false for PRE release!
+        assert_eq!(vol9.candidate_count, 1);
+        assert_eq!(vol9.top_candidate_auto_eligible, Some(false));
+        assert_eq!(vol9.top_candidate_decision_code.as_deref(), Some("PRE_RELEASE_REQUIRES_MANUAL"));
+    }
+
+    #[test]
+    fn test_timeline_decision_code_for_ineligible_pack() {
+        let conn = setup_test_db();
+        conn.execute(
+            "INSERT INTO manga (id, title, mangabaka_id) VALUES (8, 'Naruto', 1)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO series_reconciliations (manga_id, title, status, mangabaka_id, collection_id, total_official_volumes)
+             VALUES (8, 'Naruto', 'missing_volume', 1, 'col-8', 1)",
+            [],
+        ).unwrap();
+
+        // Candidate is a series pack
+        conn.execute(
+            "INSERT INTO discovered_release_candidates
+             (id, series_id, volume_number, provider, match_type, raw_title, title, score, discovered_at)
+             VALUES ('cand-pack', 'manga:8', 1.0, 'nyaa', 'series_pack', 'Naruto Complete [Batch]', 'Naruto Batch', 90.0, 1000)",
+            [],
+        ).unwrap();
+
+        let timeline = get_series_timeline(&conn, 8).unwrap();
+        let vol1 = &timeline.volumes[0];
+        assert_eq!(vol1.candidate_count, 1);
+        assert_eq!(vol1.top_candidate_auto_eligible, Some(false));
+        assert_eq!(vol1.top_candidate_decision_code.as_deref(), Some("PACK_REQUIRES_MANUAL"));
     }
 }

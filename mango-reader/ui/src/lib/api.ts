@@ -2047,6 +2047,7 @@ export interface SeriesTimelineVolumeDto {
   topCandidateSource?: string | null;
   topCandidateScore?: number | null;
   topCandidateAutoEligible?: boolean | null;
+  topCandidateDecisionCode?: string | null;
   receiptId?: string | null;
   canonicalPath?: string | null;
   downloadJobId?: string | null;

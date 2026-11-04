@@ -202,7 +202,7 @@ pub fn sync_watchers_for_series(
     let current_time = now();
     let today_str: String = conn
         .query_row("SELECT date('now', 'localtime')", [], |r| r.get(0))
-        .unwrap_or_else(|_| "2026-11-04".to_string());
+        .map_err(AppError::from)?;
 
     // Fetch title-level monitoring preferences
     let (monitoring_enabled, notify_enabled): (bool, bool) = conn
@@ -525,8 +525,7 @@ pub async fn evaluate_watcher_check(
             conn.query_row("SELECT date('now', 'localtime')", [], |r| r.get(0))
                 .map_err(AppError::from)
         })
-        .await
-        .unwrap_or_else(|_| "2026-11-04".to_string());
+        .await?;
 
     if let Some(ref rdate) = watcher.release_date {
         if rdate > &today_str {
@@ -631,16 +630,11 @@ pub async fn evaluate_watcher_check(
     let prov_checked_str = discovery_res.providers_checked.join(", ");
 
     // 8. Handle notification trigger if an eligible candidate is found
+    let already_notified = watcher.notified_at.is_some() || watcher.state == WatcherState::Notified;
     let should_notify = eligible_candidate.is_some()
         && watcher.notify_on_available
-        && watcher.state != WatcherState::Notified
+        && !already_notified
         && watcher.state != WatcherState::EligibleCandidateFound;
-
-    let final_state = if should_notify || (eligible_candidate.is_some() && watcher.state == WatcherState::Notified) {
-        WatcherState::Notified
-    } else {
-        new_state
-    };
 
     let series_id_c = watcher.series_id.clone();
     let edition_c = watcher.edition.clone();
@@ -663,7 +657,7 @@ pub async fn evaluate_watcher_check(
                     .optional()?
                     .flatten();
 
-                let _ = record_event_full(
+                match record_event_full(
                     conn,
                     &series_id_c,
                     &series_title,
@@ -675,21 +669,35 @@ pub async fn evaluate_watcher_check(
                     top_id_c.as_deref(),
                     candidate_count as i64,
                     &msg,
-                );
+                ) {
+                    Ok(()) => {
+                        notif_at = Some(current_time);
 
-                notif_at = Some(current_time);
-
-                // Fetch event ID for linkage
-                notif_event_id = conn
-                    .query_row(
-                        "SELECT id FROM reconciliation_events
-                         WHERE series_id = ?1 AND event_type = 'RELEASE_AVAILABLE' AND ABS(volume_number - ?2) < 0.001
-                         ORDER BY id DESC LIMIT 1",
-                        params![&series_id_c, volume_number],
-                        |r| r.get(0),
-                    )
-                    .optional()?;
+                        // Fetch event ID for linkage
+                        notif_event_id = conn
+                            .query_row(
+                                "SELECT id FROM reconciliation_events
+                                 WHERE series_id = ?1 AND event_type = 'RELEASE_AVAILABLE' AND ABS(volume_number - ?2) < 0.001
+                                 ORDER BY id DESC LIMIT 1",
+                                params![&series_id_c, volume_number],
+                                |r| r.get(0),
+                            )
+                            .optional()?;
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "Failed to record RELEASE_AVAILABLE event for watcher {}: {e}",
+                            watcher.id
+                        );
+                    }
+                }
             }
+
+            let final_state = if notif_at.is_some() {
+                WatcherState::Notified
+            } else {
+                new_state
+            };
 
             conn.execute(
                 "UPDATE release_availability_watchers
@@ -742,11 +750,31 @@ pub async fn run_watcher_tick(db: &Db, http: Client) -> Result<usize> {
                  ORDER BY next_check_at ASC
                  LIMIT 10",
             )?;
-            let rows = stmt.query_map([current_time], |r| r.get(0))?;
-            let mut ids = Vec::new();
+            let rows = stmt.query_map([current_time], |r| r.get::<_, i64>(0))?;
+            let mut ids: Vec<i64> = Vec::new();
             for r in rows {
                 ids.push(r?);
             }
+
+            // Atomically lease the claimed watchers for 5 minutes so concurrent ticks do not double-process
+            if !ids.is_empty() {
+                let lease_until = current_time + 300;
+                let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                let sql = format!(
+                    "UPDATE release_availability_watchers
+                     SET last_attempt_at = ?, next_check_at = ?, updated_at = ?
+                     WHERE id IN ({placeholders})"
+                );
+                let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(ids.len() + 3);
+                params.push(current_time.into());
+                params.push(lease_until.into());
+                params.push(current_time.into());
+                for id in &ids {
+                    params.push((*id).into());
+                }
+                conn.execute(&sql, rusqlite::params_from_iter(params))?;
+            }
+
             Ok(ids)
         })
         .await?;
