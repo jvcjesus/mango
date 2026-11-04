@@ -742,7 +742,10 @@ impl Downloads {
                     } else {
                         let alt_path: Option<String> = conn
                             .query_row(
-                                "SELECT download_path FROM chapters WHERE id = ?1",
+                                "SELECT COALESCE(
+                                    (SELECT pr.canonical_path FROM publication_receipts pr WHERE pr.chapter_id = ?1 ORDER BY pr.published_at DESC LIMIT 1),
+                                    c.download_path
+                                ) FROM chapters c WHERE c.id = ?1",
                                 [ch_id],
                                 |r| r.get(0),
                             )
@@ -816,6 +819,7 @@ impl Downloads {
                         let path: Option<String> = conn
                             .query_row(
                                 "SELECT COALESCE(
+                                    (SELECT pr.canonical_path FROM publication_receipts pr WHERE pr.chapter_id = ?1 ORDER BY pr.published_at DESC LIMIT 1),
                                     c.download_path,
                                     (SELECT h.canonical_path FROM metadata_handoffs h WHERE h.chapter_id = ?1),
                                     (SELECT ah.canonical_path FROM acquisition_history ah WHERE ah.chapter_id = ?1 AND ah.outcome IN ('completed', 'published') AND ah.canonical_path IS NOT NULL ORDER BY ah.id DESC LIMIT 1)

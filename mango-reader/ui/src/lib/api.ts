@@ -2096,3 +2096,67 @@ export const getAvailabilityWatchers = (limit = 50, state?: string) =>
     `/availability/watchers?limit=${limit}${state ? `&state=${encodeURIComponent(state)}` : ''}`
   );
 
+export interface PublicationReceiptDto {
+  id: string;
+  chapterId: number;
+  mangaId?: number | null;
+  seriesTitle: string;
+  volumeNumber?: number | null;
+  chapterNumber?: number | null;
+  isVolume: boolean;
+  canonicalPath: string;
+  fileSizeBytes: number;
+  fileSha256: string;
+  publishedAt: number;
+  komgaNotified: boolean;
+  komgaLibraryId?: string | null;
+  metadataStatus: 'complete' | 'pending' | 'failed' | 'skipped' | string;
+  metadataError?: string | null;
+  verifiedOwnership: boolean;
+  verifiedAt?: number | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface PublicationReceiptVerificationResultDto {
+  receiptId: string;
+  canonicalPath: string;
+  fileExists: boolean;
+  cbzValid: boolean;
+  sizeMatched: boolean;
+  sha256Matched: boolean;
+  isValid: boolean;
+  error?: string | null;
+}
+
+export const getLibraryReceipts = (limit = 50) =>
+  get<PublicationReceiptDto[]>(`/library/receipts?limit=${limit}`);
+
+export const getTitleReceipts = (mangaId: number) =>
+  get<PublicationReceiptDto[]>(`/manga/${mangaId}/receipts`);
+
+export const verifyPublicationReceipt = (receiptId: string) =>
+  send<PublicationReceiptVerificationResultDto>('POST', `/library/receipts/${receiptId}/verify`, {});
+
+export const rescanPublicationReceipt = (receiptId: string) =>
+  send<{ success: boolean; receiptId: string; canonicalPath: string }>(
+    'POST',
+    `/library/receipts/${receiptId}/rescan`,
+    {}
+  );
+
+export const retryReceiptMetadata = (receiptId: string) =>
+  send<{ success: boolean; receiptId: string; repaired: boolean }>(
+    'POST',
+    `/library/receipts/${receiptId}/retry-metadata`,
+    {}
+  );
+
+export const recoverDownload = (chapterId: number) =>
+  send<{ recovered: boolean; strategy: string; canonicalPath?: string }>(
+    'POST',
+    `/downloads/${chapterId}/recover`,
+    {}
+  );
+
+

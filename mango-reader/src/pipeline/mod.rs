@@ -16,6 +16,7 @@ pub mod normalization;
 pub mod optimizer;
 pub mod ownership;
 pub mod publisher;
+pub mod receipts;
 pub mod validation;
 
 use crate::db::Db;
@@ -1394,6 +1395,10 @@ impl Pipeline {
         let a_id_val = anilist_id;
         let req_unit_val = requested_unit.clone();
         let mb_stat_val = mangabaka_status.clone();
+        let pub_series_title = publication_title.clone();
+        let pub_manga_id = job.manga_id;
+        let (pub_size, pub_sha256) = receipts::compute_file_sha256(&canonical_dest)
+            .unwrap_or((0, String::new()));
 
         self.db.call(move |conn| {
             let transaction = conn.transaction()?;
@@ -1406,6 +1411,21 @@ impl Pipeline {
                 "UPDATE downloads SET published_path = ?2, published_at = ?3, target_library_id = ?4, state = 'verifying', error = 'Published — waiting for Komga' WHERE chapter_id = ?1",
                 rusqlite::params![chapter_id, p_str, now as i64, t_lib],
             )?;
+            let _ = receipts::record_publication_receipt(
+                conn,
+                chapter_id,
+                Some(pub_manga_id),
+                &pub_series_title,
+                is_volume,
+                release_num,
+                &p_str,
+                pub_size,
+                &pub_sha256,
+                false,
+                t_lib.as_deref(),
+                &mb_stat_val,
+                None,
+            );
             crate::acquisition::service::persist_publication_provenance(conn, chapter_id)?;
             conn.execute(
                 "UPDATE acquisition_history
@@ -1445,6 +1465,15 @@ impl Pipeline {
                 )
                 .await
                 .unwrap_or(false);
+            let p_str_meta = canonical_dest_str.clone();
+            let _ = self.db.call(move |conn| {
+                receipts::update_receipt_metadata_status(
+                    conn,
+                    &p_str_meta,
+                    if done { "complete" } else { "failed" },
+                    if done { None } else { Some("KOMF metadata handoff timed out") },
+                )
+            }).await;
             return Ok(if done {
                 AcquisitionOutcome::Complete(canonical_dest)
             } else {
@@ -1471,10 +1500,12 @@ impl Pipeline {
                 requested_unit: Some(requested_unit.clone()),
             });
 
+            let p_str_ver = canonical_dest_str.clone();
             let _ = self
                 .db
                 .call(move |conn| {
                     crate::acquisition::service::complete_queued_publication(conn, chapter_id)?;
+                    let _ = receipts::update_receipt_ownership_verified(conn, &p_str_ver, true);
                     Ok(())
                 })
                 .await;
@@ -1546,11 +1577,14 @@ impl Pipeline {
             });
 
             let err_clone = err_msg.clone();
+            let p_str_err = canonical_dest_str.clone();
+            let t_lib_err = target_library_id.map(|s| s.to_string());
             let _ = self.db.call(move |conn| {
                 conn.execute(
                     "UPDATE downloads SET state = 'failed', error = ?2, retry_at = ?3 WHERE chapter_id = ?1",
                     rusqlite::params![chapter_id, err_clone, (now + 60) as i64],
                 )?;
+                let _ = receipts::update_receipt_komga_status(conn, &p_str_err, false, t_lib_err.as_deref());
                 Ok(())
             }).await;
 
@@ -1559,6 +1593,13 @@ impl Pipeline {
                 error: err_msg,
             });
         }
+
+        // Successfully triggered Komga scan
+        let p_str_scanned = canonical_dest_str.clone();
+        let t_lib_scanned = target_library_id.map(|s| s.to_string());
+        let _ = self.db.call(move |conn| {
+            receipts::update_receipt_komga_status(conn, &p_str_scanned, true, t_lib_scanned.as_deref())
+        }).await;
 
         // 8. Bounded Asynchronous Ownership Verification
         on_stage(
@@ -1638,10 +1679,12 @@ impl Pipeline {
                 requested_unit: Some(requested_unit.clone()),
             });
 
+            let p_str_ver = canonical_dest_str.clone();
             let _ = self
                 .db
                 .call(move |conn| {
                     crate::acquisition::service::complete_queued_publication(conn, chapter_id)?;
+                    let _ = receipts::update_receipt_ownership_verified(conn, &p_str_ver, true);
                     Ok(())
                 })
                 .await;
@@ -1931,6 +1974,9 @@ impl Pipeline {
         })
     }
 }
+
+#[cfg(test)]
+mod receipts_tests;
 
 #[cfg(test)]
 mod tests {

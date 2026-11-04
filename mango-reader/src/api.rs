@@ -221,6 +221,12 @@ pub fn router(state: Spaces) -> Router {
         .route("/chapters/{id}/progress", put(progress))
         .route("/library", get(library))
         .route("/library/bulk", post(bulk))
+        .route("/library/receipts", get(get_library_receipts))
+        .route("/library/receipts/{id}/verify", post(post_receipt_verify))
+        .route("/library/receipts/{id}/rescan", post(post_receipt_rescan))
+        .route("/library/receipts/{id}/retry-metadata", post(post_receipt_retry_metadata))
+        .route("/titles/{id}/receipts", get(get_title_receipts))
+        .route("/manga/{id}/receipts", get(get_title_receipts))
         .route(
             "/categories",
             get(list_categories)
@@ -245,6 +251,7 @@ pub fn router(state: Spaces) -> Router {
         .route("/downloads/resume", post(resume_downloads))
         .route("/downloads/{chapter}", delete(cancel_download))
         .route("/downloads/{chapter}/retry", post(retry_download))
+        .route("/downloads/{chapter}/recover", post(recover_download))
         .route(
             "/downloads/{chapter}/retry-metadata",
             post(retry_metadata_download),
@@ -3828,3 +3835,172 @@ async fn post_title_availability_refresh(
     let res = crate::acquisition::watcher::refresh_title_watchers(&app.db, http, id).await?;
     Ok(Json(res))
 }
+
+#[derive(Deserialize)]
+struct ListReceiptsQuery {
+    limit: Option<usize>,
+}
+
+async fn get_library_receipts(
+    Me(app): Me,
+    Query(query): Query<ListReceiptsQuery>,
+) -> Result<Json<Vec<crate::pipeline::receipts::PublicationReceipt>>> {
+    app.me.admin()?;
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let receipts = app
+        .db
+        .call(move |conn| crate::pipeline::receipts::list_publication_receipts(conn, limit))
+        .await?;
+    Ok(Json(receipts))
+}
+
+async fn get_title_receipts(
+    Me(app): Me,
+    Path(id): Path<i64>,
+) -> Result<Json<Vec<crate::pipeline::receipts::PublicationReceipt>>> {
+    app.me.admin()?;
+    let receipts = app
+        .db
+        .call(move |conn| crate::pipeline::receipts::list_receipts_for_manga(conn, id))
+        .await?;
+    Ok(Json(receipts))
+}
+
+async fn post_receipt_verify(
+    Me(app): Me,
+    Path(id): Path<String>,
+) -> Result<Json<crate::pipeline::receipts::PublicationReceiptVerificationResult>> {
+    app.me.admin()?;
+    let result = app
+        .db
+        .call(move |conn| crate::pipeline::receipts::verify_publication_receipt_on_disk(conn, &id))
+        .await?;
+    Ok(Json(result))
+}
+
+async fn post_receipt_rescan(
+    Me(app): Me,
+    Path(id): Path<String>,
+) -> Result<Json<Value>> {
+    app.me.admin()?;
+    let receipt_id = id.clone();
+    let receipt = app
+        .db
+        .call(move |conn| crate::pipeline::receipts::get_publication_receipt(conn, &receipt_id))
+        .await?
+        .ok_or_else(|| AppError::not_found(format!("Receipt {id} not found")))?;
+
+    let (cfg, _, komga_key) = app.pipeline.load_internal_config().await?;
+
+    if !cfg.komga_enabled || !cfg.komga_scan_enabled {
+        return Err(AppError::bad_request("Komga scan is disabled in configuration"));
+    }
+
+    let komga_client = crate::pipeline::komga::KomgaClient::new(app.pipeline.http.clone(), cfg.komga_url.clone(), komga_key);
+    let target_lib = receipt.komga_library_id.as_deref().or(cfg.komga_library_id.as_deref());
+
+    komga_client.trigger_scan(target_lib).await.map_err(|e| {
+        AppError::internal(format!("Failed to trigger Komga scan: {}", e.message))
+    })?;
+
+    let canonical = receipt.canonical_path.clone();
+    let lib_str = target_lib.map(|s| s.to_string());
+    app.db.call(move |conn| {
+        crate::pipeline::receipts::update_receipt_komga_status(conn, &canonical, true, lib_str.as_deref())
+    }).await?;
+
+    Ok(Json(serde_json::json!({
+        "success": true,
+        "receiptId": receipt.id,
+        "canonicalPath": receipt.canonical_path,
+        "komgaLibraryId": target_lib,
+    })))
+}
+
+async fn post_receipt_retry_metadata(
+    Me(app): Me,
+    Path(id): Path<String>,
+) -> Result<Json<Value>> {
+    app.me.admin()?;
+    let receipt_id = id.clone();
+    let receipt = app
+        .db
+        .call(move |conn| crate::pipeline::receipts::get_publication_receipt(conn, &receipt_id))
+        .await?
+        .ok_or_else(|| AppError::not_found(format!("Receipt {id} not found")))?;
+
+    let path = std::path::PathBuf::from(&receipt.canonical_path);
+
+    let res = app
+        .pipeline
+        .repair_canonical_cbz(
+            &path,
+            Some(&receipt.series_title),
+            receipt.volume_number,
+            None,
+            None,
+        )
+        .await;
+
+    let canonical = receipt.canonical_path.clone();
+    match res {
+        Ok(outcome) => {
+            app.db.call(move |conn| {
+                crate::pipeline::receipts::update_receipt_metadata_status(conn, &canonical, "complete", None)
+            }).await?;
+            Ok(Json(serde_json::json!({
+                "success": true,
+                "receiptId": receipt.id,
+                "repaired": true,
+                "outcome": outcome,
+            })))
+        }
+        Err(e) => {
+            let err_msg = e.message.clone();
+            app.db.call(move |conn| {
+                crate::pipeline::receipts::update_receipt_metadata_status(conn, &canonical, "failed", Some(&err_msg))
+            }).await?;
+            Err(e)
+        }
+    }
+}
+
+async fn recover_download(Me(app): Me, Path(chapter): Path<i64>) -> Result<Json<Value>> {
+    app.me.admin()?;
+    // Check if canonical publication receipt or published file already exists
+    let receipt = app
+        .db
+        .call(move |conn| crate::pipeline::receipts::get_publication_receipt_by_chapter(conn, chapter))
+        .await?;
+
+    if let Some(r) = receipt {
+        let path = std::path::PathBuf::from(&r.canonical_path);
+        if path.is_file() && crate::pipeline::publisher::verify_cbz_integrity(&path).is_ok() {
+            let p_str = r.canonical_path.clone();
+            app.db.call(move |conn| {
+                conn.execute(
+                    "UPDATE downloads SET published_path = ?2, state = 'verifying', error = NULL WHERE chapter_id = ?1",
+                    rusqlite::params![chapter, p_str],
+                )?;
+                crate::acquisition::service::persist_publication_provenance(conn, chapter)?;
+                Ok(())
+            }).await?;
+            app.downloads.wake();
+            return Ok(Json(serde_json::json!({
+                "recovered": true,
+                "strategy": "existing_publication_receipt",
+                "canonicalPath": r.canonical_path,
+                "state": "verifying",
+            })));
+        }
+    }
+
+    // Otherwise standard retry
+    app.downloads.retry(chapter).await?;
+    Ok(Json(serde_json::json!({
+        "recovered": true,
+        "strategy": "retry_download",
+        "chapterId": chapter,
+    })))
+}
+

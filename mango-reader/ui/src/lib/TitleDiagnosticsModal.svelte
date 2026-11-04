@@ -3,13 +3,18 @@
     clearManualTitleMapping,
     getTitleAvailability,
     getTitleDiagnostics,
+    getTitleReceipts,
     listMangaBakaCollections,
     message,
     refreshTitleAvailability,
+    rescanPublicationReceipt,
+    retryReceiptMetadata,
     send,
     setManualTitleMapping,
     updateTitleAvailability,
+    verifyPublicationReceipt,
     type MangaBakaCollectionInfo,
+    type PublicationReceiptDto,
     type TitleAvailabilityDto,
     type TitleDiagnostics,
   } from './api';
@@ -97,6 +102,55 @@
     }
   }
 
+  // Publication receipts state (M6.9)
+  let receipts = $state<PublicationReceiptDto[]>([]);
+  let verifyingReceiptId = $state<string | null>(null);
+  let rescanningReceiptId = $state<string | null>(null);
+  let repairingReceiptId = $state<string | null>(null);
+
+  async function handleVerifyReceipt(r: PublicationReceiptDto) {
+    verifyingReceiptId = r.id;
+    try {
+      const res = await verifyPublicationReceipt(r.id);
+      if (res.isValid) {
+        toast.success(`Verified: ${r.seriesTitle} (${(r.fileSizeBytes / 1024 / 1024).toFixed(1)} MB, CBZ valid, SHA256 matched)`);
+      } else {
+        toast.error(`Verification issue: ${res.error ?? 'Invalid archive'}`);
+      }
+      receipts = await getTitleReceipts(mangaId).catch(() => receipts);
+    } catch (e) {
+      toast.error(`Verification failed: ${message(e)}`);
+    } finally {
+      verifyingReceiptId = null;
+    }
+  }
+
+  async function handleRescanReceipt(r: PublicationReceiptDto) {
+    rescanningReceiptId = r.id;
+    try {
+      await rescanPublicationReceipt(r.id);
+      toast.success(`Triggered Komga library rescan for ${r.seriesTitle}`);
+      receipts = await getTitleReceipts(mangaId).catch(() => receipts);
+    } catch (e) {
+      toast.error(`Rescan failed: ${message(e)}`);
+    } finally {
+      rescanningReceiptId = null;
+    }
+  }
+
+  async function handleRepairReceiptMetadata(r: PublicationReceiptDto) {
+    repairingReceiptId = r.id;
+    try {
+      await retryReceiptMetadata(r.id);
+      toast.success(`Metadata repaired for ${r.seriesTitle}`);
+      receipts = await getTitleReceipts(mangaId).catch(() => receipts);
+    } catch (e) {
+      toast.error(`Metadata repair failed: ${message(e)}`);
+    } finally {
+      repairingReceiptId = null;
+    }
+  }
+
   async function load() {
     if (!open || !mangaId) return;
     loading = true;
@@ -104,6 +158,7 @@
     try {
       diag = await getTitleDiagnostics(mangaId);
       availability = await getTitleAvailability(mangaId).catch(() => null);
+      receipts = await getTitleReceipts(mangaId).catch(() => []);
       if (diag.identity.mangabakaId) {
         manualMbIdInput = String(diag.identity.mangabakaId);
         loadCollections(diag.identity.mangabakaId);
@@ -668,6 +723,98 @@
             </div>
           </div>
 
+          <!-- 6. Durable Publication Receipts (M6.9) -->
+          <div class="diag-card receipts-section">
+            <div class="card-head">
+              <div class="head-title">
+                <Icon name="bookmark" size={16} />
+                <h3>Durable Publication Receipts (M6.9)</h3>
+              </div>
+              <div class="card-actions">
+                <span class="receipt-count-pill">{receipts.length} verified publications</span>
+              </div>
+            </div>
+            <div class="card-content">
+              {#if receipts.length > 0}
+                <div class="watchers-table-wrapper">
+                  <table class="watchers-table">
+                    <thead>
+                      <tr>
+                        <th>Unit</th>
+                        <th>Canonical Path</th>
+                        <th>Size</th>
+                        <th>SHA-256</th>
+                        <th>Metadata</th>
+                        <th>Komga</th>
+                        <th>Actions</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {#each receipts as r}
+                        <tr class="receipt-row">
+                          <td class="vol-cell">
+                            <strong>{r.isVolume ? `Vol ${r.volumeNumber}` : `Ch ${r.chapterNumber}`}</strong>
+                          </td>
+                          <td class="path-cell" title={r.canonicalPath}>
+                            <code>{r.canonicalPath.split('/').pop() || r.canonicalPath}</code>
+                          </td>
+                          <td class="size-cell">
+                            {(r.fileSizeBytes / (1024 * 1024)).toFixed(1)} MB
+                          </td>
+                          <td class="sha-cell" title={r.fileSha256}>
+                            <code>{r.fileSha256.slice(0, 8)}…</code>
+                          </td>
+                          <td>
+                            <span class="tag metadata-state metadata-state-{r.metadataStatus.toLowerCase()}">
+                              {r.metadataStatus}
+                            </span>
+                          </td>
+                          <td>
+                            <span class="tag komga-notif-state" class:spot={r.komgaNotified}>
+                              {r.komgaNotified ? 'Notified' : 'Pending'}
+                            </span>
+                          </td>
+                          <td class="receipt-actions-cell">
+                            <button
+                              class="btn mini outline"
+                              disabled={verifyingReceiptId === r.id}
+                              onclick={() => handleVerifyReceipt(r)}
+                              title="Verify CBZ integrity, size, and SHA-256 on disk"
+                            >
+                              {verifyingReceiptId === r.id ? 'Verifying…' : 'Verify'}
+                            </button>
+                            <button
+                              class="btn mini outline"
+                              disabled={rescanningReceiptId === r.id}
+                              onclick={() => handleRescanReceipt(r)}
+                              title="Trigger Komga library rescan for this publication"
+                            >
+                              {rescanningReceiptId === r.id ? 'Scanning…' : 'Rescan'}
+                            </button>
+                            {#if r.metadataStatus === 'failed'}
+                              <button
+                                class="btn mini spot"
+                                disabled={repairingReceiptId === r.id}
+                                onclick={() => handleRepairReceiptMetadata(r)}
+                                title="Repair ComicInfo.xml metadata without re-downloading archive"
+                              >
+                                {repairingReceiptId === r.id ? 'Repairing…' : 'Repair Meta'}
+                              </button>
+                            {/if}
+                          </td>
+                        </tr>
+                      {/each}
+                    </tbody>
+                  </table>
+                </div>
+              {:else}
+                <div class="no-receipts-msg">
+                  <p class="muted">No publication receipts recorded for this series yet.</p>
+                </div>
+              {/if}
+            </div>
+          </div>
+
         {/if}
       </div>
 
@@ -1131,6 +1278,44 @@
   }
 
   .no-watchers-msg {
+    padding: 0.75rem 0;
+  }
+
+  .receipts-section {
+    grid-column: 1 / -1;
+  }
+
+  .receipt-count-pill {
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: var(--muted, #8b949e);
+  }
+
+  .receipt-actions-cell {
+    display: flex;
+    gap: 4px;
+    flex-wrap: wrap;
+  }
+
+  .metadata-state-complete {
+    background: rgba(34, 197, 94, 0.2);
+    color: #86efac;
+    border: 1px solid rgba(34, 197, 94, 0.3);
+  }
+
+  .metadata-state-failed {
+    background: rgba(239, 68, 68, 0.2);
+    color: #fca5a5;
+    border: 1px solid rgba(239, 68, 68, 0.3);
+  }
+
+  .metadata-state-pending {
+    background: rgba(245, 158, 11, 0.2);
+    color: #fde68a;
+    border: 1px solid rgba(245, 158, 11, 0.3);
+  }
+
+  .no-receipts-msg {
     padding: 0.75rem 0;
   }
 </style>

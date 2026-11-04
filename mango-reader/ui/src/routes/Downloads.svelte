@@ -512,6 +512,14 @@
                   >
                     <Icon name="refresh" size={14} /> Try again
                   </button>
+                  <button
+                    class="btn pill"
+                    disabled={busyItems[entry.chapterId]}
+                    onclick={() => act('POST', `/downloads/${entry.chapterId}/recover`)}
+                    title="Recover published file from receipt without re-downloading"
+                  >
+                    <Icon name="check" size={14} /> Recover
+                  </button>
                 {/if}
                 <button
                   class="btn icon"
