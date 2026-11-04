@@ -353,10 +353,10 @@ pub fn get_series_timeline(conn: &Connection, manga_id: i64) -> Result<SeriesTim
     let mut active_jobs_map: HashMap<u32, String> = HashMap::new();
     let mut dl_stmt = conn
         .prepare(
-            "SELECT c.chapter_number, d.id
+            "SELECT c.chapter_number, d.chapter_id
              FROM downloads d
              JOIN chapters c ON d.chapter_id = c.id
-             WHERE c.manga_id = ?1 AND d.state IN ('pending', 'running')",
+             WHERE c.manga_id = ?1 AND d.state IN ('queued', 'downloading')",
         )
         .map_err(|e| AppError::internal(format!("Prepare active downloads failed: {e}")))?;
 
