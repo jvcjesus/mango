@@ -2159,4 +2159,90 @@ export const recoverDownload = (chapterId: number) =>
     {}
   );
 
+// -----------------------------------------------------------------------------
+// Guarded Historical Backlog Acquisition (M6.10)
+// -----------------------------------------------------------------------------
+
+export type BacklogScope = 'ALL_MISSING' | 'RANGE' | 'EXPLICIT_VOLUMES';
+
+export interface PlanBacklogRequest {
+  scope: BacklogScope;
+  rangeStart?: number;
+  rangeEnd?: number;
+  explicitVolumes?: number[];
+  batchSize?: number;
+  isDryRun?: boolean;
+}
+
+export interface BacklogItemPlanDto {
+  volumeNumber: number;
+  status: 'ELIGIBLE' | 'ALREADY_OWNED' | 'UNAVAILABLE' | 'UNRELEASED' | 'IN_FLIGHT' | string;
+  reason: string;
+  candidateId?: string | null;
+  provider?: string | null;
+  candidateTitle?: string | null;
+  sizeBytes?: number | null;
+  score?: number | null;
+  isDigital?: boolean | null;
+  uploader?: string | null;
+}
+
+export interface BacklogJobDto {
+  id: string;
+  mangaId: number;
+  seriesTitle: string;
+  scope: string;
+  requestedVolumes: number[];
+  batchSize: number;
+  isDryRun: boolean;
+  state: 'PLANNED' | 'COMPLETED' | 'PARTIAL' | 'FAILED' | 'CANCELLED' | string;
+  totalRequested: number;
+  totalEligible: number;
+  totalAlreadyOwned: number;
+  totalQueued: number;
+  totalFailed: number;
+  items: BacklogItemPlanDto[];
+  confirmedByUser: boolean;
+  error?: string | null;
+  createdAt: number;
+  updatedAt: number;
+  completedAt?: number | null;
+}
+
+export interface ExecuteBacklogRequest {
+  jobId?: string;
+  confirm: boolean;
+  confirmMultiple?: boolean;
+  isDryRun?: boolean;
+}
+
+export interface ExecuteBacklogResponse {
+  jobId: string;
+  state: string;
+  message: string;
+  isDryRun: boolean;
+  queuedCount: number;
+  failedCount: number;
+  items: BacklogItemPlanDto[];
+}
+
+export const planBacklog = (mangaId: number, payload: PlanBacklogRequest) =>
+  send<BacklogJobDto>('POST', `/manga/${mangaId}/backlog/plan`, payload);
+
+export const executeBacklog = (mangaId: number, payload: ExecuteBacklogRequest) =>
+  send<ExecuteBacklogResponse>('POST', `/manga/${mangaId}/backlog/execute`, payload);
+
+export const executeBacklogJob = (jobId: string, payload: ExecuteBacklogRequest) =>
+  send<ExecuteBacklogResponse>('POST', `/backlog/jobs/${jobId}/execute`, payload);
+
+export const getTitleBacklogJobs = (mangaId: number, limit = 20) =>
+  get<BacklogJobDto[]>(`/manga/${mangaId}/backlog/jobs?limit=${limit}`);
+
+export const getAllBacklogJobs = (limit = 50) =>
+  get<BacklogJobDto[]>(`/backlog/jobs?limit=${limit}`);
+
+export const cancelBacklogJob = (jobId: string) =>
+  send<{ cancelled: boolean }>('POST', `/backlog/jobs/${jobId}/cancel`, {});
+
+
 

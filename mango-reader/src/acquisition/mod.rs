@@ -8,6 +8,7 @@
 
 pub mod approval;
 pub mod auto_acquire;
+pub mod backlog;
 pub mod candidates;
 pub mod discovery;
 pub mod edition;
@@ -29,6 +30,8 @@ pub mod watcher;
 pub mod approval_tests;
 #[cfg(test)]
 pub mod auto_acquire_tests;
+#[cfg(test)]
+pub mod backlog_tests;
 #[cfg(test)]
 pub mod release_discovery_tests;
 #[cfg(test)]

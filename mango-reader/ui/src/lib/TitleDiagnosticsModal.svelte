@@ -1,11 +1,15 @@
 <script lang="ts">
   import {
+    cancelBacklogJob,
     clearManualTitleMapping,
+    executeBacklog,
     getTitleAvailability,
+    getTitleBacklogJobs,
     getTitleDiagnostics,
     getTitleReceipts,
     listMangaBakaCollections,
     message,
+    planBacklog,
     refreshTitleAvailability,
     rescanPublicationReceipt,
     retryReceiptMetadata,
@@ -13,6 +17,9 @@
     setManualTitleMapping,
     updateTitleAvailability,
     verifyPublicationReceipt,
+    type BacklogItemPlanDto,
+    type BacklogJobDto,
+    type BacklogScope,
     type MangaBakaCollectionInfo,
     type PublicationReceiptDto,
     type TitleAvailabilityDto,
@@ -108,6 +115,89 @@
   let rescanningReceiptId = $state<string | null>(null);
   let repairingReceiptId = $state<string | null>(null);
 
+  // Guarded Historical Backlog state (M6.10)
+  let backlogJobs = $state<BacklogJobDto[]>([]);
+  let backlogScope = $state<BacklogScope>('ALL_MISSING');
+  let backlogRangeStart = $state<number | undefined>(undefined);
+  let backlogRangeEnd = $state<number | undefined>(undefined);
+  let backlogExplicitInput = $state('');
+  let backlogBatchSize = $state(5);
+  let backlogDryRun = $state(true);
+  let planningBacklog = $state(false);
+  let executingBacklog = $state(false);
+  let plannedJob = $state<BacklogJobDto | null>(null);
+
+  async function handlePlanBacklog() {
+    if (!mangaId) return;
+    planningBacklog = true;
+    try {
+      let explicitVols: number[] | undefined = undefined;
+      if (backlogScope === 'EXPLICIT_VOLUMES') {
+        explicitVols = backlogExplicitInput
+          .split(',')
+          .map((s) => parseFloat(s.trim()))
+          .filter((n) => !isNaN(n) && n > 0);
+        if (!explicitVols.length) {
+          toast.error('Please enter at least one valid volume number');
+          planningBacklog = false;
+          return;
+        }
+      }
+      plannedJob = await planBacklog(mangaId, {
+        scope: backlogScope,
+        rangeStart: backlogRangeStart,
+        rangeEnd: backlogRangeEnd,
+        explicitVolumes: explicitVols,
+        batchSize: backlogBatchSize,
+        isDryRun: backlogDryRun,
+      });
+      toast.success(`Backlog batch planned: ${plannedJob.totalEligible} eligible volume(s)`);
+      backlogJobs = await getTitleBacklogJobs(mangaId).catch(() => backlogJobs);
+    } catch (e) {
+      toast.error(`Backlog planning failed: ${message(e)}`);
+    } finally {
+      planningBacklog = false;
+    }
+  }
+
+  async function handleExecuteBacklog(job: BacklogJobDto) {
+    if (!mangaId) return;
+    if (job.totalEligible > 1 && !confirm(`Confirm batch execution for ${job.totalEligible} volumes?`)) {
+      return;
+    }
+    if (!job.isDryRun && !confirm('WARNING: Dry-run is OFF. This may queue actual downloads. Proceed?')) {
+      return;
+    }
+    executingBacklog = true;
+    try {
+      const res = await executeBacklog(mangaId, {
+        jobId: job.id,
+        confirm: true,
+        confirmMultiple: true,
+        isDryRun: job.isDryRun,
+      });
+      toast.success(res.message);
+      plannedJob = null;
+      backlogJobs = await getTitleBacklogJobs(mangaId).catch(() => backlogJobs);
+    } catch (e) {
+      toast.error(`Backlog execution failed: ${message(e)}`);
+    } finally {
+      executingBacklog = false;
+    }
+  }
+
+  async function handleCancelJob(jobId: string) {
+    if (!mangaId) return;
+    try {
+      await cancelBacklogJob(jobId);
+      toast.success('Backlog job cancelled');
+      if (plannedJob?.id === jobId) plannedJob = null;
+      backlogJobs = await getTitleBacklogJobs(mangaId).catch(() => backlogJobs);
+    } catch (e) {
+      toast.error(`Cancel failed: ${message(e)}`);
+    }
+  }
+
   async function handleVerifyReceipt(r: PublicationReceiptDto) {
     verifyingReceiptId = r.id;
     try {
@@ -159,6 +249,7 @@
       diag = await getTitleDiagnostics(mangaId);
       availability = await getTitleAvailability(mangaId).catch(() => null);
       receipts = await getTitleReceipts(mangaId).catch(() => []);
+      backlogJobs = await getTitleBacklogJobs(mangaId).catch(() => []);
       if (diag.identity.mangabakaId) {
         manualMbIdInput = String(diag.identity.mangabakaId);
         loadCollections(diag.identity.mangabakaId);
@@ -813,6 +904,190 @@
                 </div>
               {/if}
             </div>
+
+            <!-- Guarded Historical Backlog Card (M6.10) -->
+            <div class="diag-card backlog-section">
+              <div class="card-head">
+                <span class="card-title">Guarded Historical Backlog (M6.10)</span>
+                <span class="backlog-count-pill">{backlogJobs.length} job(s) in audit trail</span>
+              </div>
+              <p class="muted card-desc">
+                Controlled, bounded acquisition for past missing volumes. Respects Komga ownership, MangaBaka limits, and defaults to dry-run verification.
+              </p>
+
+              <!-- Scope and Controls -->
+              <div class="backlog-controls-grid">
+                <div class="form-group">
+                  <label for="backlog-scope-select">Acquisition Scope</label>
+                  <select id="backlog-scope-select" bind:value={backlogScope} class="input select">
+                    <option value="ALL_MISSING">All Missing Released Volumes</option>
+                    <option value="RANGE">Volume Range</option>
+                    <option value="EXPLICIT_VOLUMES">Explicit Volumes</option>
+                  </select>
+                </div>
+
+                {#if backlogScope === 'RANGE'}
+                  <div class="form-group range-group">
+                    <label for="backlog-range-start">Range (Start – End)</label>
+                    <div class="range-inputs">
+                      <input id="backlog-range-start" type="number" min="1" placeholder="Start" bind:value={backlogRangeStart} class="input" />
+                      <span class="range-sep">–</span>
+                      <input id="backlog-range-end" type="number" min="1" placeholder="End" bind:value={backlogRangeEnd} class="input" />
+                    </div>
+                  </div>
+                {:else if backlogScope === 'EXPLICIT_VOLUMES'}
+                  <div class="form-group">
+                    <label for="backlog-explicit-input">Volume Numbers (comma-separated)</label>
+                    <input id="backlog-explicit-input" type="text" placeholder="e.g. 1, 2, 3, 5" bind:value={backlogExplicitInput} class="input" />
+                  </div>
+                {/if}
+
+                <div class="form-group">
+                  <label for="backlog-batch-size">Batch Size (1–20)</label>
+                  <input id="backlog-batch-size" type="number" min="1" max="20" bind:value={backlogBatchSize} class="input" />
+                </div>
+
+                <div class="form-group checkbox-group">
+                  <label class="checkbox-label">
+                    <input type="checkbox" bind:checked={backlogDryRun} />
+                    <span>Dry-run verification only (Safe, recommended)</span>
+                  </label>
+                </div>
+
+                <div class="form-group plan-btn-group">
+                  <button
+                    class="btn spot"
+                    disabled={planningBacklog}
+                    onclick={handlePlanBacklog}
+                  >
+                    {planningBacklog ? 'Analyzing Backlog…' : 'Plan Backlog Batch'}
+                  </button>
+                </div>
+              </div>
+
+              <!-- Planned Batch Preview -->
+              {#if plannedJob}
+                <div class="planned-job-box">
+                  <div class="planned-job-header">
+                    <h4>Planned Batch: {plannedJob.id}</h4>
+                    <div class="planned-job-summary-badges">
+                      <span class="badge info">{plannedJob.totalRequested} requested</span>
+                      <span class="badge ok">{plannedJob.totalEligible} eligible</span>
+                      <span class="badge muted">{plannedJob.totalAlreadyOwned} already owned</span>
+                      {#if plannedJob.isDryRun}
+                        <span class="badge warn">Dry-Run Only</span>
+                      {/if}
+                    </div>
+                  </div>
+
+                  {#if plannedJob.items.length > 0}
+                    <div class="table-scroll-container">
+                      <table class="receipts-table">
+                        <thead>
+                          <tr>
+                            <th>Volume</th>
+                            <th>Status</th>
+                            <th>Provider</th>
+                            <th>Candidate</th>
+                            <th>Reason / Confidence</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {#each plannedJob.items as item}
+                            <tr>
+                              <td class="code">Vol. {item.volumeNumber}</td>
+                              <td>
+                                <span class="badge {item.status === 'ELIGIBLE' ? 'ok' : item.status === 'ALREADY_OWNED' ? 'muted' : 'warn'}">
+                                  {item.status}
+                                </span>
+                              </td>
+                              <td class="code">{item.provider ?? '—'}</td>
+                              <td class="candidate-title-cell" title={item.candidateTitle ?? ''}>
+                                {item.candidateTitle ?? '—'}
+                              </td>
+                              <td class="reason-cell">{item.reason}</td>
+                            </tr>
+                          {/each}
+                        </tbody>
+                      </table>
+                    </div>
+                  {/if}
+
+                  <div class="planned-job-actions">
+                    <button
+                      class="btn {plannedJob.isDryRun ? 'spot' : 'warn'}"
+                      disabled={executingBacklog || plannedJob.totalEligible === 0}
+                      onclick={() => plannedJob && handleExecuteBacklog(plannedJob)}
+                    >
+                      {executingBacklog ? 'Executing…' : plannedJob.isDryRun ? 'Execute Dry-Run Verification' : 'Execute Real Acquisition Batch'}
+                    </button>
+                    <button
+                      class="btn"
+                      disabled={executingBacklog}
+                      onclick={() => (plannedJob = null)}
+                    >
+                      Dismiss Plan
+                    </button>
+                  </div>
+                </div>
+              {/if}
+
+              <!-- Audit Trail -->
+              {#if backlogJobs.length > 0}
+                <div class="audit-trail-container">
+                  <h4 class="audit-title">Backlog Job Audit Trail</h4>
+                  <div class="table-scroll-container">
+                    <table class="receipts-table">
+                      <thead>
+                        <tr>
+                          <th>Job ID</th>
+                          <th>Scope</th>
+                          <th>Batch</th>
+                          <th>Mode</th>
+                          <th>State</th>
+                          <th>Queued / Failed</th>
+                          <th>Created</th>
+                          <th>Actions</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {#each backlogJobs as j}
+                          <tr>
+                            <td class="code mono-sm">{j.id}</td>
+                            <td>{j.scope}</td>
+                            <td>{j.batchSize}</td>
+                            <td>
+                              <span class="badge {j.isDryRun ? 'info' : 'warn'}">
+                                {j.isDryRun ? 'Dry Run' : 'Real'}
+                              </span>
+                            </td>
+                            <td>
+                              <span class="badge {j.state === 'COMPLETED' ? 'ok' : j.state === 'PLANNED' ? 'warn' : 'muted'}">
+                                {j.state}
+                              </span>
+                            </td>
+                            <td>{j.totalQueued} / {j.totalFailed}</td>
+                            <td>{ago(j.createdAt)}</td>
+                            <td>
+                              {#if j.state === 'PLANNED'}
+                                <button
+                                  class="btn mini warn"
+                                  onclick={() => handleCancelJob(j.id)}
+                                >
+                                  Cancel
+                                </button>
+                              {:else}
+                                <span class="muted">—</span>
+                              {/if}
+                            </td>
+                          </tr>
+                        {/each}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              {/if}
+            </div>
           </div>
 
         {/if}
@@ -1317,5 +1592,94 @@
 
   .no-receipts-msg {
     padding: 0.75rem 0;
+  }
+
+  .backlog-section {
+    grid-column: 1 / -1;
+  }
+
+  .backlog-count-pill {
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: var(--muted, #8b949e);
+  }
+
+  .backlog-controls-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 12px;
+    align-items: flex-end;
+    margin: 12px 0 16px;
+    background: rgba(255, 255, 255, 0.02);
+    padding: 12px;
+    border-radius: 8px;
+    border: 1px solid var(--border-color, rgba(255, 255, 255, 0.06));
+  }
+
+  .range-inputs {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .range-sep {
+    color: var(--muted, #8b949e);
+  }
+
+  .checkbox-group {
+    padding-bottom: 8px;
+  }
+
+  .checkbox-label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.85rem;
+    cursor: pointer;
+  }
+
+  .plan-btn-group {
+    display: flex;
+    align-items: flex-end;
+  }
+
+  .planned-job-box {
+    background: rgba(59, 130, 246, 0.05);
+    border: 1px solid rgba(59, 130, 246, 0.2);
+    border-radius: 8px;
+    padding: 14px;
+    margin-bottom: 16px;
+  }
+
+  .planned-job-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 12px;
+  }
+
+  .planned-job-summary-badges {
+    display: flex;
+    gap: 6px;
+  }
+
+  .planned-job-actions {
+    display: flex;
+    gap: 8px;
+    margin-top: 14px;
+  }
+
+  .audit-trail-container {
+    margin-top: 16px;
+  }
+
+  .audit-title {
+    font-size: 0.9rem;
+    font-weight: 600;
+    margin-bottom: 8px;
+  }
+
+  .mono-sm {
+    font-size: 0.75rem;
   }
 </style>

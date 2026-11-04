@@ -227,6 +227,15 @@ pub fn router(state: Spaces) -> Router {
         .route("/library/receipts/{id}/retry-metadata", post(post_receipt_retry_metadata))
         .route("/titles/{id}/receipts", get(get_title_receipts))
         .route("/manga/{id}/receipts", get(get_title_receipts))
+        .route("/backlog/jobs", get(get_all_backlog_jobs))
+        .route("/backlog/jobs/{id}/cancel", post(post_backlog_job_cancel))
+        .route("/backlog/jobs/{id}/execute", post(post_backlog_job_execute_by_id))
+        .route("/titles/{id}/backlog/plan", post(post_manga_backlog_plan))
+        .route("/titles/{id}/backlog/execute", post(post_manga_backlog_execute))
+        .route("/titles/{id}/backlog/jobs", get(get_manga_backlog_jobs))
+        .route("/manga/{id}/backlog/plan", post(post_manga_backlog_plan))
+        .route("/manga/{id}/backlog/execute", post(post_manga_backlog_execute))
+        .route("/manga/{id}/backlog/jobs", get(get_manga_backlog_jobs))
         .route(
             "/categories",
             get(list_categories)
@@ -4003,4 +4012,74 @@ async fn recover_download(Me(app): Me, Path(chapter): Path<i64>) -> Result<Json<
         "chapterId": chapter,
     })))
 }
+
+// -----------------------------------------------------------------------------
+// Historical Backlog Acquisition (M6.10)
+// -----------------------------------------------------------------------------
+
+async fn post_manga_backlog_plan(
+    Me(app): Me,
+    Path(id): Path<i64>,
+    Json(payload): Json<crate::acquisition::backlog::PlanBacklogRequest>,
+) -> Result<Json<crate::acquisition::backlog::BacklogJobDto>> {
+    let job = app.acquisition.plan_backlog_acquisition(id, payload).await?;
+    Ok(Json(job))
+}
+
+async fn post_manga_backlog_execute(
+    Me(app): Me,
+    Path(_id): Path<i64>,
+    Json(payload): Json<crate::acquisition::backlog::ExecuteBacklogRequest>,
+) -> Result<Json<crate::acquisition::backlog::ExecuteBacklogResponse>> {
+    let job_id = payload
+        .job_id
+        .clone()
+        .ok_or_else(|| AppError::bad_request("jobId is required in execution payload"))?;
+    let res = app.acquisition.execute_backlog_job(&job_id, payload).await?;
+    Ok(Json(res))
+}
+
+async fn post_backlog_job_execute_by_id(
+    Me(app): Me,
+    Path(id): Path<String>,
+    Json(mut payload): Json<crate::acquisition::backlog::ExecuteBacklogRequest>,
+) -> Result<Json<crate::acquisition::backlog::ExecuteBacklogResponse>> {
+    payload.job_id = Some(id.clone());
+    let res = app.acquisition.execute_backlog_job(&id, payload).await?;
+    Ok(Json(res))
+}
+
+async fn get_manga_backlog_jobs(
+    Me(app): Me,
+    Path(id): Path<i64>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Vec<crate::acquisition::backlog::BacklogJobDto>>> {
+    let limit = params
+        .get("limit")
+        .and_then(|l| l.parse::<usize>().ok())
+        .unwrap_or(20);
+    let jobs = app.acquisition.get_manga_backlog_jobs(id, limit).await?;
+    Ok(Json(jobs))
+}
+
+async fn get_all_backlog_jobs(
+    Me(app): Me,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<Vec<crate::acquisition::backlog::BacklogJobDto>>> {
+    let limit = params
+        .get("limit")
+        .and_then(|l| l.parse::<usize>().ok())
+        .unwrap_or(50);
+    let jobs = app.acquisition.get_all_backlog_jobs(limit).await?;
+    Ok(Json(jobs))
+}
+
+async fn post_backlog_job_cancel(
+    Me(app): Me,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>> {
+    let cancelled = app.acquisition.cancel_backlog_job(&id).await?;
+    Ok(Json(serde_json::json!({ "cancelled": cancelled })))
+}
+
 
