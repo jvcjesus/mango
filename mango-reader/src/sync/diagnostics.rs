@@ -633,6 +633,7 @@ pub struct CandidateInspectionDto {
     pub rejection_code: Option<String>,
     pub rejection_reason: Option<String>,
     pub sanitized_reference: Option<String>,
+    pub quality_evaluation: Option<crate::acquisition::quality::CandidateQualityEvaluation>,
 }
 
 /// Result of volume candidate inspection.
@@ -643,6 +644,8 @@ pub struct VolumeCandidateInspectionResult {
     pub volume_number: f64,
     pub target_status: Option<String>,
     pub target_release_date: Option<String>,
+    pub is_currently_owned: bool,
+    pub silent_upgrade_blocked: bool,
     pub candidates_count: usize,
     pub top_candidate: Option<CandidateInspectionDto>,
     pub candidates: Vec<CandidateInspectionDto>,
@@ -702,7 +705,20 @@ pub fn inspect_volume_candidates(
         .query_row("SELECT date('now', 'localtime')", [], |r| r.get(0))
         .unwrap_or_else(|_| "1970-01-01".to_string());
 
-    // 2. Query discovered candidates
+    // 2. Check ownership status (Komga / local reconciliation)
+    let is_currently_owned: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM series_reconciliations
+                WHERE series_id = ?1 AND owned_volumes_json LIKE '%' || ?2 || '%'
+            )",
+            params![series_id, volume_number],
+            |r| r.get(0),
+        )
+        .unwrap_or(false)
+        || is_volume_owned(conn, 0, series_id, volume_number).unwrap_or(false);
+
+    // 3. Query discovered candidates
     let mut stmt = conn
         .prepare(
             "SELECT candidate_id, provider, provider_item_id, title, raw_title, match_type,
@@ -742,6 +758,7 @@ pub fn inspect_volume_candidates(
         .map_err(|e| AppError::internal(format!("Failed to query candidates: {e}")))?;
 
     let mut inspected_list = Vec::new();
+    let mut quality_evals = Vec::new();
 
     for cand_res in rows {
         let cand = cand_res.map_err(|e| AppError::internal(format!("Row error: {e}")))?;
@@ -782,6 +799,13 @@ pub fn inspect_volume_candidates(
                 }
             };
 
+        let quality_eval = crate::acquisition::quality::evaluate_candidate_quality(
+            &cand,
+            is_currently_owned,
+            rejection_reason.clone(),
+        );
+        quality_evals.push(quality_eval);
+
         let sanitized_reference = sanitize_reference(
             &cand.provider,
             cand.download_url.as_deref(),
@@ -810,8 +834,20 @@ pub fn inspect_volume_candidates(
             rejection_code,
             rejection_reason,
             sanitized_reference,
+            quality_evaluation: None,
         });
     }
+
+    // Rank quality evaluations and re-attach
+    crate::acquisition::quality::rank_quality_evaluations(&mut quality_evals);
+    for (i, eval) in quality_evals.into_iter().enumerate() {
+        if let Some(dto) = inspected_list.get_mut(i) {
+            dto.quality_evaluation = Some(eval);
+        }
+    }
+
+    // Sort inspected candidates by quality rank
+    inspected_list.sort_by_key(|c| c.quality_evaluation.as_ref().map_or(999, |q| q.rank));
 
     let top_candidate = inspected_list.first().cloned();
 
@@ -820,6 +856,8 @@ pub fn inspect_volume_candidates(
         volume_number,
         target_status,
         target_release_date,
+        is_currently_owned,
+        silent_upgrade_blocked: is_currently_owned,
         candidates_count: inspected_list.len(),
         top_candidate,
         candidates: inspected_list,

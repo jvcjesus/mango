@@ -1909,6 +1909,40 @@ export interface TitleDiagnostics {
   autoAcquireGates: TitleAutoAcquireGateEvaluation;
 }
 
+export interface QualityFactorScoreDto {
+  name: string;
+  points: number;
+  isBonus: boolean;
+  description: string;
+}
+
+export interface UpgradeEvaluationDto {
+  isCurrentlyOwned: boolean;
+  upgradeEligible: boolean;
+  upgradeJustification?: string | null;
+  silentUpgradeBlocked: boolean;
+}
+
+export interface CandidateQualityEvaluationDto {
+  candidateId: string;
+  provider: string;
+  transport: string;
+  totalScore: number;
+  rank: number;
+  selectionVerdict: 'PREFERRED' | 'ALTERNATIVE' | 'INELIGIBLE' | 'MANUAL_UPGRADE_ONLY' | 'ALREADY_OWNED' | string;
+  factors: QualityFactorScoreDto[];
+  resolutionLabel?: string | null;
+  isDigital: boolean;
+  isTrusted: boolean;
+  isQualityGroup: boolean;
+  isRevision: boolean;
+  isPreRelease: boolean;
+  isPreferredProvider: boolean;
+  healthRating: 'EXCELLENT' | 'GOOD' | 'DEGRADED' | 'DEAD' | string;
+  upgradeEvaluation: UpgradeEvaluationDto;
+  rejectionReason?: string | null;
+}
+
 export interface CandidateInspectionDto {
   candidateId: string;
   provider: string;
@@ -1930,6 +1964,7 @@ export interface CandidateInspectionDto {
   rejectionCode?: string | null;
   rejectionReason?: string | null;
   sanitizedReference?: string | null;
+  qualityEvaluation?: CandidateQualityEvaluationDto | null;
 }
 
 export interface VolumeCandidateInspectionResult {
@@ -1937,6 +1972,8 @@ export interface VolumeCandidateInspectionResult {
   volumeNumber: number;
   targetStatus?: string | null;
   targetReleaseDate?: string | null;
+  isCurrentlyOwned?: boolean;
+  silentUpgradeBlocked?: boolean;
   candidatesCount: number;
   topCandidate?: CandidateInspectionDto | null;
   candidates: CandidateInspectionDto[];

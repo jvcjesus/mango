@@ -90,10 +90,28 @@
               </div>
             {/if}
             <div class="target-stat">
+              <span class="label">Ownership</span>
+              {#if data.isCurrentlyOwned}
+                <span class="value tag owned-tag">Owned in Komga</span>
+              {:else}
+                <span class="value tag missing-tag">Not Owned</span>
+              {/if}
+            </div>
+            <div class="target-stat">
               <span class="label">Discovered Candidates</span>
               <span class="value badge-count">{data.candidatesCount}</span>
             </div>
           </div>
+
+          {#if data.isCurrentlyOwned}
+            <div class="upgrade-protection-banner">
+              <Icon name="check" size={16} />
+              <div>
+                <strong>Strict No-Silent-Upgrade Protection Active:</strong>
+                <span> This volume is already owned. Automatic background acquisition will never overwrite or duplicate it. Upgrades must be manually initiated.</span>
+              </div>
+            </div>
+          {/if}
 
           {#if data.candidates.length === 0}
             <div class="empty-candidates">
@@ -106,6 +124,22 @@
                 <div class="candidate-inspect-card" class:top-card={cand.candidateId === data.topCandidate?.candidateId}>
                   <div class="cand-top-row">
                     <div class="cand-title-block">
+                      <div class="cand-rank-row">
+                        {#if cand.qualityEvaluation?.rank}
+                          <span class="badge rank-badge">#{cand.qualityEvaluation.rank}</span>
+                        {/if}
+                        {#if cand.qualityEvaluation?.selectionVerdict}
+                          <span class="badge verdict-badge verdict-{cand.qualityEvaluation.selectionVerdict.toLowerCase()}">
+                            {cand.qualityEvaluation.selectionVerdict.replace(/_/g, ' ')}
+                          </span>
+                        {/if}
+                        {#if cand.qualityEvaluation?.isPreferredProvider}
+                          <span class="badge preferred-provider-badge">Preferred Direct Provider</span>
+                        {/if}
+                        {#if cand.qualityEvaluation?.resolutionLabel}
+                          <span class="badge res-badge">{cand.qualityEvaluation.resolutionLabel}</span>
+                        {/if}
+                      </div>
                       <span class="cand-name" title={cand.rawTitle}>{cand.title || cand.rawTitle}</span>
                       {#if cand.rawTitle && cand.rawTitle !== cand.title}
                         <span class="cand-raw-name"><code>{cand.rawTitle}</code></span>
@@ -115,6 +149,19 @@
                       Score: {cand.score.toFixed(0)}
                     </div>
                   </div>
+
+                  {#if cand.qualityEvaluation?.factors && cand.qualityEvaluation.factors.length > 0}
+                    <div class="quality-factors-wrap">
+                      <span class="factors-label">Quality Signals:</span>
+                      <div class="factors-pills">
+                        {#each cand.qualityEvaluation.factors as f}
+                          <span class="factor-pill" class:factor-bonus={f.isBonus} class:factor-penalty={!f.isBonus} title={f.description}>
+                            {f.isBonus ? '+' : ''}{f.points.toFixed(0)} {f.name}
+                          </span>
+                        {/each}
+                      </div>
+                    </div>
+                  {/if}
 
                   <div class="cand-badges-row">
                     <span class="badge transport-badge">
@@ -456,5 +503,136 @@
     padding: 2.5rem;
     gap: 0.75rem;
     color: var(--muted, #8b949e);
+  }
+
+  .owned-tag {
+    background: rgba(34, 197, 94, 0.2);
+    color: #86efac;
+    border: 1px solid rgba(34, 197, 94, 0.3);
+  }
+
+  .missing-tag {
+    background: rgba(239, 68, 68, 0.2);
+    color: #fca5a5;
+    border: 1px solid rgba(239, 68, 68, 0.3);
+  }
+
+  .upgrade-protection-banner {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    background: rgba(59, 130, 246, 0.08);
+    border: 1px solid rgba(59, 130, 246, 0.25);
+    border-radius: 8px;
+    padding: 10px 14px;
+    margin-bottom: 14px;
+    font-size: 0.85rem;
+    color: #93c5fd;
+    line-height: 1.4;
+  }
+
+  .cand-rank-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+    margin-bottom: 2px;
+  }
+
+  .rank-badge {
+    background: var(--accent, #6366f1);
+    color: #fff;
+    font-weight: 700;
+    font-size: 0.75rem;
+    padding: 0.1rem 0.4rem;
+  }
+
+  .verdict-badge {
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-transform: capitalize;
+  }
+
+  .verdict-preferred {
+    background: rgba(34, 197, 94, 0.2);
+    color: #86efac;
+    border: 1px solid rgba(34, 197, 94, 0.3);
+  }
+
+  .verdict-alternative {
+    background: rgba(59, 130, 246, 0.2);
+    color: #93c5fd;
+    border: 1px solid rgba(59, 130, 246, 0.3);
+  }
+
+  .verdict-manual_upgrade_only {
+    background: rgba(245, 158, 11, 0.2);
+    color: #fde68a;
+    border: 1px solid rgba(245, 158, 11, 0.3);
+  }
+
+  .verdict-already_owned {
+    background: rgba(107, 114, 128, 0.2);
+    color: #d1d5db;
+    border: 1px solid rgba(107, 114, 128, 0.3);
+  }
+
+  .verdict-ineligible {
+    background: rgba(239, 68, 68, 0.2);
+    color: #fca5a5;
+    border: 1px solid rgba(239, 68, 68, 0.3);
+  }
+
+  .preferred-provider-badge {
+    background: rgba(168, 85, 247, 0.2);
+    color: #d8b4fe;
+    border: 1px solid rgba(168, 85, 247, 0.3);
+    font-size: 0.75rem;
+  }
+
+  .res-badge {
+    background: rgba(14, 165, 233, 0.2);
+    color: #7dd3fc;
+    border: 1px solid rgba(14, 165, 233, 0.3);
+    font-size: 0.75rem;
+  }
+
+  .quality-factors-wrap {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    flex-wrap: wrap;
+    font-size: 0.78rem;
+    margin: 4px 0 6px;
+  }
+
+  .factors-label {
+    color: var(--muted, #8b949e);
+    font-weight: 600;
+  }
+
+  .factors-pills {
+    display: flex;
+    gap: 4px;
+    flex-wrap: wrap;
+  }
+
+  .factor-pill {
+    padding: 0.1rem 0.35rem;
+    border-radius: 4px;
+    font-size: 0.72rem;
+    font-weight: 500;
+  }
+
+  .factor-bonus {
+    background: rgba(34, 197, 94, 0.15);
+    color: #86efac;
+    border: 1px solid rgba(34, 197, 94, 0.25);
+  }
+
+  .factor-penalty {
+    background: rgba(239, 68, 68, 0.15);
+    color: #fca5a5;
+    border: 1px solid rgba(239, 68, 68, 0.25);
   }
 </style>

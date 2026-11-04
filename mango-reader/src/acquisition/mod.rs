@@ -22,6 +22,7 @@ pub mod physical;
 pub mod planner;
 pub mod profiles;
 pub mod providers;
+pub mod quality;
 pub mod release_discovery;
 pub mod service;
 pub mod source_units;
@@ -32,6 +33,8 @@ pub mod approval_tests;
 pub mod auto_acquire_tests;
 #[cfg(test)]
 pub mod backlog_tests;
+#[cfg(test)]
+pub mod quality_tests;
 #[cfg(test)]
 pub mod release_discovery_tests;
 #[cfg(test)]
