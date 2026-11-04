@@ -194,6 +194,23 @@ pub fn router(state: Spaces) -> Router {
             "/notifications/events/{id}/resolve",
             post(post_notification_event_resolve),
         )
+        .route("/availability/watchers", get(get_availability_watchers))
+        .route(
+            "/titles/{id}/availability",
+            get(get_title_availability).patch(patch_title_availability),
+        )
+        .route(
+            "/titles/{id}/availability/refresh",
+            post(post_title_availability_refresh),
+        )
+        .route(
+            "/manga/{id}/availability",
+            get(get_title_availability).patch(patch_title_availability),
+        )
+        .route(
+            "/manga/{id}/availability/refresh",
+            post(post_title_availability_refresh),
+        )
         .route("/manga/{id}/cover", get(cover))
         .route("/manga/{id}/library", put(set_library))
         .route("/manga/{id}/reader", put(set_reader))
@@ -3657,4 +3674,157 @@ async fn post_notification_event_resolve(
         .call(move |conn| crate::sync::reconciliation::resolve_notification_event(conn, id))
         .await?;
     Ok(Json(resolved))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AvailabilityWatchersQuery {
+    manga_id: Option<i64>,
+    series_id: Option<String>,
+    state: Option<String>,
+}
+
+async fn get_availability_watchers(
+    Me(app): Me,
+    Query(query): Query<AvailabilityWatchersQuery>,
+) -> Result<Json<Vec<crate::acquisition::watcher::ReleaseAvailabilityWatcher>>> {
+    app.me.admin()?;
+    let watchers = app
+        .db
+        .call(move |conn| {
+            let mut sql = "SELECT id, series_id, manga_id, series_title, volume_number, mangabaka_id, collection_id,
+                                  work_id, market, edition, release_date, is_released, is_owned, monitoring_enabled,
+                                  notify_on_available, state, last_attempt_at, last_checked_at, next_check_at,
+                                  check_interval_secs, consecutive_failures, last_provider_checked, last_check_status,
+                                  last_error, top_candidate_id, top_candidate_provider, top_candidate_title,
+                                  top_candidate_fingerprint, candidate_count, notified_at, notification_event_id,
+                                  created_at, updated_at
+                           FROM release_availability_watchers
+                           WHERE 1=1".to_string();
+            let mut params_vec: Vec<rusqlite::types::Value> = Vec::new();
+
+            if let Some(mid) = query.manga_id {
+                sql.push_str(" AND manga_id = ?");
+                params_vec.push(mid.into());
+            }
+            if let Some(ref sid) = query.series_id {
+                sql.push_str(" AND series_id = ?");
+                params_vec.push(sid.clone().into());
+            }
+            if let Some(ref st) = query.state {
+                sql.push_str(" AND state = ?");
+                params_vec.push(st.clone().into());
+            }
+            sql.push_str(" ORDER BY manga_id ASC, volume_number ASC");
+
+            let mut stmt = conn.prepare(&sql).map_err(AppError::from)?;
+            let params_slice: Vec<&dyn rusqlite::ToSql> = params_vec.iter().map(|p| p as &dyn rusqlite::ToSql).collect();
+            let rows = stmt.query_map(&params_slice[..], |r| {
+                let state_str: String = r.get(15)?;
+                let state = std::str::FromStr::from_str(&state_str).unwrap_or(crate::acquisition::watcher::WatcherState::ReleasedAwaitingProvider);
+                Ok(crate::acquisition::watcher::ReleaseAvailabilityWatcher {
+                    id: r.get(0)?,
+                    series_id: r.get(1)?,
+                    manga_id: r.get(2)?,
+                    series_title: r.get(3)?,
+                    volume_number: r.get(4)?,
+                    mangabaka_id: r.get(5)?,
+                    collection_id: r.get(6)?,
+                    work_id: r.get(7)?,
+                    market: r.get(8)?,
+                    edition: r.get(9)?,
+                    release_date: r.get(10)?,
+                    is_released: r.get::<_, i64>(11)? != 0,
+                    is_owned: r.get::<_, i64>(12)? != 0,
+                    monitoring_enabled: r.get::<_, i64>(13)? != 0,
+                    notify_on_available: r.get::<_, i64>(14)? != 0,
+                    state,
+                    last_attempt_at: r.get(16)?,
+                    last_checked_at: r.get(17)?,
+                    next_check_at: r.get(18)?,
+                    check_interval_secs: r.get(19)?,
+                    consecutive_failures: r.get(20)?,
+                    last_provider_checked: r.get(21)?,
+                    last_check_status: r.get(22)?,
+                    last_error: r.get(23)?,
+                    top_candidate_id: r.get(24)?,
+                    top_candidate_provider: r.get(25)?,
+                    top_candidate_title: r.get(26)?,
+                    top_candidate_fingerprint: r.get(27)?,
+                    candidate_count: r.get(28)?,
+                    notified_at: r.get(29)?,
+                    notification_event_id: r.get(30)?,
+                    created_at: r.get(31)?,
+                    updated_at: r.get(32)?,
+                })
+            }).map_err(AppError::from)?;
+
+            let mut list = Vec::new();
+            for r in rows {
+                list.push(r.map_err(AppError::from)?);
+            }
+            Ok(list)
+        })
+        .await?;
+    Ok(Json(watchers))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TitleAvailabilityResponse {
+    settings: crate::acquisition::watcher::TitleMonitoringSettings,
+    watchers: Vec<crate::acquisition::watcher::ReleaseAvailabilityWatcher>,
+}
+
+async fn get_title_availability(
+    Me(app): Me,
+    Path(id): Path<i64>,
+) -> Result<Json<TitleAvailabilityResponse>> {
+    let settings = app
+        .db
+        .call(move |conn| crate::acquisition::watcher::get_title_monitoring_settings(conn, id))
+        .await?;
+
+    let series_id = format!("manga:{id}");
+    let watchers = app
+        .db
+        .call(move |conn| crate::acquisition::watcher::list_watchers_for_series(conn, &series_id))
+        .await?;
+
+    Ok(Json(TitleAvailabilityResponse { settings, watchers }))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PatchTitleAvailabilityRequest {
+    monitoring_enabled: Option<bool>,
+    notify_enabled: Option<bool>,
+}
+
+async fn patch_title_availability(
+    Me(app): Me,
+    Path(id): Path<i64>,
+    Json(payload): Json<PatchTitleAvailabilityRequest>,
+) -> Result<Json<crate::acquisition::watcher::TitleMonitoringSettings>> {
+    app.me.admin()?;
+    let settings = app
+        .db
+        .call(move |conn| {
+            let current = crate::acquisition::watcher::get_title_monitoring_settings(conn, id)?;
+            let new_monitoring = payload.monitoring_enabled.unwrap_or(current.release_monitoring_enabled);
+            let new_notify = payload.notify_enabled.unwrap_or(current.release_notify_enabled);
+            crate::acquisition::watcher::set_title_monitoring_settings(conn, id, new_monitoring, new_notify)
+        })
+        .await?;
+    Ok(Json(settings))
+}
+
+async fn post_title_availability_refresh(
+    Me(app): Me,
+    Path(id): Path<i64>,
+) -> Result<Json<Vec<crate::acquisition::watcher::ReleaseAvailabilityWatcher>>> {
+    app.me.admin()?;
+    let http = reqwest::Client::new();
+    let res = crate::acquisition::watcher::refresh_title_watchers(&app.db, http, id).await?;
+    Ok(Json(res))
 }

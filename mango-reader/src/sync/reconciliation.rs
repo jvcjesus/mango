@@ -1299,6 +1299,25 @@ pub fn save_reconciliation(conn: &Connection, s: &ReconciliationSummary) -> Resu
     )
     .map_err(|e| AppError::internal(format!("Failed to save series reconciliation: {e}")))?;
 
+    // Synchronize durable availability watchers for missing and upcoming volumes
+    let resolved_manga_id = s.manga_id.or_else(|| {
+        s.series_id.strip_prefix("manga:").and_then(|id| id.parse().ok())
+    });
+
+    if let Some(m_id) = resolved_manga_id {
+        let _ = crate::acquisition::watcher::sync_watchers_for_series(
+            conn,
+            m_id,
+            &s.series_id,
+            &s.title,
+            s.mangabaka_id,
+            s.collection_id.as_deref(),
+            &s.missing_volumes,
+            &s.future_volumes,
+            &s.owned_volumes,
+        );
+    }
+
     Ok(())
 }
 

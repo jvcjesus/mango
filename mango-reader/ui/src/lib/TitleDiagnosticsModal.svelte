@@ -1,12 +1,16 @@
 <script lang="ts">
   import {
     clearManualTitleMapping,
+    getTitleAvailability,
     getTitleDiagnostics,
     listMangaBakaCollections,
     message,
+    refreshTitleAvailability,
     send,
     setManualTitleMapping,
+    updateTitleAvailability,
     type MangaBakaCollectionInfo,
+    type TitleAvailabilityDto,
     type TitleDiagnostics,
   } from './api';
   import Icon from './Icon.svelte';
@@ -44,12 +48,62 @@
   let searchingMb = $state(false);
   let searchResults = $state<Array<{ id: number; title: string; year?: number | null }>>([]);
 
+  // Release availability watcher state (M6.8.4)
+  let availability = $state<TitleAvailabilityDto | null>(null);
+  let refreshingAvailability = $state(false);
+  let updatingAvailability = $state(false);
+
+  async function handleToggleMonitoring() {
+    if (!mangaId || !availability) return;
+    updatingAvailability = true;
+    try {
+      availability = await updateTitleAvailability(mangaId, {
+        monitoringEnabled: !availability.monitoringEnabled,
+      });
+      toast.success(`Release monitoring ${availability.monitoringEnabled ? 'enabled' : 'disabled'}`);
+    } catch (e) {
+      toast.error(`Failed to update monitoring: ${message(e)}`);
+    } finally {
+      updatingAvailability = false;
+    }
+  }
+
+  async function handleToggleNotify() {
+    if (!mangaId || !availability) return;
+    updatingAvailability = true;
+    try {
+      availability = await updateTitleAvailability(mangaId, {
+        notifyEnabled: !availability.notifyEnabled,
+      });
+      toast.success(`Release notifications ${availability.notifyEnabled ? 'enabled' : 'disabled'}`);
+    } catch (e) {
+      toast.error(`Failed to update notifications: ${message(e)}`);
+    } finally {
+      updatingAvailability = false;
+    }
+  }
+
+  async function handleRefreshAvailability() {
+    if (!mangaId) return;
+    refreshingAvailability = true;
+    try {
+      const res = await refreshTitleAvailability(mangaId);
+      toast.success(`Availability check triggered (${res.watchersChecked} watchers checked)`);
+      availability = await getTitleAvailability(mangaId);
+    } catch (e) {
+      toast.error(`Availability check failed: ${message(e)}`);
+    } finally {
+      refreshingAvailability = false;
+    }
+  }
+
   async function load() {
     if (!open || !mangaId) return;
     loading = true;
     error = null;
     try {
       diag = await getTitleDiagnostics(mangaId);
+      availability = await getTitleAvailability(mangaId).catch(() => null);
       if (diag.identity.mangabakaId) {
         manualMbIdInput = String(diag.identity.mangabakaId);
         loadCollections(diag.identity.mangabakaId);
@@ -507,6 +561,113 @@
               {/if}
             </div>
           {/if}
+
+          <!-- 5. Release Availability Watchers (M6.8.4) -->
+          <div class="diag-card watcher-section">
+            <div class="card-head">
+              <div class="head-title">
+                <Icon name="search" size={16} />
+                <h3>Release Availability Watchers (M6.8.4)</h3>
+              </div>
+              <div class="card-actions">
+                <button
+                  class="btn mini outline icon-text"
+                  disabled={refreshingAvailability}
+                  onclick={handleRefreshAvailability}
+                  title="Trigger immediate availability check for missing/upcoming volumes"
+                >
+                  <Icon name="refresh" size={14} />
+                  {refreshingAvailability ? 'Checking…' : 'Check Availability'}
+                </button>
+              </div>
+            </div>
+            <div class="card-content">
+              <div class="watcher-controls-bar">
+                <div class="watcher-status-pill">
+                  <span class="control-lbl">Monitoring:</span>
+                  <button
+                    class="btn mini pill"
+                    class:spot={availability?.monitoringEnabled}
+                    disabled={updatingAvailability}
+                    onclick={handleToggleMonitoring}
+                  >
+                    {availability?.monitoringEnabled ? 'Enabled' : 'Disabled'}
+                  </button>
+                </div>
+                <div class="watcher-status-pill">
+                  <span class="control-lbl">Notifications:</span>
+                  <button
+                    class="btn mini pill"
+                    class:spot={availability?.notifyEnabled}
+                    disabled={updatingAvailability}
+                    onclick={handleToggleNotify}
+                  >
+                    {availability?.notifyEnabled ? 'Enabled' : 'Disabled'}
+                  </button>
+                </div>
+                <div class="watcher-status-pill">
+                  <span class="control-lbl">Active Watchers:</span>
+                  <strong>{availability?.activeWatchersCount ?? 0} volumes</strong>
+                </div>
+              </div>
+
+              {#if availability && availability.watchers.length > 0}
+                <div class="watchers-table-wrapper">
+                  <table class="watchers-table">
+                    <thead>
+                      <tr>
+                        <th>Volume</th>
+                        <th>Release Date</th>
+                        <th>State</th>
+                        <th>Provider</th>
+                        <th>Interval</th>
+                        <th>Next Check</th>
+                        <th>Result / Note</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {#each availability.watchers as w}
+                        <tr class="watcher-row">
+                          <td class="vol-cell"><strong>Vol {w.volumeNumber}</strong></td>
+                          <td class="date-cell">{w.releaseDate || 'Unknown'}</td>
+                          <td>
+                            <span class="tag watcher-state watcher-state-{w.state.toLowerCase()}">
+                              {w.state}
+                            </span>
+                          </td>
+                          <td class="provider-cell"><code>{w.preferredProvider}</code></td>
+                          <td class="interval-cell">{Math.round(w.checkIntervalSecs / 3600)}h</td>
+                          <td class="next-cell">
+                            {#if w.nextCheckAt > 0}
+                              {new Date(w.nextCheckAt * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
+                            {:else}
+                              <span class="muted">—</span>
+                            {/if}
+                          </td>
+                          <td class="result-cell">
+                            {#if w.foundCandidateId}
+                              <span class="found-text">Found ({w.foundProvider}): {w.foundReleaseTitle || w.foundCandidateId}</span>
+                            {:else if w.stopReason}
+                              <span class="stop-text">{w.stopReason}</span>
+                            {:else if w.lastError}
+                              <span class="error-text">{w.lastError}</span>
+                            {:else}
+                              <span class="muted">Awaiting release</span>
+                            {/if}
+                          </td>
+                        </tr>
+                      {/each}
+                    </tbody>
+                  </table>
+                </div>
+              {:else}
+                <div class="no-watchers-msg">
+                  <p class="muted">No unowned volumes actively monitored. All released volumes are owned or reconciled.</p>
+                </div>
+              {/if}
+            </div>
+          </div>
+
         {/if}
       </div>
 
@@ -865,5 +1026,111 @@
     padding: 3rem;
     gap: 0.75rem;
     color: var(--muted, #8b949e);
+  }
+
+  .watcher-section {
+    grid-column: 1 / -1;
+  }
+
+  .watcher-controls-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 1.25rem;
+    padding-bottom: 0.75rem;
+    border-bottom: 1px solid var(--border-color, rgba(255, 255, 255, 0.08));
+    margin-bottom: 0.75rem;
+  }
+
+  .watcher-status-pill {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.85rem;
+  }
+
+  .control-lbl {
+    color: var(--muted, #8b949e);
+  }
+
+  .watchers-table-wrapper {
+    overflow-x: auto;
+  }
+
+  .watchers-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.82rem;
+    text-align: left;
+  }
+
+  .watchers-table th {
+    padding: 0.4rem 0.6rem;
+    font-weight: 600;
+    color: var(--muted, #8b949e);
+    border-bottom: 1px solid var(--border-color, rgba(255, 255, 255, 0.08));
+  }
+
+  .watchers-table td {
+    padding: 0.5rem 0.6rem;
+    border-bottom: 1px solid var(--border-color, rgba(255, 255, 255, 0.04));
+    vertical-align: middle;
+  }
+
+  .watcher-state {
+    font-size: 0.7rem;
+    font-weight: 600;
+    padding: 2px 6px;
+    border-radius: 4px;
+    text-transform: uppercase;
+  }
+
+  .watcher-state-polling {
+    background: rgba(59, 130, 246, 0.2);
+    color: #93c5fd;
+    border: 1px solid rgba(59, 130, 246, 0.3);
+  }
+
+  .watcher-state-candidate_found {
+    background: rgba(34, 197, 94, 0.2);
+    color: #86efac;
+    border: 1px solid rgba(34, 197, 94, 0.3);
+  }
+
+  .watcher-state-ownership_detected {
+    background: rgba(168, 85, 247, 0.2);
+    color: #d8b4fe;
+    border: 1px solid rgba(168, 85, 247, 0.3);
+  }
+
+  .watcher-state-stopped {
+    background: rgba(107, 114, 128, 0.2);
+    color: #9ca3af;
+    border: 1px solid rgba(107, 114, 128, 0.3);
+  }
+
+  .watcher-state-failed_permanent {
+    background: rgba(239, 68, 68, 0.2);
+    color: #fca5a5;
+    border: 1px solid rgba(239, 68, 68, 0.3);
+  }
+
+  .found-text {
+    color: #86efac;
+    font-size: 0.78rem;
+  }
+
+  .stop-text {
+    color: var(--muted, #8b949e);
+    font-size: 0.78rem;
+  }
+
+  .error-text {
+    color: #fca5a5;
+    font-size: 0.78rem;
+  }
+
+  .no-watchers-msg {
+    padding: 0.75rem 0;
   }
 </style>

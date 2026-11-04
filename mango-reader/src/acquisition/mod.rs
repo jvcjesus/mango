@@ -24,6 +24,7 @@ pub mod providers;
 pub mod release_discovery;
 pub mod service;
 pub mod source_units;
+pub mod watcher;
 #[cfg(test)]
 pub mod approval_tests;
 #[cfg(test)]
@@ -33,6 +34,8 @@ pub mod release_discovery_tests;
 #[cfg(test)]
 pub mod tests;
 pub mod torbox;
+#[cfg(test)]
+pub mod watcher_tests;
 
 use crate::error::Result;
 use serde::{Deserialize, Serialize};

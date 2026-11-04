@@ -2043,3 +2043,56 @@ export const getNotificationsHistory = (limit = 50, activeOnly = false) =>
 
 export const resolveNotificationEvent = (eventId: number) =>
   send<boolean>('POST', `/notifications/events/${eventId}/resolve`);
+
+export interface TitleAvailabilityWatcherDto {
+  id: number;
+  seriesId: string;
+  mangaId: number;
+  volumeNumber: number;
+  releaseDate?: string | null;
+  edition: string;
+  state: 'POLLING' | 'CANDIDATE_FOUND' | 'OWNERSHIP_DETECTED' | 'FAILED_PERMANENT' | 'STOPPED' | string;
+  preferredProvider: string;
+  checkIntervalSecs: number;
+  lastCheckedAt?: number | null;
+  nextCheckAt: number;
+  consecutiveFailures: number;
+  foundCandidateId?: string | null;
+  foundProvider?: string | null;
+  foundReleaseTitle?: string | null;
+  foundPublishedAt?: number | null;
+  lastError?: string | null;
+  stopReason?: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface TitleAvailabilityDto {
+  mangaId: number;
+  title: string;
+  monitoringEnabled: boolean;
+  notifyEnabled: boolean;
+  activeWatchersCount: number;
+  watchers: TitleAvailabilityWatcherDto[];
+}
+
+export const getTitleAvailability = (mangaId: number) =>
+  get<TitleAvailabilityDto>(`/manga/${mangaId}/availability`);
+
+export const updateTitleAvailability = (
+  mangaId: number,
+  payload: { monitoringEnabled?: boolean; notifyEnabled?: boolean }
+) => send<TitleAvailabilityDto>('PATCH', `/manga/${mangaId}/availability`, payload);
+
+export const refreshTitleAvailability = (mangaId: number) =>
+  send<{ triggered: boolean; watchersChecked: number }>(
+    'POST',
+    `/manga/${mangaId}/availability/refresh`,
+    {}
+  );
+
+export const getAvailabilityWatchers = (limit = 50, state?: string) =>
+  get<TitleAvailabilityWatcherDto[]>(
+    `/availability/watchers?limit=${limit}${state ? `&state=${encodeURIComponent(state)}` : ''}`
+  );
+

@@ -145,6 +145,7 @@ impl Spaces {
             tokio::spawn(crate::sync::scheduler::run_scheduler_forever((*sync).clone(), db.clone())),
             tokio::spawn(crate::notification::worker::run_worker_forever(db.clone(), reqwest::Client::new())),
             tokio::spawn(crate::opentome::worker::run_worker_forever(opentome.clone())),
+            tokio::spawn(crate::acquisition::watcher::run_watcher_worker_forever(db.clone(), reqwest::Client::new())),
         ];
         let app = AppState {
             me: Who::default(),
