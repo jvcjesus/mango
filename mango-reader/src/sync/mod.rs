@@ -19,6 +19,7 @@ pub mod model;
 pub mod reconciliation;
 pub mod scheduler;
 pub mod service;
+pub mod timeline;
 pub mod totals;
 
 #[cfg(test)]

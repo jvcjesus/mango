@@ -55,6 +55,10 @@ pub struct IntegrityIssue {
     pub manga_id: Option<i64>,
     pub series_title: Option<String>,
     pub resolution_hint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub affected_paths: Vec<String>,
 }
 
 /// Comprehensive library integrity audit report.
@@ -66,6 +70,30 @@ pub struct LibraryIntegrityReport {
     pub total_issues: usize,
     pub issues_by_severity: HashMap<String, usize>,
     pub issues: Vec<IntegrityIssue>,
+}
+
+impl LibraryIntegrityReport {
+    /// Filters issues by severity, category, or title/keyword search.
+    pub fn filter(&mut self, severity: Option<&str>, category: Option<&str>, search: Option<&str>) {
+        if let Some(sev) = severity {
+            let sev_upper = sev.to_uppercase();
+            self.issues.retain(|i| i.severity.as_str().eq_ignore_ascii_case(&sev_upper));
+        }
+        if let Some(cat) = category {
+            let cat_lower = cat.to_lowercase();
+            self.issues.retain(|i| i.category.to_lowercase() == cat_lower);
+        }
+        if let Some(q) = search {
+            let q_lower = q.to_lowercase();
+            self.issues.retain(|i| {
+                i.message.to_lowercase().contains(&q_lower)
+                    || i.code.to_lowercase().contains(&q_lower)
+                    || i.series_title.as_ref().map_or(false, |t| t.to_lowercase().contains(&q_lower))
+                    || i.details.as_ref().map_or(false, |d| d.to_lowercase().contains(&q_lower))
+            });
+        }
+        self.total_issues = self.issues.len();
+    }
 }
 
 /// Runs a complete, read-only audit across all library tables and storage references.
@@ -113,6 +141,8 @@ pub fn audit_library_integrity(
             manga_id: Some(id1),
             series_title: Some(title1),
             resolution_hint: Some("Reassign one of the titles to its correct MangaBaka work or clear mapping".to_string()),
+            storage_type: None,
+            affected_paths: Vec::new(),
         });
     }
 
@@ -147,6 +177,8 @@ pub fn audit_library_integrity(
             manga_id: Some(mid),
             series_title: Some(m_title),
             resolution_hint: Some("Reconcile series to synchronize MangaBaka identity across records".to_string()),
+            storage_type: None,
+            affected_paths: Vec::new(),
         });
     }
 
@@ -188,6 +220,8 @@ pub fn audit_library_integrity(
             manga_id: Some(mid),
             series_title: Some(m_title),
             resolution_hint: Some("Ensure Komga library scan is completed and series title matches".to_string()),
+            storage_type: None,
+            affected_paths: Vec::new(),
         });
     }
 
@@ -203,7 +237,7 @@ pub fn audit_library_integrity(
          WHERE c.download_path IS NOT NULL AND c.chapter_number > 0",
     ).map_err(|e| AppError::internal(format!("Prepare dup stmt error: {e}")))?;
 
-    let mut vol_counts: HashMap<(i64, String, u32), usize> = HashMap::new();
+    let mut vol_paths: HashMap<(i64, String, u32), Vec<String>> = HashMap::new();
 
     let rows = dup_stmt.query_map([], |r| {
         Ok((
@@ -228,25 +262,57 @@ pub fn audit_library_integrity(
         };
         if exists {
             let key = (mid, m_title, (vol_num * 1000.0).round() as u32);
-            *vol_counts.entry(key).or_insert(0) += 1;
+            vol_paths.entry(key).or_default().push(dl_path);
         }
     }
 
-    let mut sorted_vols: Vec<_> = vol_counts.into_iter().filter(|(_, cnt)| *cnt > 1).collect();
+    let mut sorted_vols: Vec<_> = vol_paths.into_iter().filter(|(_, paths)| paths.len() > 1).collect();
     sorted_vols.sort_by(|a, b| a.0.0.cmp(&b.0.0).then_with(|| a.0.2.cmp(&b.0.2)));
 
-    for ((mid, m_title, vol_key), cnt) in sorted_vols {
+    for ((mid, m_title, vol_key), paths) in sorted_vols {
         let vol_num = (vol_key as f64) / 1000.0;
+        let cnt = paths.len();
+
+        let (canonical_paths, staging_paths): (Vec<_>, Vec<_>) = paths
+            .iter()
+            .cloned()
+            .partition(|p| p.starts_with("/data/local/") || p.starts_with("/srv/media/") || p.starts_with("/pipeline-library/"));
+
+        let (storage_type, message, details, hint) = if !canonical_paths.is_empty() && !staging_paths.is_empty() {
+            (
+                "canonical_and_staging".to_string(),
+                format!("Title '{m_title}' volume {vol_num} is present in both Canonical Storage and Local Download Staging"),
+                format!("Canonical: {}\nStaging: {}", canonical_paths.join(", "), staging_paths.join(", ")),
+                "Canonical copy is verified in Komga; local download copy represents historical download staging. No automatic deletion is performed; verify before removing staging files.".to_string(),
+            )
+        } else if canonical_paths.len() > 1 {
+            (
+                "duplicate_canonical".to_string(),
+                format!("Title '{m_title}' volume {vol_num} has {cnt} duplicate canonical library files"),
+                canonical_paths.join("\n"),
+                "Consolidate duplicate canonical files in library directory".to_string(),
+            )
+        } else {
+            (
+                "duplicate_staging".to_string(),
+                format!("Title '{m_title}' volume {vol_num} has {cnt} duplicate staging downloads"),
+                staging_paths.join("\n"),
+                "Clean up duplicate staging downloads".to_string(),
+            )
+        };
+
         issues.push(IntegrityIssue {
             id: format!("duplicate-vol-{mid}-{vol_num}"),
             category: "storage".to_string(),
             severity: IntegritySeverity::Warning,
             code: "DUPLICATE_VOLUME_RECORDS".to_string(),
-            message: format!("Title '{m_title}' has {cnt} duplicate downloaded chapters for volume {vol_num}"),
-            details: Some(format!("Volume {vol_num}: {cnt} downloaded rows")),
+            message,
+            details: Some(details),
             manga_id: Some(mid),
             series_title: Some(m_title),
-            resolution_hint: Some("Normalize library or remove duplicate chapter entries".to_string()),
+            resolution_hint: Some(hint),
+            storage_type: Some(storage_type),
+            affected_paths: paths,
         });
     }
 
@@ -283,6 +349,8 @@ pub fn audit_library_integrity(
             manga_id: None,
             series_title: Some(display),
             resolution_hint: Some("Will be cleaned automatically during catalog maintenance or when series is re-imported".to_string()),
+            storage_type: None,
+            affected_paths: Vec::new(),
         });
     }
 
@@ -327,6 +395,8 @@ pub fn audit_library_integrity(
             manga_id: None,
             series_title: None,
             resolution_hint: Some("Check ntfy server URL and network connectivity in Notification settings".to_string()),
+            storage_type: None,
+            affected_paths: Vec::new(),
         });
     }
 
@@ -377,6 +447,8 @@ pub fn audit_library_integrity(
             manga_id: Some(mid),
             series_title: Some(m_title),
             resolution_hint: Some("Resolve MangaBaka series and collection in Diagnostics or disable auto-acquire".to_string()),
+            storage_type: None,
+            affected_paths: Vec::new(),
         });
     }
 

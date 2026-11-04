@@ -179,6 +179,11 @@ pub fn router(state: Spaces) -> Router {
         .route("/manga/{id}/detach-source", post(post_manga_detach_source))
         .route("/manga/{id}/mangabaka", put(put_manga_mangabaka))
         .route("/manga/{id}/diagnostics", get(get_manga_diagnostics))
+        .route("/titles/{id}/diagnostics", get(get_manga_diagnostics))
+        .route("/manga/{id}/timeline", get(get_series_timeline_endpoint))
+        .route("/titles/{id}/timeline", get(get_series_timeline_endpoint))
+        .route("/manga/{id}/gaps", get(get_series_gaps_endpoint))
+        .route("/titles/{id}/gaps", get(get_series_gaps_endpoint))
         .route(
             "/manga/{id}/mapping/manual",
             post(post_manga_mapping_manual).delete(delete_manga_mapping_manual),
@@ -3516,6 +3521,28 @@ async fn get_manga_diagnostics(
     Ok(Json(diag))
 }
 
+async fn get_series_timeline_endpoint(
+    Me(app): Me,
+    Path(id): Path<i64>,
+) -> Result<Json<crate::sync::timeline::SeriesTimelineDto>> {
+    let timeline = app
+        .db
+        .call(move |conn| crate::sync::timeline::get_series_timeline(conn, id))
+        .await?;
+    Ok(Json(timeline))
+}
+
+async fn get_series_gaps_endpoint(
+    Me(app): Me,
+    Path(id): Path<i64>,
+) -> Result<Json<crate::sync::timeline::SeriesGapAnalysisDto>> {
+    let gaps = app
+        .db
+        .call(move |conn| crate::sync::timeline::get_series_gap_analysis(conn, id))
+        .await?;
+    Ok(Json(gaps))
+}
+
 async fn get_manga_volume_candidates_inspect(
     Me(app): Me,
     Path((id, volume)): Path<(i64, f64)>,
@@ -3644,17 +3671,33 @@ async fn get_releases_calendar(
     Ok(Json(items))
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SystemIntegrityQuery {
+    severity: Option<String>,
+    category: Option<String>,
+    search: Option<String>,
+}
+
 async fn get_system_integrity(
     Me(app): Me,
+    Query(query): Query<SystemIntegrityQuery>,
 ) -> Result<Json<crate::sync::integrity::LibraryIntegrityReport>> {
     app.me.admin()?;
     let downloads_dir = app.downloads.dir().to_path_buf();
-    let report = app
+    let mut report = app
         .db
         .call(move |conn| {
             crate::sync::integrity::audit_library_integrity(conn, Some(&downloads_dir))
         })
         .await?;
+    if query.severity.is_some() || query.category.is_some() || query.search.is_some() {
+        report.filter(
+            query.severity.as_deref(),
+            query.category.as_deref(),
+            query.search.as_deref(),
+        );
+    }
     Ok(Json(report))
 }
 

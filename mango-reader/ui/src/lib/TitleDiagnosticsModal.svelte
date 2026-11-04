@@ -3,6 +3,7 @@
     cancelBacklogJob,
     clearManualTitleMapping,
     executeBacklog,
+    getSeriesTimeline,
     getTitleAvailability,
     getTitleBacklogJobs,
     getTitleDiagnostics,
@@ -22,9 +23,12 @@
     type BacklogScope,
     type MangaBakaCollectionInfo,
     type PublicationReceiptDto,
+    type SeriesTimelineDto,
+    type SeriesTimelineVolumeDto,
     type TitleAvailabilityDto,
     type TitleDiagnostics,
   } from './api';
+  import CandidateInspectorModal from './CandidateInspectorModal.svelte';
   import Icon from './Icon.svelte';
   import Notice from './Notice.svelte';
   import { toast } from './toast.svelte';
@@ -47,6 +51,11 @@
   let loading = $state(false);
   let error = $state<string | null>(null);
   let diag = $state<TitleDiagnostics | null>(null);
+
+  // M6.12 Unified Series Timeline & Gap Detection state
+  let timeline = $state<SeriesTimelineDto | null>(null);
+  let timelineLoading = $state(false);
+  let inspectingVolume = $state<number | null>(null);
 
   // Manual resolution state
   let showManualSection = $state(false);
@@ -247,6 +256,7 @@
     error = null;
     try {
       diag = await getTitleDiagnostics(mangaId);
+      timeline = await getSeriesTimeline(mangaId).catch(() => null);
       availability = await getTitleAvailability(mangaId).catch(() => null);
       receipts = await getTitleReceipts(mangaId).catch(() => []);
       backlogJobs = await getTitleBacklogJobs(mangaId).catch(() => []);
@@ -428,6 +438,216 @@
               </div>
             </div>
           {/if}
+
+          <!-- Unified Series Timeline & Gap Detection (M6.12) -->
+          <div class="diag-card timeline-section">
+            <div class="card-head">
+              <div class="head-title">
+                <Icon name="grid" size={16} />
+                <h3>Unified Series Timeline & Gap Detection (M6.12)</h3>
+              </div>
+              {#if timeline}
+                <div class="card-actions">
+                  <span class="timeline-summary-pill">
+                    {timeline.gaps.ownedCount} / {timeline.gaps.totalVolumes} Owned ({timeline.gaps.missingCount} Missing)
+                  </span>
+                </div>
+              {/if}
+            </div>
+
+            <div class="card-content">
+              {#if timelineLoading}
+                <div class="loading-state">
+                  <span class="spin"><Icon name="spinner" size={20} /></span>
+                  <span>Synthesizing unified series timeline…</span>
+                </div>
+              {:else if timeline}
+                <!-- Gaps & Continuity Status Banner -->
+                <div
+                  class="gap-status-banner"
+                  class:banner-warning={timeline.gaps.hasInteriorGaps}
+                  class:banner-healthy={!timeline.gaps.hasInteriorGaps && timeline.gaps.missingCount === 0}
+                  class:banner-info={!timeline.gaps.hasInteriorGaps && timeline.gaps.missingCount > 0}
+                >
+                  <div class="gap-banner-content">
+                    <Icon name={timeline.gaps.hasInteriorGaps ? 'alert-triangle' : timeline.gaps.missingCount === 0 ? 'check' : 'info'} size={18} />
+                    <div class="gap-banner-text">
+                      <strong>{timeline.gaps.summaryText}</strong>
+                      <span>
+                        {#if timeline.gaps.hasInteriorGaps}
+                          Interior gaps detected in library: Volume {timeline.gaps.gapVolumeNumbers.join(', ')} missing between owned volumes.
+                        {:else if timeline.gaps.missingCount === 0}
+                          All official volumes established by MangaBaka are canonically owned.
+                        {:else}
+                          Continuous ownership up to volume {timeline.gaps.ownedCount}; remaining volumes awaiting acquisition.
+                        {/if}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- Volume Sequence Grid -->
+                {#if timeline.volumes.length > 0}
+                  <div class="timeline-grid-wrapper">
+                    <div class="timeline-volume-grid">
+                      {#each timeline.volumes as v}
+                        <div
+                          class="timeline-vol-card status-{v.status.toLowerCase()}"
+                          class:is-owned={v.isOwned}
+                          class:is-gap={v.isGap}
+                        >
+                          <div class="vol-card-head">
+                            <span class="vol-number">Vol {v.volumeNumber}</span>
+                            <span class="tag vol-tag vol-tag-{v.status.toLowerCase()}">
+                              {v.status.replace(/_/g, ' ')}
+                            </span>
+                          </div>
+
+                          {#if v.isGap}
+                            <div class="gap-tag-pill gap-{v.gapType?.toLowerCase()}">
+                              {v.gapType} GAP
+                            </div>
+                          {/if}
+
+                          <div class="vol-card-meta">
+                            {#if v.releaseDate}
+                              <div class="meta-row">
+                                <span class="meta-k">Release:</span>
+                                <span class="meta-v">{v.releaseDate}</span>
+                              </div>
+                            {/if}
+
+                            {#if v.candidateCount > 0}
+                              <div class="cand-pill-box">
+                                <span class="cand-pill-provider">{v.topCandidateSource || 'Candidate'}</span>
+                                <span class="cand-pill-score">{v.topCandidateScore ? `${v.topCandidateScore.toFixed(0)} pts` : `${v.candidateCount} found`}</span>
+                              </div>
+                            {/if}
+
+                            {#if v.receiptId}
+                              <div class="receipt-verified-badge" title="Published with verified receipt">
+                                <Icon name="check" size={12} />
+                                <span>Verified CBZ</span>
+                              </div>
+                            {/if}
+                          </div>
+
+                          <div class="vol-card-actions">
+                            <button
+                              type="button"
+                              class="btn mini outline vol-inspect-btn"
+                              onclick={() => { inspectingVolume = v.volumeNumber; }}
+                              title="Inspect discovered candidates and quality ranking"
+                            >
+                              Inspect Candidates
+                            </button>
+                            {#if !v.isOwned}
+                              <button
+                                type="button"
+                                class="btn mini spot vol-plan-btn"
+                                onclick={() => {
+                                  backlogScope = 'EXPLICIT_VOLUMES';
+                                  backlogExplicitVolumesInput = String(v.volumeNumber);
+                                  handleGenerateBacklogPlan();
+                                }}
+                                title="Plan backlog acquisition for Volume {v.volumeNumber}"
+                              >
+                                Plan Acquisition
+                              </button>
+                            {/if}
+                          </div>
+                        </div>
+                      {/each}
+                    </div>
+                  </div>
+                {:else}
+                  <div class="empty-state font-small muted">
+                    No volume records established for this title.
+                  </div>
+                {/if}
+
+                <!-- Reading-Source Separation Card -->
+                <div class="reading-source-separation-box">
+                  <div class="subcard-header">
+                    <Icon name="folder" size={15} />
+                    <h4>Reading-Source & Physical Ownership Separation (Section 10.3)</h4>
+                  </div>
+                  <div class="separation-grid">
+                    <div class="sep-stat-box">
+                      <span class="stat-num">{timeline.readingSourceSeparation.canonicalKomgaCount}</span>
+                      <span class="stat-lbl">Canonical Komga Volumes</span>
+                      <span class="stat-desc">Physically published in canonical manga directory</span>
+                    </div>
+                    <div class="sep-stat-box">
+                      <span class="stat-num">{timeline.readingSourceSeparation.localStagingCount}</span>
+                      <span class="stat-lbl">Local Download Staging</span>
+                      <span class="stat-desc">Historical/incoming download files in downloads directory</span>
+                    </div>
+                    <div class="sep-stat-box">
+                      <span class="stat-num">{timeline.readingSourceSeparation.readerChapterCount}</span>
+                      <span class="stat-lbl">Reading Extension Chapters</span>
+                      <span class="stat-desc">External reader cache; strictly separate from volume ownership</span>
+                    </div>
+                  </div>
+
+                  {#if timeline.readingSourceSeparation.storageDistinctionNotes.length > 0}
+                    <div class="separation-notes">
+                      {#each timeline.readingSourceSeparation.storageDistinctionNotes as note}
+                        <div class="note-item">
+                          <Icon name="info" size={13} />
+                          <span>{note}</span>
+                        </div>
+                      {/each}
+                    </div>
+                  {/if}
+                </div>
+
+                <!-- Event Timeline Sub-Section (M6.12 Section 10.5) -->
+                {#if timeline.events.length > 0}
+                  <div class="timeline-events-subcard">
+                    <div class="subcard-header">
+                      <Icon name="clock" size={15} />
+                      <h4>Notification & Lifecycle Event History (Section 10.5)</h4>
+                    </div>
+                    <div class="events-scroll-container">
+                      <table class="events-table">
+                        <thead>
+                          <tr>
+                            <th>Time</th>
+                            <th>Event</th>
+                            <th>Volume</th>
+                            <th>Message</th>
+                            <th>Status</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {#each timeline.events as ev}
+                            <tr>
+                              <td class="time-cell">{ago(ev.createdAt * 1000)}</td>
+                              <td><span class="tag event-tag">{ev.eventType}</span></td>
+                              <td>{ev.volumeNumber != null ? `Vol ${ev.volumeNumber}` : '—'}</td>
+                              <td class="msg-cell">{ev.message}</td>
+                              <td>
+                                {#if ev.resolvedAt}
+                                  <span class="badge badge-resolved">Resolved</span>
+                                {:else}
+                                  <span class="badge badge-active">Active</span>
+                                {/if}
+                              </td>
+                            </tr>
+                          {/each}
+                        </tbody>
+                      </table>
+                    </div>
+                  </div>
+                {/if}
+              {:else}
+                <div class="empty-state font-small muted">
+                  Timeline data unavailable.
+                </div>
+              {/if}
+            </div>
+          </div>
 
           <!-- Grid: Identity & MangaBaka Collection -->
           <div class="diag-grid">
@@ -1098,6 +1318,15 @@
       </div>
     </div>
   </div>
+
+  {#if inspectingVolume !== null}
+    <CandidateInspectorModal
+      open={inspectingVolume !== null}
+      mangaId={mangaId}
+      volume={inspectingVolume}
+      onClose={() => { inspectingVolume = null; }}
+    />
+  {/if}
 {/if}
 
 <style>
@@ -1681,5 +1910,334 @@
 
   .mono-sm {
     font-size: 0.75rem;
+  }
+
+  /* M6.12 Unified Series Timeline & Gap Detection Styles */
+  .timeline-section {
+    border: 1px solid var(--edge, rgba(255, 255, 255, 0.1));
+    margin-bottom: 16px;
+  }
+
+  .timeline-summary-pill {
+    background: rgba(59, 130, 246, 0.15);
+    border: 1px solid rgba(59, 130, 246, 0.35);
+    color: #60a5fa;
+    font-size: 0.78rem;
+    padding: 3px 8px;
+    border-radius: 4px;
+    font-weight: 600;
+  }
+
+  .gap-status-banner {
+    border-radius: 6px;
+    padding: 10px 14px;
+    margin-bottom: 14px;
+    border: 1px solid var(--edge, rgba(255, 255, 255, 0.1));
+  }
+
+  .gap-status-banner.banner-warning {
+    background: rgba(234, 179, 8, 0.1);
+    border-color: rgba(234, 179, 8, 0.35);
+    color: #facc15;
+  }
+
+  .gap-status-banner.banner-healthy {
+    background: rgba(34, 197, 94, 0.1);
+    border-color: rgba(34, 197, 94, 0.35);
+    color: #4ade80;
+  }
+
+  .gap-status-banner.banner-info {
+    background: rgba(59, 130, 246, 0.1);
+    border-color: rgba(59, 130, 246, 0.35);
+    color: #60a5fa;
+  }
+
+  .gap-banner-content {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .gap-banner-text {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    font-size: 0.85rem;
+  }
+
+  .timeline-grid-wrapper {
+    margin-bottom: 16px;
+  }
+
+  .timeline-volume-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+    gap: 10px;
+  }
+
+  .timeline-vol-card {
+    background: var(--surface-1, rgba(255, 255, 255, 0.02));
+    border: 1px solid var(--edge, rgba(255, 255, 255, 0.08));
+    border-radius: 6px;
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+
+  .timeline-vol-card.is-owned {
+    border-color: rgba(34, 197, 94, 0.3);
+    background: rgba(34, 197, 94, 0.03);
+  }
+
+  .timeline-vol-card.is-gap {
+    border-color: rgba(234, 179, 8, 0.3);
+  }
+
+  .vol-card-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+
+  .vol-number {
+    font-weight: 700;
+    font-size: 0.9rem;
+    color: var(--ink);
+  }
+
+  .vol-tag {
+    font-size: 0.7rem;
+    padding: 2px 6px;
+    border-radius: 4px;
+    text-transform: uppercase;
+    font-weight: 600;
+  }
+
+  .vol-tag-owned {
+    background: rgba(34, 197, 94, 0.15);
+    color: #4ade80;
+    border: 1px solid rgba(34, 197, 94, 0.3);
+  }
+
+  .vol-tag-candidate_available {
+    background: rgba(168, 85, 247, 0.15);
+    color: #c084fc;
+    border: 1px solid rgba(168, 85, 247, 0.3);
+  }
+
+  .vol-tag-candidate_unavailable {
+    background: rgba(239, 68, 68, 0.15);
+    color: #f87171;
+    border: 1px solid rgba(239, 68, 68, 0.3);
+  }
+
+  .vol-tag-acquiring {
+    background: rgba(6, 182, 212, 0.15);
+    color: #22d3ee;
+    border: 1px solid rgba(6, 182, 212, 0.3);
+  }
+
+  .vol-tag-unreleased_future {
+    background: rgba(59, 130, 246, 0.15);
+    color: #60a5fa;
+    border: 1px solid rgba(59, 130, 246, 0.3);
+  }
+
+  .vol-tag-released_missing {
+    background: rgba(249, 115, 22, 0.15);
+    color: #fb923c;
+    border: 1px solid rgba(249, 115, 22, 0.3);
+  }
+
+  .gap-tag-pill {
+    align-self: flex-start;
+    font-size: 0.68rem;
+    padding: 1px 5px;
+    border-radius: 3px;
+    font-weight: 600;
+  }
+
+  .gap-tag-pill.gap-interior {
+    background: rgba(239, 68, 68, 0.15);
+    color: #f87171;
+    border: 1px solid rgba(239, 68, 68, 0.3);
+  }
+
+  .gap-tag-pill.gap-leading {
+    background: rgba(234, 179, 8, 0.15);
+    color: #facc15;
+    border: 1px solid rgba(234, 179, 8, 0.3);
+  }
+
+  .gap-tag-pill.gap-trailing {
+    background: rgba(59, 130, 246, 0.15);
+    color: #60a5fa;
+    border: 1px solid rgba(59, 130, 246, 0.3);
+  }
+
+  .vol-card-meta {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 0.78rem;
+  }
+
+  .cand-pill-box {
+    display: flex;
+    justify-content: space-between;
+    background: var(--surface-2, rgba(255, 255, 255, 0.04));
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-size: 0.72rem;
+  }
+
+  .cand-pill-provider {
+    font-weight: 600;
+    color: #c084fc;
+  }
+
+  .receipt-verified-badge {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 0.72rem;
+    color: #4ade80;
+  }
+
+  .vol-card-actions {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-top: auto;
+  }
+
+  .vol-inspect-btn, .vol-plan-btn {
+    width: 100%;
+    justify-content: center;
+    font-size: 0.75rem;
+  }
+
+  .reading-source-separation-box {
+    background: var(--surface-2, rgba(255, 255, 255, 0.03));
+    border: 1px solid var(--edge, rgba(255, 255, 255, 0.08));
+    border-radius: 6px;
+    padding: 12px;
+    margin-bottom: 14px;
+  }
+
+  .subcard-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 10px;
+    font-size: 0.9rem;
+    font-weight: 600;
+  }
+
+  .subcard-header h4 {
+    margin: 0;
+    font-size: 0.85rem;
+  }
+
+  .separation-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 8px;
+    margin-bottom: 8px;
+  }
+
+  .sep-stat-box {
+    background: var(--surface-1, rgba(255, 255, 255, 0.02));
+    border: 1px solid var(--edge, rgba(255, 255, 255, 0.05));
+    border-radius: 4px;
+    padding: 8px 10px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .stat-num {
+    font-size: 1.1rem;
+    font-weight: 700;
+    color: var(--ink);
+  }
+
+  .stat-lbl {
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: var(--dim, #aaa);
+  }
+
+  .stat-desc {
+    font-size: 0.72rem;
+    color: var(--muted, #777);
+  }
+
+  .separation-notes {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-top: 6px;
+  }
+
+  .note-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+    font-size: 0.75rem;
+    color: var(--dim, #ccc);
+    background: rgba(255, 255, 255, 0.02);
+    padding: 4px 8px;
+    border-radius: 4px;
+  }
+
+  .timeline-events-subcard {
+    background: var(--surface-2, rgba(255, 255, 255, 0.03));
+    border: 1px solid var(--edge, rgba(255, 255, 255, 0.08));
+    border-radius: 6px;
+    padding: 12px;
+  }
+
+  .events-scroll-container {
+    max-height: 200px;
+    overflow-y: auto;
+  }
+
+  .events-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.78rem;
+  }
+
+  .events-table th, .events-table td {
+    padding: 6px 8px;
+    text-align: left;
+    border-bottom: 1px solid var(--edge, rgba(255, 255, 255, 0.05));
+  }
+
+  .event-tag {
+    font-size: 0.7rem;
+    padding: 1px 5px;
+    background: rgba(59, 130, 246, 0.15);
+    color: #60a5fa;
+    border-radius: 3px;
+  }
+
+  .badge-resolved {
+    font-size: 0.68rem;
+    background: rgba(34, 197, 94, 0.15);
+    color: #4ade80;
+    padding: 1px 5px;
+    border-radius: 3px;
+  }
+
+  .badge-active {
+    font-size: 0.68rem;
+    background: rgba(234, 179, 8, 0.15);
+    color: #facc15;
+    padding: 1px 5px;
+    border-radius: 3px;
   }
 </style>

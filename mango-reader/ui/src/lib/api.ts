@@ -2019,6 +2019,8 @@ export interface IntegrityIssue {
   mangaId?: number | null;
   seriesTitle?: string | null;
   resolutionHint?: string | null;
+  storageType?: string | null;
+  affectedPaths?: string[];
 }
 
 export interface LibraryIntegrityReport {
@@ -2027,6 +2029,76 @@ export interface LibraryIntegrityReport {
   totalIssues: number;
   issuesBySeverity: Record<string, number>;
   issues: IntegrityIssue[];
+}
+
+export interface SeriesTimelineVolumeDto {
+  volumeNumber: number;
+  displayTitle: string;
+  status: string;
+  isOwned: boolean;
+  isReaderCached: boolean;
+  isCanonicalFile: boolean;
+  isGap: boolean;
+  gapType?: string | null;
+  releaseDate?: string | null;
+  releaseStatus?: string | null;
+  candidateCount: number;
+  topCandidateTitle?: string | null;
+  topCandidateSource?: string | null;
+  topCandidateScore?: number | null;
+  topCandidateAutoEligible?: boolean | null;
+  receiptId?: string | null;
+  canonicalPath?: string | null;
+  downloadJobId?: string | null;
+}
+
+export interface SeriesGapAnalysisDto {
+  totalVolumes: number;
+  ownedCount: number;
+  missingCount: number;
+  interiorGapCount: number;
+  leadingGapCount: number;
+  trailingGapCount: number;
+  hasInteriorGaps: boolean;
+  gapVolumeNumbers: number[];
+  summaryText: string;
+}
+
+export interface ReadingSourceSeparationDto {
+  canonicalKomgaCount: number;
+  canonicalVolumes: number[];
+  localStagingCount: number;
+  localStagingVolumes: number[];
+  readerChapterCount: number;
+  readerChaptersLatest?: number | null;
+  hasDuplicateStorage: boolean;
+  storageDistinctionNotes: string[];
+}
+
+export interface SeriesTimelineEventDto {
+  id: number;
+  eventType: string;
+  message: string;
+  volumeNumber?: number | null;
+  severity: string;
+  createdAt: number;
+  resolvedAt?: number | null;
+}
+
+export interface SeriesTimelineDto {
+  mangaId: number;
+  title: string;
+  sourceId: number;
+  mangabakaId?: number | null;
+  collectionId?: string | null;
+  collectionMarket?: string | null;
+  collectionEdition?: string | null;
+  reconciliationStatus: string;
+  autoAcquireEnabled: boolean;
+  volumes: SeriesTimelineVolumeDto[];
+  gaps: SeriesGapAnalysisDto;
+  readingSourceSeparation: ReadingSourceSeparationDto;
+  events: SeriesTimelineEventDto[];
 }
 
 export interface NotificationEventHistoryDto {
@@ -2055,6 +2127,12 @@ export type NotificationEventItem = NotificationEventHistoryDto;
 export const getTitleDiagnostics = (mangaId: number) =>
   get<TitleDiagnostics>(`/manga/${mangaId}/diagnostics`);
 
+export const getSeriesTimeline = (mangaId: number) =>
+  get<SeriesTimelineDto>(`/manga/${mangaId}/timeline`);
+
+export const getSeriesGaps = (mangaId: number) =>
+  get<SeriesGapAnalysisDto>(`/manga/${mangaId}/gaps`);
+
 export const inspectVolumeCandidates = (mangaId: number, volume: number) =>
   get<VolumeCandidateInspectionResult>(`/manga/${mangaId}/volumes/${volume}/candidates/inspect`);
 
@@ -2072,8 +2150,14 @@ export const clearManualTitleMapping = (mangaId: number) =>
 export const getReleaseCalendar = (market?: string) =>
   get<ReleaseCalendarEntryDto[]>(`/releases/calendar${market ? `?market=${encodeURIComponent(market)}` : ''}`);
 
-export const getLibraryIntegrity = () =>
-  get<LibraryIntegrityReport>('/system/integrity');
+export const getLibraryIntegrity = (params?: { severity?: string; category?: string; search?: string }) => {
+  const query = new URLSearchParams();
+  if (params?.severity) query.set('severity', params.severity);
+  if (params?.category) query.set('category', params.category);
+  if (params?.search) query.set('search', params.search);
+  const qs = query.toString();
+  return get<LibraryIntegrityReport>(`/system/integrity${qs ? `?${qs}` : ''}`);
+};
 
 export const getNotificationsHistory = (limit = 50, activeOnly = false) =>
   get<NotificationEventHistoryDto[]>(`/notifications/history?limit=${limit}&activeOnly=${activeOnly}`);

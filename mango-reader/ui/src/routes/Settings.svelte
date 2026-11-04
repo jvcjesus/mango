@@ -620,6 +620,9 @@
 
   let integrityReport = $state<LibraryIntegrityReport | null>(null);
   let integrityLoading = $state(false);
+  let integritySeverityFilter = $state<string>('ALL');
+  let integrityCategoryFilter = $state<string>('ALL');
+  let integritySearchQuery = $state<string>('');
 
   async function runIntegrityAudit() {
     integrityLoading = true;
@@ -2942,33 +2945,184 @@
               </div>
 
               {#if integrityReport.issues.length > 0}
+                <!-- Filter and Search Toolbar -->
+                <div class="integrity-filters-toolbar">
+                  <div class="filter-group-row">
+                    <div class="severity-pills" role="radiogroup" aria-label="Filter by Severity">
+                      <button
+                        type="button"
+                        class="btn mini pill"
+                        class:spot={integritySeverityFilter === 'ALL'}
+                        onclick={() => { integritySeverityFilter = 'ALL'; }}
+                      >
+                        All ({integrityReport.issues.length})
+                      </button>
+                      <button
+                        type="button"
+                        class="btn mini pill sev-crit"
+                        class:spot={integritySeverityFilter === 'CRITICAL'}
+                        onclick={() => { integritySeverityFilter = 'CRITICAL'; }}
+                      >
+                        Critical ({integrityReport.issuesBySeverity['CRITICAL'] || 0})
+                      </button>
+                      <button
+                        type="button"
+                        class="btn mini pill sev-act"
+                        class:spot={integritySeverityFilter === 'ACTION_REQUIRED'}
+                        onclick={() => { integritySeverityFilter = 'ACTION_REQUIRED'; }}
+                      >
+                        Action Required ({integrityReport.issuesBySeverity['ACTION_REQUIRED'] || 0})
+                      </button>
+                      <button
+                        type="button"
+                        class="btn mini pill sev-warn"
+                        class:spot={integritySeverityFilter === 'WARNING'}
+                        onclick={() => { integritySeverityFilter = 'WARNING'; }}
+                      >
+                        Warning ({integrityReport.issuesBySeverity['WARNING'] || 0})
+                      </button>
+                      <button
+                        type="button"
+                        class="btn mini pill sev-info"
+                        class:spot={integritySeverityFilter === 'INFO'}
+                        onclick={() => { integritySeverityFilter = 'INFO'; }}
+                      >
+                        Info ({integrityReport.issuesBySeverity['INFO'] || 0})
+                      </button>
+                    </div>
+
+                    <div class="category-pills" role="radiogroup" aria-label="Filter by Category">
+                      <button
+                        type="button"
+                        class="btn mini pill"
+                        class:spot={integrityCategoryFilter === 'ALL'}
+                        onclick={() => { integrityCategoryFilter = 'ALL'; }}
+                      >
+                        All Categories
+                      </button>
+                      <button
+                        type="button"
+                        class="btn mini pill"
+                        class:spot={integrityCategoryFilter === 'storage'}
+                        onclick={() => { integrityCategoryFilter = 'storage'; }}
+                      >
+                        Storage
+                      </button>
+                      <button
+                        type="button"
+                        class="btn mini pill"
+                        class:spot={integrityCategoryFilter === 'ownership'}
+                        onclick={() => { integrityCategoryFilter = 'ownership'; }}
+                      >
+                        Ownership
+                      </button>
+                      <button
+                        type="button"
+                        class="btn mini pill"
+                        class:spot={integrityCategoryFilter === 'identity'}
+                        onclick={() => { integrityCategoryFilter = 'identity'; }}
+                      >
+                        Identity
+                      </button>
+                      <button
+                        type="button"
+                        class="btn mini pill"
+                        class:spot={integrityCategoryFilter === 'notifications'}
+                        onclick={() => { integrityCategoryFilter = 'notifications'; }}
+                      >
+                        Notifications
+                      </button>
+                      <button
+                        type="button"
+                        class="btn mini pill"
+                        class:spot={integrityCategoryFilter === 'policy'}
+                        onclick={() => { integrityCategoryFilter = 'policy'; }}
+                      >
+                        Policy
+                      </button>
+                    </div>
+                  </div>
+
+                  <div class="search-input-row">
+                    <input
+                      type="text"
+                      class="integrity-search-input"
+                      placeholder="Filter by series title, code, or message…"
+                      bind:value={integritySearchQuery}
+                    />
+                    {#if integritySearchQuery}
+                      <button
+                        type="button"
+                        class="btn mini outline"
+                        onclick={() => { integritySearchQuery = ''; }}
+                      >
+                        Clear
+                      </button>
+                    {/if}
+                  </div>
+                </div>
+
+                {@const filteredIssues = integrityReport.issues.filter(issue => {
+                  if (integritySeverityFilter !== 'ALL' && issue.severity !== integritySeverityFilter) return false;
+                  if (integrityCategoryFilter !== 'ALL' && issue.category.toLowerCase() !== integrityCategoryFilter.toLowerCase()) return false;
+                  if (integritySearchQuery.trim()) {
+                    const q = integritySearchQuery.trim().toLowerCase();
+                    const titleMatch = issue.seriesTitle?.toLowerCase().includes(q) ?? false;
+                    const msgMatch = issue.message.toLowerCase().includes(q);
+                    const codeMatch = issue.code.toLowerCase().includes(q);
+                    const detailsMatch = issue.details?.toLowerCase().includes(q) ?? false;
+                    if (!titleMatch && !msgMatch && !codeMatch && !detailsMatch) return false;
+                  }
+                  return true;
+                })}
+
                 <div class="integrity-issues-list">
-                  <h4>Detected Issues ({integrityReport.issues.length})</h4>
-                  {#each integrityReport.issues as issue}
-                    <div class="issue-item issue-sev-{issue.severity.toLowerCase()}">
-                      <div class="issue-header">
-                        <span class="badge badge-sev badge-sev-{issue.severity.toLowerCase()}">{issue.severity}</span>
-                        <span class="issue-cat">{issue.category.replace(/_/g, ' ')}</span>
-                        {#if issue.mangaId}
-                          <a href="#/title/{issue.mangaId}" class="issue-title-link">
-                            {issue.seriesTitle ? `${issue.seriesTitle} (ID #${issue.mangaId})` : `Manga #${issue.mangaId}`}
-                          </a>
-                        {:else if issue.seriesTitle}
-                          <span class="issue-title">{issue.seriesTitle}</span>
+                  <h4>Filtered Issues ({filteredIssues.length} of {integrityReport.issues.length})</h4>
+                  {#if filteredIssues.length === 0}
+                    <div class="empty-state font-small muted">
+                      No issues match the selected severity, category, or search filters.
+                    </div>
+                  {:else}
+                    {#each filteredIssues as issue}
+                      <div class="issue-item issue-sev-{issue.severity.toLowerCase()}">
+                        <div class="issue-header">
+                          <span class="badge badge-sev badge-sev-{issue.severity.toLowerCase()}">{issue.severity}</span>
+                          <span class="issue-cat">{issue.category.replace(/_/g, ' ')}</span>
+                          {#if issue.storageType === 'canonical_and_staging'}
+                            <span class="badge badge-storage-dual" title="Present in canonical library and historical download staging">
+                              Dual Storage: Canonical + Staging
+                            </span>
+                          {:else if issue.storageType === 'duplicate_canonical'}
+                            <span class="badge badge-storage-dup" title="Multiple files in canonical storage">
+                              Duplicate Canonical
+                            </span>
+                          {:else if issue.storageType === 'duplicate_staging'}
+                            <span class="badge badge-storage-staging" title="Multiple files in download staging">
+                              Duplicate Staging
+                            </span>
+                          {/if}
+                          {#if issue.mangaId}
+                            <a href="#/title/{issue.mangaId}" class="issue-title-link">
+                              {issue.seriesTitle ? `${issue.seriesTitle} (ID #${issue.mangaId})` : `Manga #${issue.mangaId}`}
+                              <Icon name="chevron-right" size={14} />
+                            </a>
+                          {:else if issue.seriesTitle}
+                            <span class="issue-title">{issue.seriesTitle}</span>
+                          {/if}
+                        </div>
+                        <div class="issue-desc">{issue.message}</div>
+                        {#if issue.details}
+                          <div class="issue-desc font-small muted monospace">{issue.details}</div>
+                        {/if}
+                        {#if issue.resolutionHint}
+                          <div class="issue-hint">
+                            <Icon name="info" size={13} />
+                            <span><strong>Resolution:</strong> {issue.resolutionHint}</span>
+                          </div>
                         {/if}
                       </div>
-                      <div class="issue-desc">{issue.message}</div>
-                      {#if issue.details}
-                        <div class="issue-desc font-small muted monospace">{issue.details}</div>
-                      {/if}
-                      {#if issue.resolutionHint}
-                        <div class="issue-hint">
-                          <Icon name="info" size={13} />
-                          <span><strong>Resolution:</strong> {issue.resolutionHint}</span>
-                        </div>
-                      {/if}
-                    </div>
-                  {/each}
+                    {/each}
+                  {/if}
                 </div>
               {/if}
             {/if}
@@ -5354,6 +5508,79 @@
     background: var(--surface-2, rgba(255, 255, 255, 0.03));
     padding: 4px 8px;
     border-radius: 4px;
+  }
+
+  /* M6.12 Integrity UX Filters & Storage Badges */
+  .integrity-filters-toolbar {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin-bottom: 14px;
+    padding: 10px 14px;
+    background: var(--surface-2, rgba(255, 255, 255, 0.03));
+    border: 1px solid var(--edge, rgba(255, 255, 255, 0.08));
+    border-radius: 6px;
+  }
+
+  .filter-group-row {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+
+  .severity-pills, .category-pills {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+
+  .search-input-row {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+
+  .integrity-search-input {
+    flex: 1;
+    min-width: 220px;
+    font-size: 0.85rem;
+    padding: 6px 12px;
+    background: var(--surface-1, rgba(255, 255, 255, 0.05));
+    border: 1px solid var(--edge, rgba(255, 255, 255, 0.1));
+    border-radius: 4px;
+    color: var(--ink);
+  }
+
+  .badge-storage-dual {
+    background: rgba(147, 51, 234, 0.15);
+    border: 1px solid rgba(147, 51, 234, 0.4);
+    color: #c084fc;
+    font-size: 0.72rem;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-weight: 600;
+  }
+
+  .badge-storage-dup {
+    background: rgba(239, 68, 68, 0.15);
+    border: 1px solid rgba(239, 68, 68, 0.4);
+    color: #f87171;
+    font-size: 0.72rem;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-weight: 600;
+  }
+
+  .badge-storage-staging {
+    background: rgba(234, 179, 8, 0.15);
+    border: 1px solid rgba(234, 179, 8, 0.4);
+    color: #facc15;
+    font-size: 0.72rem;
+    padding: 2px 6px;
+    border-radius: 4px;
+    font-weight: 600;
   }
 
   /* Notification Events Audit Styles */
