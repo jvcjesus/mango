@@ -364,7 +364,39 @@ impl AcquisitionService {
             .await
     }
 
-    /// Fetches Madokami credentials from DB state or environment.
+    /// Helper to extract configured credentials from the Keiyoushi Madokami extension settings file if present.
+    fn load_madokami_extension_credentials() -> (Option<String>, Option<String>) {
+        let candidate_paths = [
+            std::path::PathBuf::from("/data/host/settings/source_7291521832235473745.xml"),
+            std::path::PathBuf::from("data/host/settings/source_7291521832235473745.xml"),
+            std::path::PathBuf::from("/srv/apps/manga/mango-fork-test/data/host/settings/source_7291521832235473745.xml"),
+        ];
+        for path in &candidate_paths {
+            if let Ok(content) = std::fs::read_to_string(path) {
+                let u = Self::extract_xml_tag_value(&content, "username");
+                let p = Self::extract_xml_tag_value(&content, "password");
+                if u.is_some() || p.is_some() {
+                    return (u, p);
+                }
+            }
+        }
+        (None, None)
+    }
+
+    pub fn extract_xml_tag_value(xml: &str, tag_name: &str) -> Option<String> {
+        let pattern = format!(r#"name="{}">"#, tag_name);
+        let start = xml.find(&pattern)? + pattern.len();
+        let end = xml[start..].find("</string>")? + start;
+        let val = xml[start..end].trim().to_string();
+        if val.is_empty() {
+            None
+        } else {
+            Some(val)
+        }
+    }
+
+    /// Fetches Madokami credentials from DB state or environment, falling back to
+    /// the Keiyoushi Madokami extension preferences file if configured.
     pub async fn get_madokami_credentials(&self) -> Result<(Option<String>, Option<String>)> {
         self.db
             .call(|conn| {
@@ -372,7 +404,11 @@ impl AcquisitionService {
                     .or_else(|| std::env::var("MADOKAMI_USERNAME").ok());
                 let p = crate::db::state(conn, "acquisition.madokami_password")?
                     .or_else(|| std::env::var("MADOKAMI_PASSWORD").ok());
-                Ok((u, p))
+                if u.is_some() && p.is_some() {
+                    return Ok((u, p));
+                }
+                let (ext_u, ext_p) = Self::load_madokami_extension_credentials();
+                Ok((u.or(ext_u), p.or(ext_p)))
             })
             .await
     }

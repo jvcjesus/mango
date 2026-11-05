@@ -226,6 +226,33 @@ pub struct Rules {
     pub anyone_installs: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SourceVerifyResponse {
+    pub ok: bool,
+    pub status: String,
+    pub message: String,
+    pub count: Option<usize>,
+}
+
+/// Sanitizes preference changes, trimming whitespace from usernames and stripping accidental
+/// newlines/carriage-returns from passwords copied from password managers.
+pub fn sanitize_preference_change(change: &Value) -> Value {
+    let mut change = change.clone();
+    if let Some(obj) = change.as_object_mut() {
+        let key = obj.get("key").and_then(|v| v.as_str()).unwrap_or("").to_lowercase();
+        if let Some(val_str) = obj.get("value").and_then(|v| v.as_str()) {
+            if key.contains("username") {
+                obj.insert("value".to_string(), Value::String(val_str.trim().to_string()));
+            } else if key.contains("password") {
+                let cleaned = val_str.trim_matches(|c: char| c == '\r' || c == '\n').trim().to_string();
+                obj.insert("value".to_string(), Value::String(cleaned));
+            }
+        }
+    }
+    change
+}
+
 #[derive(Clone)]
 pub struct Stores {
     db: Db,
@@ -525,7 +552,57 @@ impl Stores {
 
     /// Changes one preference. Answers with the list as it is afterwards.
     pub async fn set_preference(&self, id: i64, change: &Value) -> Result<Value> {
-        self.preference_call(id, Method::PUT, Some(change)).await
+        let sanitized = sanitize_preference_change(change);
+        self.preference_call(id, Method::PUT, Some(&sanitized)).await
+    }
+
+    /// Verifies connectivity and authentication credentials for a source by executing a probe against its listing.
+    pub async fn verify_source(&self, id: i64) -> Result<SourceVerifyResponse> {
+        let pkg: Option<String> =
+            self.db.call(move |conn| Ok(conn.query_row("SELECT pkg FROM sources WHERE id = ?1", [id], |r| r.get(0)).optional()?)).await?;
+        match pkg.as_deref() {
+            None => Err(AppError::new(404, "unknown_source", "No installed extension provides this source")),
+            Some(LOCAL_PKG) => Ok(SourceVerifyResponse {
+                ok: true,
+                status: "verified".to_string(),
+                message: "Local filesystem source is available and requires no authentication.".to_string(),
+                count: None,
+            }),
+            Some(_) => {
+                #[derive(Deserialize)]
+                #[serde(rename_all = "camelCase")]
+                struct Found {
+                    mangas: Vec<Value>,
+                }
+                let body = json!({ "page": 1, "query": "", "filters": [] });
+                let opts = Call {
+                    source: Some(id),
+                    timeout: Some(Duration::from_secs(25)),
+                    ..Call::default()
+                };
+                match self.host.call::<Found>(Method::POST, &format!("/sources/{id}/popular"), Some(&body), opts).await {
+                    Ok(found) => Ok(SourceVerifyResponse {
+                        ok: true,
+                        status: "verified".to_string(),
+                        message: format!("Authentication verified successfully (retrieved {} items).", found.mangas.len()),
+                        count: Some(found.mangas.len()),
+                    }),
+                    Err(e) => {
+                        let status = match e.code.as_str() {
+                            "authentication_failed" => "authentication_failed",
+                            "credentials_missing" => "credentials_missing",
+                            _ => "error",
+                        };
+                        Ok(SourceVerifyResponse {
+                            ok: false,
+                            status: status.to_string(),
+                            message: e.message,
+                            count: None,
+                        })
+                    }
+                }
+            }
+        }
     }
 
     async fn preference_call(&self, id: i64, method: Method, body: Option<&Value>) -> Result<Value> {
@@ -1310,5 +1387,32 @@ mod tests {
         assert!(http_url("https://example.org/repo.json").is_ok());
         assert!(http_url("file:///etc/passwd").is_err());
         assert!(http_url("not a url").is_err());
+    }
+
+    #[test]
+    fn test_sanitize_preference_change_username_and_password() {
+        let user_change = json!({
+            "position": 0,
+            "key": "username",
+            "value": "  my_username  "
+        });
+        let sanitized_user = sanitize_preference_change(&user_change);
+        assert_eq!(sanitized_user["value"], "my_username");
+
+        let pass_change = json!({
+            "position": 1,
+            "key": "password",
+            "value": "secret_pass\r\n"
+        });
+        let sanitized_pass = sanitize_preference_change(&pass_change);
+        assert_eq!(sanitized_pass["value"], "secret_pass");
+
+        let other_change = json!({
+            "position": 2,
+            "key": "filter_tag",
+            "value": " some value "
+        });
+        let sanitized_other = sanitize_preference_change(&other_change);
+        assert_eq!(sanitized_other["value"], " some value ");
     }
 }

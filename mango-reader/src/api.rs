@@ -112,6 +112,7 @@ pub fn router(state: Spaces) -> Router {
             "/sources/{id}/preferences",
             get(source_preferences).put(set_source_preference),
         )
+        .route("/sources/{id}/verify", post(verify_source))
         .route("/sources/{id}/filters", get(source_filters))
         .route("/sources/{id}/{kind}", get(browse))
         .route("/manga/{id}", get(title))
@@ -1026,6 +1027,17 @@ async fn set_source_preference(
         app.me.admin()?;
     }
     Ok(Json(app.stores.set_preference(id, &change).await?))
+}
+
+/// Verifies whether the source credentials and connection authenticate against the remote service.
+async fn verify_source(
+    Me(app): Me,
+    Path(id): Path<i64>,
+) -> Result<Json<crate::store::SourceVerifyResponse>> {
+    if !app.stores.open_to(&app.me) {
+        app.me.admin()?;
+    }
+    Ok(Json(app.stores.verify_source(id).await?))
 }
 
 // ---------- browse and titles ----------

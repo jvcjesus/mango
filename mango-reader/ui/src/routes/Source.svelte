@@ -164,6 +164,14 @@
   </div>
 
   <Notice {loading} {error} retry={() => load(items.length === 0)} />
+  {#if error && source && (error.includes('Extensions > Details') || error.includes('credentials') || error.includes('Authentication'))}
+    <div class="auth-action">
+      <a class="btn spot" href="#/extension/{source.pkg}">
+        <Icon name="sliders" size={16} stroke={3} />
+        Open Extension Settings
+      </a>
+    </div>
+  {/if}
   {#if !loading && !error && items.length === 0}
     <Notice>Nothing here.</Notice>
   {/if}
@@ -205,5 +213,11 @@
   .more {
     display: flex;
     justify-content: center;
+  }
+
+  .auth-action {
+    display: flex;
+    justify-content: center;
+    margin-top: 14px;
   }
 </style>

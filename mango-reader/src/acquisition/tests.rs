@@ -3125,3 +3125,26 @@ fn dummy_missing_summary() -> crate::acquisition::missing::MissingContentSummary
         explanation: "".into(),
     }
 }
+
+#[test]
+fn test_madokami_extension_xml_tag_extraction() {
+    let xml = r#"<?xml version='1.0' encoding='utf-8' standalone='yes' ?>
+<map>
+    <string name="password">secret123!</string>
+    <string name="username">test_user</string>
+    <boolean name="prefer_upload_date" value="true" />
+</map>"#;
+
+    assert_eq!(
+        crate::acquisition::service::AcquisitionService::extract_xml_tag_value(xml, "username"),
+        Some("test_user".to_string())
+    );
+    assert_eq!(
+        crate::acquisition::service::AcquisitionService::extract_xml_tag_value(xml, "password"),
+        Some("secret123!".to_string())
+    );
+    assert_eq!(
+        crate::acquisition::service::AcquisitionService::extract_xml_tag_value(xml, "missing"),
+        None
+    );
+}

@@ -20,6 +20,11 @@
   let drafts = $state<Record<number, string>>({});
   // Counts the changes that failed, so the controls are drawn again from what is kept.
   let drawn = $state(0);
+  // Tracks password reveal toggles by position
+  let revealed = $state<Record<number, boolean>>({});
+  // Source verification state
+  let verifying = $state(false);
+  let verifyResult = $state<{ ok: boolean; status: string; message: string } | null>(null);
 
   const shown = $derived(prefs.filter((pref) => pref.visible));
 
@@ -53,6 +58,8 @@
     open = source.id;
     prefs = [];
     drafts = {};
+    revealed = {};
+    verifyResult = null;
     trouble = null;
     asking = true;
     try {
@@ -62,6 +69,30 @@
       if (open === source.id) trouble = message(e);
     }
     if (open === source.id) asking = false;
+  }
+
+  async function verifySource(source: Source) {
+    verifying = true;
+    verifyResult = null;
+    try {
+      const res = await send<{ ok: boolean; status: string; message: string; count?: number }>(
+        'POST',
+        `/sources/${source.id}/verify`,
+        {},
+      );
+      verifyResult = { ok: res.ok, status: res.status, message: res.message };
+      if (res.ok) {
+        toast.success(res.message);
+      } else {
+        toast.error(res.message);
+      }
+    } catch (e) {
+      const msg = message(e);
+      verifyResult = { ok: false, status: 'error', message: msg };
+      toast.error(msg);
+    } finally {
+      verifying = false;
+    }
   }
 
   async function set(pref: SourcePref, value: boolean | string | string[]) {
@@ -195,15 +226,29 @@
                             {/each}
                           </div>
                         {:else if pref.type === 'text'}
+                          {@const isPassword = pref.key?.toLowerCase().includes('password') || pref.title?.toLowerCase().includes('password')}
                           <form class="tools" onsubmit={(e) => save(e, pref)}>
                             <label class="field">
                               <span class="sr">{pref.title}</span>
                               <input
+                                type={isPassword && !revealed[pref.position] ? 'password' : 'text'}
                                 value={drafts[pref.position] ?? (typeof pref.value === 'string' ? pref.value : '')}
                                 oninput={(e) => (drafts[pref.position] = e.currentTarget.value)}
                                 disabled={off}
+                                autocomplete={isPassword ? 'current-password' : 'off'}
                               />
                             </label>
+                            {#if isPassword}
+                              <button
+                                type="button"
+                                class="btn icon"
+                                title={revealed[pref.position] ? 'Hide password' : 'Show password'}
+                                aria-label={revealed[pref.position] ? 'Hide password' : 'Show password'}
+                                onclick={() => (revealed[pref.position] = !revealed[pref.position])}
+                              >
+                                <Icon name={revealed[pref.position] ? 'eyeoff' : 'eye'} size={18} />
+                              </button>
+                            {/if}
                             <button class="btn ink" disabled={off || drafts[pref.position] === undefined}>
                               {#if saving}
                                 <span class="spin"><Icon name="spinner" size={16} stroke={3} /></span>
@@ -215,6 +260,29 @@
                       </div>
                     {/each}
                   {/key}
+                  {#if shown.length > 0}
+                    <div class="verify-action">
+                      <button
+                        type="button"
+                        class="btn spot"
+                        disabled={asking || saving || verifying}
+                        onclick={() => verifySource(source)}
+                      >
+                        {#if verifying}
+                          <span class="spin"><Icon name="spinner" size={16} stroke={3} /></span>
+                          Testing Connection…
+                        {:else}
+                          <Icon name="check" size={16} stroke={3} />
+                          Test Connection / Verify Login
+                        {/if}
+                      </button>
+                      {#if verifyResult}
+                        <div class="verify-badge" class:ok={verifyResult.ok} class:fail={!verifyResult.ok}>
+                          {verifyResult.message}
+                        </div>
+                      {/if}
+                    </div>
+                  {/if}
                   {#if !trouble && shown.length === 0}<p class="muted">This source has nothing to set.</p>{/if}
                 {/if}
               </div>
@@ -319,5 +387,35 @@
   .prefs p {
     margin: 0;
     font-weight: 700;
+  }
+
+  .verify-action {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 12px;
+    margin-top: 14px;
+    padding-top: 14px;
+    border-top: 2px dashed var(--ink);
+  }
+
+  .verify-badge {
+    padding: 6px 14px;
+    font-size: 13px;
+    font-weight: 700;
+    border: 2px solid var(--ink);
+    box-shadow: var(--sh-3);
+    max-width: 100%;
+    overflow-wrap: anywhere;
+  }
+
+  .verify-badge.ok {
+    background: #d4edda;
+    color: #155724;
+  }
+
+  .verify-badge.fail {
+    background: #f8d7da;
+    color: #721c24;
   }
 </style>

@@ -552,15 +552,36 @@ fn noise(line: &str) -> bool {
     line.starts_with('[') && line.contains(":ERROR:dbus/")
 }
 
+/// Clarifies extension-level authentication and configuration errors so that
+/// the user is given an actionable, accurate diagnosis instead of misleading "logged out" text.
+pub fn map_host_error_details(status: u16, code: &str, message: &str) -> (u16, String, String) {
+    if message.contains("You are currently logged out") {
+        (
+            401,
+            "authentication_failed".to_string(),
+            "Authentication failed (HTTP 401 Unauthorized): The remote source rejected the username or password. Please verify your credentials under Extensions > Details.".to_string(),
+        )
+    } else if message.contains("Username or password cannot be empty") {
+        (
+            400,
+            "credentials_missing".to_string(),
+            "Authentication required: Username and password must be configured under Extensions > Details.".to_string(),
+        )
+    } else {
+        // A 401 or 500 from the host is the core's fault or the host's bug, never the caller's.
+        let status = if matches!(status, 401 | 500) { 502 } else { status };
+        (status, code.to_string(), message.to_string())
+    }
+}
+
 /// The error a failed host answer describes.
 async fn host_error(response: reqwest::Response) -> AppError {
     let status = response.status().as_u16();
     let body: Value = response.json().await.unwrap_or(Value::Null);
     let code = body["error"]["code"].as_str().unwrap_or("host_error");
     let message = body["error"]["message"].as_str().unwrap_or("The extension host reported an error");
-    // A 401 or 500 from the host is the core's fault or the host's bug, never the caller's.
-    let status = if matches!(status, 401 | 500) { 502 } else { status };
-    AppError::new(status, code, message)
+    let (status, code, message) = map_host_error_details(status, code, message);
+    AppError::new(status, &code, message)
 }
 
 fn backoff(failures: u32) -> Duration {
@@ -616,5 +637,42 @@ mod tests {
         assert_eq!(backoff(1), Duration::from_millis(500));
         assert_eq!(backoff(3), Duration::from_secs(2));
         assert_eq!(backoff(40), MAX_BACKOFF);
+    }
+
+    #[test]
+    fn test_map_host_error_details_authentication_failed() {
+        let (status, code, msg) = map_host_error_details(
+            502,
+            "source_error",
+            "You are currently logged out.\nGo to Extensions > Details to input your credentials.",
+        );
+        assert_eq!(status, 401);
+        assert_eq!(code, "authentication_failed");
+        assert!(msg.contains("HTTP 401 Unauthorized"));
+        assert!(msg.contains("Extensions > Details"));
+    }
+
+    #[test]
+    fn test_map_host_error_details_credentials_missing() {
+        let (status, code, msg) = map_host_error_details(
+            502,
+            "source_error",
+            "Username or password cannot be empty.\nGo to Extensions > Details to input your credentials.",
+        );
+        assert_eq!(status, 400);
+        assert_eq!(code, "credentials_missing");
+        assert!(msg.contains("Username and password must be configured"));
+    }
+
+    #[test]
+    fn test_map_host_error_details_generic_error() {
+        let (status, code, msg) = map_host_error_details(
+            500,
+            "internal_error",
+            "NullPointerException in extension",
+        );
+        assert_eq!(status, 502);
+        assert_eq!(code, "internal_error");
+        assert_eq!(msg, "NullPointerException in extension");
     }
 }
