@@ -254,7 +254,11 @@ COPY --from=core /mango /usr/local/bin/mango
 RUN mkdir -p /opt/mango/bin
 COPY --from=optimizer /RustyLibraryShrinker /opt/mango/bin/RustyLibraryShrinker
 RUN chmod 755 /opt/mango/bin/RustyLibraryShrinker \
- && ln -sf /opt/mango/bin/RustyLibraryShrinker /usr/local/bin/RustyLibraryShrinker
+ && ln -sf /opt/mango/bin/RustyLibraryShrinker /opt/mango/bin/rusty-library-shrinker \
+ && ln -sf /opt/mango/bin/RustyLibraryShrinker /opt/mango/bin/rustylibraryshrinker \
+ && ln -sf /opt/mango/bin/RustyLibraryShrinker /usr/local/bin/RustyLibraryShrinker \
+ && ln -sf /opt/mango/bin/RustyLibraryShrinker /usr/local/bin/rusty-library-shrinker \
+ && ln -sf /opt/mango/bin/RustyLibraryShrinker /usr/local/bin/rustylibraryshrinker
 USER mango
 # `mango.toml` is looked for here, so it can live in the volume.
 WORKDIR /data

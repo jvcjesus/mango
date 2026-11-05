@@ -1377,6 +1377,50 @@ export const getNormalizationHistory = (limit: number = 50) =>
 export const rollbackNormalizationRecord = (id: string) =>
   send<NormalizationHistoryRecord>('POST', `/pipeline/maintenance/rollback/${encodeURIComponent(id)}`, {});
 
+export interface StagingItem {
+  filePath: string;
+  fileName: string;
+  sizeBytes: number;
+  sha256?: string;
+  classification: string;
+  reason: string;
+  relatedChapterId?: number;
+  relatedMangaId?: number;
+  seriesTitle?: string;
+  canonicalDestination?: string;
+  canonicalReceiptId?: string;
+  ownershipVerified: boolean;
+  activeDependencyDetected: boolean;
+  reclaimableBytes: number;
+}
+
+export interface StagingInventoryReport {
+  totalFiles: number;
+  totalStagingBytes: number;
+  activeTransferBytes: number;
+  verifiedDuplicateBytes: number;
+  failedRecoveryBytes: number;
+  unknownBytes: number;
+  estimatedReclaimableBytes: number;
+  items: StagingItem[];
+  generatedAt: number;
+}
+
+export interface CleanupManifest {
+  manifestId: string;
+  generatedAt: number;
+  executionEnabled: boolean;
+  eligibleItems: StagingItem[];
+  blockedItems: StagingItem[];
+  totalStagedBytes: number;
+  estimatedReclaimableBytes: number;
+  quarantineRecommended: boolean;
+  notice: string;
+}
+
+export const getStagingInventory = () => get<StagingInventoryReport>('/pipeline/staging/inventory');
+export const previewStagingCleanup = () => send<CleanupManifest>('POST', '/pipeline/staging/preview', {});
+
 export type ReconciliationStatus = 'up_to_date' | 'missing_volume' | 'review_required' | 'sync_error' | 'collection_unavailable';
 
 export interface ReconciliationSummary {

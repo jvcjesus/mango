@@ -342,6 +342,8 @@ pub fn router(state: Spaces) -> Router {
             "/pipeline/maintenance/rollback/{id}",
             post(post_maintenance_rollback),
         )
+        .route("/pipeline/staging/inventory", get(get_staging_inventory))
+        .route("/pipeline/staging/preview", post(post_staging_cleanup_preview))
         .route(
             "/imports/payload/{id}/cleanup",
             post(cleanup_import_payload),
@@ -2175,6 +2177,38 @@ async fn post_maintenance_rollback(
         .await?;
 
     Ok(Json(rec))
+}
+
+async fn get_staging_inventory(
+    Me(app): Me,
+) -> Result<Json<crate::pipeline::staging::StagingInventoryReport>> {
+    app.me.admin()?;
+    let config = app.pipeline.load_config().await?;
+    let downloads_dir = app.downloads.dir();
+    let library_dir = config.library_dir.as_ref().map(std::path::PathBuf::from);
+    let inventory = crate::pipeline::staging::generate_staging_inventory(
+        &app.db,
+        downloads_dir,
+        library_dir.as_deref(),
+    )
+    .await?;
+    Ok(Json(inventory))
+}
+
+async fn post_staging_cleanup_preview(
+    Me(app): Me,
+) -> Result<Json<crate::pipeline::staging::CleanupManifest>> {
+    app.me.admin()?;
+    let config = app.pipeline.load_config().await?;
+    let downloads_dir = app.downloads.dir();
+    let library_dir = config.library_dir.as_ref().map(std::path::PathBuf::from);
+    let manifest = crate::pipeline::staging::generate_cleanup_manifest(
+        &app.db,
+        downloads_dir,
+        library_dir.as_deref(),
+    )
+    .await?;
+    Ok(Json(manifest))
 }
 
 #[derive(Debug, Clone, Serialize)]

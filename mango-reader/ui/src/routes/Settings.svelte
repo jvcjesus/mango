@@ -64,6 +64,11 @@
     getLibraryIntegrity,
     type LibraryIntegrityReport,
     type IntegrityIssue,
+    getStagingInventory,
+    previewStagingCleanup,
+    type StagingInventoryReport,
+    type CleanupManifest,
+    type StagingItem,
   } from '../lib/api';
   import { confirm } from '../lib/confirm.svelte';
   import { COVERS, display, MENUS, setDisplay, SIZES } from '../lib/display.svelte';
@@ -637,6 +642,41 @@
       toast.error(message(e));
     } finally {
       integrityLoading = false;
+    }
+  }
+
+  // ---------- Staging Lifecycle & Cleanup Preview (M7.1) ----------
+  let stagingReport = $state<StagingInventoryReport | null>(null);
+  let stagingLoading = $state<boolean>(false);
+  let stagingManifest = $state<CleanupManifest | null>(null);
+  let stagingManifestLoading = $state<boolean>(false);
+  let stagingError = $state<string | null>(null);
+
+  async function loadStagingInventory() {
+    stagingLoading = true;
+    stagingError = null;
+    try {
+      stagingReport = await getStagingInventory();
+      toast.success(`Staging scanned: ${stagingReport.totalFiles} files (${sized(stagingReport.totalStagingBytes)})`);
+    } catch (e: any) {
+      stagingError = message(e);
+      toast.error(stagingError);
+    } finally {
+      stagingLoading = false;
+    }
+  }
+
+  async function loadCleanupPreview() {
+    stagingManifestLoading = true;
+    stagingError = null;
+    try {
+      stagingManifest = await previewStagingCleanup();
+      toast.info(`Cleanup preview ready: ${stagingManifest.eligibleItems.length} eligible, ${stagingManifest.blockedItems.length} blocked`);
+    } catch (e: any) {
+      stagingError = message(e);
+      toast.error(stagingError);
+    } finally {
+      stagingManifestLoading = false;
     }
   }
 
@@ -3128,6 +3168,108 @@
             {/if}
           </section>
 
+          <!-- Staging Storage Hygiene & Cleanup Manifest (M7.1) -->
+          <section class="card">
+            <div class="card-header-row">
+              <div>
+                <h3>Staging Storage Hygiene & Cleanup Preview</h3>
+                <span class="muted font-small">Safety-first inventory and preview manifest for staged/downloaded manga archives. Real deletion is strictly preview-only in M7.</span>
+              </div>
+              <div class="left-actions">
+                <button class="btn small" onclick={loadStagingInventory} disabled={stagingLoading || stagingManifestLoading}>
+                  <Icon name={stagingLoading ? 'spinner' : 'search'} size={16} />
+                  {stagingLoading ? 'Scanning…' : 'Scan Staging'}
+                </button>
+                <button class="btn small spot" onclick={loadCleanupPreview} disabled={stagingLoading || stagingManifestLoading}>
+                  <Icon name={stagingManifestLoading ? 'spinner' : 'check'} size={16} />
+                  {stagingManifestLoading ? 'Generating…' : 'Cleanup Preview'}
+                </button>
+              </div>
+            </div>
+
+            {#if stagingError}
+              <Notice error={stagingError} />
+            {/if}
+
+            {#if !stagingReport && !stagingLoading}
+              <div class="empty-state">
+                Click "Scan Staging" to inspect staged artifacts, active transfers, and verified duplicates.
+              </div>
+            {:else if stagingReport}
+              <div class="analysis-summary-grid">
+                <div class="metric-card">
+                  <span class="metric-val">{stagingReport.totalFiles}</span>
+                  <span class="metric-lbl">Total Files</span>
+                </div>
+                <div class="metric-card">
+                  <span class="metric-val">{sized(stagingReport.totalStagingBytes)}</span>
+                  <span class="metric-lbl">Staged Storage</span>
+                </div>
+                <div class="metric-card metric-already">
+                  <span class="metric-val">{sized(stagingReport.activeTransferBytes)}</span>
+                  <span class="metric-lbl">Active Transfers</span>
+                </div>
+                <div class="metric-card metric-matched">
+                  <span class="metric-val">{sized(stagingReport.verifiedDuplicateBytes)}</span>
+                  <span class="metric-lbl">Verified Duplicates</span>
+                </div>
+                <div class="metric-card metric-update">
+                  <span class="metric-val">{sized(stagingReport.estimatedReclaimableBytes)}</span>
+                  <span class="metric-lbl">Est. Reclaimable</span>
+                </div>
+              </div>
+
+              {#if stagingManifest}
+                <div class="integrity-summary-banner banner-warning">
+                  <div class="banner-main">
+                    <strong>⚠️ {stagingManifest.manifestId} — Execution Locked</strong>
+                    <span>{stagingManifest.notice}</span>
+                  </div>
+                </div>
+
+                <div class="staging-manifest-summary">
+                  <span class="pill-badge active">Eligible: {stagingManifest.eligibleItems.length}</span>
+                  <span class="pill-badge paused">Blocked: {stagingManifest.blockedItems.length}</span>
+                  <span class="muted font-small">Reclaimable if approved: {sized(stagingManifest.estimatedReclaimableBytes)}</span>
+                </div>
+              {/if}
+
+              {#if stagingReport.items.length > 0}
+                <div class="normalization-table-wrap">
+                  {#each stagingReport.items as item}
+                    <div class="diagnostic-card">
+                      <div class="diag-header-row">
+                        <div class="diag-title-area">
+                          <strong>{item.fileName}</strong>
+                          {#if item.seriesTitle}
+                            <span class="muted font-small">({item.seriesTitle})</span>
+                          {/if}
+                        </div>
+                        <div class="diag-badges">
+                          <span class="pill-badge {item.classification === 'PUBLISHED_VERIFIED_DUPLICATE' && !item.activeDependencyDetected ? 'active' : 'paused'}">
+                            {item.classification}
+                          </span>
+                          {#if item.activeDependencyDetected}
+                            <span class="pill-badge error">Active Chapter Ref</span>
+                          {/if}
+                          <span class="muted font-small">{sized(item.sizeBytes)}</span>
+                        </div>
+                      </div>
+                      <div class="diag-body font-small">
+                        <span>{item.reason}</span>
+                        {#if item.canonicalDestination}
+                          <span class="muted">Canonical: <code>{item.canonicalDestination}</code></span>
+                        {/if}
+                      </div>
+                    </div>
+                  {/each}
+                </div>
+              {:else}
+                <p class="muted font-small">No staged files found in downloads folder.</p>
+              {/if}
+            {/if}
+          </section>
+
           <section class="card">
             <h3>Recent Pipeline Activity</h3>
             {#if pipelineEvents.length === 0}
@@ -5030,6 +5172,14 @@
     border-radius: 6px;
     font-size: 0.82rem;
     color: var(--spot, #ff7a00);
+  }
+
+  .staging-manifest-summary {
+    display: flex;
+    gap: 0.75rem;
+    align-items: center;
+    margin: 0.75rem 0;
+    flex-wrap: wrap;
   }
 
   /* Library Normalization & Maintenance Styles */

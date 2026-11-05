@@ -17,6 +17,7 @@ pub mod optimizer;
 pub mod ownership;
 pub mod publisher;
 pub mod receipts;
+pub mod staging;
 pub mod validation;
 
 use crate::db::Db;
