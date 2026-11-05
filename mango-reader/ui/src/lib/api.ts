@@ -393,6 +393,9 @@ export interface OptimizerValidationResult {
   code: 'valid' | 'not_configured' | 'missing' | 'not_a_file' | 'not_executable' | 'failed';
   message: string;
   version: string | null;
+  detected_architecture?: string | null;
+  is_operational?: boolean;
+  verified_at?: number | null;
 }
 
 export interface ValidatePathsResponse {
@@ -1382,6 +1385,7 @@ export interface StagingItem {
   fileName: string;
   sizeBytes: number;
   sha256?: string;
+  canonicalSha256?: string;
   classification: string;
   reason: string;
   relatedChapterId?: number;
@@ -1392,6 +1396,9 @@ export interface StagingItem {
   ownershipVerified: boolean;
   activeDependencyDetected: boolean;
   reclaimableBytes: number;
+  missingEvidence?: string[];
+  eligibilityDecision?: 'ELIGIBLE' | 'BLOCKED' | string;
+  verificationTimestamp?: number;
 }
 
 export interface StagingInventoryReport {
@@ -1408,6 +1415,7 @@ export interface StagingInventoryReport {
 
 export interface CleanupManifest {
   manifestId: string;
+  verificationIdentity?: string;
   generatedAt: number;
   executionEnabled: boolean;
   eligibleItems: StagingItem[];

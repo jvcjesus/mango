@@ -58,6 +58,12 @@ pub struct OptimizerValidationResult {
     pub code: OptimizerValidationCode,
     pub message: String,
     pub version: Option<String>,
+    #[serde(default)]
+    pub detected_architecture: Option<String>,
+    #[serde(default)]
+    pub is_operational: bool,
+    #[serde(default)]
+    pub verified_at: Option<i64>,
 }
 
 impl OptimizerValidationResult {
@@ -118,6 +124,12 @@ pub fn resolve_optimizer_binary(custom_bin: Option<&str>) -> (Option<PathBuf>, &
     if let Some(in_path) = find_in_path("RustyLibraryShrinker") {
         return (Some(in_path), "path");
     }
+    if let Some(in_path) = find_in_path("rusty-library-shrinker") {
+        return (Some(in_path), "path");
+    }
+    if let Some(in_path) = find_in_path("rustylibraryshrinker") {
+        return (Some(in_path), "path");
+    }
 
     (None, "none")
 }
@@ -161,6 +173,8 @@ pub async fn validate_optimizer(custom_bin: Option<&str>) -> OptimizerValidation
         .map(ToString::to_string);
 
     let (resolved, source) = resolve_optimizer_binary(custom_bin);
+    let arch = std::env::consts::ARCH.to_string();
+    let now = crate::db::now();
 
     let resolved_path = match resolved {
         Some(p) => p,
@@ -172,6 +186,9 @@ pub async fn validate_optimizer(custom_bin: Option<&str>) -> OptimizerValidation
                 code: OptimizerValidationCode::Missing,
                 message: "No optimizer binary found (bundled optimizer not installed and not in PATH)".to_string(),
                 version: None,
+                detected_architecture: Some(arch),
+                is_operational: false,
+                verified_at: Some(now),
             };
         }
     };
@@ -186,6 +203,9 @@ pub async fn validate_optimizer(custom_bin: Option<&str>) -> OptimizerValidation
             code: OptimizerValidationCode::Missing,
             message: format!("Binary not found at '{resolved_str}'"),
             version: None,
+            detected_architecture: Some(arch),
+            is_operational: false,
+            verified_at: Some(now),
         };
     }
 
@@ -197,6 +217,9 @@ pub async fn validate_optimizer(custom_bin: Option<&str>) -> OptimizerValidation
             code: OptimizerValidationCode::NotAFile,
             message: format!("Path '{resolved_str}' is not a regular file"),
             version: None,
+            detected_architecture: Some(arch),
+            is_operational: false,
+            verified_at: Some(now),
         };
     }
 
@@ -208,6 +231,9 @@ pub async fn validate_optimizer(custom_bin: Option<&str>) -> OptimizerValidation
             code: OptimizerValidationCode::NotExecutable,
             message: format!("Binary '{resolved_str}' does not have executable permissions"),
             version: None,
+            detected_architecture: Some(arch),
+            is_operational: false,
+            verified_at: Some(now),
         };
     }
 
@@ -219,6 +245,9 @@ pub async fn validate_optimizer(custom_bin: Option<&str>) -> OptimizerValidation
             code: OptimizerValidationCode::Valid,
             message: format!("Valid and executable ({version})"),
             version: Some(version),
+            detected_architecture: Some(arch),
+            is_operational: true,
+            verified_at: Some(now),
         },
         Err(e) => OptimizerValidationResult {
             configured_path: configured,
@@ -227,6 +256,9 @@ pub async fn validate_optimizer(custom_bin: Option<&str>) -> OptimizerValidation
             code: OptimizerValidationCode::Failed,
             message: format!("Execution test failed: {e}"),
             version: None,
+            detected_architecture: Some(arch),
+            is_operational: false,
+            verified_at: Some(now),
         },
     }
 }
@@ -378,9 +410,9 @@ pub async fn optimize_cbz(
     fs::copy(source_path, &candidate_path)?;
 
     // 2. Prepare process command with explicit quality and resolution options
-    let bin_str = bin_path.to_string_lossy();
+    let bin_str = bin_path.to_string_lossy().to_ascii_lowercase();
     let mut cmd = tokio::process::Command::new(&bin_path);
-    if bin_str.ends_with("RustyLibraryShrinker") || bin_str.contains("RustyLibraryShrinker") {
+    if bin_str.contains("rustylibraryshrinker") || bin_str.contains("rusty-library-shrinker") {
         cmd.arg("--lang")
             .arg("en")
             .arg("-r")
@@ -1094,5 +1126,178 @@ exit 0
         let res_high = optimize_cbz(&cbz, Some(bin_str), 2400, 90, 99).await.unwrap();
         assert!(!res_high.applied);
         assert!(res_high.reason.contains("below required threshold"));
+    }
+
+    #[tokio::test]
+    async fn test_optimizer_architecture_and_operational_status() {
+        let dir = TempDir::new("opt-arch-status");
+        let script = dir.path().join("mock-shrinker");
+        fs::write(&script, b"#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo \"RustyLibraryShrinker 1.0.3\"; exit 0; fi\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script, perms).unwrap();
+        }
+
+        let res = validate_optimizer(Some(script.to_str().unwrap())).await;
+        assert_eq!(res.code, OptimizerValidationCode::Valid);
+        assert!(res.is_operational);
+        assert_eq!(res.detected_architecture.as_deref(), Some(std::env::consts::ARCH));
+        assert!(res.version.is_some());
+        assert!(res.verified_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_optimizer_binary_missing() {
+        let res = validate_optimizer(Some("/nonexistent/path/to/optimizer_binary")).await;
+        assert_eq!(res.code, OptimizerValidationCode::Missing);
+        assert!(!res.is_operational);
+        assert!(res.message.contains("not found"));
+        assert_eq!(res.detected_architecture.as_deref(), Some(std::env::consts::ARCH));
+    }
+
+    #[tokio::test]
+    async fn test_optimizer_unsupported_or_not_executable() {
+        let dir = TempDir::new("opt-not-exec");
+        let file = dir.path().join("not_executable");
+        fs::write(&file, b"not executable").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&file).unwrap().permissions();
+            perms.set_mode(0o644); // Not executable
+            fs::set_permissions(&file, perms).unwrap();
+        }
+
+        let res = validate_optimizer(Some(file.to_str().unwrap())).await;
+        assert_eq!(res.code, OptimizerValidationCode::NotExecutable);
+        assert!(!res.is_operational);
+        assert!(res.message.contains("executable permissions"));
+    }
+
+    #[tokio::test]
+    async fn test_optimizer_exits_nonzero_leaves_original_unchanged() {
+        let dir = TempDir::new("opt-nonzero");
+        let cbz = dir.path().join("test.cbz");
+        make_test_archive(&cbz, 2);
+        let orig_bytes = fs::read(&cbz).unwrap();
+
+        let script = dir.path().join("crash.sh");
+        fs::write(&script, b"#!/bin/sh\nexit 42\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script, perms).unwrap();
+        }
+
+        let res = optimize_cbz(&cbz, Some(script.to_str().unwrap()), 2400, 90, 10).await.unwrap();
+        assert!(!res.applied);
+        assert_eq!(fs::read(&cbz).unwrap(), orig_bytes);
+    }
+
+    #[tokio::test]
+    async fn test_optimizer_produces_valid_output_on_synthetic_cbz() {
+        let dir = TempDir::new("opt-valid-synth");
+        let cbz = dir.path().join("test_synth.cbz");
+        make_realistic_cbz(&cbz, 2);
+        let orig_size = fs::metadata(&cbz).unwrap().len();
+
+        let script = dir.path().join("mock_shrink.sh");
+        let script_content = r#"#!/bin/sh
+for arg in "$@"; do
+    case "$arg" in
+        *.cbz) target="$arg" ;;
+    esac
+done
+if [ -n "$target" ]; then
+    tmp="$target.tmp.zip"
+    python3 -c "
+import zipfile
+with zipfile.ZipFile('$tmp', 'w') as z:
+    z.writestr('ComicInfo.xml', '<ComicInfo><Series>Test</Series><Number>1</Number></ComicInfo>')
+    z.writestr('001.webp', b'compressed1')
+    z.writestr('002.webp', b'compressed2')
+" 2>/dev/null
+    if [ -f "$tmp" ]; then
+        mv "$tmp" "$target"
+    fi
+fi
+exit 0
+"#;
+        fs::write(&script, script_content.as_bytes()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script, perms).unwrap();
+        }
+
+        let res = optimize_cbz(&cbz, Some(script.to_str().unwrap()), 2400, 90, 10).await.unwrap();
+        assert!(res.applied);
+        assert!(res.optimized_bytes < orig_size);
+        assert_eq!(count_cbz_pages(&cbz).unwrap(), 2);
+        assert!(cbz_has_comic_info(&cbz).unwrap());
+        verify_cbz_integrity(&cbz).unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_optimizer_canonical_media_remains_unchanged() {
+        let dir = TempDir::new("opt-canonical-isolation");
+        // Simulate a canonical library directory
+        let canonical_dir = dir.path().join("canonical").join("Blood on the Tracks");
+        fs::create_dir_all(&canonical_dir).unwrap();
+        let canonical_cbz = canonical_dir.join("Blood on the Tracks v01.cbz");
+        make_test_archive(&canonical_cbz, 5);
+        let canonical_bytes_before = fs::read(&canonical_cbz).unwrap();
+
+        // Staged download in another directory
+        let downloads_dir = dir.path().join("downloads");
+        fs::create_dir_all(&downloads_dir).unwrap();
+        let staged_cbz = downloads_dir.join("download.cbz");
+        make_realistic_cbz(&staged_cbz, 2);
+
+        // Run optimization on staged download
+        let script = dir.path().join("shrink.sh");
+        let script_content = r#"#!/bin/sh
+for arg in "$@"; do
+    case "$arg" in
+        *.cbz) target="$arg" ;;
+    esac
+done
+if [ -n "$target" ]; then
+    tmp="$target.tmp.zip"
+    python3 -c "
+import zipfile
+with zipfile.ZipFile('$tmp', 'w') as z:
+    z.writestr('ComicInfo.xml', '<ComicInfo><Series>Test</Series></ComicInfo>')
+    z.writestr('001.webp', b'data')
+    z.writestr('002.webp', b'data')
+" 2>/dev/null
+    if [ -f "$tmp" ]; then
+        mv "$tmp" "$target"
+    fi
+fi
+exit 0
+"#;
+        fs::write(&script, script_content.as_bytes()).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&script).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&script, perms).unwrap();
+        }
+
+        let res = optimize_cbz(&staged_cbz, Some(script.to_str().unwrap()), 2400, 90, 10).await.unwrap();
+        assert!(res.applied);
+
+        // Verify canonical CBZ is 100% untouched
+        let canonical_bytes_after = fs::read(&canonical_cbz).unwrap();
+        assert_eq!(canonical_bytes_before, canonical_bytes_after, "Canonical library file must NEVER be touched by optimization");
     }
 }

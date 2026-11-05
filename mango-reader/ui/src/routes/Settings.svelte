@@ -2363,7 +2363,7 @@
                 <div class="path-status-row">
                   <span class="status-badge status-{optimizerStatus.code}">
                     {#if optimizerStatus.code === 'valid'}
-                      ✓ Ready ({optimizerStatus.version ?? 'Executable'} — {optimizerStatus.source === 'bundled' ? 'bundled' : optimizerStatus.source === 'path' ? 'system PATH' : 'custom override'})
+                      ✓ Operational ({optimizerStatus.version ?? 'Executable'} — {optimizerStatus.source === 'bundled' ? 'bundled' : optimizerStatus.source === 'path' ? 'system PATH' : 'custom override'}{optimizerStatus.detected_architecture ? ` [${optimizerStatus.detected_architecture}]` : ''})
                     {:else if optimizerStatus.code === 'missing'}
                       ✗ Not found ({optimizerStatus.source === 'custom' ? 'custom path' : 'bundled optimizer'})
                     {:else if optimizerStatus.code === 'not_a_file'}
@@ -2376,7 +2376,9 @@
                       Not configured
                     {/if}
                   </span>
-                  {#if optimizerStatus.code !== 'valid' && optimizerStatus.message}
+                  {#if optimizerStatus.code === 'valid'}
+                    <span class="status-msg muted">Architecture: {optimizerStatus.detected_architecture ?? 'unknown'} • Verified operational: {optimizerStatus.is_operational ? 'Yes' : 'No'}</span>
+                  {:else if optimizerStatus.message}
                     <span class="status-msg">{optimizerStatus.message}</span>
                   {/if}
                 </div>
@@ -3223,6 +3225,9 @@
                 <div class="integrity-summary-banner banner-warning">
                   <div class="banner-main">
                     <strong>⚠️ {stagingManifest.manifestId} — Execution Locked</strong>
+                    {#if stagingManifest.verificationIdentity}
+                      <span class="muted font-small">Verification ID: <code>{stagingManifest.verificationIdentity}</code></span>
+                    {/if}
                     <span>{stagingManifest.notice}</span>
                   </div>
                 </div>
@@ -3246,6 +3251,11 @@
                           {/if}
                         </div>
                         <div class="diag-badges">
+                          {#if item.eligibilityDecision === 'ELIGIBLE'}
+                            <span class="pill-badge active">Eligible</span>
+                          {:else if item.eligibilityDecision === 'BLOCKED'}
+                            <span class="pill-badge paused">Blocked</span>
+                          {/if}
                           <span class="pill-badge {item.classification === 'PUBLISHED_VERIFIED_DUPLICATE' && !item.activeDependencyDetected ? 'active' : 'paused'}">
                             {item.classification}
                           </span>
@@ -3257,8 +3267,24 @@
                       </div>
                       <div class="diag-body font-small">
                         <span>{item.reason}</span>
+                        {#if item.sha256}
+                          <span class="muted font-small">SHA-256: <code>{item.sha256.slice(0, 16)}…</code></span>
+                        {/if}
                         {#if item.canonicalDestination}
                           <span class="muted">Canonical: <code>{item.canonicalDestination}</code></span>
+                        {/if}
+                        {#if item.canonicalSha256}
+                          <span class="muted font-small">Canonical SHA: <code>{item.canonicalSha256.slice(0, 16)}…</code></span>
+                        {/if}
+                        {#if item.missingEvidence && item.missingEvidence.length > 0}
+                          <div class="missing-evidence font-small text-danger">
+                            <span>Missing evidence:</span>
+                            <ul>
+                              {#each item.missingEvidence as evidence}
+                                <li>{evidence}</li>
+                              {/each}
+                            </ul>
+                          </div>
                         {/if}
                       </div>
                     </div>
