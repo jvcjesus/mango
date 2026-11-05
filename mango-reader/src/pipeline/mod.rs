@@ -1997,6 +1997,8 @@ impl Pipeline {
 
 #[cfg(test)]
 mod receipts_tests;
+#[cfg(test)]
+mod recovery_tests;
 
 #[cfg(test)]
 mod tests {

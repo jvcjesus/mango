@@ -717,80 +717,124 @@ impl Downloads {
         }
     }
 
+    /// Performs startup recovery for interrupted downloads and durably published files.
+    pub async fn run_startup_recovery(db: &Db) -> Result<()> {
+        db.call(|conn| {
+            conn.execute("UPDATE import_candidates SET state=CASE WHEN cancel_requested=1 THEN 'ignored' ELSE 'queued' END WHERE state='processing'",[])?;
+            // 1. Verify any downloads marked with published_path
+            let mut stmt = conn.prepare("SELECT chapter_id, published_path FROM downloads WHERE published_path IS NOT NULL")?;
+            let published_items = stmt
+                .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+                .filter_map(std::result::Result::ok)
+                .collect::<Vec<_>>();
+
+            for (ch_id, pub_path) in published_items {
+                let path = PathBuf::from(&pub_path);
+                if path.is_file() && crate::pipeline::publisher::verify_cbz_integrity(&path).is_ok() {
+                    conn.execute(
+                        "UPDATE downloads SET state = CASE WHEN EXISTS(SELECT 1 FROM metadata_handoffs h WHERE h.chapter_id=downloads.chapter_id) THEN CASE WHEN state='metadata_wait' THEN 'metadata_wait' ELSE state END ELSE 'verifying' END WHERE chapter_id = ?1",
+                        [ch_id],
+                    )?;
+                } else {
+                    let alt_path: Option<String> = conn
+                        .query_row(
+                            "SELECT COALESCE(
+                                (SELECT pr.canonical_path FROM publication_receipts pr WHERE pr.chapter_id = ?1 ORDER BY pr.published_at DESC LIMIT 1),
+                                c.download_path
+                            ) FROM chapters c WHERE c.id = ?1",
+                            [ch_id],
+                            |r| r.get(0),
+                        )
+                        .optional()?
+                        .flatten();
+                    let recovered = alt_path
+                        .as_ref()
+                        .map(PathBuf::from)
+                        .filter(|p| p.is_file() && crate::pipeline::publisher::verify_cbz_integrity(p).is_ok());
+                    if let Some(rec) = recovered {
+                        let rec_str = rec.to_string_lossy().to_string();
+                        conn.execute(
+                            "UPDATE downloads SET published_path = ?2, state = 'verifying', error = NULL WHERE chapter_id = ?1",
+                            rusqlite::params![ch_id, rec_str],
+                        )?;
+                    } else {
+                        conn.execute(
+                            "UPDATE downloads SET state = 'failed', error = 'Published canonical file verification failed on startup' WHERE chapter_id = ?1",
+                            [ch_id],
+                        )?;
+                    }
+                }
+            }
+
+            // 2. Interrupted staging downloads reset to queued with recovery message
+            let mut stmt = conn.prepare(
+                "SELECT d.chapter_id, m.title, c.name FROM downloads d
+                 JOIN chapters c ON c.id = d.chapter_id
+                 JOIN manga m ON m.id = c.manga_id
+                 WHERE d.state = 'downloading' AND d.published_path IS NULL",
+            )?;
+            let orphaned = stmt
+                .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?
+                .filter_map(std::result::Result::ok)
+                .collect::<Vec<_>>();
+            for (ch_id, title, name) in orphaned {
+                tracing::info!("Orphaned transfer recovered after startup for {} ({})", title, name);
+                conn.execute(
+                    "UPDATE downloads SET state = 'queued', error = 'Interrupted by server restart — queued for recovery' WHERE chapter_id = ?1",
+                    [ch_id],
+                )?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// Checks if a chapter already has a verified published canonical file in receipts, chapters, or history,
+    /// avoiding duplicate downloads or re-publication.
+    pub async fn check_and_recover_published_canonical(db: &Db, chapter_id: i64) -> Result<Option<String>> {
+        let existing_canonical: Option<String> = db
+            .call(move |conn| {
+                let path: Option<String> = conn
+                    .query_row(
+                        "SELECT COALESCE(
+                            (SELECT pr.canonical_path FROM publication_receipts pr WHERE pr.chapter_id = ?1 ORDER BY pr.published_at DESC LIMIT 1),
+                            c.download_path,
+                            (SELECT h.canonical_path FROM metadata_handoffs h WHERE h.chapter_id = ?1),
+                            (SELECT ah.canonical_path FROM acquisition_history ah WHERE ah.chapter_id = ?1 AND ah.outcome IN ('completed', 'published') AND ah.canonical_path IS NOT NULL ORDER BY ah.id DESC LIMIT 1)
+                        ) FROM chapters c WHERE c.id = ?1",
+                        [chapter_id],
+                        |r| r.get(0),
+                    )
+                    .optional()?
+                    .flatten();
+                Ok(path)
+            })
+            .await?;
+
+        if let Some(ref p) = existing_canonical {
+            let pb = PathBuf::from(p);
+            if pb.is_file() && crate::pipeline::publisher::verify_cbz_integrity(&pb).is_ok() {
+                let p_clone = p.clone();
+                db.call(move |conn| {
+                    conn.execute(
+                        "UPDATE downloads SET published_path = ?2, state = 'verifying' WHERE chapter_id = ?1",
+                        rusqlite::params![chapter_id, p_clone],
+                    )?;
+                    crate::acquisition::service::persist_publication_provenance(conn, chapter_id)?;
+                    Ok(())
+                })
+                .await?;
+                return Ok(Some(p.clone()));
+            }
+        }
+        Ok(None)
+    }
+
     /// Works through the queue, one chapter at a time. Never returns.
     pub async fn run(self) {
         // Whatever was being fetched when Mango stopped starts over,
         // but downloads that were already published durably remain published (do NOT redownload!).
-        let _ = self
-            .db
-            .call(|conn| {
-                conn.execute("UPDATE import_candidates SET state=CASE WHEN cancel_requested=1 THEN 'ignored' ELSE 'queued' END WHERE state='processing'",[])?;
-                // 1. Verify any downloads marked with published_path
-                let mut stmt = conn.prepare("SELECT chapter_id, published_path FROM downloads WHERE published_path IS NOT NULL")?;
-                let published_items = stmt
-                    .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
-                    .filter_map(std::result::Result::ok)
-                    .collect::<Vec<_>>();
-
-                for (ch_id, pub_path) in published_items {
-                    let path = PathBuf::from(&pub_path);
-                    if path.is_file() && crate::pipeline::publisher::verify_cbz_integrity(&path).is_ok() {
-                        conn.execute(
-                            "UPDATE downloads SET state = CASE WHEN EXISTS(SELECT 1 FROM metadata_handoffs h WHERE h.chapter_id=downloads.chapter_id) THEN CASE WHEN state='metadata_wait' THEN 'metadata_wait' ELSE state END ELSE 'verifying' END WHERE chapter_id = ?1",
-                            [ch_id],
-                        )?;
-                    } else {
-                        let alt_path: Option<String> = conn
-                            .query_row(
-                                "SELECT COALESCE(
-                                    (SELECT pr.canonical_path FROM publication_receipts pr WHERE pr.chapter_id = ?1 ORDER BY pr.published_at DESC LIMIT 1),
-                                    c.download_path
-                                ) FROM chapters c WHERE c.id = ?1",
-                                [ch_id],
-                                |r| r.get(0),
-                            )
-                            .optional()?
-                            .flatten();
-                        let recovered = alt_path
-                            .as_ref()
-                            .map(PathBuf::from)
-                            .filter(|p| p.is_file() && crate::pipeline::publisher::verify_cbz_integrity(p).is_ok());
-                        if let Some(rec) = recovered {
-                            let rec_str = rec.to_string_lossy().to_string();
-                            conn.execute(
-                                "UPDATE downloads SET published_path = ?2, state = 'verifying', error = NULL WHERE chapter_id = ?1",
-                                rusqlite::params![ch_id, rec_str],
-                            )?;
-                        } else {
-                            conn.execute(
-                                "UPDATE downloads SET state = 'failed', error = 'Published canonical file verification failed on startup' WHERE chapter_id = ?1",
-                                [ch_id],
-                            )?;
-                        }
-                    }
-                }
-
-                // 2. Interrupted staging downloads reset to queued with recovery message
-                let mut stmt = conn.prepare(
-                    "SELECT d.chapter_id, m.title, c.name FROM downloads d
-                     JOIN chapters c ON c.id = d.chapter_id
-                     JOIN manga m ON m.id = c.manga_id
-                     WHERE d.state = 'downloading' AND d.published_path IS NULL",
-                )?;
-                let orphaned = stmt
-                    .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))?
-                    .filter_map(std::result::Result::ok)
-                    .collect::<Vec<_>>();
-                for (ch_id, title, name) in orphaned {
-                    tracing::info!("Orphaned transfer recovered after startup for {} ({})", title, name);
-                    conn.execute(
-                        "UPDATE downloads SET state = 'queued', error = 'Interrupted by server restart — queued for recovery' WHERE chapter_id = ?1",
-                        [ch_id],
-                    )?;
-                }
-                Ok(())
-            })
-            .await;
+        let _ = Self::run_startup_recovery(&self.db).await;
 
         loop {
             let Ok(Some(job)) = self.db.call(|conn| next_job(conn)).await else {
@@ -812,46 +856,9 @@ impl Downloads {
 
             let mut resolved_published_path = job.published_path.clone();
             if resolved_published_path.is_none() {
-                let chapter_id = job.chapter;
-                let existing_canonical: Option<String> = self
-                    .db
-                    .call(move |conn| {
-                        let path: Option<String> = conn
-                            .query_row(
-                                "SELECT COALESCE(
-                                    (SELECT pr.canonical_path FROM publication_receipts pr WHERE pr.chapter_id = ?1 ORDER BY pr.published_at DESC LIMIT 1),
-                                    c.download_path,
-                                    (SELECT h.canonical_path FROM metadata_handoffs h WHERE h.chapter_id = ?1),
-                                    (SELECT ah.canonical_path FROM acquisition_history ah WHERE ah.chapter_id = ?1 AND ah.outcome IN ('completed', 'published') AND ah.canonical_path IS NOT NULL ORDER BY ah.id DESC LIMIT 1)
-                                ) FROM chapters c WHERE c.id = ?1",
-                                [chapter_id],
-                                |r| r.get(0),
-                            )
-                            .optional()?
-                            .flatten();
-                        Ok(path)
-                    })
+                resolved_published_path = Self::check_and_recover_published_canonical(&self.db, job.chapter)
                     .await
                     .unwrap_or(None);
-
-                if let Some(ref p) = existing_canonical {
-                    let pb = PathBuf::from(p);
-                    if pb.is_file() && crate::pipeline::publisher::verify_cbz_integrity(&pb).is_ok() {
-                        resolved_published_path = Some(p.clone());
-                        let p_clone = p.clone();
-                        let _ = self
-                            .db
-                            .call(move |conn| {
-                                conn.execute(
-                                    "UPDATE downloads SET published_path = ?2, state = 'verifying' WHERE chapter_id = ?1",
-                                    rusqlite::params![chapter_id, p_clone],
-                                )?;
-                                crate::acquisition::service::persist_publication_provenance(conn, chapter_id)?;
-                                Ok(())
-                            })
-                            .await;
-                    }
-                }
             }
 
             // If this job was already published (e.g. restart recovery or retry from verification timeout):
