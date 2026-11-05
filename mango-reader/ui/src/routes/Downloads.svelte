@@ -1,5 +1,20 @@
 <script lang="ts">
-  import { get, message, send, type PipelineEvent, type Queue, type Queued } from '../lib/api';
+  import {
+    get,
+    message,
+    send,
+    getAllBacklogJobs,
+    cancelBacklogJob,
+    getLibraryReceipts,
+    verifyPublicationReceipt,
+    getAcquisitionOperationsSummary,
+    type PipelineEvent,
+    type Queue,
+    type Queued,
+    type BacklogJobDto,
+    type PublicationReceiptDto,
+    type AcquisitionOperationsSummaryDto,
+  } from '../lib/api';
   import { confirm } from '../lib/confirm.svelte';
   import Icon from '../lib/Icon.svelte';
   import Notice from '../lib/Notice.svelte';
@@ -47,6 +62,88 @@
   let busyItems = $state<Record<number, boolean>>({});
   let expandedCollections = $state<Record<string, boolean>>({});
   let showHistory = $state(false);
+
+  // Operations Center Tabs (M7.4)
+  let activeTab = $state<'queue' | 'backlog' | 'receipts' | 'health'>('queue');
+
+  // Backlog state
+  let allBacklogJobs = $state<BacklogJobDto[]>([]);
+  let backlogLoading = $state(false);
+  let backlogError = $state<string | null>(null);
+
+  async function loadBacklogJobs() {
+    backlogLoading = true;
+    backlogError = null;
+    try {
+      allBacklogJobs = await getAllBacklogJobs(50);
+    } catch (e) {
+      backlogError = message(e);
+    } finally {
+      backlogLoading = false;
+    }
+  }
+
+  async function handleCancelBacklog(jobId: string) {
+    try {
+      await cancelBacklogJob(jobId);
+      toast.success('Backlog job cancelled.');
+      await loadBacklogJobs();
+    } catch (e) {
+      toast.error(message(e));
+    }
+  }
+
+  // Receipts state
+  let allReceipts = $state<PublicationReceiptDto[]>([]);
+  let receiptsLoading = $state(false);
+  let receiptsError = $state<string | null>(null);
+  let verifyingReceipts = $state<Record<string, boolean>>({});
+
+  async function loadReceipts() {
+    receiptsLoading = true;
+    receiptsError = null;
+    try {
+      allReceipts = await getLibraryReceipts(50);
+    } catch (e) {
+      receiptsError = message(e);
+    } finally {
+      receiptsLoading = false;
+    }
+  }
+
+  async function handleVerifyReceipt(receiptId: string) {
+    verifyingReceipts[receiptId] = true;
+    try {
+      const res = await verifyPublicationReceipt(receiptId);
+      if (res.isValid) {
+        toast.success(`Verified CBZ integrity and SHA-256 for receipt ${receiptId.slice(0, 8)}…`);
+      } else {
+        toast.error(`Verification issue: ${res.error || 'Invalid CBZ'}`);
+      }
+      await loadReceipts();
+    } catch (e) {
+      toast.error(message(e));
+    } finally {
+      verifyingReceipts[receiptId] = false;
+    }
+  }
+
+  // Health summary state
+  let healthSummary = $state<AcquisitionOperationsSummaryDto | null>(null);
+  let healthLoading = $state(false);
+  let healthError = $state<string | null>(null);
+
+  async function loadHealthSummary() {
+    healthLoading = true;
+    healthError = null;
+    try {
+      healthSummary = await getAcquisitionOperationsSummary();
+    } catch (e) {
+      healthError = message(e);
+    } finally {
+      healthLoading = false;
+    }
+  }
 
   type CollectionGroup = {
     collectionId: string;
@@ -392,19 +489,68 @@
 
 <div class="page">
   <div class="page-head">
-    <div class="heading">
-      <h1 class="display">DOWNLOADS</h1>
-      <span class="queue-status-text">
-        <strong>{activeQueue.length} active</strong>
-        {#if totalAttentionCount > 0}
-          · <span class="attention-badge">{totalAttentionCount} need attention</span>
-        {/if}
-        {#if data?.paused}
-          · <span class="paused-badge">Paused</span>
-        {/if}
-      </span>
+    <div class="head-left">
+      <div class="heading">
+        <h1 class="display">DOWNLOADS</h1>
+        <span class="queue-status-text">
+          <strong>{activeQueue.length} active</strong>
+          {#if totalAttentionCount > 0}
+            · <span class="attention-badge">{totalAttentionCount} need attention</span>
+          {/if}
+          {#if data?.paused}
+            · <span class="paused-badge">Paused</span>
+          {/if}
+        </span>
+      </div>
+      <div class="pill-group view-switcher" role="tablist" aria-label="Downloads view">
+        <button
+          class="pill"
+          class:active={activeTab === 'queue'}
+          onclick={() => (activeTab = 'queue')}
+          role="tab"
+          aria-selected={activeTab === 'queue'}
+        >
+          <Icon name="download" size={14} /> Active Queue
+        </button>
+        <button
+          class="pill"
+          class:active={activeTab === 'backlog'}
+          onclick={() => {
+            activeTab = 'backlog';
+            if (allBacklogJobs.length === 0) loadBacklogJobs();
+          }}
+          role="tab"
+          aria-selected={activeTab === 'backlog'}
+        >
+          <Icon name="list" size={14} /> Backlog Jobs
+        </button>
+        <button
+          class="pill"
+          class:active={activeTab === 'receipts'}
+          onclick={() => {
+            activeTab = 'receipts';
+            if (allReceipts.length === 0) loadReceipts();
+          }}
+          role="tab"
+          aria-selected={activeTab === 'receipts'}
+        >
+          <Icon name="check" size={14} /> Publication Receipts
+        </button>
+        <button
+          class="pill"
+          class:active={activeTab === 'health'}
+          onclick={() => {
+            activeTab = 'health';
+            if (!healthSummary) loadHealthSummary();
+          }}
+          role="tab"
+          aria-selected={activeTab === 'health'}
+        >
+          <Icon name="sliders" size={14} /> Operations Health
+        </button>
+      </div>
     </div>
-    {#if data}
+    {#if activeTab === 'queue' && data}
       <div class="tools">
         {#if data.paused}
           <button class="btn big spot" disabled={togglingPause} onclick={togglePause}>
@@ -436,9 +582,43 @@
           </button>
         {/if}
       </div>
+    {:else if activeTab === 'backlog'}
+      <div class="tools">
+        <button class="btn" disabled={backlogLoading} onclick={loadBacklogJobs}>
+          {#if backlogLoading}
+            <span class="spin"><Icon name="spinner" size={18} stroke={3} /></span>
+          {:else}
+            <Icon name="refresh" size={18} />
+          {/if}
+          Refresh
+        </button>
+      </div>
+    {:else if activeTab === 'receipts'}
+      <div class="tools">
+        <button class="btn" disabled={receiptsLoading} onclick={loadReceipts}>
+          {#if receiptsLoading}
+            <span class="spin"><Icon name="spinner" size={18} stroke={3} /></span>
+          {:else}
+            <Icon name="refresh" size={18} />
+          {/if}
+          Refresh
+        </button>
+      </div>
+    {:else if activeTab === 'health'}
+      <div class="tools">
+        <button class="btn" disabled={healthLoading} onclick={loadHealthSummary}>
+          {#if healthLoading}
+            <span class="spin"><Icon name="spinner" size={18} stroke={3} /></span>
+          {:else}
+            <Icon name="refresh" size={18} />
+          {/if}
+          Refresh
+        </button>
+      </div>
     {/if}
   </div>
 
+  {#if activeTab === 'queue'}
   <Notice {loading} {error} retry={() => load(false)} />
 
   <!-- SECTION 1: NEEDS ATTENTION -->
@@ -833,6 +1013,229 @@
       Nothing is waiting. Acquisitions are triggered from a title's page, from Updates, or by background title rules.
     </Notice>
   {/if}
+
+  {:else if activeTab === 'backlog'}
+    <Notice loading={backlogLoading} error={backlogError} retry={loadBacklogJobs} />
+
+    {#if !backlogLoading && !backlogError}
+      {#if allBacklogJobs.length === 0}
+        <Notice>
+          No historical backlog jobs recorded. Backlog jobs can be planned and reviewed from any series' title page or diagnostics modal.
+        </Notice>
+      {:else}
+        <section class="section-card">
+          <div class="section-header">
+            <h2 class="display section-title">HISTORICAL BACKLOG JOBS ({allBacklogJobs.length})</h2>
+          </div>
+          <ul class="rows backlog-rows">
+            {#each allBacklogJobs as job (job.id)}
+              <li class="backlog-row">
+                <div class="main">
+                  <div class="row-header">
+                    <strong>{job.seriesTitle}</strong>
+                    <span class="tag" class:spot={job.state === 'COMPLETED'} class:danger={job.state === 'FAILED'} class:warning={job.state === 'PLANNED'}>
+                      {job.state}
+                    </span>
+                    <span class="tag">{job.scope}</span>
+                    {#if job.isDryRun}
+                      <span class="tag muted">DRY-RUN</span>
+                    {/if}
+                  </div>
+                  <div class="job-meta">
+                    <span>Requested: {job.totalRequested}</span>
+                    <span>·</span>
+                    <span>Eligible: {job.totalEligible}</span>
+                    <span>·</span>
+                    <span>Already Owned: {job.totalAlreadyOwned}</span>
+                    <span>·</span>
+                    <span>Queued: {job.totalQueued}</span>
+                    {#if job.totalFailed > 0}
+                      <span>·</span>
+                      <span class="attention-badge">Failed: {job.totalFailed}</span>
+                    {/if}
+                    <span>·</span>
+                    <span class="muted">{ago(job.createdAt > 1e11 ? Math.floor(job.createdAt / 1000) : job.createdAt)}</span>
+                  </div>
+                  {#if job.requestedVolumes && job.requestedVolumes.length > 0}
+                    <div class="volume-tags">
+                      <span class="muted-label">Volumes:</span>
+                      {#each job.requestedVolumes.slice(0, 15) as v}
+                        <span class="vol-chip">Vol. {v}</span>
+                      {/each}
+                      {#if job.requestedVolumes.length > 15}
+                        <span class="muted">+{job.requestedVolumes.length - 15} more</span>
+                      {/if}
+                    </div>
+                  {/if}
+                  {#if job.error}
+                    <div class="error-desc">{job.error}</div>
+                  {/if}
+                </div>
+                {#if job.state === 'PLANNED' || job.state === 'executing'}
+                  <div class="row-actions">
+                    <button class="btn pill danger" onclick={() => handleCancelBacklog(job.id)}>
+                      Cancel Job
+                    </button>
+                  </div>
+                {/if}
+              </li>
+            {/each}
+          </ul>
+        </section>
+      {/if}
+    {/if}
+
+  {:else if activeTab === 'receipts'}
+    <Notice loading={receiptsLoading} error={receiptsError} retry={loadReceipts} />
+
+    {#if !receiptsLoading && !receiptsError}
+      {#if allReceipts.length === 0}
+        <Notice>
+          No publication receipts recorded yet. Receipts are generated when acquisitions complete the native pipeline and are verified into canonical storage.
+        </Notice>
+      {:else}
+        <section class="section-card">
+          <div class="section-header">
+            <div>
+              <h2 class="display section-title">PUBLICATION RECEIPTS ({allReceipts.length})</h2>
+              <span class="queue-status-text">Immutable audit trail of pipeline publications and canonical storage verification</span>
+            </div>
+          </div>
+          <ul class="rows receipt-rows">
+            {#each allReceipts as r (r.id)}
+              <li class="receipt-row">
+                <div class="main">
+                  <div class="row-header">
+                    <strong>{r.seriesTitle}</strong>
+                    {#if r.volumeNumber != null}
+                      <span class="tag">Vol. {r.volumeNumber}</span>
+                    {:else if r.chapterNumber != null}
+                      <span class="tag">Ch. {r.chapterNumber}</span>
+                    {/if}
+                    {#if r.verifiedOwnership}
+                      <span class="tag spot">Verified in Library</span>
+                    {:else}
+                      <span class="tag warning">Unverified</span>
+                    {/if}
+                    {#if r.komgaNotified}
+                      <span class="tag">Komga Synced</span>
+                    {/if}
+                    {#if r.metadataStatus === 'complete'}
+                      <span class="tag">Metadata Enriched</span>
+                    {/if}
+                  </div>
+                  <div class="receipt-path mono muted">
+                    {r.canonicalPath}
+                  </div>
+                  <div class="receipt-meta">
+                    <span>Size: {formatBytes(r.fileSizeBytes)}</span>
+                    <span>·</span>
+                    <span class="mono">SHA: {r.fileSha256 ? r.fileSha256.slice(0, 16) + '…' : 'None'}</span>
+                    <span>·</span>
+                    <span class="muted">{ago(r.publishedAt > 1e11 ? Math.floor(r.publishedAt / 1000) : r.publishedAt)}</span>
+                  </div>
+                  {#if r.metadataError}
+                    <div class="error-desc">Metadata error: {r.metadataError}</div>
+                  {/if}
+                </div>
+                <div class="row-actions">
+                  <button
+                    class="btn pill"
+                    disabled={verifyingReceipts[r.id]}
+                    onclick={() => handleVerifyReceipt(r.id)}
+                  >
+                    {#if verifyingReceipts[r.id]}
+                      <span class="spin"><Icon name="spinner" size={14} /></span>
+                    {:else}
+                      <Icon name="check" size={14} />
+                    {/if}
+                    Verify CBZ
+                  </button>
+                </div>
+              </li>
+            {/each}
+          </ul>
+        </section>
+      {/if}
+    {/if}
+
+  {:else if activeTab === 'health'}
+    <Notice loading={healthLoading} error={healthError} retry={loadHealthSummary} />
+
+    {#if !healthLoading && !healthError}
+      {#if healthSummary}
+        <!-- CRITICAL SAFETY LOCK BANNER -->
+        <div class="safety-card">
+          <div class="safety-header">
+            <span class="status-indicator active"></span>
+            <strong>ACQUISITION SAFETY LOCK ACTIVE</strong>
+          </div>
+          <p class="safety-desc">
+            Mango operates under strict fail-closed safety constraints. Autonomous downloads without explicit user approval are completely locked out.
+          </p>
+          <div class="safety-grid">
+            <div class="safety-item">
+              <span class="safety-label">Global Auto-Acquire Switch</span>
+              <span class="status-badge" class:locked={!healthSummary.autoAcquireEnabled}>
+                {healthSummary.autoAcquireEnabled ? 'ENABLED (Risk)' : 'DISABLED (Safety Locked)'}
+              </span>
+            </div>
+            <div class="safety-item">
+              <span class="safety-label">Auto-Acquire Dry-Run Mode</span>
+              <span class="status-badge" class:active={healthSummary.autoAcquireDryRun}>
+                {healthSummary.autoAcquireDryRun ? 'ENFORCED (Dry-Run)' : 'MUTATING'}
+              </span>
+            </div>
+            <div class="safety-item">
+              <span class="safety-label">Titles Opted-In to Auto-Acquire</span>
+              <span class="safety-val">
+                <strong>{healthSummary.autoAcquireOptedInCount}</strong> titles (0 expected in safe operation)
+              </span>
+            </div>
+          </div>
+        </div>
+
+        <!-- OPERATIONAL METRICS -->
+        <div class="metrics-grid">
+          <div class="metric-card">
+            <div class="metric-val">{healthSummary.queueTotal}</div>
+            <div class="metric-label">Active Downloads Queue</div>
+            <div class="metric-sub">{healthSummary.queuePaused ? 'Queue is Paused' : 'Queue is Processing'}</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-val">{healthSummary.backlogJobsTotal}</div>
+            <div class="metric-label">Backlog Jobs</div>
+            <div class="metric-sub">{healthSummary.backlogJobsPending} planned · {healthSummary.backlogJobsRunning} executing</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-val">{healthSummary.receiptsTotal}</div>
+            <div class="metric-label">Published Receipts</div>
+            <div class="metric-sub">{healthSummary.receiptsVerified} verified · {healthSummary.receiptsUnverified} pending check</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-val">{formatBytes(healthSummary.freeDiskBytes)}</div>
+            <div class="metric-label">Staging Free Disk Space</div>
+            <div class="metric-sub">Download directory storage</div>
+          </div>
+        </div>
+
+        <!-- OPERATIONS CONTROL & LINKS -->
+        <div class="operations-links-card">
+          <h3 class="display sub-title">STORAGE & RELEASE CONTROLS</h3>
+          <div class="links-row">
+            <a class="btn" href="#/settings">
+              <Icon name="sliders" size={16} />
+              Staging Storage Hygiene & Manifest
+            </a>
+            <a class="btn" href="#/updates">
+              <Icon name="bell" size={16} />
+              Availability Watchers & Release Calendar
+            </a>
+          </div>
+        </div>
+      {/if}
+    {/if}
+  {/if}
 </div>
 
 <style>
@@ -1169,5 +1572,237 @@
     justify-content: space-between;
     gap: 12px;
     flex-wrap: wrap;
+  }
+
+  .head-left {
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    flex-wrap: wrap;
+  }
+
+  .view-switcher {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .pill-group {
+    display: flex;
+    gap: 4px;
+    background: var(--shade);
+    padding: 3px;
+    border-radius: 9999px;
+  }
+
+  .pill {
+    border: none;
+    background: transparent;
+    color: var(--dim);
+    padding: 5px 12px;
+    border-radius: 9999px;
+    font-size: 0.85rem;
+    font-weight: 600;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    transition: background-color 0.15s, color 0.15s;
+  }
+
+  .pill:hover {
+    color: var(--ink);
+  }
+
+  .pill.active {
+    background: var(--surface);
+    color: var(--ink);
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+  }
+
+  /* Safety card */
+  .safety-card {
+    background: #f0fdf4;
+    border: 2px solid #16a34a;
+    border-radius: var(--radius, 6px);
+    box-shadow: 2px 2px 0 var(--ink);
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .safety-header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    color: #15803d;
+    font-size: 0.95rem;
+  }
+
+  .safety-desc {
+    margin: 0;
+    font-size: 0.88rem;
+    color: var(--ink);
+  }
+
+  .safety-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 12px;
+  }
+
+  .safety-item {
+    background: var(--surface);
+    border: 1px solid var(--ink);
+    border-radius: 4px;
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .safety-label {
+    font-size: 0.78rem;
+    color: var(--dim);
+    text-transform: uppercase;
+    font-weight: 700;
+  }
+
+  .safety-val {
+    font-size: 0.9rem;
+    color: var(--ink);
+  }
+
+  .status-badge {
+    display: inline-block;
+    padding: 2px 8px;
+    border-radius: 4px;
+    font-size: 0.82rem;
+    font-weight: 700;
+  }
+
+  .status-badge.locked {
+    background: #dcfce7;
+    color: #166534;
+    border: 1px solid #16a34a;
+  }
+
+  .status-badge.active {
+    background: #e0f2fe;
+    color: #0369a1;
+    border: 1px solid #0284c7;
+  }
+
+  /* Operational metrics */
+  .metrics-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 12px;
+  }
+
+  .metric-card {
+    background: var(--surface);
+    border: 2px solid var(--ink);
+    border-radius: var(--radius, 6px);
+    box-shadow: 2px 2px 0 var(--ink);
+    padding: 14px 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .metric-val {
+    font-size: 1.6rem;
+    font-weight: 800;
+    line-height: 1.1;
+  }
+
+  .metric-label {
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: var(--ink);
+  }
+
+  .metric-sub {
+    font-size: 0.78rem;
+    color: var(--dim);
+  }
+
+  .operations-links-card {
+    background: var(--surface);
+    border: 2px solid var(--ink);
+    border-radius: var(--radius, 6px);
+    box-shadow: 2px 2px 0 var(--ink);
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .links-row {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+
+  /* Backlog rows & Receipt rows */
+  .backlog-rows, .receipt-rows {
+    background: var(--surface);
+    border: 1px solid var(--ink);
+    border-radius: 4px;
+    overflow: hidden;
+  }
+
+  .backlog-row, .receipt-row {
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--muted);
+  }
+
+  .backlog-row:last-child, .receipt-row:last-child {
+    border-bottom: none;
+  }
+
+  .job-meta, .receipt-meta {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 0.82rem;
+    color: var(--dim);
+    margin-top: 4px;
+    flex-wrap: wrap;
+  }
+
+  .volume-tags {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: 6px;
+    flex-wrap: wrap;
+  }
+
+  .vol-chip {
+    background: var(--shade);
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-size: 0.78rem;
+    font-weight: 600;
+  }
+
+  .muted-label {
+    font-size: 0.78rem;
+    color: var(--dim);
+  }
+
+  .receipt-path {
+    font-size: 0.8rem;
+    margin-top: 4px;
+    word-break: break-all;
+  }
+
+  .tag.warning {
+    background: #fef3c7;
+    color: #92400e;
+    border: 1px solid #f59e0b;
   }
 </style>

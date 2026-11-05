@@ -2408,6 +2408,24 @@ export const recoverDownload = (chapterId: number) =>
     {}
   );
 
+export interface AcquisitionOperationsSummaryDto {
+  queueTotal: number;
+  queuePaused: boolean;
+  backlogJobsTotal: number;
+  backlogJobsPending: number;
+  backlogJobsRunning: number;
+  receiptsTotal: number;
+  receiptsVerified: number;
+  receiptsUnverified: number;
+  autoAcquireEnabled: boolean;
+  autoAcquireDryRun: boolean;
+  autoAcquireOptedInCount: number;
+  freeDiskBytes: number;
+}
+
+export const getAcquisitionOperationsSummary = () =>
+  get<AcquisitionOperationsSummaryDto>('/acquisition/operations/summary');
+
 // -----------------------------------------------------------------------------
 // Guarded Historical Backlog Acquisition (M6.10)
 // -----------------------------------------------------------------------------

@@ -400,6 +400,12 @@ pub fn router(state: Spaces) -> Router {
         .route("/imports/{id}/assignment", post(assign_import_candidate))
         .route("/acquisition/sources", get(get_acquisition_sources))
         .route("/acquisition/plan-by-title", post(post_plan_by_title))
+        .route(
+            "/acquisition/operations/summary",
+            get(get_acquisition_operations_summary),
+        )
+        .route("/pipeline/receipts", get(get_library_receipts))
+        .route("/pipeline/receipts/{id}/verify", post(post_receipt_verify))
         .route("/pipeline/events", get(get_pipeline_events))
         .route(
             "/titles/{id}/acquisition-releases",
@@ -4374,6 +4380,111 @@ async fn post_backlog_job_cancel(
 ) -> Result<Json<serde_json::Value>> {
     let cancelled = app.acquisition.cancel_backlog_job(&id).await?;
     Ok(Json(serde_json::json!({ "cancelled": cancelled })))
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AcquisitionOperationsSummary {
+    pub queue_total: usize,
+    pub queue_paused: bool,
+    pub backlog_jobs_total: usize,
+    pub backlog_jobs_pending: usize,
+    pub backlog_jobs_running: usize,
+    pub receipts_total: usize,
+    pub receipts_verified: usize,
+    pub receipts_unverified: usize,
+    pub auto_acquire_enabled: bool,
+    pub auto_acquire_dry_run: bool,
+    pub auto_acquire_opted_in_count: usize,
+    pub free_disk_bytes: u64,
+}
+
+async fn get_acquisition_operations_summary(
+    Me(app): Me,
+) -> Result<Json<AcquisitionOperationsSummary>> {
+    let q_view = app.downloads.list().await?;
+    let queue_total = q_view.queue.len();
+    let queue_paused = q_view.paused;
+
+    let (b_total, b_pending, b_running, r_total, r_verified, r_unverified, auto_en, auto_dry, opt_count) = app
+        .db
+        .call(|conn| {
+            let b_total: usize = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM backlog_acquisition_jobs",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            let b_pending: usize = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM backlog_acquisition_jobs WHERE status = 'planned'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            let b_running: usize = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM backlog_acquisition_jobs WHERE status = 'executing'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+
+            let r_total: usize = conn
+                .query_row("SELECT COUNT(*) FROM publication_receipts", [], |r| {
+                    r.get(0)
+                })
+                .unwrap_or(0);
+            let r_verified: usize = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM publication_receipts WHERE verified_ownership = 1",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            let r_unverified = r_total.saturating_sub(r_verified);
+
+            let auto_en: bool = crate::settings::get::<bool>(conn, "acquisition.auto_acquire.enabled")
+                .unwrap_or(false);
+            let auto_dry: bool = crate::settings::get::<bool>(conn, "acquisition.auto_acquire.dry_run")
+                .unwrap_or(true);
+            let opt_count: usize = conn
+                .query_row("SELECT COUNT(*) FROM manga WHERE auto_acquire = 1", [], |r| {
+                    r.get(0)
+                })
+                .unwrap_or(0);
+
+            Ok((
+                b_total,
+                b_pending,
+                b_running,
+                r_total,
+                r_verified,
+                r_unverified,
+                auto_en,
+                auto_dry,
+                opt_count,
+            ))
+        })
+        .await?;
+
+    let free_disk_bytes = crate::downloads::free_space(app.downloads.dir()).unwrap_or(0);
+
+    Ok(Json(AcquisitionOperationsSummary {
+        queue_total,
+        queue_paused,
+        backlog_jobs_total: b_total,
+        backlog_jobs_pending: b_pending,
+        backlog_jobs_running: b_running,
+        receipts_total: r_total,
+        receipts_verified: r_verified,
+        receipts_unverified: r_unverified,
+        auto_acquire_enabled: auto_en,
+        auto_acquire_dry_run: auto_dry,
+        auto_acquire_opted_in_count: opt_count,
+        free_disk_bytes,
+    }))
 }
 
 
