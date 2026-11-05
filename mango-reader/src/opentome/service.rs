@@ -6,8 +6,18 @@ use crate::acquisition::release_discovery::ReleaseDiscoveryTarget;
 use crate::db::Db;
 use crate::error::{AppError, Result};
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TitleOpenTomeLinesResponse {
+    pub manga_id: i64,
+    pub work_id: Option<String>,
+    pub current_gcd_series_id: Option<i64>,
+    pub lines: Vec<crate::opentome::catalog::OpenTomeReleaseLine>,
+}
 
 pub struct OpenTomeService {
     db: Db,
@@ -390,6 +400,113 @@ impl OpenTomeService {
                     _ => return Err(AppError::bad_request("Invalid action; must be 'confirm', 'reject', or 'auto'")),
                 }
                 Ok(())
+            })
+            .await
+    }
+
+    /// Fetches candidate OpenTome release lines for a manga series.
+    pub async fn get_manga_opentome_lines(&self, manga_id: i64) -> Result<TitleOpenTomeLinesResponse> {
+        let (work_id, current_en_id): (Option<String>, Option<i64>) = self
+            .db
+            .call(move |conn| {
+                let res = conn
+                    .query_row(
+                        "SELECT work_id, english_series_id FROM opentome_series_mappings WHERE manga_id = ?1",
+                        [manga_id],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                Ok(res.unwrap_or((None, None)))
+            })
+            .await?;
+
+        let Some(ref wid) = work_id else {
+            return Ok(TitleOpenTomeLinesResponse {
+                manga_id,
+                work_id: None,
+                current_gcd_series_id: None,
+                lines: Vec::new(),
+            });
+        };
+
+        let ot_conn_opt = self.open_catalogue_connection()?;
+        let lines = if let Some(ref ot_conn) = ot_conn_opt {
+            catalog::get_work_lines(ot_conn, wid).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        Ok(TitleOpenTomeLinesResponse {
+            manga_id,
+            work_id: Some(wid.clone()),
+            current_gcd_series_id: current_en_id,
+            lines,
+        })
+    }
+
+    /// Explicitly retargets a manga series to a chosen OpenTome release line.
+    pub async fn set_manga_opentome_line(
+        &self,
+        manga_id: i64,
+        gcd_series_id: i64,
+    ) -> Result<Option<catalog::OpenTomeSeriesSchedule>> {
+        let ot_conn_opt = self.open_catalogue_connection()?;
+        let today = self.current_date_str().await;
+
+        self.db
+            .call(move |conn| {
+                let (work_id, _series_id, _series_title): (String, String, String) = conn
+                    .query_row(
+                        "SELECT osm.work_id, osm.series_id, m.title
+                         FROM opentome_series_mappings osm
+                         JOIN manga m ON m.id = osm.manga_id
+                         WHERE osm.manga_id = ?1",
+                        [manga_id],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                    )
+                    .map_err(|e| AppError::bad_request(format!("No OpenTome mapping for manga {manga_id}: {e}")))?;
+
+                let Some(ref ot_conn) = ot_conn_opt else {
+                    return Err(AppError::bad_request("OpenTome catalogue is not available"));
+                };
+
+                let lines = catalog::get_work_lines(ot_conn, &work_id)
+                    .map_err(|e| AppError::internal(format!("Failed to query work lines: {e}")))?;
+                let chosen_line = lines
+                    .iter()
+                    .find(|l| l.gcd_series_id == gcd_series_id)
+                    .ok_or_else(|| {
+                        AppError::not_found(format!(
+                            "Release line {gcd_series_id} not found for work {work_id}"
+                        ))
+                    })?;
+
+                let schedule = catalog::evaluate_work_schedule_with_line(
+                    ot_conn,
+                    &work_id,
+                    "user_confirmed",
+                    &today,
+                    Some(gcd_series_id),
+                )
+                .map_err(|e| AppError::internal(format!("Schedule evaluation failed: {e}")))?;
+
+                let schedule_json = serde_json::to_string(&schedule).unwrap_or_default();
+                let now = crate::db::now();
+
+                conn.execute(
+                    "UPDATE opentome_series_mappings
+                     SET english_series_id = ?1, english_tome_id = ?2, metadata_json = ?3, updated_at = ?4
+                     WHERE manga_id = ?5",
+                    params![
+                        gcd_series_id,
+                        chosen_line.tome_id,
+                        schedule_json,
+                        now,
+                        manga_id,
+                    ],
+                )?;
+
+                Ok(Some(schedule))
             })
             .await
     }

@@ -31,6 +31,7 @@ use axum::{
     routing::{delete, get, post, put},
 };
 use flate2::{Compression, write::GzEncoder};
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -191,6 +192,38 @@ pub fn router(state: Spaces) -> Router {
         .route(
             "/catalog/mangabaka/{id}/collections",
             get(get_catalog_mangabaka_collections),
+        )
+        .route(
+            "/titles/{id}/mangabaka/collections",
+            get(get_title_mangabaka_collections),
+        )
+        .route(
+            "/manga/{id}/mangabaka/collections",
+            get(get_title_mangabaka_collections),
+        )
+        .route(
+            "/titles/{id}/mangabaka/collection",
+            post(post_title_mangabaka_collection),
+        )
+        .route(
+            "/manga/{id}/mangabaka/collection",
+            post(post_title_mangabaka_collection),
+        )
+        .route(
+            "/titles/{id}/opentome/lines",
+            get(get_title_opentome_lines),
+        )
+        .route(
+            "/manga/{id}/opentome/lines",
+            get(get_title_opentome_lines),
+        )
+        .route(
+            "/titles/{id}/opentome/line",
+            post(post_title_opentome_line),
+        )
+        .route(
+            "/manga/{id}/opentome/line",
+            post(post_title_opentome_line),
         )
         .route("/releases/calendar", get(get_releases_calendar))
         .route("/system/integrity", get(get_system_integrity))
@@ -3699,6 +3732,141 @@ async fn get_catalog_mangabaka_collections(
     );
     let collections = mb_client.list_series_collections(id).await?;
     Ok(Json(collections))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TitleMangaBakaCollectionsDto {
+    manga_id: i64,
+    mangabaka_id: Option<i64>,
+    current_collection_id: Option<String>,
+    current_edition: Option<String>,
+    status: String,
+    collections: Vec<crate::pipeline::mangabaka::MangaBakaCollectionInfo>,
+}
+
+async fn get_title_mangabaka_collections(
+    Me(app): Me,
+    Path(id): Path<i64>,
+) -> Result<Json<TitleMangaBakaCollectionsDto>> {
+    let (mb_id, current_coll_id, current_ed): (Option<i64>, Option<String>, Option<String>) = app
+        .db
+        .call(move |conn| {
+            let res = conn
+                .query_row(
+                    "SELECT COALESCE(sr.mangabaka_id, m.mangabaka_id), sr.collection_id, sr.edition
+                     FROM manga m
+                     LEFT JOIN series_reconciliations sr ON sr.manga_id = m.id
+                     WHERE m.id = ?1",
+                    [id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+            Ok(res.unwrap_or((None, None, None)))
+        })
+        .await?;
+
+    let Some(mangabaka_id) = mb_id else {
+        return Ok(Json(TitleMangaBakaCollectionsDto {
+            manga_id: id,
+            mangabaka_id: None,
+            current_collection_id: None,
+            current_edition: None,
+            status: "no_mangabaka_id".to_string(),
+            collections: Vec::new(),
+        }));
+    };
+
+    let (cfg, mb_token, _) = app.pipeline.load_internal_config().await?;
+    let mb_client = crate::pipeline::mangabaka::MangaBakaClient::new(
+        app.trackers.http().clone(),
+        cfg.mangabaka_url,
+        mb_token,
+    );
+    let collections = mb_client.list_series_collections(mangabaka_id).await?;
+
+    let status = if collections.is_empty() {
+        "collection_unavailable".to_string()
+    } else if current_coll_id.is_some() {
+        "resolved".to_string()
+    } else if collections.len() == 1 {
+        "single_collection".to_string()
+    } else {
+        "ambiguous".to_string()
+    };
+
+    Ok(Json(TitleMangaBakaCollectionsDto {
+        manga_id: id,
+        mangabaka_id: Some(mangabaka_id),
+        current_collection_id: current_coll_id,
+        current_edition: current_ed,
+        status,
+        collections,
+    }))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetTitleCollectionPayload {
+    collection_id: String,
+    edition: Option<String>,
+}
+
+async fn post_title_mangabaka_collection(
+    Me(app): Me,
+    Path(id): Path<i64>,
+    Json(payload): Json<SetTitleCollectionPayload>,
+) -> Result<Json<crate::sync::reconciliation::ReconciliationSummary>> {
+    app.me.admin()?;
+
+    let (title, komga_series_id) = app
+        .db
+        .call(move |conn| {
+            crate::sync::reconciliation::set_manual_series_and_collection(
+                conn,
+                id,
+                None,
+                Some(&payload.collection_id),
+                payload.edition.as_deref(),
+            )
+        })
+        .await?;
+
+    let target = crate::sync::reconciliation::ReconciliationTarget {
+        manga_id: Some(id),
+        komga_series_id,
+        title,
+        edition: None,
+    };
+    let summary = app.sync.run_reconciliation(target).await?;
+    Ok(Json(summary))
+}
+
+async fn get_title_opentome_lines(
+    Me(app): Me,
+    Path(id): Path<i64>,
+) -> Result<Json<crate::opentome::service::TitleOpenTomeLinesResponse>> {
+    let lines_resp = app.opentome.get_manga_opentome_lines(id).await?;
+    Ok(Json(lines_resp))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SetTitleOpenTomeLinePayload {
+    gcd_series_id: i64,
+}
+
+async fn post_title_opentome_line(
+    Me(app): Me,
+    Path(id): Path<i64>,
+    Json(payload): Json<SetTitleOpenTomeLinePayload>,
+) -> Result<Json<Option<crate::opentome::catalog::OpenTomeSeriesSchedule>>> {
+    app.me.admin()?;
+    let schedule = app
+        .opentome
+        .set_manga_opentome_line(id, payload.gcd_series_id)
+        .await?;
+    Ok(Json(schedule))
 }
 
 #[derive(Deserialize)]

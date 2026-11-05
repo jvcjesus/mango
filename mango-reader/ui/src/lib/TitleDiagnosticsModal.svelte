@@ -8,6 +8,10 @@
     getTitleBacklogJobs,
     getTitleDiagnostics,
     getTitleReceipts,
+    getTitleMangaBakaCollections,
+    setTitleMangaBakaCollection,
+    getTitleOpenTomeLines,
+    setTitleOpenTomeLine,
     listMangaBakaCollections,
     message,
     planBacklog,
@@ -27,6 +31,9 @@
     type SeriesTimelineVolumeDto,
     type TitleAvailabilityDto,
     type TitleDiagnostics,
+    type TitleMangaBakaCollectionsDto,
+    type TitleOpenTomeLinesDto,
+    type OpenTomeReleaseLineDto,
   } from './api';
   import CandidateInspectorModal from './CandidateInspectorModal.svelte';
   import Icon from './Icon.svelte';
@@ -270,10 +277,66 @@
       if (diag.collection.edition) {
         manualEditionInput = diag.collection.edition;
       }
+      loadOpenTomeLines();
+      loadTitleMbCollections();
     } catch (e) {
       error = message(e);
     } finally {
       loading = false;
+    }
+  }
+
+  let openTomeLinesData = $state<TitleOpenTomeLinesDto | null>(null);
+  let loadingOpenTomeLines = $state(false);
+  let selectingOpenTomeLine = $state(false);
+  let showOpenTomeLineSelector = $state(false);
+
+  async function loadOpenTomeLines() {
+    loadingOpenTomeLines = true;
+    try {
+      openTomeLinesData = await getTitleOpenTomeLines(mangaId);
+    } catch {
+      openTomeLinesData = null;
+    } finally {
+      loadingOpenTomeLines = false;
+    }
+  }
+
+  async function handleSelectOpenTomeLine(gcdSeriesId: number) {
+    selectingOpenTomeLine = true;
+    try {
+      await setTitleOpenTomeLine(mangaId, gcdSeriesId);
+      toast.success('OpenTome release line retargeted.');
+      showOpenTomeLineSelector = false;
+      await load();
+    } catch (e) {
+      toast.error(message(e));
+    } finally {
+      selectingOpenTomeLine = false;
+    }
+  }
+
+  let titleMbCollectionsData = $state<TitleMangaBakaCollectionsDto | null>(null);
+  let loadingTitleMbCollections = $state(false);
+
+  async function loadTitleMbCollections() {
+    loadingTitleMbCollections = true;
+    try {
+      titleMbCollectionsData = await getTitleMangaBakaCollections(mangaId);
+    } catch {
+      titleMbCollectionsData = null;
+    } finally {
+      loadingTitleMbCollections = false;
+    }
+  }
+
+  async function handleSelectTitleCollection(collectionId: string, edition?: string) {
+    try {
+      await setTitleMangaBakaCollection(mangaId, collectionId, edition);
+      toast.success('MangaBaka edition collection resolved and saved.');
+      await load();
+    } catch (e) {
+      toast.error(message(e));
     }
   }
 
@@ -740,6 +803,28 @@
                     <span class="field-v warning-text">{diag.collection.reason}</span>
                   </div>
                 {/if}
+
+                {#if titleMbCollectionsData}
+                  {#if titleMbCollectionsData.status === 'collection_unavailable'}
+                    <div class="edition-notice notice-info font-small">
+                      <Icon name="info" size={14} />
+                      <span>Collection Unavailable: MangaBaka has not published an edition collection for this title. Physical volumes are tracked canonically via Komga without fabricating fake volume records.</span>
+                    </div>
+                  {:else if titleMbCollectionsData.status === 'ambiguous'}
+                    <div class="edition-notice notice-warning font-small">
+                      <Icon name="info" size={14} />
+                      <span>Multiple Collections ({titleMbCollectionsData.collections.length}): Please select the authoritative edition:</span>
+                      <div class="quick-collections-list">
+                        {#each titleMbCollectionsData.collections as col}
+                          <div class="quick-col-item">
+                            <span><strong>{col.name}</strong> ({col.language || 'en'}) — {col.totalWorks ? `${col.totalWorks} vols` : 'unknown'}</span>
+                            <button class="btn mini spot" onclick={() => handleSelectTitleCollection(col.id, col.edition)}>Select</button>
+                          </div>
+                        {/each}
+                      </div>
+                    </div>
+                  {/if}
+                {/if}
               </div>
             </div>
           </div>
@@ -906,6 +991,48 @@
                   <span class="field-k">Release Discovery Targets:</span>
                   <span class="field-v">{diag.releaseIntelligence.totalReleaseTargets} targets tracked</span>
                 </div>
+
+                {#if openTomeLinesData && openTomeLinesData.lines.length > 0}
+                  <div class="diag-field">
+                    <span class="field-k">Release Line:</span>
+                    <span class="field-v">
+                      <strong>{openTomeLinesData.lines.find(l => l.gcdSeriesId === openTomeLinesData?.currentGcdSeriesId)?.name || 'Default English Line'}</strong>
+                    </span>
+                  </div>
+                  <div class="line-selector-row">
+                    <button
+                      class="btn mini outline icon-text"
+                      onclick={() => showOpenTomeLineSelector = !showOpenTomeLineSelector}
+                    >
+                      <Icon name="sliders" size={13} />
+                      {showOpenTomeLineSelector ? 'Hide Release Lines' : `Change Release Line (${openTomeLinesData.lines.length})`}
+                    </button>
+                  </div>
+
+                  {#if showOpenTomeLineSelector}
+                    <div class="opentome-lines-dropdown">
+                      {#each openTomeLinesData.lines as line}
+                        <div class="ot-line-item" class:current={line.gcdSeriesId === openTomeLinesData.currentGcdSeriesId}>
+                          <div class="line-info">
+                            <strong>{line.name}</strong>
+                            <span class="muted font-small">({line.language.toUpperCase()}) · {line.volumeCount} vols · {line.publisher || 'Unknown pub'}</span>
+                          </div>
+                          {#if line.gcdSeriesId === openTomeLinesData.currentGcdSeriesId}
+                            <span class="pill-badge active">Active Line</span>
+                          {:else}
+                            <button
+                              class="btn mini"
+                              disabled={selectingOpenTomeLine}
+                              onclick={() => handleSelectOpenTomeLine(line.gcdSeriesId)}
+                            >
+                              Select Line
+                            </button>
+                          {/if}
+                        </div>
+                      {/each}
+                    </div>
+                  {/if}
+                {/if}
               </div>
             </div>
           </div>
@@ -2239,5 +2366,80 @@
     color: #facc15;
     padding: 1px 5px;
     border-radius: 3px;
+  }
+
+  /* MangaBaka Edition Resolution & OpenTome Lines (M7.3) */
+  .edition-notice {
+    padding: 8px 10px;
+    border-radius: 6px;
+    margin-top: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+
+  .edition-notice.notice-info {
+    background: rgba(59, 130, 246, 0.1);
+    border: 1px solid rgba(59, 130, 246, 0.25);
+    color: #93c5fd;
+  }
+
+  .edition-notice.notice-warning {
+    background: rgba(234, 179, 8, 0.1);
+    border: 1px solid rgba(234, 179, 8, 0.25);
+    color: #fde047;
+  }
+
+  .quick-collections-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-top: 4px;
+  }
+
+  .quick-col-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: rgba(0, 0, 0, 0.2);
+    padding: 4px 8px;
+    border-radius: 4px;
+    gap: 8px;
+  }
+
+  .line-selector-row {
+    margin-top: 6px;
+  }
+
+  .opentome-lines-dropdown {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    background: var(--surface-1, rgba(255, 255, 255, 0.03));
+    border: 1px solid var(--edge, rgba(255, 255, 255, 0.1));
+    border-radius: 6px;
+    padding: 8px;
+    margin-top: 8px;
+  }
+
+  .ot-line-item {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    padding: 6px 8px;
+    border-radius: 4px;
+    background: rgba(255, 255, 255, 0.02);
+    gap: 8px;
+  }
+
+  .ot-line-item.current {
+    border-left: 3px solid var(--spot, #ff7a00);
+    background: rgba(255, 122, 0, 0.05);
+  }
+
+  .line-info {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
   }
 </style>

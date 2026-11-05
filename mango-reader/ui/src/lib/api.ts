@@ -2192,6 +2192,46 @@ export const setManualTitleMapping = (
 export const clearManualTitleMapping = (mangaId: number) =>
   send<ReconciliationSummary>('DELETE', `/manga/${mangaId}/mapping/manual`);
 
+export interface TitleMangaBakaCollectionsDto {
+  mangaId: number;
+  mangabakaId?: number | null;
+  currentCollectionId?: string | null;
+  currentEdition?: string | null;
+  status: 'resolved' | 'ambiguous' | 'collection_unavailable' | 'single_collection' | 'no_mangabaka_id' | string;
+  collections: MangaBakaCollectionInfo[];
+}
+
+export const getTitleMangaBakaCollections = (mangaId: number) =>
+  get<TitleMangaBakaCollectionsDto>(`/manga/${mangaId}/mangabaka/collections`);
+
+export const setTitleMangaBakaCollection = (mangaId: number, collectionId: string, edition?: string) =>
+  send<ReconciliationSummary>('POST', `/manga/${mangaId}/mangabaka/collection`, { collectionId, edition });
+
+export interface OpenTomeReleaseLineDto {
+  gcdSeriesId: number;
+  name: string;
+  language: string;
+  isMain: boolean;
+  isOmnibus: boolean;
+  volumeCount: number;
+  tomeId: string;
+  publisher?: string | null;
+  medium?: string | null;
+}
+
+export interface TitleOpenTomeLinesDto {
+  mangaId: number;
+  workId?: string | null;
+  currentGcdSeriesId?: number | null;
+  lines: OpenTomeReleaseLineDto[];
+}
+
+export const getTitleOpenTomeLines = (mangaId: number) =>
+  get<TitleOpenTomeLinesDto>(`/manga/${mangaId}/opentome/lines`);
+
+export const setTitleOpenTomeLine = (mangaId: number, gcdSeriesId: number) =>
+  send<OpenTomeSeriesSchedule | null>('POST', `/manga/${mangaId}/opentome/line`, { gcdSeriesId });
+
 export const getReleaseCalendar = (market?: string) =>
   get<ReleaseCalendarEntryDto[]>(`/releases/calendar${market ? `?market=${encodeURIComponent(market)}` : ''}`);
 

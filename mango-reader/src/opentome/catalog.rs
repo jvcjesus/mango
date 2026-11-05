@@ -48,7 +48,8 @@ pub struct OpenTomeWorkCandidate {
     pub anilist_id: Option<i64>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct OpenTomeReleaseLine {
     pub gcd_series_id: i64,
     pub name: String,
@@ -343,10 +344,28 @@ pub fn evaluate_work_schedule(
     confidence: &str,
     today_str: &str,
 ) -> SqlResult<OpenTomeSeriesSchedule> {
+    evaluate_work_schedule_with_line(conn, work_id, confidence, today_str, None)
+}
+
+pub fn evaluate_work_schedule_with_line(
+    conn: &Connection,
+    work_id: &str,
+    confidence: &str,
+    today_str: &str,
+    chosen_en_line_id: Option<i64>,
+) -> SqlResult<OpenTomeSeriesSchedule> {
     let lines = get_work_lines(conn, work_id)?;
 
     let ja_line = pick_main_line(&lines, "ja");
-    let en_line = pick_main_line(&lines, "en");
+    let en_line = if let Some(chosen_id) = chosen_en_line_id {
+        lines
+            .iter()
+            .find(|l| l.gcd_series_id == chosen_id)
+            .cloned()
+            .or_else(|| pick_main_line(&lines, "en"))
+    } else {
+        pick_main_line(&lines, "en")
+    };
 
     let ja_schedule = if let Some(ja) = ja_line {
         Some(get_line_schedule(conn, &ja, today_str)?)
