@@ -201,6 +201,20 @@ pub fn router(state: Spaces) -> Router {
         )
         .route("/availability/watchers", get(get_availability_watchers))
         .route(
+            "/availability/watchers/dashboard",
+            get(get_availability_watchers_dashboard),
+        )
+        .route(
+            "/availability/watchers/{id}/refresh",
+            post(post_availability_watcher_refresh),
+        )
+        .route("/watchers", get(get_availability_watchers))
+        .route("/watchers/dashboard", get(get_availability_watchers_dashboard))
+        .route(
+            "/watchers/{id}/refresh",
+            post(post_availability_watcher_refresh),
+        )
+        .route(
             "/titles/{id}/availability",
             get(get_title_availability).patch(patch_title_availability),
         )
@@ -3919,6 +3933,41 @@ async fn post_title_availability_refresh(
     app.me.admin()?;
     let http = reqwest::Client::new();
     let res = crate::acquisition::watcher::refresh_title_watchers(&app.db, http, id).await?;
+    Ok(Json(res))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WatchersDashboardQuery {
+    state: Option<String>,
+    query: Option<String>,
+}
+
+async fn get_availability_watchers_dashboard(
+    Me(app): Me,
+    Query(query): Query<WatchersDashboardQuery>,
+) -> Result<Json<crate::acquisition::watcher::WatchersDashboardResponse>> {
+    app.me.admin()?;
+    let resp = app
+        .db
+        .call(move |conn| {
+            crate::acquisition::watcher::list_all_watchers(
+                conn,
+                query.state.as_deref(),
+                query.query.as_deref(),
+            )
+        })
+        .await?;
+    Ok(Json(resp))
+}
+
+async fn post_availability_watcher_refresh(
+    Me(app): Me,
+    Path(id): Path<i64>,
+) -> Result<Json<Option<crate::acquisition::watcher::ReleaseAvailabilityWatcher>>> {
+    app.me.admin()?;
+    let http = reqwest::Client::new();
+    let res = crate::acquisition::watcher::refresh_watcher_by_id(&app.db, http, id).await?;
     Ok(Json(res))
 }
 

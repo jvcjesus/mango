@@ -2213,25 +2213,68 @@ export const resolveNotificationEvent = (eventId: number) =>
 export interface TitleAvailabilityWatcherDto {
   id: number;
   seriesId: string;
-  mangaId: number;
+  mangaId?: number | null;
+  seriesTitle?: string;
   volumeNumber: number;
   releaseDate?: string | null;
   edition: string;
+  isReleased?: boolean;
+  isOwned?: boolean;
+  monitoringEnabled?: boolean;
+  notifyOnAvailable?: boolean;
   state: 'POLLING' | 'CANDIDATE_FOUND' | 'OWNERSHIP_DETECTED' | 'FAILED_PERMANENT' | 'STOPPED' | string;
-  preferredProvider: string;
+  preferredProvider?: string;
   checkIntervalSecs: number;
+  lastAttemptAt?: number | null;
   lastCheckedAt?: number | null;
   nextCheckAt: number;
   consecutiveFailures: number;
+  lastProviderChecked?: string | null;
+  lastCheckStatus?: string | null;
+  lastError?: string | null;
+  topCandidateId?: string | null;
+  topCandidateProvider?: string | null;
+  topCandidateTitle?: string | null;
+  topCandidateFingerprint?: string | null;
+  candidateCount?: number;
+  notifiedAt?: number | null;
+  notificationEventId?: number | null;
   foundCandidateId?: string | null;
   foundProvider?: string | null;
   foundReleaseTitle?: string | null;
   foundPublishedAt?: number | null;
-  lastError?: string | null;
   stopReason?: string | null;
   createdAt: number;
   updatedAt: number;
 }
+
+export interface WatchersSummaryDto {
+  totalWatchers: number;
+  upcomingCount: number;
+  releasedAwaitingCount: number;
+  candidateFoundCount: number;
+  notifiedCount: number;
+  acquiredCount: number;
+  errorCount: number;
+  ownedCount: number;
+}
+
+export interface WatchersDashboardResponseDto {
+  summary: WatchersSummaryDto;
+  watchers: TitleAvailabilityWatcherDto[];
+}
+
+export const getWatchersDashboard = (state?: string, query?: string) =>
+  get<WatchersDashboardResponseDto>(
+    `/availability/watchers/dashboard?${state ? `state=${encodeURIComponent(state)}&` : ''}${query ? `query=${encodeURIComponent(query)}` : ''}`
+  );
+
+export const refreshWatcherById = (watcherId: number) =>
+  send<TitleAvailabilityWatcherDto | null>(
+    'POST',
+    `/availability/watchers/${watcherId}/refresh`,
+    {}
+  );
 
 export interface TitleAvailabilityDto {
   mangaId: number;

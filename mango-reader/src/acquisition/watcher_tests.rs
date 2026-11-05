@@ -451,3 +451,74 @@ async fn test_run_watcher_tick_atomic_lease() {
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
+
+#[tokio::test]
+async fn test_list_all_watchers_summary_and_filtering() {
+    let temp_dir = std::env::temp_dir().join(format!("mango_watchers_dash_test_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let db = crate::db::Db::open(&temp_dir.join("test.db")).unwrap();
+
+    let cur_time = crate::db::now();
+
+    db.call(move |conn| {
+        conn.execute(
+            "INSERT INTO manga (id, source_id, url, title, update_strategy)
+             VALUES (402, 1, 'url:402', 'Kagurabachi', 'ALWAYS_UPDATE')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO release_availability_watchers (
+                series_id, manga_id, series_title, volume_number, edition,
+                is_released, is_owned, monitoring_enabled, notify_on_available,
+                state, last_attempt_at, last_checked_at, next_check_at,
+                check_interval_secs, consecutive_failures, created_at, updated_at
+             ) VALUES (
+                'manga:402', 402, 'Kagurabachi', 9.0, 'standard',
+                1, 0, 1, 1,
+                'RELEASED_AWAITING_PROVIDER', 0, 0, ?1,
+                3600, 0, ?1, ?1
+             )",
+            [cur_time],
+        )?;
+        conn.execute(
+            "INSERT INTO release_availability_watchers (
+                series_id, manga_id, series_title, volume_number, edition,
+                is_released, is_owned, monitoring_enabled, notify_on_available,
+                state, last_attempt_at, last_checked_at, next_check_at,
+                check_interval_secs, consecutive_failures, created_at, updated_at
+             ) VALUES (
+                'manga:402', 402, 'Kagurabachi', 8.0, 'standard',
+                1, 1, 1, 1,
+                'OWNERSHIP_DETECTED', 0, 0, ?1,
+                3600, 0, ?1, ?1
+             )",
+            [cur_time],
+        )?;
+
+        // Test list_all_watchers without filters
+        let resp = list_all_watchers(conn, None, None)?;
+        assert_eq!(resp.summary.total_watchers, 2);
+        assert_eq!(resp.summary.released_awaiting_count, 1);
+        assert_eq!(resp.summary.owned_count, 1);
+        assert_eq!(resp.watchers.len(), 2);
+
+        // Test filter by state
+        let resp_state = list_all_watchers(conn, Some("RELEASED_AWAITING_PROVIDER"), None)?;
+        assert_eq!(resp_state.watchers.len(), 1);
+        assert_eq!(resp_state.watchers[0].volume_number, 9.0);
+
+        // Test filter by series title
+        let resp_title = list_all_watchers(conn, None, Some("Kagura"))?;
+        assert_eq!(resp_title.watchers.len(), 2);
+
+        let resp_empty = list_all_watchers(conn, None, Some("NonExistent"))?;
+        assert_eq!(resp_empty.watchers.len(), 0);
+
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}

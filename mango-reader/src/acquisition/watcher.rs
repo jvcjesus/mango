@@ -428,6 +428,106 @@ fn map_watcher_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ReleaseAvailabilit
     })
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WatchersSummary {
+    pub total_watchers: usize,
+    pub upcoming_count: usize,
+    pub released_awaiting_count: usize,
+    pub candidate_found_count: usize,
+    pub notified_count: usize,
+    pub acquired_count: usize,
+    pub error_count: usize,
+    pub owned_count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WatchersDashboardResponse {
+    pub summary: WatchersSummary,
+    pub watchers: Vec<ReleaseAvailabilityWatcher>,
+}
+
+/// Lists all release availability watchers with aggregate summary statistics and optional filters.
+pub fn list_all_watchers(
+    conn: &Connection,
+    state_filter: Option<&str>,
+    series_title_filter: Option<&str>,
+) -> Result<WatchersDashboardResponse> {
+    let mut stmt = conn.prepare(
+        "SELECT id, series_id, manga_id, series_title, volume_number, mangabaka_id, collection_id,
+                work_id, market, edition, release_date, is_released, is_owned, monitoring_enabled,
+                notify_on_available, state, last_attempt_at, last_checked_at, next_check_at,
+                check_interval_secs, consecutive_failures, last_provider_checked, last_check_status,
+                last_error, top_candidate_id, top_candidate_provider, top_candidate_title,
+                top_candidate_fingerprint, candidate_count, notified_at, notification_event_id,
+                created_at, updated_at
+         FROM release_availability_watchers
+         ORDER BY is_owned ASC, is_released DESC, volume_number ASC",
+    )?;
+
+    let rows = stmt.query_map([], map_watcher_row)?;
+    let mut all = Vec::new();
+    for r in rows {
+        all.push(r?);
+    }
+
+    let mut summary = WatchersSummary {
+        total_watchers: all.len(),
+        upcoming_count: 0,
+        released_awaiting_count: 0,
+        candidate_found_count: 0,
+        notified_count: 0,
+        acquired_count: 0,
+        error_count: 0,
+        owned_count: 0,
+    };
+
+    for w in &all {
+        if w.is_owned {
+            summary.owned_count += 1;
+        }
+        match w.state {
+            WatcherState::Upcoming => summary.upcoming_count += 1,
+            WatcherState::ReleasedAwaitingProvider => summary.released_awaiting_count += 1,
+            WatcherState::EligibleCandidateFound => summary.candidate_found_count += 1,
+            WatcherState::Notified => summary.notified_count += 1,
+            WatcherState::Acquired => summary.acquired_count += 1,
+            WatcherState::ProviderUnavailable
+            | WatcherState::RateLimited
+            | WatcherState::ReviewRequired => summary.error_count += 1,
+            _ => {}
+        }
+    }
+
+    let mut filtered = all;
+    if let Some(st) = state_filter {
+        if !st.is_empty() && st != "ALL" {
+            filtered.retain(|w| w.state.as_str().eq_ignore_ascii_case(st));
+        }
+    }
+    if let Some(title) = series_title_filter {
+        let title_lower = title.trim().to_lowercase();
+        if !title_lower.is_empty() {
+            filtered.retain(|w| w.series_title.to_lowercase().contains(&title_lower));
+        }
+    }
+
+    Ok(WatchersDashboardResponse {
+        summary,
+        watchers: filtered,
+    })
+}
+
+/// Triggers on-demand evaluation of a single watcher record with rate-limit protection.
+pub async fn refresh_watcher_by_id(
+    db: &Db,
+    http: Client,
+    watcher_id: i64,
+) -> Result<Option<ReleaseAvailabilityWatcher>> {
+    evaluate_watcher_check(db, http, watcher_id).await
+}
+
 /// Evaluates a single watcher record against discovery providers and updates state.
 ///
 /// Strict Guarantees:

@@ -2,11 +2,14 @@
   import {
     get,
     getReleaseCalendar,
+    getWatchersDashboard,
+    refreshWatcherById,
     message,
     send,
     type ReleaseCalendarItem,
     type UpdateItem,
     type Updates,
+    type WatchersDashboardResponseDto,
   } from '../lib/api';
   import CandidateInspectorModal from '../lib/CandidateInspectorModal.svelte';
   import Icon from '../lib/Icon.svelte';
@@ -16,7 +19,7 @@
   import { ago, dayKey, dayLabel } from '../lib/util';
 
   // Navigation mode
-  let activeTab = $state<'chapters' | 'calendar'>('chapters');
+  let activeTab = $state<'chapters' | 'calendar' | 'watchers'>('chapters');
 
   // Chapters tab state
   const kept = recall<Updates>('updates');
@@ -34,6 +37,48 @@
   let calendarError = $state<string | null>(null);
   let marketFilter = $state<string>('EN');
   let inspectingVolumeTarget = $state<{ mangaId: number; volume: number } | null>(null);
+
+  // Availability Watchers state (M7.2)
+  let watchersData = $state<WatchersDashboardResponseDto | null>(null);
+  let watchersLoading = $state<boolean>(false);
+  let watchersError = $state<string | null>(null);
+  let watchersFilter = $state<string>('ALL');
+  let watchersSearch = $state<string>('');
+  let refreshingWatchers = $state<Record<number, boolean>>({});
+
+  async function loadWatchers() {
+    watchersLoading = true;
+    watchersError = null;
+    try {
+      watchersData = await getWatchersDashboard();
+    } catch (e) {
+      watchersError = message(e);
+      toast.error(watchersError);
+    } finally {
+      watchersLoading = false;
+    }
+  }
+
+  async function handleRefreshWatcher(id: number) {
+    if (refreshingWatchers[id]) return;
+    refreshingWatchers[id] = true;
+    try {
+      const updated = await refreshWatcherById(id);
+      if (updated && watchersData) {
+        const idx = watchersData.watchers.findIndex(w => w.id === id);
+        if (idx !== -1) {
+          watchersData.watchers[idx] = updated;
+        }
+        toast.success(`Checked Vol ${updated.volumeNumber}: ${updated.state}`);
+      } else {
+        toast.info('Watcher checked.');
+      }
+    } catch (e) {
+      toast.error(message(e));
+    } finally {
+      refreshingWatchers[id] = false;
+    }
+  }
 
   const running = $derived(data?.status.running ?? false);
   const days = $derived.by(() => {
@@ -166,6 +211,18 @@
         >
           <Icon name="clock" size={14} /> Release Calendar
         </button>
+        <button
+          class="pill"
+          class:active={activeTab === 'watchers'}
+          onclick={() => {
+            activeTab = 'watchers';
+            if (!watchersData) loadWatchers();
+          }}
+          role="tab"
+          aria-selected={activeTab === 'watchers'}
+        >
+          <Icon name="bell" size={14} /> Availability Watchers
+        </button>
       </div>
     </div>
 
@@ -278,7 +335,7 @@
       <Notice>No new chapters yet. Titles in the library are checked on a schedule; “Update now” checks them right away.</Notice>
     {/if}
 
-  {:else}
+  {:else if activeTab === 'calendar'}
     <!-- RELEASE CALENDAR VIEW -->
     <Notice loading={calendarLoading} error={calendarError} retry={loadCalendar} />
 
@@ -335,6 +392,186 @@
               {/each}
             </div>
           </section>
+        {/if}
+      {/if}
+    {/if}
+
+  {:else if activeTab === 'watchers'}
+    <!-- AVAILABILITY & WATCHERS DASHBOARD (M7.2) -->
+    <Notice loading={watchersLoading} error={watchersError} retry={loadWatchers} />
+
+    {#if !watchersLoading && !watchersError}
+      {#if watchersData}
+        <!-- Metrics Grid -->
+        <div class="watchers-summary-grid">
+          <button type="button" class="metric-card" class:selected={watchersFilter === 'ALL'} onclick={() => watchersFilter = 'ALL'}>
+            <span class="metric-val">{watchersData.summary.totalWatchers}</span>
+            <span class="metric-lbl">Total Watchers</span>
+          </button>
+          <button type="button" class="metric-card metric-upcoming" class:selected={watchersFilter === 'UPCOMING'} onclick={() => watchersFilter = 'UPCOMING'}>
+            <span class="metric-val">{watchersData.summary.upcomingCount}</span>
+            <span class="metric-lbl">Upcoming</span>
+          </button>
+          <button type="button" class="metric-card metric-awaiting" class:selected={watchersFilter === 'RELEASED_AWAITING_PROVIDER'} onclick={() => watchersFilter = 'RELEASED_AWAITING_PROVIDER'}>
+            <span class="metric-val">{watchersData.summary.releasedAwaitingCount}</span>
+            <span class="metric-lbl">Awaiting Upload</span>
+          </button>
+          <button type="button" class="metric-card metric-candidate" class:selected={watchersFilter === 'ELIGIBLE_CANDIDATE_FOUND'} onclick={() => watchersFilter = 'ELIGIBLE_CANDIDATE_FOUND'}>
+            <span class="metric-val">{watchersData.summary.candidateFoundCount}</span>
+            <span class="metric-lbl">Candidates Found</span>
+          </button>
+          <button type="button" class="metric-card metric-notified" class:selected={watchersFilter === 'NOTIFIED'} onclick={() => watchersFilter = 'NOTIFIED'}>
+            <span class="metric-val">{watchersData.summary.notifiedCount}</span>
+            <span class="metric-lbl">Notified</span>
+          </button>
+          <button type="button" class="metric-card metric-owned" class:selected={watchersFilter === 'OWNED'} onclick={() => watchersFilter = 'OWNED'}>
+            <span class="metric-val">{watchersData.summary.ownedCount}</span>
+            <span class="metric-lbl">Owned / Complete</span>
+          </button>
+          <button type="button" class="metric-card metric-error" class:selected={watchersFilter === 'ERROR'} onclick={() => watchersFilter = 'ERROR'}>
+            <span class="metric-val">{watchersData.summary.errorCount}</span>
+            <span class="metric-lbl">Issues / Errors</span>
+          </button>
+        </div>
+
+        <!-- Filter & Search Toolbar -->
+        <div class="watchers-toolbar">
+          <div class="filter-pills">
+            {#each [
+              ['ALL', 'All'],
+              ['UPCOMING', 'Upcoming'],
+              ['RELEASED_AWAITING_PROVIDER', 'Awaiting Upload'],
+              ['ELIGIBLE_CANDIDATE_FOUND', 'Candidates Found'],
+              ['NOTIFIED', 'Notified'],
+              ['OWNED', 'Owned'],
+              ['ERROR', 'Issues']
+            ] as [fKey, fLabel]}
+              <button
+                class="pill mini"
+                class:active={watchersFilter === fKey}
+                onclick={() => watchersFilter = fKey}
+              >
+                {fLabel}
+              </button>
+            {/each}
+          </div>
+          <div class="search-box">
+            <input
+              type="search"
+              class="field search-field"
+              placeholder="Search title…"
+              bind:value={watchersSearch}
+            />
+          </div>
+        </div>
+
+        <!-- Filtered Watchers List -->
+        {@const filteredWatchers = watchersData.watchers.filter(w => {
+          if (watchersSearch.trim()) {
+            const q = watchersSearch.toLowerCase();
+            if (!w.seriesTitle?.toLowerCase().includes(q)) return false;
+          }
+          if (watchersFilter === 'ALL') return true;
+          if (watchersFilter === 'OWNED') return w.isOwned;
+          if (watchersFilter === 'ERROR') {
+            return w.state === 'PROVIDER_UNAVAILABLE' || w.state === 'RATE_LIMITED' || w.state === 'REVIEW_REQUIRED';
+          }
+          return w.state === watchersFilter;
+        })}
+
+        {#if filteredWatchers.length === 0}
+          <div class="panel empty-watchers-panel">
+            <p class="muted">No availability watchers match current filter.</p>
+          </div>
+        {:else}
+          <div class="watchers-list">
+            {#each filteredWatchers as watcher (watcher.id)}
+              <div class="watcher-card" class:card-highlight={watcher.seriesTitle === 'Kagurabachi' && watcher.volumeNumber === 9}>
+                <div class="watcher-main-row">
+                  <div class="watcher-title-col">
+                    <div class="watcher-series-head">
+                      {#if watcher.mangaId}
+                        <a href="#/title/{watcher.mangaId}" class="watcher-series-link">
+                          <strong>{watcher.seriesTitle || `Manga #${watcher.mangaId}`}</strong>
+                        </a>
+                      {:else}
+                        <strong>{watcher.seriesTitle}</strong>
+                      {/if}
+                      <span class="vol-tag">Vol {watcher.volumeNumber}</span>
+                      <span class="pill-badge edition-pill">{watcher.edition}</span>
+                      {#if watcher.isOwned}
+                        <span class="pill-badge active">Owned</span>
+                      {:else}
+                        <span class="pill-badge state-badge state-{watcher.state.toLowerCase()}">
+                          {watcher.state}
+                        </span>
+                      {/if}
+                    </div>
+
+                    <div class="watcher-meta-row font-small muted">
+                      {#if watcher.releaseDate}
+                        <span>Released: <strong>{watcher.releaseDate}</strong></span>
+                      {/if}
+                      {#if watcher.lastCheckedAt}
+                        <span>Checked: {ago(watcher.lastCheckedAt * 1000)}</span>
+                      {/if}
+                      <span>Next Check: {ago(watcher.nextCheckAt * 1000)}</span>
+                      {#if watcher.lastProviderChecked}
+                        <span>Provider: <code>{watcher.lastProviderChecked}</code></span>
+                      {/if}
+                    </div>
+                  </div>
+
+                  <div class="watcher-actions-col">
+                    <button
+                      class="btn mini"
+                      disabled={refreshingWatchers[watcher.id]}
+                      onclick={() => handleRefreshWatcher(watcher.id)}
+                      title="Run on-demand check for Volume {watcher.volumeNumber}"
+                    >
+                      {#if refreshingWatchers[watcher.id]}
+                        <span class="spin"><Icon name="spinner" size={13} stroke={3} /></span> Checking…
+                      {:else}
+                        <Icon name="search" size={13} /> Check Now
+                      {/if}
+                    </button>
+
+                    {#if watcher.mangaId}
+                      <button
+                        class="btn mini flat"
+                        onclick={() => {
+                          inspectingVolumeTarget = { mangaId: watcher.mangaId!, volume: watcher.volumeNumber };
+                        }}
+                        title="Inspect candidate transports"
+                      >
+                        <Icon name="eye" size={13} /> Inspect
+                      </button>
+                    {/if}
+                  </div>
+                </div>
+
+                <!-- Top Candidate Preview if available -->
+                {#if watcher.topCandidateTitle || (watcher.candidateCount && watcher.candidateCount > 0)}
+                  <div class="candidate-preview-bar font-small">
+                    <span class="cand-badge">
+                      <Icon name="download" size={12} />
+                      {watcher.candidateCount || 1} Candidate{(watcher.candidateCount || 1) > 1 ? 's' : ''}
+                    </span>
+                    {#if watcher.topCandidateProvider}
+                      <span class="provider-pill">{watcher.topCandidateProvider}</span>
+                    {/if}
+                    <span class="cand-title font-mono">{watcher.topCandidateTitle || 'Candidate Available'}</span>
+                  </div>
+                {/if}
+
+                {#if watcher.lastError}
+                  <div class="watcher-error-note font-small">
+                    <Icon name="close" size={12} /> {watcher.lastError}
+                  </div>
+                {/if}
+              </div>
+            {/each}
+          </div>
         {/if}
       {/if}
     {/if}
@@ -713,5 +950,200 @@
 
   .font-small {
     font-size: 12px;
+  }
+
+  /* Availability Watchers Dashboard Styles (M7.2) */
+  .watchers-summary-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+    gap: 0.65rem;
+    margin: 1rem 0;
+  }
+
+  .watchers-summary-grid .metric-card {
+    background: var(--shade);
+    border: 1px solid var(--border-color, rgba(255, 255, 255, 0.08));
+    border-radius: 6px;
+    padding: 0.75rem;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0.25rem;
+    text-align: center;
+    cursor: pointer;
+    transition: border-color 0.15s ease, background 0.15s ease;
+  }
+
+  .watchers-summary-grid .metric-card:hover {
+    border-color: var(--spot, #ff7a00);
+  }
+
+  .watchers-summary-grid .metric-card.selected {
+    border-color: var(--spot, #ff7a00);
+    background: rgba(255, 122, 0, 0.08);
+  }
+
+  .metric-val {
+    font-size: 1.4rem;
+    font-weight: 700;
+  }
+
+  .metric-lbl {
+    font-size: 0.72rem;
+    color: var(--muted, #888);
+  }
+
+  .metric-upcoming .metric-val { color: #3b82f6; }
+  .metric-awaiting .metric-val { color: #eab308; }
+  .metric-candidate .metric-val { color: var(--spot, #ff7a00); }
+  .metric-notified .metric-val { color: #a855f7; }
+  .metric-owned .metric-val { color: #22c55e; }
+  .metric-error .metric-val { color: #ef4444; }
+
+  .watchers-toolbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+    margin-bottom: 1rem;
+  }
+
+  .filter-pills {
+    display: flex;
+    gap: 0.4rem;
+    flex-wrap: wrap;
+  }
+
+  .search-field {
+    min-width: 220px;
+    padding: 0.4rem 0.75rem;
+    font-size: 13px;
+  }
+
+  .watchers-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+  }
+
+  .watcher-card {
+    background: var(--shade);
+    border: 1px solid var(--border-color, rgba(255, 255, 255, 0.08));
+    border-radius: 8px;
+    padding: 1rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+  }
+
+  .watcher-card.card-highlight {
+    border-color: var(--spot, #ff7a00);
+    box-shadow: 0 0 12px rgba(255, 122, 0, 0.15);
+  }
+
+  .watcher-main-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 1rem;
+    flex-wrap: wrap;
+  }
+
+  .watcher-title-col {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+  }
+
+  .watcher-series-head {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+  }
+
+  .watcher-series-link {
+    color: var(--ink);
+    text-decoration: none;
+    font-size: 15px;
+  }
+
+  .watcher-series-link:hover {
+    text-decoration: underline;
+  }
+
+  .vol-tag {
+    font-weight: 700;
+    font-size: 13px;
+    color: var(--spot, #ff7a00);
+  }
+
+  .edition-pill {
+    font-size: 11px;
+    padding: 2px 6px;
+    border-radius: 4px;
+    background: rgba(255, 255, 255, 0.06);
+  }
+
+  .state-badge {
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 8px;
+    border-radius: 4px;
+    background: rgba(255, 255, 255, 0.08);
+  }
+
+  .watcher-meta-row {
+    display: flex;
+    gap: 1rem;
+    flex-wrap: wrap;
+  }
+
+  .watcher-actions-col {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+  }
+
+  .candidate-preview-bar {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    background: rgba(255, 122, 0, 0.08);
+    border: 1px solid rgba(255, 122, 0, 0.2);
+    border-radius: 6px;
+    padding: 0.4rem 0.75rem;
+  }
+
+  .cand-badge {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+    font-weight: 700;
+    color: var(--spot, #ff7a00);
+  }
+
+  .provider-pill {
+    background: var(--spot, #ff7a00);
+    color: #111;
+    font-size: 10px;
+    font-weight: 700;
+    padding: 1px 5px;
+    border-radius: 3px;
+    text-transform: uppercase;
+  }
+
+  .cand-title {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .watcher-error-note {
+    color: #ef4444;
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
   }
 </style>
