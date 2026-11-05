@@ -782,7 +782,7 @@ pub async fn convert_to_catalog_title(
 
                 let cat_id = if let Some(id) = existing {
                     conn.execute(
-                        "UPDATE manga SET in_library = 1, source_manga_id = ?1, mangabaka_id = COALESCE(?2, mangabaka_id), thumbnail_url = COALESCE(?3, thumbnail_url), description = COALESCE(?4, description) WHERE id = ?5",
+                        "UPDATE manga SET in_library = 1, source_manga_id = COALESCE(source_manga_id, ?1), mangabaka_id = COALESCE(?2, mangabaka_id), thumbnail_url = COALESCE(?3, thumbnail_url), description = COALESCE(?4, description) WHERE id = ?5",
                         params![source_manga_id, mb_id, thumb_for_db, desc_c, id],
                     )?;
                     id
@@ -1042,29 +1042,61 @@ pub async fn revert_to_source_title(
 pub async fn detach_source_from_catalog(
     app: &AppState,
     catalog_manga_id: i64,
+    specific_source_id: Option<i64>,
 ) -> Result<DetachSourceResponse> {
     let detached_src: i64 = app
         .db
         .call(move |conn| {
-            let src_id: Option<i64> = conn
+            let cat_row: Option<(Option<i64>, i64)> = conn
                 .query_row(
-                    "SELECT source_manga_id FROM manga WHERE id = ?1 AND source_id = 0",
+                    "SELECT source_manga_id, source_id FROM manga WHERE id = ?1",
                     [catalog_manga_id],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
-                .optional()?
-                .flatten();
+                .optional()?;
 
-            let detached = src_id.ok_or_else(|| AppError::bad_request("Catalog title has no reading source attached"))?;
+            let (current_primary_src, raw_source_id) = cat_row
+                .ok_or_else(|| AppError::not_found("Catalog title not found"))?;
 
-            conn.execute(
-                "UPDATE manga SET source_manga_id = NULL WHERE id = ?1",
-                [catalog_manga_id],
-            )?;
+            if raw_source_id != 0 {
+                return Err(AppError::bad_request("Specified title is not a catalog title"));
+            }
+
+            let detached = if let Some(target_id) = specific_source_id {
+                let is_attached: bool = conn
+                    .query_row(
+                        "SELECT 1 FROM manga WHERE id = ?1 AND (catalog_manga_id = ?2 OR id = ?3)",
+                        params![target_id, catalog_manga_id, current_primary_src],
+                        |_| Ok(true),
+                    )
+                    .optional()?
+                    .unwrap_or(false);
+                if !is_attached {
+                    return Err(AppError::bad_request("Source is not attached to this catalog title"));
+                }
+                target_id
+            } else {
+                current_primary_src.ok_or_else(|| AppError::bad_request("Catalog title has no reading source attached"))?
+            };
+
             conn.execute(
                 "UPDATE manga SET catalog_manga_id = NULL WHERE id = ?1",
                 [detached],
             )?;
+
+            if current_primary_src == Some(detached) {
+                let next_src: Option<i64> = conn
+                    .query_row(
+                        "SELECT id FROM manga WHERE catalog_manga_id = ?1 AND id != ?2 LIMIT 1",
+                        params![catalog_manga_id, detached],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                conn.execute(
+                    "UPDATE manga SET source_manga_id = ?1 WHERE id = ?2",
+                    params![next_src, catalog_manga_id],
+                )?;
+            }
 
             Ok(detached)
         })
@@ -1076,4 +1108,77 @@ pub async fn detach_source_from_catalog(
         success: true,
         message: "Successfully detached reading source".to_string(),
     })
+}
+
+/// Attaches an existing source manga to an existing catalog manga.
+pub async fn attach_source_to_catalog(
+    app: &AppState,
+    catalog_manga_id: i64,
+    source_manga_id: i64,
+) -> Result<ConvertToCatalogResponse> {
+    let res = app
+        .db
+        .call(move |conn| {
+            let cat_row: Option<(String, Option<i64>, Option<i64>, i64)> = conn
+                .query_row(
+                    "SELECT title, mangabaka_id, source_manga_id, source_id FROM manga WHERE id = ?1",
+                    [catalog_manga_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .optional()?;
+
+            let (cat_title, cat_mb_id, current_primary, raw_src_id) = cat_row
+                .ok_or_else(|| AppError::not_found("Catalog title not found"))?;
+
+            if raw_src_id != 0 {
+                return Err(AppError::bad_request("Target is not a catalog title"));
+            }
+
+            let src_row: Option<(String, Option<i64>, i64)> = conn
+                .query_row(
+                    "SELECT title, mangabaka_id, source_id FROM manga WHERE id = ?1",
+                    [source_manga_id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .optional()?;
+
+            let (src_title, src_mb_id, src_raw_source_id) = src_row
+                .ok_or_else(|| AppError::not_found("Source manga not found"))?;
+
+            if src_raw_source_id == 0 {
+                return Err(AppError::bad_request("Cannot attach a catalog title as a source"));
+            }
+
+            conn.execute(
+                "UPDATE manga SET catalog_manga_id = ?1, in_library = 0 WHERE id = ?2",
+                params![catalog_manga_id, source_manga_id],
+            )?;
+
+            if current_primary.is_none() {
+                conn.execute(
+                    "UPDATE manga SET source_manga_id = ?1 WHERE id = ?2",
+                    params![source_manga_id, catalog_manga_id],
+                )?;
+            }
+
+            if cat_mb_id.is_none() && src_mb_id.is_some() {
+                conn.execute(
+                    "UPDATE manga SET mangabaka_id = ?1 WHERE id = ?2",
+                    params![src_mb_id, catalog_manga_id],
+                )?;
+            }
+
+            Ok(ConvertToCatalogResponse {
+                catalog_manga_id,
+                source_manga_id,
+                title: cat_title,
+                success: true,
+                message: format!("Successfully attached '{}' as reading source", src_title),
+            })
+        })
+        .await?;
+
+    app.pipeline.ownership.invalidate(catalog_manga_id);
+
+    Ok(res)
 }

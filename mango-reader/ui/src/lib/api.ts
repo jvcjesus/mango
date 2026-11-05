@@ -95,6 +95,18 @@ export type Chapter = {
   releaseType?: 'chapter' | 'volume';
 };
 
+export type AttachedSource = {
+  mangaId: number;
+  sourceId: string;
+  sourceName: string;
+  sourceLang?: string | null;
+  chapterCount: number;
+  volumeCount: number;
+  url: string;
+  isPrimary: boolean;
+  lastRefreshed?: number | null;
+};
+
 export type Title = {
   id: number;
   sourceId: string;
@@ -124,6 +136,9 @@ export type Title = {
   sourceMangaId?: number | null;
   catalogMangaId?: number | null;
   attachedSourceName?: string | null;
+  attachedSources?: AttachedSource[];
+  suggestedCatalogMangaId?: number | null;
+  suggestedCatalogTitle?: string | null;
   autoAcquire?: boolean;
   autoAcquireActivatedAt?: number | null;
 };
@@ -1809,8 +1824,8 @@ export const convertToCatalogTitle = (mangaId: number) =>
 export const revertToSourceTitle = (mangaId: number) =>
   send<RevertToSourceResponse>('POST', `/manga/${mangaId}/revert-to-source`);
 
-export const detachReadingSource = (mangaId: number) =>
-  send<DetachSourceResponse>('POST', `/manga/${mangaId}/detach-source`);
+export const detachReadingSource = (mangaId: number, sourceId?: number) =>
+  send<DetachSourceResponse>('POST', `/manga/${mangaId}/detach-source`, sourceId ? { sourceId } : {});
 
 
 // ---------- M6.8: Guarded Auto-Acquisition ----------
@@ -2518,6 +2533,21 @@ export const getAllBacklogJobs = (limit = 50) =>
 
 export const cancelBacklogJob = (jobId: string) =>
   send<{ cancelled: boolean }>('POST', `/backlog/jobs/${jobId}/cancel`, {});
+
+export const attachSourceToCatalog = (catalogId: number, sourceId: number) =>
+  send<{ success: boolean; message: string; catalogMangaId: number; sourceMangaId: number }>(
+    'POST',
+    `/manga/${catalogId}/attach-source/${sourceId}`,
+    {}
+  );
+
+export const detachSourceFromCatalog = (catalogId: number, sourceId?: number) =>
+  send<{ success: boolean; message: string; mangaId: number; detachedSourceMangaId: number }>(
+    'POST',
+    `/manga/${catalogId}/detach-source`,
+    sourceId ? { sourceId } : {}
+  );
+
 
 
 

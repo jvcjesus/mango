@@ -43,7 +43,7 @@
   // On a narrow screen the menu is a row of tabs along the bottom, under the thumb.
   const tabbed = $derived(display.tabs);
   // There a title is a screen of its own: it brings its own way back, and the menu makes room for its buttons.
-  const pushed = $derived(tabbed && area === 'title');
+  const pushed = $derived(tabbed && (area === 'title' || area === 'manga'));
   // Any other screen that is not one of the menu's gets a way back: an app on a phone's home screen has no other.
   const deep = $derived(tabbed && !NAV.some((item) => item.to === route.path));
   // Unread chapters found lately, shown beside Updates. Looked up again on each change of screen.
@@ -162,7 +162,7 @@
         {#key parts[1]}
           <Extension pkg={parts[1]} />
         {/key}
-      {:else if area === 'title' && parts[1]}
+      {:else if (area === 'title' || area === 'manga') && parts[1]}
         {#key parts[1]}
           <Title id={Number(parts[1])} />
         {/key}

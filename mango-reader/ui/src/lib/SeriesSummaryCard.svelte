@@ -53,6 +53,7 @@
     onOpenTomeRemap,
     openTomeLoading = false,
     onSearchNyaa,
+    searchingNyaa = false,
     onCheckReleaseDiscovery,
     autoAcquire = false,
     autoAcquireActivatedAt = null,
@@ -84,6 +85,7 @@
     onOpenTomeRemap?: (action: 'confirm' | 'reject' | 'auto') => void;
     openTomeLoading?: boolean;
     onSearchNyaa?: () => void;
+    searchingNyaa?: boolean;
     onCheckReleaseDiscovery?: () => void;
     onOpenDiagnostics?: () => void;
   } = $props();
@@ -312,12 +314,12 @@
 
     <!-- Metric Counters (Only when identity verified) -->
     <div class="metric-counters">
-      <div class="counter-item owned">
-        <span class="counter-num">{summary.ownedCount}</span>
-        <span class="counter-lbl">Owned</span>
+      <div class="counter-item owned" title="Verified official volumes physically present in canonical Komga library">
+        <span class="counter-num">{summary.ownedCount}{summary.totalExpectedVolumes ? ` / ${summary.totalExpectedVolumes}` : ''}</span>
+        <span class="counter-lbl">Owned in Komga</span>
       </div>
 
-      <div class="counter-item missing">
+      <div class="counter-item missing" title="Expected released official volumes not yet owned in Komga">
         <span class="counter-num">{summary.missingCount}</span>
         <span class="counter-lbl">Missing</span>
       </div>
@@ -335,6 +337,14 @@
           <span class="counter-lbl">Needs Attention</span>
         </div>
       {/if}
+    </div>
+
+    <!-- Ownership Authority Clarification Note -->
+    <div class="ownership-distinction-note">
+      <Icon name="info" size={14} />
+      <span>
+        <strong>Ownership Authority:</strong> Komga is the canonical library authority. Web reader chapters are saved for reading; only published CBZ volumes count toward verified physical ownership.
+      </span>
     </div>
   {/if}
 
@@ -519,10 +529,16 @@
             <button
               class="btn pill sm icon-text"
               onclick={onSearchNyaa}
+              disabled={searchingNyaa}
               title="Open manual Nyaa release search"
             >
-              <Icon name="search" size={12} />
-              Search Nyaa
+              {#if searchingNyaa}
+                <span class="spin"><Icon name="spinner" size={12} stroke={3} /></span>
+                Searching Nyaa...
+              {:else}
+                <Icon name="search" size={12} />
+                Search Nyaa
+              {/if}
             </button>
           {/if}
         </div>
@@ -903,6 +919,26 @@
 
   .counter-item.missing .counter-num {
     color: var(--muted);
+  }
+
+  .ownership-distinction-note {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 8px 12px;
+    margin-top: 10px;
+    background: var(--surface);
+    border: 1px dashed var(--ink-faint, #cbd5e1);
+    border-radius: 6px;
+    font-size: 11px;
+    line-height: 1.4;
+    color: var(--muted);
+  }
+
+  .ownership-distinction-note :global(svg) {
+    flex-shrink: 0;
+    margin-top: 1px;
+    color: var(--accent, #6366f1);
   }
 
   .counter-item.has-active {

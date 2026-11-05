@@ -68,6 +68,8 @@
     convertToCatalogTitle,
     revertToSourceTitle,
     detachReadingSource,
+    attachSourceToCatalog,
+    detachSourceFromCatalog,
     putMangaAutoAcquire,
     linkMangaBaka,
   } from '../lib/api';
@@ -788,6 +790,10 @@
     if (unitType && unitNumber !== undefined) {
       targetedUnit = { type: unitType, number: unitNumber };
     }
+    toast.info('Searching Nyaa releases...');
+    setTimeout(() => {
+      document.getElementById('nyaa-discovery-card')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }, 60);
     try {
       nyaaReleases = await getTitleAcquisitionReleases(id, {
         unitType: targetedUnit?.type,
@@ -1060,6 +1066,41 @@
     try {
       const resp = await detachReadingSource(title.id);
       toast.success(resp.message || 'Reading source detached');
+      load();
+    } catch (e) {
+      toast.error(message(e));
+    } finally {
+      detachingSource = false;
+    }
+  }
+
+  let attachingSource = $state(false);
+  async function handleAttachToCatalog(catId: number) {
+    if (attachingSource || !title) return;
+    attachingSource = true;
+    try {
+      await attachSourceToCatalog(catId, title.id);
+      toast.success(`Attached "${title.title}" to catalog title!`);
+      go('/title/' + catId);
+    } catch (e) {
+      toast.error(`Failed to attach to catalog: ${message(e)}`);
+    } finally {
+      attachingSource = false;
+    }
+  }
+
+  async function handleDetachSpecificSource(sourceMangaId: number, sourceName: string) {
+    if (detachingSource || !title) return;
+    const ok = await confirm({
+      title: 'Detach Reading Source',
+      message: `Detach "${sourceName}" from this catalog title? Scraped chapters will remain preserved on the source record.`,
+      confirmText: 'Detach',
+    });
+    if (!ok) return;
+    detachingSource = true;
+    try {
+      const resp = await detachSourceFromCatalog(title.id, sourceMangaId);
+      toast.success(resp.message || `Detached ${sourceName}`);
       load();
     } catch (e) {
       toast.error(message(e));
@@ -1422,16 +1463,36 @@
             </div>
           </div>
         {:else if !title.isCatalog}
-          <div class="conversion-banner convert-prompt">
-            <Icon name="puzzle" size={20} />
-            <div class="banner-text">
-              <strong>Convert to Catalog Title</strong>
-              <span>Manage this work natively with Komga volume ownership, OpenTome release schedules, and Nyaa acquisition without scraper bloat. Chapters and reading progress are preserved.</span>
+          {#if title.suggestedCatalogMangaId}
+            <div class="conversion-banner convert-prompt" style="border-left: 4px solid var(--accent, #6366f1);">
+              <Icon name="puzzle" size={20} />
+              <div class="banner-text">
+                <strong>Catalog Record Available: {title.suggestedCatalogTitle || 'Existing Title'}</strong>
+                <span>A catalog title already exists for this manga. You can attach this extension source directly to avoid creating duplicate catalog entries.</span>
+              </div>
+              <div class="banner-actions">
+                <button
+                  class="btn primary"
+                  onclick={() => title?.suggestedCatalogMangaId && handleAttachToCatalog(title.suggestedCatalogMangaId)}
+                  disabled={attachingSource}
+                >
+                  {attachingSource ? 'Attaching...' : 'Attach as Reading Source'}
+                </button>
+                <a class="btn subtle" href={`#/title/${title.suggestedCatalogMangaId}`}>View Catalog Title</a>
+              </div>
             </div>
-            <button class="btn primary" onclick={handleConvertToCatalog} disabled={convertingCatalog}>
-              {convertingCatalog ? 'Converting...' : 'Convert to Catalog Title'}
-            </button>
-          </div>
+          {:else}
+            <div class="conversion-banner convert-prompt">
+              <Icon name="puzzle" size={20} />
+              <div class="banner-text">
+                <strong>Convert to Catalog Title</strong>
+                <span>Manage this work natively with Komga volume ownership, OpenTome release schedules, and Nyaa acquisition without scraper bloat. Chapters and reading progress are preserved.</span>
+              </div>
+              <button class="btn primary" onclick={handleConvertToCatalog} disabled={convertingCatalog}>
+                {convertingCatalog ? 'Converting...' : 'Convert to Catalog Title'}
+              </button>
+            </div>
+          {/if}
         {/if}
 
         {#if !title.isCatalog || chapters.length > 0}
@@ -1471,8 +1532,65 @@
               reconciling={reconciling}
               onOpenTomeRemap={handleOpenTomeRemap}
               onSearchNyaa={() => searchNyaa()}
+              searchingNyaa={loadingNyaa}
               onCheckReleaseDiscovery={handleCheckReleaseDiscovery}
             />
+          </div>
+        {/if}
+
+        {#if title.isCatalog}
+          <div class="acquisition-hub-section">
+            <div class="hub-header">
+              <span class="hub-title">Acquisition Actions</span>
+              <span class="hub-subtitle">Manage volume releases, reading sources, and download jobs</span>
+            </div>
+            <div class="hub-actions-grid">
+              <button
+                class="hub-action-btn primary"
+                onclick={findAllMissingReleases}
+                disabled={discoveringAll}
+                title="Discover release candidates across providers for missing volumes"
+              >
+                {#if discoveringAll}
+                  <span class="spin"><Icon name="spinner" size={16} stroke={3} /></span>
+                  <span>Discovering...</span>
+                {:else}
+                  <Icon name="search" size={16} />
+                  <span>Find Releases</span>
+                {/if}
+              </button>
+
+              <button
+                class="hub-action-btn"
+                onclick={() => {
+                  document.getElementById('reading-sources-section')?.scrollIntoView({ behavior: 'smooth' });
+                }}
+                title="Browse and jump to attached reading sources"
+              >
+                <Icon name="puzzle" size={16} />
+                <span>Browse Source Downloads</span>
+              </button>
+
+              <button
+                class="hub-action-btn"
+                onclick={() => searchNyaa()}
+                disabled={loadingNyaa}
+                title="Query Nyaa directly for manga literature releases"
+              >
+                {#if loadingNyaa}
+                  <span class="spin"><Icon name="spinner" size={16} stroke={3} /></span>
+                  <span>Searching...</span>
+                {:else}
+                  <Icon name="download" size={16} />
+                  <span>Search Nyaa</span>
+                {/if}
+              </button>
+
+              <a class="hub-action-btn" href="#/downloads" title="View active and completed acquisition jobs">
+                <Icon name="clock" size={16} />
+                <span>Acquisition Queue</span>
+              </a>
+            </div>
           </div>
         {/if}
 
@@ -1533,7 +1651,7 @@
         <Tracking {id} title={title.title} />
 
         {#if showNyaa}
-          <div class="nyaa-discovery-card">
+          <div id="nyaa-discovery-card" class="nyaa-discovery-card">
             <div class="nyaa-header-row">
               <div>
                 <h3 class="display nyaa-title">MANUAL NYAA SEARCH</h3>
@@ -1771,23 +1889,68 @@
       </div>
 
       {#if title.isCatalog && chapters.length === 0}
-        <div class="reading-section">
+        <div class="reading-section" id="reading-sources-section">
           <div class="section-head">
             <h2 class="display">READING</h2>
           </div>
           <div class="reading-card">
-            {#if title.sourceMangaId}
-              <div class="reading-attached-info">
-                <div class="attached-header">
-                  <span class="reading-status-label">Reading source attached:</span>
-                  <strong>{title.attachedSourceName || 'Extension source'}</strong>
-                </div>
-                <p class="subtext">Scraped chapters and reading state are preserved on the source record.</p>
-                <div class="reading-actions">
-                  <a class="btn" href={`#/manga/${title.sourceMangaId}`}>View Scraped Chapters</a>
-                  <button class="btn subtle" onclick={handleRevertToSource} disabled={revertingSource}>Revert to Source Primary</button>
-                  <button class="btn subtle" onclick={handleDetachSource} disabled={detachingSource}>Detach Reading Source</button>
-                </div>
+            {#if (title.attachedSources && title.attachedSources.length > 0) || title.sourceMangaId}
+              <div class="attached-sources-list">
+                {#if title.attachedSources && title.attachedSources.length > 0}
+                  {#each title.attachedSources as src (src.mangaId)}
+                    <div class="attached-source-row">
+                      <div class="source-info-col">
+                        <div class="source-title-line">
+                          <span class="reading-status-label">Reading source attached:</span>
+                          <strong class="source-name">{src.sourceName}</strong>
+                          {#if src.isPrimary}
+                            <span class="tag spot">Primary</span>
+                          {/if}
+                          {#if src.sourceLang}
+                            <span class="tag muted">{src.sourceLang.toUpperCase()}</span>
+                          {/if}
+                        </div>
+                        <div class="source-meta-line">
+                          <span>{src.chapterCount} scraped chapter{src.chapterCount === 1 ? '' : 's'}</span>
+                          {#if src.volumeCount > 0}
+                            <span>· {src.volumeCount} volume{src.volumeCount === 1 ? '' : 's'}</span>
+                          {/if}
+                          {#if src.lastRefreshed}
+                            <span class="muted">· updated {ago(src.lastRefreshed * 1000)}</span>
+                          {/if}
+                        </div>
+                      </div>
+                      <div class="source-actions-line">
+                        <a class="btn primary" href={`#/manga/${src.mangaId}`}>View Scraped Chapters</a>
+                        <button
+                          class="btn subtle"
+                          onclick={() => handleDetachSpecificSource(src.mangaId, src.sourceName)}
+                          disabled={detachingSource}
+                        >
+                          Detach Reading Source
+                        </button>
+                      </div>
+                    </div>
+                  {/each}
+                {:else if title.sourceMangaId}
+                  <div class="attached-source-row">
+                    <div class="source-info-col">
+                      <div class="source-title-line">
+                        <span class="reading-status-label">Reading source attached:</span>
+                        <strong class="source-name">{title.attachedSourceName || 'Extension source'}</strong>
+                        <span class="tag spot">Primary</span>
+                      </div>
+                      <div class="source-meta-line">
+                        <span>Scraped chapters and reading state preserved on source record</span>
+                      </div>
+                    </div>
+                    <div class="source-actions-line">
+                      <a class="btn primary" href={`#/manga/${title.sourceMangaId}`}>View Scraped Chapters</a>
+                      <button class="btn subtle" onclick={handleRevertToSource} disabled={revertingSource}>Revert to Source Primary</button>
+                      <button class="btn subtle" onclick={handleDetachSource} disabled={detachingSource}>Detach Reading Source</button>
+                    </div>
+                  </div>
+                {/if}
               </div>
             {:else}
               <div class="reading-empty-state">
@@ -4020,6 +4183,115 @@
     font-weight: 800;
     margin: 0;
     color: var(--ink);
+  }
+
+  .acquisition-hub-section {
+    background: var(--paper);
+    border: 2px solid var(--ink);
+    box-shadow: var(--sh-3);
+    border-radius: 4px;
+    padding: 16px;
+    margin: 16px 0;
+  }
+
+  .hub-header {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin-bottom: 12px;
+  }
+
+  .hub-title {
+    font-size: 14px;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--ink);
+  }
+
+  .hub-subtitle {
+    font-size: 12px;
+    color: var(--muted);
+  }
+
+  .hub-actions-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+    gap: 10px;
+  }
+
+  .hub-action-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 10px 14px;
+    border: 2px solid var(--ink);
+    border-radius: 4px;
+    background: var(--surface);
+    color: var(--ink);
+    font-weight: 700;
+    font-size: 13px;
+    text-decoration: none;
+    cursor: pointer;
+    transition: background 0.15s, transform 0.1s;
+    box-shadow: 2px 2px 0 var(--ink);
+  }
+
+  .hub-action-btn:hover:not(:disabled) {
+    background: var(--paper);
+    transform: translateY(-1px);
+  }
+
+  .hub-action-btn.primary {
+    background: var(--spot);
+    color: var(--paper);
+  }
+
+  .hub-action-btn:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+
+  .attached-sources-list {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .attached-source-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    padding: 12px 14px;
+    background: var(--surface);
+    border: 1.5px solid var(--ink);
+    border-radius: 4px;
+  }
+
+  .source-info-col {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .source-title-line {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 15px;
+  }
+
+  .source-meta-line {
+    font-size: 12px;
+    color: var(--muted);
+  }
+
+  .source-actions-line {
+    display: flex;
+    align-items: center;
+    gap: 8px;
   }
 </style>
 

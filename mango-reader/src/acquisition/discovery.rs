@@ -548,15 +548,289 @@ pub async fn discover_missing_for_series(
     let missing_volumes = reconciliation.missing_volumes;
     let missing_volumes_count = missing_volumes.len();
 
+    if missing_volumes.is_empty() {
+        return Ok(SeriesDiscoverySummary {
+            series_id: series_id.to_string(),
+            missing_volumes_count: 0,
+            discovered_volumes_count: 0,
+            results: Vec::new(),
+        });
+    }
+
+    if reconciliation.status == ReconciliationStatus::ReviewRequired
+        || reconciliation.status == ReconciliationStatus::CollectionUnavailable
+    {
+        return Ok(SeriesDiscoverySummary {
+            series_id: series_id.to_string(),
+            missing_volumes_count,
+            discovered_volumes_count: 0,
+            results: Vec::new(),
+        });
+    }
+
+    let series_title = reconciliation.title.clone();
+    let current_time = now();
+
+    // 1. Fetch provider configuration once
+    let (nyaa_enabled, nyaa_url, nyaa_cat, mado_enabled, mado_url, mado_user, mado_pass) = db
+        .call(|conn| {
+            let n_enabled = crate::db::state(conn, "acquisition.nyaa_enabled")?
+                .map(|s| s.parse::<bool>().unwrap_or(true))
+                .unwrap_or(true);
+            let n_url = crate::db::state(conn, "acquisition.nyaa_url")?;
+            let n_cat = crate::db::state(conn, "acquisition.nyaa_category")?;
+
+            let m_enabled = crate::db::state(conn, "acquisition.madokami_enabled")?
+                .map(|s| s.parse::<bool>().unwrap_or(true))
+                .unwrap_or(true);
+            let m_url = crate::db::state(conn, "acquisition.madokami_url")?;
+            let m_user = crate::db::state(conn, "acquisition.madokami_username")?
+                .or_else(|| std::env::var("MADOKAMI_USERNAME").ok());
+            let m_pass = crate::db::state(conn, "acquisition.madokami_password")?
+                .or_else(|| std::env::var("MADOKAMI_PASSWORD").ok());
+
+            Ok((n_enabled, n_url, n_cat, m_enabled, m_url, m_user, m_pass))
+        })
+        .await?;
+
+    let nyaa_provider = NyaaReleaseProvider::new(http.clone(), nyaa_url, nyaa_cat, nyaa_enabled);
+    let madokami_provider = MadokamiReleaseProvider::new(
+        http.clone(),
+        mado_url,
+        mado_user,
+        mado_pass,
+        mado_enabled,
+    );
+
+    let series_query = ReleaseQuery {
+        series_title: series_title.clone(),
+        target_volume: None,
+        target_chapter: None,
+        preferred_edition: Some(reconciliation.edition.clone()),
+    };
+
+    let mut raw_candidates = Vec::new();
+    let mut providers_checked = Vec::new();
+    let mut provider_errors = HashMap::new();
+
+    // Query both providers concurrently ONCE for the whole series
+    let (nyaa_res, mado_res) = tokio::join!(
+        nyaa_provider.search_releases(&series_query),
+        madokami_provider.search_releases(&series_query)
+    );
+
+    providers_checked.push("nyaa".to_string());
+    match nyaa_res {
+        Ok(res) => raw_candidates.extend(res),
+        Err(e) => {
+            provider_errors.insert("nyaa".to_string(), e.to_string());
+        }
+    }
+
+    providers_checked.push("madokami".to_string());
+    let madokami_health = madokami_provider.check_health().await;
+    if let Some(msg) = madokami_health.message {
+        if madokami_health.status != ProviderStatus::Available {
+            provider_errors.insert("madokami".to_string(), msg);
+        }
+    }
+    match mado_res {
+        Ok(res) => raw_candidates.extend(res),
+        Err(e) => {
+            provider_errors.insert("madokami".to_string(), e.to_string());
+        }
+    }
+
+    // Deduplicate series releases across providers
+    let mut deduped_series: Vec<ReleaseCandidate> = Vec::new();
+    let mut seen_keys = std::collections::HashSet::new();
+    for c in raw_candidates {
+        let key = c
+            .info_hash
+            .clone()
+            .unwrap_or_else(|| c.candidate_id.clone());
+        if seen_keys.insert(key) {
+            deduped_series.push(c);
+        }
+    }
+
     let mut results = Vec::new();
     let mut discovered_volumes_count = 0;
 
     for &vol in &missing_volumes {
-        let res = discover_for_volume(db, http.clone(), series_id, vol).await?;
-        if res.candidate_count > 0 {
-            discovered_volumes_count += 1;
+        // Pre-flight check D: Actively acquiring in downloads queue
+        let s_id_c = series_id.to_string();
+        let title_c = series_title.clone();
+        let is_acquiring = db
+            .call(move |conn| is_volume_actively_acquiring(conn, &s_id_c, &title_c, vol))
+            .await?;
+        if is_acquiring {
+            results.push(VolumeDiscoveryResult {
+                series_id: series_id.to_string(),
+                volume_number: vol,
+                status: "acquiring".to_string(),
+                candidate_count: 0,
+                top_candidate: None,
+                candidates: Vec::new(),
+                providers_checked: providers_checked.clone(),
+                provider_errors: provider_errors.clone(),
+                last_discovered_at: current_time,
+            });
+            continue;
         }
-        results.push(res);
+
+        // Classify deduped_series for this volume in-memory
+        let mut candidates_for_vol = Vec::new();
+        for raw_cand in &deduped_series {
+            let (match_type, detected_v, is_digital) =
+                super::providers::classify_candidate_release(
+                    &raw_cand.title,
+                    &raw_cand.raw_title,
+                    Some(vol),
+                    None,
+                );
+            if match_type != CandidateMatchType::Rejected {
+                let mut c = raw_cand.clone();
+                c.match_type = match_type;
+                c.is_digital = is_digital;
+                c.target_volume = detected_v;
+                candidates_for_vol.push(c);
+            }
+        }
+
+        super::providers::score_and_rank_candidates(&mut candidates_for_vol, Some(vol));
+
+        let candidate_count = candidates_for_vol.len();
+        let top_candidate = candidates_for_vol.first().cloned();
+        let status = if candidate_count > 0 {
+            discovered_volumes_count += 1;
+            "found".to_string()
+        } else {
+            "no_candidates".to_string()
+        };
+
+        let result = VolumeDiscoveryResult {
+            series_id: series_id.to_string(),
+            volume_number: vol,
+            status,
+            candidate_count,
+            top_candidate: top_candidate.clone(),
+            candidates: candidates_for_vol.clone(),
+            providers_checked: providers_checked.clone(),
+            provider_errors: provider_errors.clone(),
+            last_discovered_at: current_time,
+        };
+
+        // Persist discovery result to DB
+        let res_c = result.clone();
+        let s_id_save = series_id.to_string();
+        let edition_c = reconciliation.edition.clone();
+        let mb_id = reconciliation.mangabaka_id;
+        let s_title = series_title.clone();
+
+        db.call(move |conn| {
+            conn.execute(
+                "DELETE FROM discovered_release_candidates
+                 WHERE series_id = ?1 AND ABS(volume_number - ?2) < 0.001",
+                params![s_id_save, vol],
+            )?;
+
+            for c in &res_c.candidates {
+                conn.execute(
+                    "INSERT INTO discovered_release_candidates (
+                        series_id, volume_number, candidate_id, provider, provider_item_id,
+                        title, raw_title, match_type, size_bytes, uploader, is_trusted,
+                        is_digital, score, score_explanation, download_url, magnet_url,
+                        info_hash, seeders, leechers, published_at, discovered_at
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
+                    ON CONFLICT(series_id, volume_number, candidate_id) DO UPDATE SET
+                        score = excluded.score,
+                        score_explanation = excluded.score_explanation,
+                        seeders = excluded.seeders,
+                        leechers = excluded.leechers,
+                        discovered_at = excluded.discovered_at",
+                    params![
+                        s_id_save,
+                        vol,
+                        c.candidate_id,
+                        c.provider,
+                        c.provider_item_id,
+                        c.title,
+                        c.raw_title,
+                        c.match_type.as_str(),
+                        c.size_bytes.map(|s| s as i64),
+                        c.uploader,
+                        if c.is_trusted { 1 } else { 0 },
+                        if c.is_digital { 1 } else { 0 },
+                        c.score,
+                        c.score_explanation,
+                        c.download_url,
+                        c.magnet_url,
+                        c.info_hash,
+                        c.seeders,
+                        c.leechers,
+                        c.published_at,
+                        res_c.last_discovered_at,
+                    ],
+                )?;
+            }
+
+            conn.execute(
+                "INSERT INTO volume_discovery_status (
+                    series_id, volume_number, last_discovered_at, status,
+                    candidate_count, top_candidate_id, top_candidate_title,
+                    top_candidate_provider, top_candidate_score,
+                    providers_checked, provider_errors
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                ON CONFLICT(series_id, volume_number) DO UPDATE SET
+                    last_discovered_at = excluded.last_discovered_at,
+                    status = excluded.status,
+                    candidate_count = excluded.candidate_count,
+                    top_candidate_id = excluded.top_candidate_id,
+                    top_candidate_title = excluded.top_candidate_title,
+                    top_candidate_provider = excluded.top_candidate_provider,
+                    top_candidate_score = excluded.top_candidate_score,
+                    providers_checked = excluded.providers_checked,
+                    provider_errors = excluded.provider_errors",
+                params![
+                    s_id_save,
+                    vol,
+                    res_c.last_discovered_at,
+                    res_c.status,
+                    res_c.candidate_count as i64,
+                    res_c.top_candidate.as_ref().map(|c| c.candidate_id.as_str()),
+                    res_c.top_candidate.as_ref().map(|c| c.title.as_str()),
+                    res_c.top_candidate.as_ref().map(|c| c.provider.as_str()),
+                    res_c.top_candidate.as_ref().map(|c| c.score),
+                    serde_json::to_string(&res_c.providers_checked).unwrap_or_default(),
+                    serde_json::to_string(&res_c.provider_errors).ok(),
+                ],
+            )?;
+
+            if let Some(top) = &res_c.top_candidate {
+                record_event_full(
+                    conn,
+                    &s_id_save,
+                    &s_title,
+                    mb_id,
+                    None,
+                    &edition_c,
+                    Some(vol),
+                    "RELEASE_AVAILABLE",
+                    Some(&top.candidate_id),
+                    res_c.candidate_count as i64,
+                    &format!(
+                        "Found {} release candidate(s) for {} Vol. {} (Top: {} via {})",
+                        res_c.candidate_count, s_title, vol, top.title, top.provider
+                    ),
+                )?;
+            }
+
+            Ok(())
+        })
+        .await?;
+
+        results.push(result);
     }
 
     Ok(SeriesDiscoverySummary {

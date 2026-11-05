@@ -179,6 +179,7 @@ pub fn router(state: Spaces) -> Router {
         .route("/manga/{id}/convert-to-catalog", post(post_manga_convert_to_catalog))
         .route("/manga/{id}/revert-to-source", post(post_manga_revert_to_source))
         .route("/manga/{id}/detach-source", post(post_manga_detach_source))
+        .route("/manga/{id}/attach-source/{source_id}", post(post_manga_attach_source))
         .route("/manga/{id}/mangabaka", put(put_manga_mangabaka))
         .route("/manga/{id}/diagnostics", get(get_manga_diagnostics))
         .route("/titles/{id}/diagnostics", get(get_manga_diagnostics))
@@ -3521,12 +3522,29 @@ async fn post_manga_revert_to_source(
     Ok(Json(res))
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DetachSourcePayload {
+    pub source_id: Option<i64>,
+}
+
 async fn post_manga_detach_source(
     Me(app): Me,
     Path(id): Path<i64>,
+    payload: Option<Json<DetachSourcePayload>>,
 ) -> Result<Json<crate::catalog::DetachSourceResponse>> {
     app.me.admin()?;
-    let res = crate::catalog::detach_source_from_catalog(&app, id).await?;
+    let specific = payload.and_then(|p| p.0.source_id);
+    let res = crate::catalog::detach_source_from_catalog(&app, id, specific).await?;
+    Ok(Json(res))
+}
+
+async fn post_manga_attach_source(
+    Me(app): Me,
+    Path((catalog_id, source_id)): Path<(i64, i64)>,
+) -> Result<Json<crate::catalog::ConvertToCatalogResponse>> {
+    app.me.admin()?;
+    let res = crate::catalog::attach_source_to_catalog(&app, catalog_id, source_id).await?;
     Ok(Json(res))
 }
 

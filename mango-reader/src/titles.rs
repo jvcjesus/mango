@@ -133,6 +133,20 @@ pub struct ChapterView {
     pub release_type: crate::release::ReleaseType,
 }
 
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachedSourceView {
+    pub manga_id: i64,
+    pub source_id: String,
+    pub source_name: String,
+    pub source_lang: Option<String>,
+    pub chapter_count: i64,
+    pub volume_count: i64,
+    pub url: String,
+    pub is_primary: bool,
+    pub last_refreshed: Option<i64>,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TitleView {
@@ -167,6 +181,9 @@ pub struct TitleView {
     pub source_manga_id: Option<i64>,
     pub catalog_manga_id: Option<i64>,
     pub attached_source_name: Option<String>,
+    pub attached_sources: Vec<AttachedSourceView>,
+    pub suggested_catalog_manga_id: Option<i64>,
+    pub suggested_catalog_title: Option<String>,
     pub auto_acquire: bool,
     pub auto_acquire_activated_at: Option<i64>,
 }
@@ -735,6 +752,9 @@ pub(crate) fn read_title(conn: &Connection, id: i64) -> Result<TitleView> {
                     source_manga_id: r.get(21)?,
                     catalog_manga_id: r.get(22)?,
                     attached_source_name: r.get(23)?,
+                    attached_sources: Vec::new(),
+                    suggested_catalog_manga_id: None,
+                    suggested_catalog_title: None,
                     auto_acquire: auto_acq != 0,
                     auto_acquire_activated_at: r.get(25)?,
                 })
@@ -750,6 +770,65 @@ pub(crate) fn read_title(conn: &Connection, id: i64) -> Result<TitleView> {
     title.chapters = read_chapters(conn, id)?;
     let days = title.chapters.iter().filter(|c| c.date_upload > 0).map(|c| c.date_upload / DAY_MS).collect();
     title.release_days = rhythm(days).map(|(every, _)| every);
+
+    if title.is_catalog {
+        let mut stmt = conn.prepare(
+            "SELECT sm.id, sm.source_id, COALESCE(s.name, 'Unknown source'), s.lang, sm.url, sm.chapters_at,
+                    (SELECT COUNT(*) FROM chapters c WHERE c.manga_id = sm.id) AS ch_count,
+                    (SELECT COUNT(DISTINCT chapter_number) FROM chapters c WHERE c.manga_id = sm.id AND (c.name LIKE 'Vol%' OR c.name LIKE 'v%')) AS vol_count
+             FROM manga sm
+             LEFT JOIN sources s ON s.id = sm.source_id
+             WHERE sm.catalog_manga_id = ?1 OR (sm.id = ?2 AND ?2 IS NOT NULL)
+             ORDER BY sm.id ASC",
+        )?;
+        let attached: Vec<AttachedSourceView> = stmt
+            .query_map(params![id, title.source_manga_id], |r| {
+                let sm_id: i64 = r.get(0)?;
+                let src_raw_id: i64 = r.get(1)?;
+                let is_primary = title.source_manga_id == Some(sm_id);
+                Ok(AttachedSourceView {
+                    manga_id: sm_id,
+                    source_id: src_raw_id.to_string(),
+                    source_name: r.get(2)?,
+                    source_lang: r.get(3)?,
+                    url: r.get(4)?,
+                    last_refreshed: r.get(5)?,
+                    chapter_count: r.get(6)?,
+                    volume_count: r.get(7)?,
+                    is_primary,
+                })
+            })?
+            .filter_map(std::result::Result::ok)
+            .collect();
+        title.attached_sources = attached;
+    } else {
+        if let Some(cat_id) = title.catalog_manga_id {
+            let cat_title: Option<String> = conn
+                .query_row(
+                    "SELECT title FROM manga WHERE id = ?1",
+                    [cat_id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            title.suggested_catalog_title = cat_title;
+        } else {
+            let cat_match: Option<(i64, String)> = conn
+                .query_row(
+                    "SELECT id, title FROM manga
+                     WHERE source_id = 0 AND (
+                         (mangabaka_id IS NOT NULL AND mangabaka_id = ?1)
+                         OR (LOWER(title) = LOWER(?2))
+                     ) LIMIT 1",
+                    params![title.mangabaka_id, title.title],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .optional()?;
+            if let Some((cat_id, cat_title)) = cat_match {
+                title.suggested_catalog_manga_id = Some(cat_id);
+                title.suggested_catalog_title = Some(cat_title);
+            }
+        }
+    }
     Ok(title)
 }
 
@@ -1086,5 +1165,57 @@ mod tests {
         assert!(!cleaned.contains("**Alternative Names:**"), "Alternative names block must be stripped");
         assert!(cleaned.starts_with("After a disastrous defeat"));
         assert!(cleaned.ends_with("*Source: Kodansha USA, Vol. 1*"));
+    }
+
+    #[test]
+    fn test_catalog_attached_sources_and_suggestions() {
+        let mut conn = database();
+
+        conn.execute_batch(
+            "INSERT INTO extensions (pkg, name, version_name, version_code, lib, content_warning, installed_at, updated_at)
+             VALUES ('ext.sources', 'Sources Extension', '1.0', 1, '1.6', 0, 0, 0);
+             INSERT INTO sources (id, pkg, name, lang, base_url, supports_latest)
+             VALUES (10, 'ext.sources', 'Madokami', 'en', 'https://madokami.al/', 1),
+                    (20, 'ext.sources', 'MangaDot', 'en', 'https://mangadot.org/', 1);",
+        ).unwrap();
+
+        let s1_cards = save_listing(&mut conn, 10, &[manga("/manga/haikyu", "Haikyu!!")]).unwrap();
+        let s1_id = s1_cards[0].id;
+        apply_update(&mut conn, s1_id, &manga("/manga/haikyu", "Haikyu!!"), &[chapter("/ch1", "Ch. 1", 1000)], true, true).unwrap();
+
+        // 2. Create catalog title for Haikyu!!
+        conn.execute(
+            "INSERT INTO manga (id, source_id, url, title, source_manga_id, mangabaka_id) 
+             VALUES (999, 0, 'catalog:haikyu', 'Haikyu!!', ?1, 8718)",
+            [s1_id],
+        ).unwrap();
+        // Update s1 to point to catalog title
+        conn.execute("UPDATE manga SET catalog_manga_id = 999, mangabaka_id = 8718 WHERE id = ?1", [s1_id]).unwrap();
+
+        // 3. Create source 2: MangaDot
+        let s2_cards = save_listing(&mut conn, 20, &[manga("/manga/haikyu-md", "Haikyu!!")]).unwrap();
+        let s2_id = s2_cards[0].id;
+        conn.execute("UPDATE manga SET mangabaka_id = 8718 WHERE id = ?1", [s2_id]).unwrap();
+
+        // 4. Test read_title on source 2: should suggest catalog title 999
+        let view_s2 = read_title(&conn, s2_id).unwrap();
+        assert_eq!(view_s2.suggested_catalog_manga_id, Some(999));
+        assert_eq!(view_s2.suggested_catalog_title.as_deref(), Some("Haikyu!!"));
+
+        // 5. Test read_title on catalog title 999: should have attached_sources with s1
+        let view_cat = read_title(&conn, 999).unwrap();
+        assert_eq!(view_cat.attached_sources.len(), 1);
+        assert_eq!(view_cat.attached_sources[0].source_name, "Madokami");
+        assert_eq!(view_cat.attached_sources[0].chapter_count, 1);
+        assert!(view_cat.attached_sources[0].is_primary);
+
+        // 6. Attach source 2 to catalog title
+        conn.execute("UPDATE manga SET catalog_manga_id = 999 WHERE id = ?1", [s2_id]).unwrap();
+
+        let view_cat_both = read_title(&conn, 999).unwrap();
+        assert_eq!(view_cat_both.attached_sources.len(), 2);
+        let names: Vec<_> = view_cat_both.attached_sources.iter().map(|s| s.source_name.as_str()).collect();
+        assert!(names.contains(&"Madokami"));
+        assert!(names.contains(&"MangaDot"));
     }
 }
