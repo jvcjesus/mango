@@ -2646,6 +2646,50 @@ export const getVolumeManager = (mangaId: number) =>
 export const planVolumeManagerBatch = (mangaId: number, payload: VolumeManagerBatchPlanRequest) =>
   send<VolumeManagerBatchPlanResponse>('POST', `/manga/${mangaId}/volumes-manager/plan`, payload);
 
+export interface DownloadRecoveryInfo {
+  chapterId: number;
+  title: string;
+  volumeNumber?: number | null;
+  chapterName: string;
+  state: string;
+  stage: string;
+  failedStage: string;
+  errorCategory: string;
+  errorMessage?: string | null;
+  lastSuccessfulStage: string;
+  artifactExists: boolean;
+  artifactPath?: string | null;
+  canonicalPublicationOccurred: boolean;
+  canonicalReceiptId?: string | null;
+  canonicalPath?: string | null;
+  komgaStatus: string;
+  metadataStatus: string;
+  retryIsSafe: boolean;
+  recommendedAction: string;
+  canRecover: boolean;
+}
+
+export interface DownloadRecoverySummary {
+  totalFailedDownloads: number;
+  totalStalledDownloads: number;
+  recoverableDownloadsCount: number;
+  items: DownloadRecoveryInfo[];
+}
+
+export const getDownloadRecoveryInfo = (chapterId: number) =>
+  get<DownloadRecoveryInfo>(`/downloads/${chapterId}/recovery-info`);
+
+export const getDownloadsRecoverySummary = () =>
+  get<DownloadRecoverySummary>(`/downloads/recovery-summary`);
+
+export const recoverDownloadJob = (chapterId: number) =>
+  send<{ recovered: boolean; strategy: string; canonicalPath?: string; chapterId?: number }>(
+    'POST',
+    `/downloads/${chapterId}/recover`,
+    {}
+  );
+
+
 
 
 

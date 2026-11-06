@@ -175,4 +175,66 @@ describe('Unified Volume Manager (M8.2)', () => {
     expect(plan.executionBlockedReason).toContain('requires review');
     expect(plan.items[0].status).toBe('UNCERTAIN_EDITION');
   });
+
+  it('evaluates crash recovery diagnostics and idempotency safety (M8.3)', () => {
+    const recoveryInfo: import('./api').DownloadRecoveryInfo = {
+      chapterId: 101,
+      title: 'Haikyu!!',
+      volumeNumber: 1,
+      chapterName: 'Volume 1',
+      state: 'failed',
+      stage: 'komga_verification',
+      failedStage: 'komga_verification',
+      errorCategory: 'network',
+      errorMessage: 'Komga scan notification timed out (HTTP 504)',
+      lastSuccessfulStage: 'published',
+      artifactExists: true,
+      artifactPath: '/data/manga/Haikyu!!/Haikyu!! v01.cbz',
+      canonicalPublicationOccurred: true,
+      canonicalReceiptId: 'rcpt-101',
+      canonicalPath: '/data/manga/Haikyu!!/Haikyu!! v01.cbz',
+      komgaStatus: 'published_awaiting_scan',
+      metadataStatus: 'completed',
+      retryIsSafe: true,
+      recommendedAction: 'verify_komga',
+      canRecover: true,
+    };
+
+    expect(recoveryInfo.canonicalPublicationOccurred).toBe(true);
+    expect(recoveryInfo.canonicalReceiptId).toBe('rcpt-101');
+    expect(recoveryInfo.recommendedAction).toBe('verify_komga');
+    expect(recoveryInfo.retryIsSafe).toBe(true);
+    expect(recoveryInfo.komgaStatus).toBe('published_awaiting_scan');
+    expect(recoveryInfo.metadataStatus).toBe('completed');
+  });
+
+  it('recommends safe restart download on corrupt staging archive (M8.3)', () => {
+    const corruptRecovery: import('./api').DownloadRecoveryInfo = {
+      chapterId: 201,
+      title: 'Blue Lock',
+      volumeNumber: 5,
+      chapterName: 'Volume 5',
+      state: 'failed',
+      stage: 'archive_integrity_validation',
+      failedStage: 'archive_integrity_validation',
+      errorCategory: 'corrupt_archive',
+      errorMessage: 'Invalid central directory in CBZ archive',
+      lastSuccessfulStage: 'downloaded_to_staging',
+      artifactExists: true,
+      artifactPath: '/data/downloads/staging/part_201.cbz',
+      canonicalPublicationOccurred: false,
+      canonicalReceiptId: null,
+      canonicalPath: null,
+      komgaStatus: 'not_published',
+      metadataStatus: 'not_requested',
+      retryIsSafe: true,
+      recommendedAction: 'safe_restart_download',
+      canRecover: true,
+    };
+
+    expect(corruptRecovery.canonicalPublicationOccurred).toBe(false);
+    expect(corruptRecovery.errorCategory).toBe('corrupt_archive');
+    expect(corruptRecovery.recommendedAction).toBe('safe_restart_download');
+    expect(corruptRecovery.canRecover).toBe(true);
+  });
 });

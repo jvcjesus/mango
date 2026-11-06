@@ -319,6 +319,8 @@ pub fn router(state: Spaces) -> Router {
         .route("/downloads/{chapter}", delete(cancel_download))
         .route("/downloads/{chapter}/retry", post(retry_download))
         .route("/downloads/{chapter}/recover", post(recover_download))
+        .route("/downloads/{chapter}/recovery-info", get(get_download_recovery_info))
+        .route("/downloads/recovery-summary", get(get_downloads_recovery_summary))
         .route(
             "/downloads/{chapter}/retry-metadata",
             post(retry_metadata_download),
@@ -4371,6 +4373,29 @@ async fn recover_download(Me(app): Me, Path(chapter): Path<i64>) -> Result<Json<
         "strategy": "retry_download",
         "chapterId": chapter,
     })))
+}
+
+async fn get_download_recovery_info(
+    Me(app): Me,
+    Path(chapter): Path<i64>,
+) -> Result<Json<crate::pipeline::recovery::DownloadRecoveryInfo>> {
+    app.me.admin()?;
+    let info = app
+        .db
+        .call(move |conn| crate::pipeline::recovery::analyze_download_recovery(conn, chapter))
+        .await?;
+    Ok(Json(info))
+}
+
+async fn get_downloads_recovery_summary(
+    Me(app): Me,
+) -> Result<Json<crate::pipeline::recovery::DownloadRecoverySummary>> {
+    app.me.admin()?;
+    let summary = app
+        .db
+        .call(move |conn| crate::pipeline::recovery::list_all_recovery_info(conn))
+        .await?;
+    Ok(Json(summary))
 }
 
 // -----------------------------------------------------------------------------

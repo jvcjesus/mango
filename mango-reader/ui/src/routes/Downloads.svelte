@@ -8,6 +8,8 @@
     getLibraryReceipts,
     verifyPublicationReceipt,
     getAcquisitionOperationsSummary,
+    getDownloadRecoveryInfo,
+    type DownloadRecoveryInfo,
     type PipelineEvent,
     type Queue,
     type Queued,
@@ -80,6 +82,21 @@
       backlogError = message(e);
     } finally {
       backlogLoading = false;
+    }
+  }
+
+  // Recovery Inspection State (M8.3)
+  let inspectingRecovery = $state<DownloadRecoveryInfo | null>(null);
+  let loadingRecovery = $state(false);
+
+  async function openRecoveryInspector(chapterId: number) {
+    loadingRecovery = true;
+    try {
+      inspectingRecovery = await getDownloadRecoveryInfo(chapterId);
+    } catch (e) {
+      toast.error(message(e));
+    } finally {
+      loadingRecovery = false;
     }
   }
 
@@ -700,6 +717,14 @@
                   >
                     <Icon name="check" size={14} /> Recover
                   </button>
+                  <button
+                    class="btn pill"
+                    disabled={busyItems[entry.chapterId] || loadingRecovery}
+                    onclick={() => openRecoveryInspector(entry.chapterId)}
+                    title="Inspect crash-safe recovery details"
+                  >
+                    <Icon name="info" size={14} /> Recovery Details
+                  </button>
                 {/if}
                 <button
                   class="btn icon"
@@ -1237,6 +1262,136 @@
     {/if}
   {/if}
 </div>
+
+{#if inspectingRecovery}
+  <!-- svelte-ignore a11y_click_events_have_key_events -->
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <div class="recovery-modal-backdrop" onclick={() => (inspectingRecovery = null)}>
+    <div class="recovery-modal-card" onclick={(e) => e.stopPropagation()}>
+      <div class="recovery-modal-header">
+        <div>
+          <h3 class="display">RECOVERY DIAGNOSTICS</h3>
+          <p class="recovery-modal-subtitle">
+            {inspectingRecovery.title} · {inspectingRecovery.chapterName}
+          </p>
+        </div>
+        <button class="btn icon subtle" onclick={() => (inspectingRecovery = null)}>
+          <Icon name="close" size={18} />
+        </button>
+      </div>
+
+      <div class="recovery-modal-body">
+        <div class="recovery-status-strip">
+          <div class="strip-item">
+            <span class="strip-label">Error Category</span>
+            <span class="strip-val danger">{inspectingRecovery.errorCategory.toUpperCase()}</span>
+          </div>
+          <div class="strip-item">
+            <span class="strip-label">Failed Stage</span>
+            <span class="strip-val">{inspectingRecovery.failedStage}</span>
+          </div>
+          <div class="strip-item">
+            <span class="strip-label">Last Succeeded</span>
+            <span class="strip-val">{inspectingRecovery.lastSuccessfulStage}</span>
+          </div>
+        </div>
+
+        {#if inspectingRecovery.errorMessage}
+          <div class="recovery-error-banner">
+            <Icon name="info" size={16} />
+            <span class="error-text">{inspectingRecovery.errorMessage}</span>
+          </div>
+        {/if}
+
+        <div class="recovery-details-grid">
+          <div class="detail-box">
+            <h4>Canonical Media State</h4>
+            <div class="detail-line">
+              <span class="dt-k">Publication Receipt:</span>
+              <span class="dt-v">{inspectingRecovery.canonicalPublicationOccurred ? 'Recorded' : 'Not Published'}</span>
+            </div>
+            {#if inspectingRecovery.canonicalReceiptId}
+              <div class="detail-line">
+                <span class="dt-k">Receipt ID:</span>
+                <span class="dt-v mono">{inspectingRecovery.canonicalReceiptId}</span>
+              </div>
+            {/if}
+            {#if inspectingRecovery.canonicalPath}
+              <div class="detail-line">
+                <span class="dt-k">Canonical Path:</span>
+                <span class="dt-v mono">{inspectingRecovery.canonicalPath}</span>
+              </div>
+            {/if}
+            <div class="detail-line">
+              <span class="dt-k">Komga Status:</span>
+              <span class="dt-v tag {inspectingRecovery.komgaStatus === 'komga_verified' ? 'spot' : 'warning'}">{inspectingRecovery.komgaStatus}</span>
+            </div>
+            <div class="detail-line">
+              <span class="dt-k">Metadata Status:</span>
+              <span class="dt-v tag">{inspectingRecovery.metadataStatus}</span>
+            </div>
+          </div>
+
+          <div class="detail-box">
+            <h4>Staging & Artifact State</h4>
+            <div class="detail-line">
+              <span class="dt-k">Artifact on Disk:</span>
+              <span class="dt-v">{inspectingRecovery.artifactExists ? 'Verified Present' : 'None Found'}</span>
+            </div>
+            {#if inspectingRecovery.artifactPath}
+              <div class="detail-line">
+                <span class="dt-k">Artifact Path:</span>
+                <span class="dt-v mono">{inspectingRecovery.artifactPath}</span>
+              </div>
+            {/if}
+            <div class="detail-line">
+              <span class="dt-k">Retry Safety:</span>
+              <span class="dt-v">{inspectingRecovery.retryIsSafe ? 'Safe (Idempotent)' : 'Blocked'}</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="recommendation-card">
+          <div class="rec-title">
+            <Icon name="check" size={16} />
+            <strong>Recommended Action:</strong>
+          </div>
+          <p class="rec-desc">
+            {#if inspectingRecovery.recommendedAction === 'verify_komga'}
+              Canonical file exists and receipt is recorded. Triggering a targeted Komga scan will verify ownership without re-downloading media.
+            {:else if inspectingRecovery.recommendedAction === 'republish_staged_archive'}
+              Valid archive was found in staging. Recovery can validate and publish without initiating a new external download.
+            {:else if inspectingRecovery.recommendedAction === 'already_verified_complete'}
+              This acquisition is already published and verified in Komga canonical library. No recovery action needed.
+            {:else if inspectingRecovery.recommendedAction === 'retry_metadata_only'}
+              Media archive is published. Only metadata delivery needs to be retried. Canonical file will not be modified.
+            {:else}
+              Download failed before completing staging. A safe download restart is recommended.
+            {/if}
+          </p>
+        </div>
+      </div>
+
+      <div class="recovery-modal-footer">
+        <button class="btn subtle" onclick={() => (inspectingRecovery = null)}>
+          Close
+        </button>
+        {#if inspectingRecovery.canRecover}
+          <button
+            class="btn spot"
+            onclick={async () => {
+              const cid = inspectingRecovery!.chapterId;
+              inspectingRecovery = null;
+              await act('POST', `/downloads/${cid}/recover`);
+            }}
+          >
+            Apply Recommended Recovery
+          </button>
+        {/if}
+      </div>
+    </div>
+  </div>
+{/if}
 
 <style>
   .page {
@@ -1804,5 +1959,156 @@
     background: #fef3c7;
     color: #92400e;
     border: 1px solid #f59e0b;
+  }
+
+  .recovery-modal-backdrop {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.75);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 100;
+    padding: 1rem;
+  }
+
+  .recovery-modal-card {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    max-width: 680px;
+    width: 100%;
+    max-height: 90vh;
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5);
+  }
+
+  .recovery-modal-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    padding: 1.25rem 1.5rem;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .recovery-modal-subtitle {
+    margin: 0.25rem 0 0 0;
+    font-size: 0.85rem;
+    color: var(--muted);
+  }
+
+  .recovery-modal-body {
+    padding: 1.25rem 1.5rem;
+    overflow-y: auto;
+    flex: 1;
+  }
+
+  .recovery-status-strip {
+    display: flex;
+    gap: 1rem;
+    background: var(--surface-alt, rgba(0, 0, 0, 0.04));
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.75rem 1rem;
+    margin-bottom: 1rem;
+  }
+
+  .strip-item {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+    flex: 1;
+  }
+
+  .strip-label {
+    font-size: 0.7rem;
+    text-transform: uppercase;
+    color: var(--muted);
+    letter-spacing: 0.05em;
+  }
+
+  .strip-val {
+    font-size: 0.9rem;
+    font-weight: 700;
+  }
+
+  .strip-val.danger {
+    color: #ef4444;
+  }
+
+  .recovery-error-banner {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.5rem;
+    background: rgba(239, 68, 68, 0.1);
+    border: 1px solid rgba(239, 68, 68, 0.3);
+    color: #ef4444;
+    padding: 0.75rem 1rem;
+    border-radius: 6px;
+    font-size: 0.85rem;
+    margin-bottom: 1rem;
+  }
+
+  .recovery-details-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1rem;
+    margin-bottom: 1rem;
+  }
+
+  .detail-box {
+    background: var(--surface-alt, rgba(0, 0, 0, 0.02));
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.85rem 1rem;
+  }
+
+  .detail-box h4 {
+    margin: 0 0 0.5rem 0;
+    font-size: 0.85rem;
+    letter-spacing: 0.03em;
+  }
+
+  .detail-line {
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.8rem;
+    margin-bottom: 0.35rem;
+  }
+
+  .dt-k {
+    color: var(--muted);
+  }
+
+  .recommendation-card {
+    background: rgba(34, 197, 94, 0.08);
+    border: 1px solid rgba(34, 197, 94, 0.3);
+    border-radius: 6px;
+    padding: 0.85rem 1rem;
+  }
+
+  .rec-title {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    color: #22c55e;
+    font-size: 0.85rem;
+    margin-bottom: 0.25rem;
+  }
+
+  .rec-desc {
+    font-size: 0.85rem;
+    color: var(--fg);
+    margin: 0;
+    line-height: 1.4;
+  }
+
+  .recovery-modal-footer {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.5rem;
+    padding: 1rem 1.5rem;
+    border-top: 1px solid var(--border);
   }
 </style>
