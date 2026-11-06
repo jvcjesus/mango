@@ -84,12 +84,12 @@ pub fn scan_library_duplicates(conn: &Connection) -> Result<LibraryDuplicateRepo
     let mut overlap_count = 0;
     let mut total_reclaimable = 0u64;
 
-    // 1. Exact Duplicates by identical file_hash across publication receipts
+    // 1. Exact Duplicates by identical file_sha256 across publication receipts
     let mut stmt_exact = conn.prepare(
-        "SELECT file_hash, COUNT(*)
+        "SELECT file_sha256, COUNT(*)
          FROM publication_receipts
-         WHERE file_hash IS NOT NULL AND file_hash != ''
-         GROUP BY file_hash
+         WHERE file_sha256 IS NOT NULL AND file_sha256 != ''
+         GROUP BY file_sha256
          HAVING COUNT(*) > 1",
     )?;
 
@@ -103,7 +103,7 @@ pub fn scan_library_duplicates(conn: &Connection) -> Result<LibraryDuplicateRepo
             "SELECT r.id, r.series_title, r.canonical_path, r.file_size_bytes, r.volume_number,
                     r.manga_id, r.created_at
              FROM publication_receipts r
-             WHERE r.file_hash = ?1
+             WHERE r.file_sha256 = ?1
              ORDER BY r.created_at DESC",
         )?;
 
@@ -180,11 +180,11 @@ pub fn scan_library_duplicates(conn: &Connection) -> Result<LibraryDuplicateRepo
 
     // 2. Semantic Duplicates: Same series and volume number with different receipts/hashes
     let mut stmt_semantic = conn.prepare(
-        "SELECT r.manga_id, r.volume_number, COUNT(DISTINCT r.file_hash)
+        "SELECT r.manga_id, r.volume_number, COUNT(DISTINCT r.file_sha256)
          FROM publication_receipts r
          WHERE r.manga_id IS NOT NULL AND r.volume_number IS NOT NULL
          GROUP BY r.manga_id, r.volume_number
-         HAVING COUNT(DISTINCT r.file_hash) > 1",
+         HAVING COUNT(DISTINCT r.file_sha256) > 1",
     )?;
 
     let semantic_pairs: Vec<(i64, f64)> = stmt_semantic
@@ -194,7 +194,7 @@ pub fn scan_library_duplicates(conn: &Connection) -> Result<LibraryDuplicateRepo
 
     for (m_id, v_num) in semantic_pairs {
         let mut stmt_items = conn.prepare(
-            "SELECT r.id, r.series_title, r.canonical_path, r.file_size_bytes, r.file_hash, r.created_at
+            "SELECT r.id, r.series_title, r.canonical_path, r.file_size_bytes, r.file_sha256, r.created_at
              FROM publication_receipts r
              WHERE r.manga_id = ?1 AND ABS(r.volume_number - ?2) < 0.001
              ORDER BY r.file_size_bytes DESC, r.created_at DESC",
@@ -376,7 +376,7 @@ mod tests {
                 volume_number REAL,
                 canonical_path TEXT NOT NULL,
                 file_size_bytes INTEGER NOT NULL,
-                file_hash TEXT,
+                file_sha256 TEXT,
                 published_at INTEGER NOT NULL,
                 created_at INTEGER NOT NULL
             );
@@ -394,7 +394,7 @@ mod tests {
         conn.execute(
             "INSERT INTO publication_receipts (
                 id, chapter_id, manga_id, series_id, series_title, volume_number,
-                canonical_path, file_size_bytes, file_hash, published_at, created_at
+                canonical_path, file_size_bytes, file_sha256, published_at, created_at
              ) VALUES
              ('rcpt-1', 101, 1, 'manga:1', 'Haikyu!!', 1.0, '/manga/Haikyu!!/Haikyu!! v01.cbz', 85000000, ?1, 1000, 1000),
              ('rcpt-2', 102, 1, 'manga:1', 'Haikyu!!', 1.0, '/manga/Haikyu!!/Haikyu!! v01 (Copy).cbz', 85000000, ?1, 2000, 2000)",
@@ -420,7 +420,7 @@ mod tests {
         conn.execute(
             "INSERT INTO publication_receipts (
                 id, chapter_id, manga_id, series_id, series_title, volume_number,
-                canonical_path, file_size_bytes, file_hash, published_at, created_at
+                canonical_path, file_size_bytes, file_sha256, published_at, created_at
              ) VALUES
              ('rcpt-scan', 201, 2, 'manga:2', 'Blue Lock', 1.0, '/manga/Blue Lock/Blue Lock v01 [Scanlation].cbz', 45000000, 'hash-scan', 1000, 1000),
              ('rcpt-digital', 202, 2, 'manga:2', 'Blue Lock', 1.0, '/manga/Blue Lock/Blue Lock v01 [Digital].cbz', 95000000, 'hash-digital', 2000, 2000)",

@@ -290,7 +290,7 @@ mod tests {
                 volume_number REAL,
                 canonical_path TEXT NOT NULL,
                 file_size_bytes INTEGER NOT NULL,
-                file_hash TEXT,
+                file_sha256 TEXT,
                 published_at INTEGER NOT NULL,
                 created_at INTEGER NOT NULL
             );
@@ -331,7 +331,7 @@ mod tests {
         conn.execute(
             "INSERT INTO publication_receipts (
                 id, chapter_id, manga_id, series_id, series_title, volume_number,
-                canonical_path, file_size_bytes, file_hash, published_at, created_at
+                canonical_path, file_size_bytes, file_sha256, published_at, created_at
              ) VALUES ('rcpt-1', 101, 1, 'manga:1', 'Haikyu!!', 1.0, '/manga/h.cbz', 500, 'h1', 1, 1)",
             [],
         ).unwrap();
