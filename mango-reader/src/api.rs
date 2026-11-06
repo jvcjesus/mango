@@ -148,6 +148,10 @@ pub fn router(state: Spaces) -> Router {
             "/manga/{id}/volumes/{volume}/candidates/inspect",
             get(get_manga_volume_candidates_inspect),
         )
+        .route(
+            "/manga/{id}/volumes/{volume}/compare-candidates",
+            get(get_manga_volume_candidates_compare),
+        )
         .route("/manga/{id}/volumes/{volume}/candidates/{candidate_id}/acquire", post(post_manga_volume_candidate_acquire))
         .route("/manga/{id}/volumes/{volume}/discover", post(post_manga_volume_discover))
         .route("/manga/{id}/discover-missing", post(post_manga_discover_missing))
@@ -3721,6 +3725,41 @@ async fn get_manga_volume_candidates_inspect(
         .db
         .call(move |conn| {
             crate::sync::diagnostics::inspect_volume_candidates(conn, &s_id, volume, &profile)
+        })
+        .await?;
+
+    Ok(Json(res))
+}
+
+async fn get_manga_volume_candidates_compare(
+    Me(app): Me,
+    Path((id, volume)): Path<(i64, f64)>,
+) -> Result<Json<crate::acquisition::quality::CandidateComparisonMatrix>> {
+    use rusqlite::OptionalExtension;
+    let series_id = app
+        .db
+        .call(move |conn| {
+            if let Some(sum) = crate::sync::reconciliation::get_reconciliation_for_manga(conn, id)? {
+                Ok(Some(sum.series_id))
+            } else {
+                let title: Option<String> = conn
+                    .query_row("SELECT title FROM manga WHERE id = ?1", [id], |r| r.get(0))
+                    .optional()?;
+                Ok(title.as_deref().map(|t| format!("title:{}", crate::pipeline::mangabaka::normalize_title(t))))
+            }
+        })
+        .await?;
+
+    let Some(s_id) = series_id else {
+        return Err(AppError::not_found(format!("Manga {id} not found")));
+    };
+
+    let profile = app.acquisition.get_manga_profile(id).await.unwrap_or_default();
+
+    let res = app
+        .db
+        .call(move |conn| {
+            crate::sync::diagnostics::compare_volume_candidates(conn, &s_id, volume, &profile)
         })
         .await?;
 

@@ -1,4 +1,4 @@
-//! Unit tests for M6.11 Candidate Quality Intelligence & Release Selection.
+//! Unit tests for M6.11 / M8.4 Candidate Quality Intelligence & Release Selection.
 
 use crate::acquisition::approval::PersistedCandidate;
 use crate::acquisition::quality::*;
@@ -42,7 +42,7 @@ fn test_quality_scoring_digital_and_trusted_bonuses() {
     let cand = make_candidate(
         "cand-nyaa-1",
         "nyaa",
-        "[danke-Empire] Frieren v01 (Digital) (2048px)",
+        "[danke-Empire] Frieren v01 (Digital) (2048px).cbz",
         "exact_volume",
         true,
         true,
@@ -58,16 +58,20 @@ fn test_quality_scoring_digital_and_trusted_bonuses() {
     assert!(eval.is_quality_group);
     assert_eq!(eval.health_rating, "EXCELLENT");
     assert_eq!(eval.resolution_label.as_deref(), Some("2048px (Ultra-HD)"));
+    assert_eq!(eval.format, "CBZ");
+    assert_eq!(eval.edition, "Digital");
+    assert!(eval.size_per_page_kb.is_some());
 
     // Expected score breakdown:
-    // Match type: 60
+    // Match type (exact volume): 50
     // Digital: 15
-    // Trusted: 10
-    // Quality group: 5
+    // Trusted uploader: 20
+    // Preferred language (English): 10
+    // Expected size (150MB): 10
     // Resolution (2048px): 5
     // Seeds (>=20): 10
-    // Total: 105.0
-    assert_eq!(eval.total_score, 105.0);
+    // Total: 120.0
+    assert_eq!(eval.total_score, 120.0);
     assert_eq!(eval.selection_verdict, "ALTERNATIVE"); // Nyaa is alternative when Madokami is evaluated
 }
 
@@ -205,4 +209,156 @@ fn test_detect_resolution_label() {
         Some("Digital Archival")
     );
     assert_eq!(detect_resolution_label("Dungeon Meshi v01"), None);
+}
+
+#[test]
+fn test_scoring_penalties_chapter_size_language() {
+    // 1. Chapter-only penalty (-50)
+    let cand_ch = make_candidate(
+        "cand-ch",
+        "nyaa",
+        "Frieren ch. 01.cbz",
+        "chapter",
+        false,
+        false,
+        None,
+        Some(10),
+    );
+    let eval_ch = evaluate_candidate_quality(&cand_ch, false, None);
+    assert!(eval_ch.factors.iter().any(|f| f.points == -50.0 && f.name == "Match Type"));
+    assert!(eval_ch.warning_badges.contains(&"Chapter only".to_string()));
+    assert_eq!(eval_ch.selection_verdict, "INELIGIBLE");
+
+    // 2. Unwanted language penalty (-50)
+    let cand_fr = make_candidate(
+        "cand-fr",
+        "nyaa",
+        "[FR] Frieren v01.cbz",
+        "exact_volume",
+        false,
+        false,
+        None,
+        Some(10),
+    );
+    let eval_fr = evaluate_candidate_quality(&cand_fr, false, None);
+    assert!(eval_fr.factors.iter().any(|f| f.name == "Unwanted Language" && f.points == -50.0));
+    assert!(eval_fr.warning_badges.iter().any(|b| b.contains("French")));
+    assert_eq!(eval_fr.selection_verdict, "INELIGIBLE");
+
+    // 3. Extreme size anomaly penalty (-30)
+    let mut cand_huge = make_candidate(
+        "cand-huge",
+        "nyaa",
+        "Frieren v01.cbz",
+        "exact_volume",
+        false,
+        false,
+        None,
+        Some(10),
+    );
+    cand_huge.size_bytes = Some(4_200_000_000); // 4.2 GB
+    let eval_huge = evaluate_candidate_quality(&cand_huge, false, None);
+    assert!(eval_huge.factors.iter().any(|f| f.name == "Extreme Size Anomaly" && f.points == -30.0));
+    assert!(eval_huge.warning_badges.contains(&"Size anomaly".to_string()));
+    assert!(eval_huge.rejection_reason.as_ref().unwrap().contains("exceeds expected volume size"));
+
+    // 4. Format CBR warning
+    let cand_cbr = make_candidate(
+        "cand-cbr",
+        "nyaa",
+        "Frieren v01.cbr",
+        "exact_volume",
+        false,
+        false,
+        None,
+        Some(10),
+    );
+    let eval_cbr = evaluate_candidate_quality(&cand_cbr, false, None);
+    assert_eq!(eval_cbr.format, "CBR");
+    assert!(eval_cbr.warning_badges.iter().any(|b| b.contains("CBR")));
+    assert!(eval_cbr.rejection_reason.as_ref().unwrap().contains("requires conversion"));
+}
+
+#[test]
+fn test_deduplicate_candidate_evaluations() {
+    let cand_mado = make_candidate(
+        "cand-mado",
+        "madokami",
+        "[danke-Empire] Frieren v01.cbz",
+        "exact_volume",
+        true,
+        true,
+        Some("danke-Empire"),
+        None,
+    );
+    let cand_nyaa = make_candidate(
+        "cand-nyaa",
+        "nyaa",
+        "[danke-Empire] Frieren v01 [CBZ]",
+        "exact_volume",
+        true,
+        true,
+        Some("danke-Empire"),
+        Some(15),
+    );
+
+    let candidates = vec![cand_mado.clone(), cand_nyaa.clone()];
+    let evals = vec![
+        evaluate_candidate_quality(&cand_mado, false, None),
+        evaluate_candidate_quality(&cand_nyaa, false, None),
+    ];
+
+    let (deduped, dup_count) = deduplicate_candidate_evaluations(evals, &candidates);
+
+    assert_eq!(dup_count, 1);
+    assert_eq!(deduped.len(), 1);
+    let primary = &deduped[0];
+    assert_eq!(primary.candidate_id, "cand-mado"); // Madokami preferred
+    assert_eq!(primary.alternate_sources.len(), 1);
+    assert_eq!(primary.alternate_sources[0].candidate_id, "cand-nyaa");
+    assert_eq!(primary.alternate_sources[0].provider, "nyaa");
+}
+
+#[test]
+fn test_side_by_side_comparison_matrix() {
+    let cand_mado = make_candidate(
+        "cand-mado",
+        "madokami",
+        "[danke-Empire] Frieren v01.cbz",
+        "exact_volume",
+        true,
+        true,
+        Some("danke-Empire"),
+        None,
+    );
+    let cand_nyaa = make_candidate(
+        "cand-nyaa",
+        "nyaa",
+        "Frieren v01.cbr",
+        "exact_volume",
+        false,
+        false,
+        None,
+        Some(1),
+    );
+
+    let candidates = vec![cand_mado.clone(), cand_nyaa.clone()];
+    let evals = vec![
+        evaluate_candidate_quality(&cand_mado, false, None),
+        evaluate_candidate_quality(&cand_nyaa, false, None),
+    ];
+
+    let matrix = build_candidate_comparison_matrix("title:frieren", 1.0, &evals, &candidates, 0);
+
+    assert_eq!(matrix.candidates.len(), 2);
+    assert!(matrix.preference_explanation.contains("Candidate #1"));
+    assert!(matrix.preference_explanation.contains("preferred over Candidate #2"));
+
+    // Check advantages and disadvantages
+    let first = &matrix.candidates[0];
+    assert!(first.advantages.iter().any(|a| a.contains("Direct HTTP")));
+    assert!(first.advantages.iter().any(|a| a.contains("digital")));
+
+    let second = &matrix.candidates[1];
+    assert!(second.disadvantages.iter().any(|d| d.contains("conversion") || d.contains("BitTorrent")));
 }

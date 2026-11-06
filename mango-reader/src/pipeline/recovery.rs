@@ -275,7 +275,6 @@ pub fn list_all_recovery_info(conn: &Connection) -> Result<DownloadRecoverySumma
 
     let mut items = Vec::new();
     let mut recoverable_count = 0;
-    let mut stalled_count = 0;
     let mut failed_count = 0;
 
     for cid in ch_ids {
@@ -297,7 +296,7 @@ pub fn list_all_recovery_info(conn: &Connection) -> Result<DownloadRecoverySumma
             |r| r.get(0),
         )
         .unwrap_or(0);
-    stalled_count = stalled_res as usize;
+    let stalled_count = stalled_res as usize;
 
     Ok(DownloadRecoverySummary {
         total_failed_downloads: failed_count,

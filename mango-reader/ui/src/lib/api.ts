@@ -2008,6 +2008,54 @@ export interface CandidateQualityEvaluationDto {
   healthRating: 'EXCELLENT' | 'GOOD' | 'DEGRADED' | 'DEAD' | string;
   upgradeEvaluation: UpgradeEvaluationDto;
   rejectionReason?: string | null;
+  format?: string;
+  edition?: string;
+  sizePerPageKb?: number | null;
+  warningBadges?: string[];
+  alternateSources?: AlternateSourceDto[];
+}
+
+export interface AlternateSourceDto {
+  candidateId: string;
+  provider: string;
+  transport: string;
+  uploader?: string | null;
+  sizeBytes?: number | null;
+  seeders?: number | null;
+  rawTitle: string;
+  score: number;
+}
+
+export interface CandidateComparisonItem {
+  candidateId: string;
+  rank: number;
+  provider: string;
+  transport: string;
+  title: string;
+  rawTitle: string;
+  format: string;
+  edition: string;
+  uploader?: string | null;
+  sizeBytes?: number | null;
+  sizePerPageKb?: number | null;
+  seeders?: number | null;
+  healthRating: string;
+  totalScore: number;
+  selectionVerdict: string;
+  factors: QualityFactorScoreDto[];
+  warningBadges: string[];
+  rejectionReason?: string | null;
+  alternateSources: AlternateSourceDto[];
+  advantages: string[];
+  disadvantages: string[];
+}
+
+export interface CandidateComparisonMatrix {
+  seriesId: string;
+  volumeNumber: number;
+  candidates: CandidateComparisonItem[];
+  preferenceExplanation: string;
+  duplicateGroupsCount: number;
 }
 
 export interface CandidateInspectionDto {
@@ -2203,6 +2251,9 @@ export const getSeriesGaps = (mangaId: number) =>
 
 export const inspectVolumeCandidates = (mangaId: number, volume: number) =>
   get<VolumeCandidateInspectionResult>(`/manga/${mangaId}/volumes/${volume}/candidates/inspect`);
+
+export const compareVolumeCandidates = (mangaId: number, volume: number) =>
+  get<CandidateComparisonMatrix>(`/manga/${mangaId}/volumes/${volume}/compare-candidates`);
 
 export const listMangaBakaCollections = (seriesId: number) =>
   get<MangaBakaCollectionInfo[]>(`/catalog/mangabaka/${seriesId}/collections`);

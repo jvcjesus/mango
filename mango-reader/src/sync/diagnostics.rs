@@ -757,12 +757,14 @@ pub fn inspect_volume_candidates(
         })
         .map_err(|e| AppError::internal(format!("Failed to query candidates: {e}")))?;
 
-    let mut inspected_list = Vec::new();
+    let candidates_vec: Vec<PersistedCandidate> = rows
+        .map(|cand_res| cand_res.map_err(|e| AppError::internal(format!("Row error: {e}"))))
+        .collect::<std::result::Result<Vec<_>, AppError>>()?;
+
     let mut quality_evals = Vec::new();
+    let mut cand_meta_map = std::collections::HashMap::new();
 
-    for cand_res in rows {
-        let cand = cand_res.map_err(|e| AppError::internal(format!("Row error: {e}")))?;
-
+    for cand in &candidates_vec {
         let transport = match cand.provider.as_str() {
             "madokami" => "Direct HTTP (Range resume)".to_string(),
             "nyaa" => "TorBox BitTorrent (Debrid)".to_string(),
@@ -778,7 +780,7 @@ pub fn inspect_volume_candidates(
 
         // Evaluate eligibility via shared auto-acquire gate logic
         let (auto_acquire_eligible, rejection_code, rejection_reason) =
-            match is_candidate_auto_eligible(&cand, profile) {
+            match is_candidate_auto_eligible(cand, profile) {
                 Ok(()) => (true, None, None),
                 Err(code) => {
                     let reason = match code {
@@ -800,7 +802,7 @@ pub fn inspect_volume_candidates(
             };
 
         let quality_eval = crate::acquisition::quality::evaluate_candidate_quality(
-            &cand,
+            cand,
             is_currently_owned,
             rejection_reason.clone(),
         );
@@ -813,36 +815,66 @@ pub fn inspect_volume_candidates(
             cand.info_hash.as_deref(),
         );
 
-        inspected_list.push(CandidateInspectionDto {
-            candidate_id: cand.candidate_id,
-            provider: cand.provider,
-            transport,
-            title: cand.title,
-            raw_title: cand.raw_title,
-            match_type: cand.match_type,
-            is_pre,
-            size_bytes: cand.size_bytes,
-            uploader: cand.uploader,
-            is_trusted: cand.is_trusted,
-            is_digital: cand.is_digital,
-            score: cand.score,
-            score_explanation: cand.score_explanation,
-            seeders: cand.seeders,
-            leechers: cand.leechers,
-            published_at: cand.published_at,
-            auto_acquire_eligible,
-            rejection_code,
-            rejection_reason,
-            sanitized_reference,
-            quality_evaluation: None,
-        });
+        cand_meta_map.insert(
+            cand.candidate_id.clone(),
+            (
+                transport,
+                is_pre,
+                auto_acquire_eligible,
+                rejection_code,
+                rejection_reason,
+                sanitized_reference,
+            ),
+        );
     }
 
-    // Rank quality evaluations and re-attach
-    crate::acquisition::quality::rank_quality_evaluations(&mut quality_evals);
-    for (i, eval) in quality_evals.into_iter().enumerate() {
-        if let Some(dto) = inspected_list.get_mut(i) {
-            dto.quality_evaluation = Some(eval);
+    // Deduplicate across providers/mirrors
+    let (deduped_evals, _dup_count) =
+        crate::acquisition::quality::deduplicate_candidate_evaluations(quality_evals, &candidates_vec);
+
+    let mut inspected_list = Vec::new();
+    let cand_map: std::collections::HashMap<_, _> =
+        candidates_vec.into_iter().map(|c| (c.candidate_id.clone(), c)).collect();
+
+    for eval in deduped_evals {
+        if let Some(cand) = cand_map.get(&eval.candidate_id) {
+            let (transport, is_pre, auto_acquire_eligible, rejection_code, rejection_reason, sanitized_reference) =
+                cand_meta_map
+                    .remove(&eval.candidate_id)
+                    .unwrap_or_else(|| {
+                        (
+                            eval.transport.clone(),
+                            false,
+                            false,
+                            None,
+                            eval.rejection_reason.clone(),
+                            None,
+                        )
+                    });
+
+            inspected_list.push(CandidateInspectionDto {
+                candidate_id: cand.candidate_id.clone(),
+                provider: cand.provider.clone(),
+                transport,
+                title: cand.title.clone(),
+                raw_title: cand.raw_title.clone(),
+                match_type: cand.match_type.clone(),
+                is_pre,
+                size_bytes: cand.size_bytes.map(|s| s as u64),
+                uploader: cand.uploader.clone(),
+                is_trusted: cand.is_trusted,
+                is_digital: cand.is_digital,
+                score: eval.total_score,
+                score_explanation: cand.score_explanation.clone(),
+                seeders: cand.seeders,
+                leechers: cand.leechers,
+                published_at: cand.published_at,
+                auto_acquire_eligible,
+                rejection_code,
+                rejection_reason,
+                sanitized_reference,
+                quality_evaluation: Some(eval),
+            });
         }
     }
 
@@ -862,4 +894,94 @@ pub fn inspect_volume_candidates(
         top_candidate,
         candidates: inspected_list,
     })
+}
+
+/// Compares candidates side-by-side with explainable advantages and disadvantages.
+pub fn compare_volume_candidates(
+    conn: &Connection,
+    series_id: &str,
+    volume_number: f64,
+    profile: &AcquisitionProfile,
+) -> Result<crate::acquisition::quality::CandidateComparisonMatrix> {
+    // 1. Check ownership status
+    let is_currently_owned: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM series_reconciliations
+                WHERE series_id = ?1 AND owned_volumes_json LIKE '%' || ?2 || '%'
+            )",
+            params![series_id, volume_number],
+            |r| r.get(0),
+        )
+        .unwrap_or(false)
+        || is_volume_owned(conn, 0, series_id, volume_number).unwrap_or(false);
+
+    // 2. Query discovered candidates
+    let mut stmt = conn
+        .prepare(
+            "SELECT candidate_id, provider, provider_item_id, title, raw_title, match_type,
+                    size_bytes, uploader, is_trusted, is_digital, score, score_explanation,
+                    download_url, magnet_url, info_hash, seeders, leechers, published_at
+             FROM discovered_release_candidates
+             WHERE series_id = ?1 AND ABS(volume_number - ?2) < 0.001
+             ORDER BY score DESC",
+        )
+        .map_err(|e| AppError::internal(format!("Failed to prepare candidates query: {e}")))?;
+
+    let candidates: Vec<PersistedCandidate> = stmt
+        .query_map(params![series_id, volume_number], |r| {
+            Ok(PersistedCandidate {
+                series_id: series_id.to_string(),
+                volume_number,
+                candidate_id: r.get(0)?,
+                provider: r.get(1)?,
+                provider_item_id: r.get(2)?,
+                title: r.get(3)?,
+                raw_title: r.get(4)?,
+                match_type: r.get(5)?,
+                size_bytes: r.get(6)?,
+                uploader: r.get(7)?,
+                is_trusted: r.get::<_, i64>(8)? != 0,
+                is_digital: r.get::<_, i64>(9)? != 0,
+                score: r.get(10)?,
+                score_explanation: r.get(11)?,
+                download_url: r.get(12)?,
+                magnet_url: r.get(13)?,
+                info_hash: r.get(14)?,
+                seeders: r.get(15)?,
+                leechers: r.get(16)?,
+                published_at: r.get(17)?,
+            })
+        })
+        .map_err(|e| AppError::internal(format!("Failed to query candidates: {e}")))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let mut quality_evals = Vec::new();
+    for cand in &candidates {
+        let (_, _, rejection_reason) = match is_candidate_auto_eligible(cand, profile) {
+            Ok(()) => (true, None, None),
+            Err(code) => (false, Some(code.as_str().to_string()), Some(code.as_str().to_string())),
+        };
+
+        let eval = crate::acquisition::quality::evaluate_candidate_quality(
+            cand,
+            is_currently_owned,
+            rejection_reason,
+        );
+        quality_evals.push(eval);
+    }
+
+    let (deduped_evals, dup_count) =
+        crate::acquisition::quality::deduplicate_candidate_evaluations(quality_evals, &candidates);
+
+    let matrix = crate::acquisition::quality::build_candidate_comparison_matrix(
+        series_id,
+        volume_number,
+        &deduped_evals,
+        &candidates,
+        dup_count,
+    );
+
+    Ok(matrix)
 }

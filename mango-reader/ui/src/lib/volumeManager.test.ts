@@ -237,4 +237,110 @@ describe('Unified Volume Manager (M8.2)', () => {
     expect(corruptRecovery.recommendedAction).toBe('safe_restart_download');
     expect(corruptRecovery.canRecover).toBe(true);
   });
+
+  it('evaluates intelligent release selection and side-by-side comparison matrix (M8.4)', () => {
+    const comparison: import('./api').CandidateComparisonMatrix = {
+      seriesId: 'title:haikyu',
+      volumeNumber: 1,
+      duplicateGroupsCount: 1,
+      preferenceExplanation:
+        'Candidate #1 (madokami) is preferred over Candidate #2 (nyaa) due to direct HTTP range transport over torrent swarm, official digital archival edition, higher quality score (120 vs 85).',
+      candidates: [
+        {
+          candidateId: 'cand-mado',
+          rank: 1,
+          provider: 'madokami',
+          transport: 'Direct HTTP (Range resume)',
+          title: '[danke-Empire] Haikyu!! v01 (Digital)',
+          rawTitle: '[danke-Empire] Haikyu!! v01 (Digital).cbz',
+          format: 'CBZ',
+          edition: 'Digital',
+          uploader: 'danke-Empire',
+          sizeBytes: 85000000,
+          sizePerPageKb: 415,
+          seeders: null,
+          healthRating: 'EXCELLENT',
+          totalScore: 120,
+          selectionVerdict: 'PREFERRED',
+          factors: [
+            { name: 'Match Type', points: 50, isBonus: true, description: 'Exact volume match bonus (+50)' },
+            { name: 'Provider Preference', points: 10, isBonus: true, description: 'Direct HTTP (+10)' },
+            { name: 'Official Digital', points: 15, isBonus: true, description: 'Digital edition bonus (+15)' },
+            { name: 'Trusted Uploader', points: 20, isBonus: true, description: 'Trusted uploader bonus (+20)' },
+            { name: 'Preferred Language', points: 10, isBonus: true, description: 'Preferred language match (+10)' },
+            { name: 'Expected Size', points: 10, isBonus: true, description: 'Size within expected range (+10)' },
+            { name: 'Resolution', points: 5, isBonus: true, description: '2048px (Ultra-HD) (+5)' },
+          ],
+          warningBadges: [],
+          rejectionReason: null,
+          alternateSources: [
+            {
+              candidateId: 'cand-nyaa-mirror',
+              provider: 'nyaa',
+              transport: 'TorBox BitTorrent (Debrid)',
+              uploader: 'danke-Empire',
+              sizeBytes: 85000000,
+              seeders: 14,
+              rawTitle: '[danke-Empire] Haikyu!! v01 [CBZ]',
+              score: 95,
+            },
+          ],
+          advantages: [
+            'Direct HTTP transport from Madokami (range resume, no torrent wait)',
+            'Official digital archival edition',
+            'Verified trusted uploader / recognized quality group',
+            'Standard CBZ archive format (native Komga support)',
+          ],
+          disadvantages: [],
+        },
+        {
+          candidateId: 'cand-nyaa-alt',
+          rank: 2,
+          provider: 'nyaa',
+          transport: 'TorBox BitTorrent (Debrid)',
+          title: 'Haikyu!! v01.cbr',
+          rawTitle: 'Haikyu!! v01.cbr',
+          format: 'CBR',
+          edition: 'Scanlation',
+          uploader: 'unknown',
+          sizeBytes: 75000000,
+          sizePerPageKb: 366,
+          seeders: 2,
+          healthRating: 'DEGRADED',
+          totalScore: 40,
+          selectionVerdict: 'ALTERNATIVE',
+          factors: [
+            { name: 'Match Type', points: 50, isBonus: true, description: 'Exact volume match bonus (+50)' },
+            { name: 'Swarm Health', points: 2, isBonus: true, description: 'Low seeds: 2 seeds (+2)' },
+          ],
+          warningBadges: ['CBR (Needs conversion)', 'Low seeders'],
+          rejectionReason: 'File format CBR requires conversion',
+          alternateSources: [],
+          advantages: [],
+          disadvantages: [
+            'BitTorrent transfer requires debrid caching/swarm availability',
+            'CBR RAR archive requires format conversion',
+            'Low seeder count in torrent swarm',
+          ],
+        },
+      ],
+    };
+
+    expect(comparison.candidates.length).toBe(2);
+    expect(comparison.duplicateGroupsCount).toBe(1);
+    expect(comparison.preferenceExplanation).toContain('Candidate #1 (madokami) is preferred');
+
+    const top = comparison.candidates[0];
+    expect(top.rank).toBe(1);
+    expect(top.selectionVerdict).toBe('PREFERRED');
+    expect(top.format).toBe('CBZ');
+    expect(top.edition).toBe('Digital');
+    expect(top.alternateSources.length).toBe(1);
+    expect(top.alternateSources[0].provider).toBe('nyaa');
+
+    const alt = comparison.candidates[1];
+    expect(alt.rank).toBe(2);
+    expect(alt.warningBadges).toContain('CBR (Needs conversion)');
+    expect(alt.rejectionReason).toContain('requires conversion');
+  });
 });
