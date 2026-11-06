@@ -8,6 +8,7 @@
 //! 5. Detailed in-memory audit trail of recent pipeline executions
 
 mod cover;
+pub mod duplicates;
 pub mod komf;
 pub mod komga;
 pub mod mangabaka;

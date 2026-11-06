@@ -1444,6 +1444,58 @@ export interface CleanupManifest {
 export const getStagingInventory = () => get<StagingInventoryReport>('/pipeline/staging/inventory');
 export const previewStagingCleanup = () => send<CleanupManifest>('POST', '/pipeline/staging/preview', {});
 
+export interface DuplicateItemDto {
+  itemId: string;
+  fileName: string;
+  path: string;
+  sizeBytes: number;
+  sha256?: string | null;
+  isCanonicalReceiptMatch: boolean;
+  isDigital: boolean;
+  resolutionLabel?: string | null;
+  format: string;
+}
+
+export interface DuplicateGroupDto {
+  groupType: 'EXACT_HASH' | 'SEMANTIC_VOLUME' | 'CHAPTER_VOLUME_OVERLAP' | string;
+  seriesId: string;
+  mangaId?: number | null;
+  seriesTitle: string;
+  volumeNumber?: number | null;
+  items: DuplicateItemDto[];
+  recommendedKeepId?: string | null;
+  resolutionRecommendation: string;
+  potentialReclaimableBytes: number;
+}
+
+export interface LibraryDuplicateReportDto {
+  totalDuplicateGroups: number;
+  exactDuplicatesCount: number;
+  semanticDuplicatesCount: number;
+  chapterVolumeOverlapsCount: number;
+  potentialReclaimableBytes: number;
+  groups: DuplicateGroupDto[];
+  generatedAt: number;
+}
+
+export interface StorageOptimizerStatusDto {
+  isAvailable: boolean;
+  configuredPath?: string | null;
+  resolvedPath?: string | null;
+  source: string;
+  version?: string | null;
+  message: string;
+  defaultTargetHeight: number;
+  defaultImageQuality: number;
+  defaultMinSavingsPercent: number;
+}
+
+export const getStorageOptimizerStatus = () =>
+  get<StorageOptimizerStatusDto>('/storage/optimizer-status');
+
+export const getLibraryDuplicates = () =>
+  get<LibraryDuplicateReportDto>('/storage/duplicates');
+
 export type ReconciliationStatus = 'up_to_date' | 'missing_volume' | 'review_required' | 'sync_error' | 'collection_unavailable';
 
 export interface ReconciliationSummary {

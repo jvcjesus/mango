@@ -343,4 +343,73 @@ describe('Unified Volume Manager (M8.2)', () => {
     expect(alt.warningBadges).toContain('CBR (Needs conversion)');
     expect(alt.rejectionReason).toContain('requires conversion');
   });
+
+  it('models library duplicates and storage optimizer status (M8.6)', () => {
+    const report: import('./api').LibraryDuplicateReportDto = {
+      totalDuplicateGroups: 2,
+      exactDuplicatesCount: 1,
+      semanticDuplicatesCount: 1,
+      chapterVolumeOverlapsCount: 0,
+      potentialReclaimableBytes: 85000000,
+      generatedAt: 1700000000,
+      groups: [
+        {
+          groupType: 'EXACT_HASH',
+          seriesId: 'manga:1092',
+          mangaId: 1092,
+          seriesTitle: 'Haikyu!!',
+          volumeNumber: 1,
+          recommendedKeepId: 'rcpt-1',
+          resolutionRecommendation: 'Exact duplicate hash: keep primary canonical receipt; review duplicate copy for removal.',
+          potentialReclaimableBytes: 85000000,
+          items: [
+            {
+              itemId: 'rcpt-1',
+              fileName: 'Haikyu!! v01.cbz',
+              path: '/srv/media/manga/Haikyu!!/Haikyu!! v01.cbz',
+              sizeBytes: 85000000,
+              sha256: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+              isCanonicalReceiptMatch: true,
+              isDigital: true,
+              resolutionLabel: '2048px (Ultra-HD)',
+              format: 'CBZ',
+            },
+            {
+              itemId: 'rcpt-2',
+              fileName: 'Haikyu!! v01 (Copy).cbz',
+              path: '/srv/media/manga/Haikyu!!/Haikyu!! v01 (Copy).cbz',
+              sizeBytes: 85000000,
+              sha256: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+              isCanonicalReceiptMatch: true,
+              isDigital: true,
+              resolutionLabel: '2048px (Ultra-HD)',
+              format: 'CBZ',
+            },
+          ],
+        },
+      ],
+    };
+
+    expect(report.totalDuplicateGroups).toBe(2);
+    expect(report.exactDuplicatesCount).toBe(1);
+    expect(report.groups[0].recommendedKeepId).toBe('rcpt-1');
+    expect(report.groups[0].items.length).toBe(2);
+
+    const optimizer: import('./api').StorageOptimizerStatusDto = {
+      isAvailable: true,
+      configuredPath: '/opt/mango/bin/RustyLibraryShrinker',
+      resolvedPath: '/opt/mango/bin/RustyLibraryShrinker',
+      source: 'bundled',
+      version: 'RustyLibraryShrinker 1.2.0',
+      message: 'RustyLibraryShrinker is available and verified for CBZ optimization.',
+      defaultTargetHeight: 2400,
+      defaultImageQuality: 90,
+      defaultMinSavingsPercent: 10,
+    };
+
+    expect(optimizer.isAvailable).toBe(true);
+    expect(optimizer.defaultTargetHeight).toBe(2400);
+    expect(optimizer.defaultImageQuality).toBe(90);
+    expect(optimizer.defaultMinSavingsPercent).toBe(10);
+  });
 });

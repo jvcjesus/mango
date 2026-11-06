@@ -415,6 +415,9 @@ pub fn router(state: Spaces) -> Router {
             post(post_maintenance_rollback),
         )
         .route("/pipeline/staging/inventory", get(get_staging_inventory))
+        .route("/storage/staging-inventory", get(get_staging_inventory))
+        .route("/storage/optimizer-status", get(get_storage_optimizer_status))
+        .route("/storage/duplicates", get(get_storage_duplicates))
         .route("/pipeline/staging/preview", post(post_staging_cleanup_preview))
         .route(
             "/imports/payload/{id}/cleanup",
@@ -2324,6 +2327,26 @@ async fn post_staging_cleanup_preview(
     )
     .await?;
     Ok(Json(manifest))
+}
+
+async fn get_storage_optimizer_status(
+    Me(app): Me,
+) -> Result<Json<crate::pipeline::duplicates::StorageOptimizerStatus>> {
+    app.me.admin()?;
+    let config = app.pipeline.load_config().await?;
+    let status = crate::pipeline::duplicates::get_storage_optimizer_status(config.optimizer_bin.as_deref()).await;
+    Ok(Json(status))
+}
+
+async fn get_storage_duplicates(
+    Me(app): Me,
+) -> Result<Json<crate::pipeline::duplicates::LibraryDuplicateReport>> {
+    app.me.admin()?;
+    let report = app
+        .db
+        .call(|conn| crate::pipeline::duplicates::scan_library_duplicates(conn))
+        .await?;
+    Ok(Json(report))
 }
 
 #[derive(Debug, Clone, Serialize)]

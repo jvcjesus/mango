@@ -66,9 +66,13 @@
     type IntegrityIssue,
     getStagingInventory,
     previewStagingCleanup,
+    getStorageOptimizerStatus,
+    getLibraryDuplicates,
     type StagingInventoryReport,
     type CleanupManifest,
     type StagingItem,
+    type StorageOptimizerStatusDto,
+    type LibraryDuplicateReportDto,
   } from '../lib/api';
   import { confirm } from '../lib/confirm.svelte';
   import { COVERS, display, MENUS, setDisplay, SIZES } from '../lib/display.svelte';
@@ -677,6 +681,39 @@
       toast.error(stagingError);
     } finally {
       stagingManifestLoading = false;
+    }
+  }
+
+  // ---------- Optimizer Status & Library Duplicates (M8.6) ----------
+  let storageOptimizerStatus = $state<StorageOptimizerStatusDto | null>(null);
+  let optimizerStatusLoading = $state<boolean>(false);
+
+  let duplicatesReport = $state<LibraryDuplicateReportDto | null>(null);
+  let duplicatesLoading = $state<boolean>(false);
+  let duplicatesError = $state<string | null>(null);
+
+  async function loadOptimizerStatus() {
+    optimizerStatusLoading = true;
+    try {
+      storageOptimizerStatus = await getStorageOptimizerStatus();
+    } catch (e: any) {
+      // Non-fatal probe
+    } finally {
+      optimizerStatusLoading = false;
+    }
+  }
+
+  async function loadDuplicates() {
+    duplicatesLoading = true;
+    duplicatesError = null;
+    try {
+      duplicatesReport = await getLibraryDuplicates();
+      toast.success(`Duplicate scan complete: ${duplicatesReport.totalDuplicateGroups} issue(s) detected`);
+    } catch (e: any) {
+      duplicatesError = message(e);
+      toast.error(duplicatesError);
+    } finally {
+      duplicatesLoading = false;
     }
   }
 
@@ -3292,6 +3329,141 @@
                 </div>
               {:else}
                 <p class="muted font-small">No staged files found in downloads folder.</p>
+              {/if}
+            {/if}
+          </section>
+
+          <!-- IMAGE OPTIMIZER STATUS (M8.6) -->
+          <section class="card">
+            <div class="card-header-row">
+              <div class="header-with-badge">
+                <h3>Image Optimizer — RustyLibraryShrinker</h3>
+                {#if storageOptimizerStatus}
+                  <span class="pill-badge" class:active={storageOptimizerStatus.isAvailable} class:paused={!storageOptimizerStatus.isAvailable}>
+                    {storageOptimizerStatus.isAvailable ? 'Available' : 'Unavailable'}
+                  </span>
+                {/if}
+              </div>
+              <button class="btn small" onclick={loadOptimizerStatus} disabled={optimizerStatusLoading}>
+                <Icon name="refresh" size={14} /> Refresh Status
+              </button>
+            </div>
+            {#if storageOptimizerStatus}
+              <div class="optimizer-details-grid">
+                <div class="opt-row"><span class="opt-k">Status:</span><span class="opt-v">{storageOptimizerStatus.message}</span></div>
+                {#if storageOptimizerStatus.resolvedPath}
+                  <div class="opt-row"><span class="opt-k">Binary Path:</span><code class="opt-v">{storageOptimizerStatus.resolvedPath}</code></div>
+                {/if}
+                {#if storageOptimizerStatus.version}
+                  <div class="opt-row"><span class="opt-k">Version:</span><span class="opt-v">{storageOptimizerStatus.version}</span></div>
+                {/if}
+                <div class="opt-row"><span class="opt-k">Target Max Height:</span><span class="opt-v">{storageOptimizerStatus.defaultTargetHeight}px</span></div>
+                <div class="opt-row"><span class="opt-k">WebP/JPEG Quality:</span><span class="opt-v">{storageOptimizerStatus.defaultImageQuality}%</span></div>
+                <div class="opt-row"><span class="opt-k">Min Savings Required:</span><span class="opt-v">{storageOptimizerStatus.defaultMinSavingsPercent}%</span></div>
+              </div>
+            {:else}
+              <p class="muted">Click "Refresh Status" to probe RustyLibraryShrinker installation and capabilities.</p>
+            {/if}
+          </section>
+
+          <!-- LIBRARY DUPLICATES & OVERLAPS (M8.6) -->
+          <section class="card">
+            <div class="card-header-row">
+              <h3>Library Duplicate Detection & Overlaps</h3>
+              <button class="btn small" onclick={loadDuplicates} disabled={duplicatesLoading}>
+                {#if duplicatesLoading}
+                  <span class="spin"><Icon name="spinner" size={14} stroke={3} /></span> Scanning…
+                {:else}
+                  <Icon name="search" size={14} /> Scan Duplicates
+                {/if}
+              </button>
+            </div>
+
+            <div class="integrity-summary-banner banner-info">
+              <div class="banner-main">
+                <strong>Zero Auto-Deletion Invariant:</strong>
+                <span> All duplicate resolution recommendations are strictly non-destructive previews and require manual review. Canonical media files are never automatically pruned.</span>
+              </div>
+            </div>
+
+            {#if duplicatesError}
+              <Notice error={duplicatesError} />
+            {/if}
+
+            {#if duplicatesReport}
+              <div class="analysis-summary-grid">
+                <div class="metric-card">
+                  <span class="metric-val">{duplicatesReport.totalDuplicateGroups}</span>
+                  <span class="metric-lbl">Total Issues</span>
+                </div>
+                <div class="metric-card metric-matched">
+                  <span class="metric-val">{duplicatesReport.exactDuplicatesCount}</span>
+                  <span class="metric-lbl">Exact Hash Duplicates</span>
+                </div>
+                <div class="metric-card metric-update">
+                  <span class="metric-val">{duplicatesReport.semanticDuplicatesCount}</span>
+                  <span class="metric-lbl">Semantic Duplicates</span>
+                </div>
+                <div class="metric-card metric-already">
+                  <span class="metric-val">{duplicatesReport.chapterVolumeOverlapsCount}</span>
+                  <span class="metric-lbl">Chapter Overlaps</span>
+                </div>
+                <div class="metric-card">
+                  <span class="metric-val">{sized(duplicatesReport.potentialReclaimableBytes)}</span>
+                  <span class="metric-lbl">Reclaimable Space</span>
+                </div>
+              </div>
+
+              {#if duplicatesReport.groups.length === 0}
+                <div class="empty-state">
+                  No duplicate archives or chapter overlaps detected in your library.
+                </div>
+              {:else}
+                <div class="duplicates-groups-list">
+                  {#each duplicatesReport.groups as group}
+                    <div class="diagnostic-card">
+                      <div class="diag-header-row">
+                        <div class="diag-title-area">
+                          <span class="pill-badge">{group.groupType.replace(/_/g, ' ')}</span>
+                          <strong>{group.seriesTitle}</strong>
+                          {#if group.volumeNumber != null}
+                            <span class="vol-tag">Vol {group.volumeNumber}</span>
+                          {/if}
+                          {#if group.potentialReclaimableBytes > 0}
+                            <span class="muted font-small">({sized(group.potentialReclaimableBytes)} reclaimable)</span>
+                          {/if}
+                        </div>
+                      </div>
+
+                      <div class="candidate-preview-bar">
+                        <Icon name="check" size={14} />
+                        <span>{group.resolutionRecommendation}</span>
+                      </div>
+
+                      {#if group.items && group.items.length > 0}
+                        <div class="items-preview-list">
+                          {#each group.items as item}
+                            <div class="item-preview-row">
+                              <div class="item-name-block">
+                                {#if item.itemId === group.recommendedKeepId}
+                                  <span class="pill-badge active">KEEP (RECOMMENDED)</span>
+                                {:else}
+                                  <span class="pill-badge paused">DUPLICATE</span>
+                                {/if}
+                                <span class="font-small"><code>{item.fileName}</code></span>
+                              </div>
+                              <div class="item-meta-block font-small muted">
+                                <span>{item.format}</span>
+                                {#if item.isDigital}<span>Digital</span>{/if}
+                                <span>{sized(item.sizeBytes)}</span>
+                              </div>
+                            </div>
+                          {/each}
+                        </div>
+                      {/if}
+                    </div>
+                  {/each}
+                </div>
               {/if}
             {/if}
           </section>
@@ -5912,5 +6084,87 @@
     display: flex;
     gap: 12px;
     align-items: center;
+  }
+
+  .optimizer-details-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+    gap: 0.65rem 1.25rem;
+    font-size: 0.85rem;
+    background: rgba(0, 0, 0, 0.2);
+    padding: 0.85rem 1rem;
+    border-radius: 8px;
+    border: 1px solid var(--border-color, rgba(255, 255, 255, 0.08));
+  }
+
+  .opt-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .opt-k {
+    color: var(--muted, #8b949e);
+  }
+
+  .opt-v {
+    font-weight: 500;
+  }
+
+  .duplicates-groups-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.85rem;
+    margin-top: 0.75rem;
+  }
+
+  .group-head {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    margin-bottom: 0.4rem;
+  }
+
+  .recommendation-bar {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    background: rgba(34, 197, 94, 0.08);
+    border: 1px solid rgba(34, 197, 94, 0.2);
+    border-radius: 6px;
+    padding: 0.4rem 0.65rem;
+    font-size: 0.8rem;
+    color: #86efac;
+    margin-bottom: 0.5rem;
+  }
+
+  .items-preview-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+  }
+
+  .item-preview-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 0.5rem;
+    background: rgba(0, 0, 0, 0.15);
+    padding: 0.35rem 0.65rem;
+    border-radius: 4px;
+  }
+
+  .item-name-block {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .item-meta-block {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
   }
 </style>
