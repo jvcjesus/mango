@@ -269,18 +269,14 @@ pub fn scan_library_duplicates(conn: &Connection) -> Result<LibraryDuplicateRepo
     }
 
     // 3. Chapter vs Volume Overlap
-    // When volume rows exist with volume_number != null and loose chapter entries exist for the same manga
+    // When volume receipts exist with is_volume = 1 and loose chapter downloads exist for the same manga
     let mut stmt_overlap = conn.prepare(
-        "SELECT c_vol.manga_id, c_vol.volume_number, COUNT(c_ch.id), m.title
-         FROM chapters c_vol
-         JOIN manga m ON m.id = c_vol.manga_id
-         JOIN chapters c_ch ON c_ch.manga_id = c_vol.manga_id
-                            AND c_ch.volume_number IS NULL
-                            AND c_ch.is_downloaded = 1
-         WHERE c_vol.volume_number IS NOT NULL
-           AND c_vol.is_downloaded = 1
-         GROUP BY c_vol.manga_id, c_vol.volume_number
-         HAVING COUNT(c_ch.id) > 0
+        "SELECT r.manga_id, r.volume_number, COUNT(c.id), r.series_title
+         FROM publication_receipts r
+         JOIN chapters c ON c.manga_id = r.manga_id AND c.download_path IS NOT NULL
+         WHERE r.is_volume = 1 AND r.volume_number IS NOT NULL
+         GROUP BY r.manga_id, r.volume_number, r.series_title
+         HAVING COUNT(c.id) > 0
          LIMIT 25",
     )?;
 
@@ -361,10 +357,7 @@ mod tests {
             CREATE TABLE chapters (
                 id INTEGER PRIMARY KEY,
                 manga_id INTEGER NOT NULL,
-                title TEXT NOT NULL,
-                volume_number REAL,
-                chapter_number REAL,
-                is_downloaded INTEGER NOT NULL DEFAULT 0
+                download_path TEXT
             );
 
             CREATE TABLE publication_receipts (
@@ -374,6 +367,7 @@ mod tests {
                 series_id TEXT NOT NULL,
                 series_title TEXT NOT NULL,
                 volume_number REAL,
+                is_volume INTEGER NOT NULL DEFAULT 1,
                 canonical_path TEXT NOT NULL,
                 file_size_bytes INTEGER NOT NULL,
                 file_sha256 TEXT,
@@ -435,6 +429,36 @@ mod tests {
         assert_eq!(group.group_type, DuplicateType::SemanticVolume);
         assert_eq!(group.recommended_keep_id, Some("rcpt-digital".to_string()));
         assert!(group.resolution_recommendation.contains("recommend keeping higher quality digital release"));
+    }
+
+    #[test]
+    fn test_scan_library_duplicates_chapter_volume_overlap() {
+        let conn = setup_test_db();
+
+        conn.execute(
+            "INSERT INTO publication_receipts (
+                id, chapter_id, manga_id, series_id, series_title, volume_number,
+                is_volume, canonical_path, file_size_bytes, file_sha256, published_at, created_at
+             ) VALUES
+             ('rcpt-vol1', 301, 3, 'manga:3', 'Jujutsu Kaisen', 1.0, 1, '/manga/Jujutsu Kaisen/v01.cbz', 60000000, 'hash-vol1', 1000, 1000)",
+            [],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO chapters (id, manga_id, download_path) VALUES
+             (401, 3, '/downloads/manga_3/c1.cbz'),
+             (402, 3, '/downloads/manga_3/c2.cbz')",
+            [],
+        )
+        .unwrap();
+
+        let report = scan_library_duplicates(&conn).unwrap();
+        assert_eq!(report.chapter_volume_overlaps_count, 1);
+        let group = &report.groups[0];
+        assert_eq!(group.group_type, DuplicateType::ChapterVolumeOverlap);
+        assert_eq!(group.volume_number, Some(1.0));
+        assert!(group.resolution_recommendation.contains("2 loose chapter download(s)"));
     }
 
     #[tokio::test]
