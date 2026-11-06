@@ -4,6 +4,7 @@
     getReleaseCalendar,
     getWatchersDashboard,
     refreshWatcherById,
+    executeWatchersBulkAction,
     message,
     send,
     type ReleaseCalendarItem,
@@ -77,6 +78,66 @@
       toast.error(message(e));
     } finally {
       refreshingWatchers[id] = false;
+    }
+  }
+
+  let selectedWatcherIds = $state(new Set<number>());
+  let bulkBusy = $state(false);
+
+  function toggleWatcherSelect(id: number, checked: boolean) {
+    if (checked) {
+      selectedWatcherIds.add(id);
+    } else {
+      selectedWatcherIds.delete(id);
+    }
+  }
+
+  async function handleCheckAllWatchers() {
+    bulkBusy = true;
+    try {
+      const res = await executeWatchersBulkAction({ action: 'check_all' });
+      toast.success(res.message);
+      await loadWatchers();
+    } catch (e) {
+      toast.error(message(e));
+    } finally {
+      bulkBusy = false;
+    }
+  }
+
+  async function handlePauseSelected() {
+    if (selectedWatcherIds.size === 0) return;
+    bulkBusy = true;
+    try {
+      const res = await executeWatchersBulkAction({
+        action: 'pause_selected',
+        watcherIds: Array.from(selectedWatcherIds),
+      });
+      toast.success(res.message);
+      selectedWatcherIds.clear();
+      await loadWatchers();
+    } catch (e) {
+      toast.error(message(e));
+    } finally {
+      bulkBusy = false;
+    }
+  }
+
+  async function handleResumeSelected() {
+    if (selectedWatcherIds.size === 0) return;
+    bulkBusy = true;
+    try {
+      const res = await executeWatchersBulkAction({
+        action: 'resume_selected',
+        watcherIds: Array.from(selectedWatcherIds),
+      });
+      toast.success(res.message);
+      selectedWatcherIds.clear();
+      await loadWatchers();
+    } catch (e) {
+      toast.error(message(e));
+    } finally {
+      bulkBusy = false;
     }
   }
 
@@ -402,6 +463,26 @@
 
     {#if !watchersLoading && !watchersError}
       {#if watchersData}
+        <!-- Educational Workflow Explainer (M8.5) -->
+        <div class="watchers-explainer-card">
+          <div class="explainer-item">
+            <span class="exp-title"><Icon name="eye" size={14} /> <strong>Watch</strong></span>
+            <p>Tracks official publication dates from OpenTome.</p>
+          </div>
+          <div class="explainer-item">
+            <span class="exp-title"><Icon name="search" size={14} /> <strong>Discover</strong></span>
+            <p>Searches Madokami & Nyaa providers as release date arrives.</p>
+          </div>
+          <div class="explainer-item">
+            <span class="exp-title"><Icon name="bell" size={14} /> <strong>Notify</strong></span>
+            <p>Alerts user when eligible candidates are discovered.</p>
+          </div>
+          <div class="explainer-item">
+            <span class="exp-title"><Icon name="download" size={14} /> <strong>Auto-Acquire</strong></span>
+            <p>Strictly opt-in (default OFF) automated acquisition with hard gates.</p>
+          </div>
+        </div>
+
         <!-- Metrics Grid -->
         <div class="watchers-summary-grid">
           <button type="button" class="metric-card" class:selected={watchersFilter === 'ALL'} onclick={() => watchersFilter = 'ALL'}>
@@ -455,6 +536,32 @@
               </button>
             {/each}
           </div>
+          <div class="bulk-actions-group">
+            <button
+              class="btn mini"
+              onclick={handleCheckAllWatchers}
+              disabled={bulkBusy}
+              title="Queue all active watchers for immediate check"
+            >
+              {#if bulkBusy}
+                <span class="spin"><Icon name="spinner" size={12} stroke={3} /></span>
+              {:else}
+                <Icon name="refresh" size={12} />
+              {/if}
+              <span>Check All</span>
+            </button>
+            {#if selectedWatcherIds.size > 0}
+              <button class="btn mini flat" onclick={handlePauseSelected} disabled={bulkBusy}>
+                <Icon name="pause" size={12} /> Pause ({selectedWatcherIds.size})
+              </button>
+              <button class="btn mini flat" onclick={handleResumeSelected} disabled={bulkBusy}>
+                <Icon name="play" size={12} /> Resume ({selectedWatcherIds.size})
+              </button>
+              <button class="btn mini text" onclick={() => selectedWatcherIds.clear()}>
+                Clear
+              </button>
+            {/if}
+          </div>
           <div class="search-box">
             <input
               type="search"
@@ -488,6 +595,13 @@
             {#each filteredWatchers as watcher (watcher.id)}
               <div class="watcher-card" class:card-highlight={watcher.seriesTitle === 'Kagurabachi' && watcher.volumeNumber === 9}>
                 <div class="watcher-main-row">
+                  <label class="watcher-checkbox-label" title="Select Volume {watcher.volumeNumber}">
+                    <input
+                      type="checkbox"
+                      checked={selectedWatcherIds.has(watcher.id)}
+                      onchange={(e) => toggleWatcherSelect(watcher.id, (e.target as HTMLInputElement).checked)}
+                    />
+                  </label>
                   <div class="watcher-title-col">
                     <div class="watcher-series-head">
                       {#if watcher.mangaId}
@@ -1145,5 +1259,58 @@
     display: flex;
     align-items: center;
     gap: 0.35rem;
+  }
+
+  .watchers-explainer-card {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 0.75rem;
+    background: rgba(0, 0, 0, 0.25);
+    border: 1px solid var(--border-color, rgba(255, 255, 255, 0.08));
+    border-radius: 8px;
+    padding: 0.85rem 1rem;
+    margin-bottom: 0.5rem;
+  }
+
+  .explainer-item {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+  }
+
+  .exp-title {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    font-size: 0.82rem;
+    color: var(--accent, #6366f1);
+  }
+
+  .explainer-item p {
+    margin: 0;
+    font-size: 0.76rem;
+    color: var(--muted, #8b949e);
+    line-height: 1.35;
+  }
+
+  .bulk-actions-group {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    flex-wrap: wrap;
+  }
+
+  .watcher-checkbox-label {
+    display: flex;
+    align-items: center;
+    cursor: pointer;
+    padding-right: 0.25rem;
+  }
+
+  .watcher-checkbox-label input {
+    cursor: pointer;
+    width: 15px;
+    height: 15px;
+    accent-color: var(--accent, #6366f1);
   }
 </style>

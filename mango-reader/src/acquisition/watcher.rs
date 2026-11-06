@@ -439,6 +439,12 @@ pub struct WatchersSummary {
     pub acquired_count: usize,
     pub error_count: usize,
     pub owned_count: usize,
+    #[serde(default)]
+    pub acquiring_count: usize,
+    #[serde(default)]
+    pub published_count: usize,
+    #[serde(default)]
+    pub paused_count: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -446,6 +452,101 @@ pub struct WatchersSummary {
 pub struct WatchersDashboardResponse {
     pub summary: WatchersSummary,
     pub watchers: Vec<ReleaseAvailabilityWatcher>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WatchersBulkActionRequest {
+    pub action: String,
+    pub watcher_ids: Option<Vec<i64>>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WatchersBulkActionResponse {
+    pub action: String,
+    pub affected_count: usize,
+    pub message: String,
+}
+
+/// Executes a bulk management action across availability watchers.
+pub fn execute_watchers_bulk_action(
+    conn: &Connection,
+    action: &str,
+    watcher_ids: Option<&[i64]>,
+) -> Result<WatchersBulkActionResponse> {
+    let now_ts = now();
+    match action {
+        "pause_selected" => {
+            let ids = watcher_ids.unwrap_or(&[]);
+            if ids.is_empty() {
+                return Ok(WatchersBulkActionResponse {
+                    action: action.to_string(),
+                    affected_count: 0,
+                    message: "No watchers specified to pause".to_string(),
+                });
+            }
+            let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "UPDATE release_availability_watchers
+                 SET monitoring_enabled = 0, state = 'MONITORING_DISABLED', updated_at = ?
+                 WHERE id IN ({placeholders})"
+            );
+            let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(ids.len() + 1);
+            params.push(now_ts.into());
+            for id in ids {
+                params.push((*id).into());
+            }
+            let affected = conn.execute(&sql, rusqlite::params_from_iter(params))?;
+            Ok(WatchersBulkActionResponse {
+                action: action.to_string(),
+                affected_count: affected,
+                message: format!("Successfully paused {affected} watchers"),
+            })
+        }
+        "resume_selected" => {
+            let ids = watcher_ids.unwrap_or(&[]);
+            if ids.is_empty() {
+                return Ok(WatchersBulkActionResponse {
+                    action: action.to_string(),
+                    affected_count: 0,
+                    message: "No watchers specified to resume".to_string(),
+                });
+            }
+            let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "UPDATE release_availability_watchers
+                 SET monitoring_enabled = 1, next_check_at = ?, updated_at = ?
+                 WHERE id IN ({placeholders})"
+            );
+            let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(ids.len() + 2);
+            params.push(now_ts.into());
+            params.push(now_ts.into());
+            for id in ids {
+                params.push((*id).into());
+            }
+            let affected = conn.execute(&sql, rusqlite::params_from_iter(params))?;
+            Ok(WatchersBulkActionResponse {
+                action: action.to_string(),
+                affected_count: affected,
+                message: format!("Successfully resumed {affected} watchers"),
+            })
+        }
+        "check_all" => {
+            let affected = conn.execute(
+                "UPDATE release_availability_watchers
+                 SET next_check_at = ?1, updated_at = ?1
+                 WHERE monitoring_enabled = 1 AND is_owned = 0",
+                [now_ts],
+            )?;
+            Ok(WatchersBulkActionResponse {
+                action: action.to_string(),
+                affected_count: affected,
+                message: format!("Queued {affected} watchers for immediate check"),
+            })
+        }
+        other => Err(AppError::bad_request(format!("Unsupported bulk action: {other}"))),
+    }
 }
 
 /// Lists all release availability watchers with aggregate summary statistics and optional filters.
@@ -481,12 +582,46 @@ pub fn list_all_watchers(
         acquired_count: 0,
         error_count: 0,
         owned_count: 0,
+        acquiring_count: 0,
+        published_count: 0,
+        paused_count: 0,
     };
 
+    let mut acquiring_set = std::collections::HashSet::new();
+    if let Ok(mut stmt_dl) = conn.prepare(
+        "SELECT d.manga_id, c.volume_number
+         FROM downloads d
+         JOIN chapters c ON c.id = d.chapter_id
+         WHERE d.state IN ('queued', 'downloading', 'processing', 'validating')",
+    ) {
+        if let Ok(dl_rows) = stmt_dl.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Option<f64>>(1)?))
+        }) {
+            for row in dl_rows.flatten() {
+                if let (mid, Some(v)) = row {
+                    acquiring_set.insert((mid, (v * 100.0).round() as i64));
+                }
+            }
+        }
+    }
+
     for w in &all {
+        let is_acquiring = w.manga_id.map_or(false, |mid| {
+            acquiring_set.contains(&(mid, (w.volume_number * 100.0).round() as i64))
+        });
+        if is_acquiring {
+            summary.acquiring_count += 1;
+        }
+
         if w.is_owned {
             summary.owned_count += 1;
+            summary.published_count += 1;
         }
+
+        if !w.monitoring_enabled {
+            summary.paused_count += 1;
+        }
+
         match w.state {
             WatcherState::Upcoming => summary.upcoming_count += 1,
             WatcherState::ReleasedAwaitingProvider => summary.released_awaiting_count += 1,

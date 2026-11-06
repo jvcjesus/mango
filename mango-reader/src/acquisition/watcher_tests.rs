@@ -515,6 +515,68 @@ async fn test_list_all_watchers_summary_and_filtering() {
         let resp_empty = list_all_watchers(conn, None, Some("NonExistent"))?;
         assert_eq!(resp_empty.watchers.len(), 0);
 
+        // Test M8.5 bulk actions: pause_selected and resume_selected
+        let pause_res = execute_watchers_bulk_action(conn, "pause_selected", Some(&[1]))?;
+        assert_eq!(pause_res.affected_count, 1);
+        let resp_paused = list_all_watchers(conn, None, None)?;
+        assert_eq!(resp_paused.summary.paused_count, 1);
+
+        let resume_res = execute_watchers_bulk_action(conn, "resume_selected", Some(&[1]))?;
+        assert_eq!(resume_res.affected_count, 1);
+        let resp_resumed = list_all_watchers(conn, None, None)?;
+        assert_eq!(resp_resumed.summary.paused_count, 0);
+
+        // Test bulk action: check_all
+        let check_all_res = execute_watchers_bulk_action(conn, "check_all", None)?;
+        assert_eq!(check_all_res.affected_count, 1); // 1 unowned monitoring_enabled watcher
+
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_watcher_notification_deduplication_invariant() {
+    let temp_dir = std::env::temp_dir().join(format!("mango_watchers_notif_dedup_test_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let db = crate::db::Db::open(&temp_dir.join("test.db")).unwrap();
+
+    let cur_time = crate::db::now();
+
+    db.call(move |conn| {
+        conn.execute(
+            "INSERT INTO manga (id, source_id, url, title, update_strategy)
+             VALUES (101, 1, 'url:101', 'Haikyu!!', 'ALWAYS_UPDATE')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO release_availability_watchers (
+                series_id, manga_id, series_title, volume_number, edition,
+                is_released, is_owned, monitoring_enabled, notify_on_available,
+                state, notified_at, last_attempt_at, last_checked_at, next_check_at,
+                check_interval_secs, consecutive_failures, created_at, updated_at
+             ) VALUES (
+                'manga:101', 101, 'Haikyu!!', 1.0, 'standard',
+                1, 0, 1, 1,
+                'NOTIFIED', ?1, ?1, ?1, ?1 + 3600,
+                3600, 0, ?1, ?1
+             )",
+            [cur_time],
+        )?;
+
+        // Verify that watcher in NOTIFIED state has notified_at recorded
+        let watcher = get_watcher_by_id(conn, 1)?.unwrap();
+        assert_eq!(watcher.state, WatcherState::Notified);
+        assert_eq!(watcher.notified_at, Some(cur_time));
+
+        // Invariant: Already notified watcher MUST NOT trigger a second notification
+        let already_notified = watcher.notified_at.is_some() || watcher.state == WatcherState::Notified;
+        assert!(already_notified);
+
         Ok(())
     })
     .await

@@ -2371,7 +2371,24 @@ export interface WatchersSummaryDto {
   acquiredCount: number;
   errorCount: number;
   ownedCount: number;
+  acquiringCount?: number;
+  publishedCount?: number;
+  pausedCount?: number;
 }
+
+export interface WatchersBulkActionRequest {
+  action: 'check_all' | 'pause_selected' | 'resume_selected' | string;
+  watcherIds?: number[];
+}
+
+export interface WatchersBulkActionResponse {
+  action: string;
+  affectedCount: number;
+  message: string;
+}
+
+export const executeWatchersBulkAction = (payload: WatchersBulkActionRequest) =>
+  send<WatchersBulkActionResponse>('POST', '/watchers/bulk-action', payload);
 
 export interface WatchersDashboardResponseDto {
   summary: WatchersSummaryDto;

@@ -248,11 +248,24 @@ pub fn router(state: Spaces) -> Router {
             get(get_availability_watchers_dashboard),
         )
         .route(
+            "/availability/watchers/summary",
+            get(get_availability_watchers_summary),
+        )
+        .route(
+            "/availability/watchers/bulk-action",
+            post(post_availability_watchers_bulk_action),
+        )
+        .route(
             "/availability/watchers/{id}/refresh",
             post(post_availability_watcher_refresh),
         )
         .route("/watchers", get(get_availability_watchers))
         .route("/watchers/dashboard", get(get_availability_watchers_dashboard))
+        .route("/watchers/summary", get(get_availability_watchers_summary))
+        .route(
+            "/watchers/bulk-action",
+            post(post_availability_watchers_bulk_action),
+        )
         .route(
             "/watchers/{id}/refresh",
             post(post_availability_watcher_refresh),
@@ -4230,6 +4243,38 @@ async fn get_availability_watchers_dashboard(
                 conn,
                 query.state.as_deref(),
                 query.query.as_deref(),
+            )
+        })
+        .await?;
+    Ok(Json(resp))
+}
+
+async fn get_availability_watchers_summary(
+    Me(app): Me,
+) -> Result<Json<crate::acquisition::watcher::WatchersSummary>> {
+    app.me.admin()?;
+    let resp = app
+        .db
+        .call(move |conn| {
+            let dash = crate::acquisition::watcher::list_all_watchers(conn, None, None)?;
+            Ok(dash.summary)
+        })
+        .await?;
+    Ok(Json(resp))
+}
+
+async fn post_availability_watchers_bulk_action(
+    Me(app): Me,
+    Json(payload): Json<crate::acquisition::watcher::WatchersBulkActionRequest>,
+) -> Result<Json<crate::acquisition::watcher::WatchersBulkActionResponse>> {
+    app.me.admin()?;
+    let resp = app
+        .db
+        .call(move |conn| {
+            crate::acquisition::watcher::execute_watchers_bulk_action(
+                conn,
+                &payload.action,
+                payload.watcher_ids.as_deref(),
             )
         })
         .await?;
