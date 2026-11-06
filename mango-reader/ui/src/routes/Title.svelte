@@ -4,6 +4,7 @@
   import VolumeRow from "../lib/VolumeRow.svelte";
   import TitleDiagnosticsModal from "../lib/TitleDiagnosticsModal.svelte";
   import CandidateInspectorModal from "../lib/CandidateInspectorModal.svelte";
+  import VolumeManager from "../lib/VolumeManager.svelte";
   import {
     resolveSeriesSummary,
     resolveVolumePresentation,
@@ -1887,6 +1888,20 @@
           </div>
         {/if}
       </div>
+
+      {#if title.isCatalog || (ownership?.volumes && ownership.volumes.length > 0)}
+        <VolumeManager
+          mangaId={id}
+          title={title.title}
+          isCatalog={Boolean(title.isCatalog)}
+          onInspectCandidate={(vol) => {
+            inspectingCandidateVolume = vol;
+          }}
+          onAcquireCandidate={(vol, candId) => {
+            handleAcquireCandidate(vol, { candidateId: candId, title: '', rawTitle: '', matchType: 'exact_volume' } as any);
+          }}
+        />
+      {/if}
 
       {#if title.isCatalog && chapters.length === 0}
         <div class="reading-section" id="reading-sources-section">

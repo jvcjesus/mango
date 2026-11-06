@@ -26,6 +26,7 @@ pub mod quality;
 pub mod release_discovery;
 pub mod service;
 pub mod source_units;
+pub mod volume_manager;
 pub mod watcher;
 #[cfg(test)]
 pub mod approval_tests;

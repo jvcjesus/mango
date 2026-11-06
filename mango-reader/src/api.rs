@@ -140,6 +140,10 @@ pub fn router(state: Spaces) -> Router {
             get(get_followed_reconciliations).post(post_run_followed_reconciliations),
         )
         .route("/manga/{id}/volumes/{volume}/candidates", get(get_manga_volume_candidates))
+        .route("/manga/{id}/volumes-manager", get(get_manga_volumes_manager))
+        .route("/titles/{id}/volumes-manager", get(get_manga_volumes_manager))
+        .route("/manga/{id}/volumes-manager/plan", post(post_manga_volumes_manager_plan))
+        .route("/titles/{id}/volumes-manager/plan", post(post_manga_volumes_manager_plan))
         .route(
             "/manga/{id}/volumes/{volume}/candidates/inspect",
             get(get_manga_volume_candidates_inspect),
@@ -1233,6 +1237,32 @@ async fn post_run_followed_reconciliations(
     app.me.admin()?;
     let list = app.sync.run_reconciliation_all_followed().await?;
     Ok(Json(list))
+}
+
+async fn get_manga_volumes_manager(
+    Me(app): Me,
+    Path(id): Path<i64>,
+) -> Result<Json<crate::acquisition::volume_manager::VolumeManagerSummary>> {
+    let res = app
+        .db
+        .call(move |conn| crate::acquisition::volume_manager::get_volume_manager_summary(conn, id))
+        .await?;
+    Ok(Json(res))
+}
+
+async fn post_manga_volumes_manager_plan(
+    Me(app): Me,
+    Path(id): Path<i64>,
+    Json(payload): Json<crate::acquisition::volume_manager::VolumeManagerBatchPlanRequest>,
+) -> Result<Json<crate::acquisition::volume_manager::VolumeManagerBatchPlanResponse>> {
+    let profile = app.acquisition.get_manga_profile(id).await.unwrap_or_default();
+    let res = app
+        .db
+        .call(move |conn| {
+            crate::acquisition::volume_manager::plan_volume_manager_batch(conn, id, &payload, &profile)
+        })
+        .await?;
+    Ok(Json(res))
 }
 
 async fn get_manga_volume_candidates(

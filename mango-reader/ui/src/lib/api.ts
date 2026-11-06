@@ -2548,6 +2548,105 @@ export const detachSourceFromCatalog = (catalogId: number, sourceId?: number) =>
     sourceId ? { sourceId } : {}
   );
 
+export interface VolumeManagerEntry {
+  volumeNumber: number;
+  label: string;
+  title?: string | null;
+  coverUrl?: string | null;
+  releaseDate?: string | null;
+  releaseDatePrecision?: string | null;
+  releaseRegion: string;
+  language: string;
+  opentomeStatus: 'released' | 'upcoming' | 'unannounced' | 'unknown' | string;
+  isOwned: boolean;
+  canonicalPath?: string | null;
+  fileSizeBytes?: number | null;
+  fileHash?: string | null;
+  publicationReceiptId?: string | null;
+  publishedAt?: number | null;
+  verifiedAt?: number | null;
+  inProgress: boolean;
+  activeJobId?: string | null;
+  activeStage?: string | null;
+  candidateCount: number;
+  topProvider?: string | null;
+  topCandidateId?: string | null;
+  topCandidateTitle?: string | null;
+  topCandidateScore?: number | null;
+  topCandidateSize?: number | null;
+  lastDiscoveryAt?: number | null;
+  edition: string;
+  editionId?: string | null;
+  isAuthoritative: boolean;
+  uncertaintyReason?: string | null;
+  displayStatus: 'owned' | 'published' | 'downloading' | 'candidate_available' | 'missing_released' | 'unreleased' | 'uncertain' | string;
+  statusLabel: string;
+}
+
+export interface VolumeManagerSummary {
+  mangaId: number;
+  seriesId: string;
+  title: string;
+  mangabakaId?: number | null;
+  edition: string;
+  editionId?: string | null;
+  market: string;
+  totalOfficialVolumes: number;
+  ownedCount: number;
+  publishedCount: number;
+  inProgressCount: number;
+  candidateAvailableCount: number;
+  missingReleasedCount: number;
+  unreleasedCount: number;
+  isAuthoritative: boolean;
+  uncertaintyReason?: string | null;
+  volumes: VolumeManagerEntry[];
+}
+
+export interface VolumeManagerBatchPlanRequest {
+  selectedVolumes: number[];
+  profileId?: string | null;
+  isDryRun?: boolean | null;
+}
+
+export interface BatchPlanItemDto {
+  volumeNumber: number;
+  isOwned: boolean;
+  isEligible: boolean;
+  status: 'ELIGIBLE' | 'ALREADY_OWNED' | 'IN_FLIGHT' | 'UNAVAILABLE' | 'UNRELEASED' | 'UNCERTAIN_EDITION' | string;
+  reason: string;
+  proposedBackend?: string | null;
+  provider?: string | null;
+  candidateId?: string | null;
+  candidateTitle?: string | null;
+  candidateScore?: number | null;
+  sizeBytes?: number | null;
+  isDigital?: boolean | null;
+}
+
+export interface VolumeManagerBatchPlanResponse {
+  mangaId: number;
+  title: string;
+  edition: string;
+  editionId?: string | null;
+  totalSelected: number;
+  eligibleCount: number;
+  blockedCount: number;
+  estimatedTotalBytes: number;
+  items: BatchPlanItemDto[];
+  draftJobId?: string | null;
+  canExecute: boolean;
+  executionBlockedReason?: string | null;
+  isDryRun: boolean;
+}
+
+export const getVolumeManager = (mangaId: number) =>
+  get<VolumeManagerSummary>(`/manga/${mangaId}/volumes-manager`);
+
+export const planVolumeManagerBatch = (mangaId: number, payload: VolumeManagerBatchPlanRequest) =>
+  send<VolumeManagerBatchPlanResponse>('POST', `/manga/${mangaId}/volumes-manager/plan`, payload);
+
+
 
 
 
