@@ -418,6 +418,7 @@ pub fn router(state: Spaces) -> Router {
         .route("/storage/staging-inventory", get(get_staging_inventory))
         .route("/storage/optimizer-status", get(get_storage_optimizer_status))
         .route("/storage/duplicates", get(get_storage_duplicates))
+        .route("/dashboard/summary", get(get_dashboard_summary))
         .route("/pipeline/staging/preview", post(post_staging_cleanup_preview))
         .route(
             "/imports/payload/{id}/cleanup",
@@ -2347,6 +2348,21 @@ async fn get_storage_duplicates(
         .call(|conn| crate::pipeline::duplicates::scan_library_duplicates(conn))
         .await?;
     Ok(Json(report))
+}
+
+async fn get_dashboard_summary(
+    Me(app): Me,
+) -> Result<Json<crate::acquisition::dashboard::DashboardSummaryDto>> {
+    app.me.admin()?;
+    let config = app.pipeline.load_config().await?;
+    let downloads_dir = app.downloads.dir();
+    let summary = crate::acquisition::dashboard::get_dashboard_summary(
+        &app.db,
+        downloads_dir,
+        config.optimizer_bin.as_deref(),
+    )
+    .await?;
+    Ok(Json(summary))
 }
 
 #[derive(Debug, Clone, Serialize)]

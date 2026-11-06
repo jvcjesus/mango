@@ -10,6 +10,7 @@
   import { back, go, route } from './lib/router.svelte';
   import { loadSession, session } from './lib/session.svelte';
   import { loadVersion, version } from './lib/version.svelte';
+  import Home from './routes/Home.svelte';
   import SignIn from './routes/SignIn.svelte';
   import Downloads from './routes/Downloads.svelte';
   import UpdatesScreen from './routes/Updates.svelte';
@@ -30,7 +31,8 @@
 
   // `under` lists the first path segments that light the entry up.
   const NAV: { to: string; label: string; icon: IconName; under: string[] }[] = [
-    { to: '/', label: 'Library', icon: 'book', under: [''] },
+    { to: '/', label: 'Home', icon: 'grid', under: ['', 'home'] },
+    { to: '/library', label: 'Library', icon: 'book', under: ['library'] },
     { to: '/lists', label: 'Lists', icon: 'bookmark', under: ['lists'] },
     { to: '/updates', label: 'Updates', icon: 'refresh', under: ['updates'] },
     { to: '/browse', label: 'Browse', icon: 'globe', under: ['browse', 'source', 'search', 'extensions', 'extension'] },
@@ -74,7 +76,37 @@
     event.preventDefault();
     scrollTo({ top: 0, behavior: 'smooth' });
   }
+
+  function handleGlobalKeydown(e: KeyboardEvent) {
+    const target = e.target as HTMLElement | null;
+    const inInput = target && (
+      target.tagName === 'INPUT' ||
+      target.tagName === 'TEXTAREA' ||
+      target.tagName === 'SELECT' ||
+      target.isContentEditable
+    );
+    if (inInput) return;
+
+    // '/' -> jump to search/browse
+    if (e.key === '/' && !e.ctrlKey && !e.metaKey && !e.altKey) {
+      e.preventDefault();
+      go('/browse');
+      return;
+    }
+
+    // Number keys '1' through '7' switch tabs
+    if (!e.ctrlKey && !e.metaKey && !e.altKey) {
+      const num = parseInt(e.key, 10);
+      if (num >= 1 && num <= NAV.length) {
+        e.preventDefault();
+        go(NAV[num - 1].to);
+        return;
+      }
+    }
+  }
 </script>
+
+<svelte:window onkeydown={handleGlobalKeydown} />
 
 {#snippet badge()}
   {#if fresh > 0}<span class="badge"><span class="sr">New chapters: </span>{fresh > 99 ? '99+' : fresh}</span>{/if}
@@ -127,8 +159,56 @@
       </header>
     {/if}
 
+    {#if !pushed && area && area !== 'home'}
+      <nav class="breadcrumbs-bar" aria-label="Breadcrumbs">
+        <a href="#/" class="bc-link"><Icon name="grid" size={13} /> Home</a>
+        <span class="bc-sep" aria-hidden="true">/</span>
+        {#if area === 'library'}
+          <span class="bc-current" aria-current="page">Library</span>
+        {:else if area === 'lists'}
+          <span class="bc-current" aria-current="page">Lists</span>
+        {:else if area === 'updates'}
+          <span class="bc-current" aria-current="page">Updates</span>
+        {:else if area === 'browse'}
+          <span class="bc-current" aria-current="page">Browse</span>
+        {:else if area === 'downloads'}
+          <span class="bc-current" aria-current="page">Downloads</span>
+        {:else if area === 'history'}
+          <span class="bc-current" aria-current="page">History</span>
+        {:else if area === 'settings'}
+          {#if parts[1]}
+            <a href="#/settings" class="bc-link">Settings</a>
+            <span class="bc-sep" aria-hidden="true">/</span>
+            <span class="bc-current" aria-current="page">{parts[1]}</span>
+          {:else}
+            <span class="bc-current" aria-current="page">Settings</span>
+          {/if}
+        {:else if (area === 'title' || area === 'manga') && parts[1]}
+          <a href="#/library" class="bc-link">Library</a>
+          <span class="bc-sep" aria-hidden="true">/</span>
+          <span class="bc-current" aria-current="page">Series #{parts[1]}</span>
+        {:else if area === 'source' && parts[1]}
+          <a href="#/browse" class="bc-link">Browse</a>
+          <span class="bc-sep" aria-hidden="true">/</span>
+          <span class="bc-current" aria-current="page">Source ({parts[1]})</span>
+        {:else if area === 'extension' && parts[1]}
+          <a href="#/browse" class="bc-link">Browse</a>
+          <span class="bc-sep" aria-hidden="true">/</span>
+          <span class="bc-current" aria-current="page">Extension ({parts[1]})</span>
+        {:else if area === 'search'}
+          <a href="#/browse" class="bc-link">Browse</a>
+          <span class="bc-sep" aria-hidden="true">/</span>
+          <span class="bc-current" aria-current="page">Search</span>
+        {:else}
+          <span class="bc-current" aria-current="page">{area}</span>
+        {/if}
+      </nav>
+    {/if}
+
     <main>
-      {#if area === ''}
+      {#if area === '' || area === 'home'}
+        <Home />
+      {:else if area === 'library'}
         <Library />
       {:else if area === 'lists'}
         <Lists />
@@ -217,6 +297,44 @@
     gap: 12px 28px;
     padding: 14px var(--gutter);
     border-bottom: 3px solid var(--ink);
+  }
+
+  .breadcrumbs-bar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 8px var(--gutter);
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    color: var(--muted);
+    border-bottom: 2px solid var(--line);
+    background: var(--shade);
+    overflow-x: auto;
+    white-space: nowrap;
+  }
+
+  .bc-link {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    color: var(--ink);
+    text-decoration: none;
+    opacity: 0.75;
+  }
+
+  .bc-link:hover {
+    opacity: 1;
+    text-decoration: underline;
+  }
+
+  .bc-sep {
+    opacity: 0.4;
+  }
+
+  .bc-current {
+    color: var(--ink);
+    font-weight: 900;
   }
 
   .logo {

@@ -1496,6 +1496,52 @@ export const getStorageOptimizerStatus = () =>
 export const getLibraryDuplicates = () =>
   get<LibraryDuplicateReportDto>('/storage/duplicates');
 
+export interface DashboardLibraryStats {
+  totalTrackedTitles: number;
+  totalOwnedVolumes: number;
+  missingReleasedVolumes: number;
+  titlesNeedingReview: number;
+}
+
+export interface DashboardAcquisitionStats {
+  activeDownloads: number;
+  pendingApprovals: number;
+  failedJobs: number;
+  recoverableJobs: number;
+}
+
+export interface DashboardReleaseStats {
+  upcomingReleasesCount: number;
+  releasedAwaitingCount: number;
+  candidateFoundCount: number;
+}
+
+export interface DashboardProviderHealthItem {
+  name: string;
+  category: string;
+  status: 'HEALTHY' | 'CONFIGURED' | 'AVAILABLE' | 'DISABLED' | 'ATTENTION_REQUIRED' | string;
+  details: string;
+}
+
+export interface DashboardStorageStats {
+  stagingBytes: number;
+  reclaimableBytes: number;
+  duplicateGroupsCount: number;
+  optimizerAvailable: boolean;
+}
+
+export interface DashboardSummaryDto {
+  library: DashboardLibraryStats;
+  acquisition: DashboardAcquisitionStats;
+  releaseIntelligence: DashboardReleaseStats;
+  providerHealth: DashboardProviderHealthItem[];
+  storage: DashboardStorageStats;
+  generatedAt: number;
+}
+
+export const getDashboardSummary = () =>
+  get<DashboardSummaryDto>('/dashboard/summary');
+
 export type ReconciliationStatus = 'up_to_date' | 'missing_volume' | 'review_required' | 'sync_error' | 'collection_unavailable';
 
 export interface ReconciliationSummary {

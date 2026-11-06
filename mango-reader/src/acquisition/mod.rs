@@ -10,6 +10,7 @@ pub mod approval;
 pub mod auto_acquire;
 pub mod backlog;
 pub mod candidates;
+pub mod dashboard;
 pub mod discovery;
 pub mod edition;
 pub mod execution;
