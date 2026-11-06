@@ -837,6 +837,7 @@ pub async fn evaluate_target_for_auto_acquire(
         confirm_range: Some(false),
         confirm_pack: Some(false),
         confirm_review: Some(false),
+        dry_run: None,
     };
 
     let resp = acquisition

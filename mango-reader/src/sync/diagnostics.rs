@@ -634,6 +634,12 @@ pub struct CandidateInspectionDto {
     pub rejection_reason: Option<String>,
     pub sanitized_reference: Option<String>,
     pub quality_evaluation: Option<crate::acquisition::quality::CandidateQualityEvaluation>,
+    #[serde(default)]
+    pub cache_status: Option<crate::acquisition::torbox::TorBoxCacheStatus>,
+    #[serde(default)]
+    pub ranking_breakdown: Option<crate::acquisition::quality::RankingBreakdown>,
+    #[serde(default)]
+    pub hard_eligibility: Option<crate::acquisition::quality::HardEligibilityResult>,
 }
 
 /// Result of volume candidate inspection.
@@ -684,22 +690,50 @@ pub fn inspect_volume_candidates(
     series_id: &str,
     volume_number: f64,
     profile: &AcquisitionProfile,
+    cache_map: Option<&std::collections::HashMap<String, crate::acquisition::torbox::TorBoxCacheStatus>>,
 ) -> Result<VolumeCandidateInspectionResult> {
     // 1. Fetch target info if recorded
     let target_row: Option<(String, String)> = conn
         .query_row(
             "SELECT status, release_date FROM release_discovery_targets
-             WHERE series_id = ?1 AND ABS(volume_number - ?2) < 0.001",
+             WHERE (series_id = ?1 OR series_id = 'manga:' || ?1 OR manga_id = (SELECT id FROM manga WHERE title = ?1 LIMIT 1))
+               AND ABS(volume_number - ?2) < 0.001",
             params![series_id, volume_number],
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()
         .unwrap_or(None);
 
-    let (target_status, target_release_date) = match target_row {
+    let (mut target_status, target_release_date) = match target_row {
         Some((s, d)) => (Some(s), Some(d)),
         None => (None, None),
     };
+
+    // If target row is absent in release_discovery_targets, inspect series_reconciliations
+    if target_status.is_none() {
+        let recon: Option<(Option<u32>, Option<String>)> = conn
+            .query_row(
+                "SELECT total_official_volumes, future_volumes_json FROM series_reconciliations
+                 WHERE series_id = ?1 OR series_id = 'manga:' || ?1 OR manga_id = (SELECT id FROM manga WHERE title = ?1 LIMIT 1)",
+                params![series_id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .unwrap_or(None);
+
+        if let Some((Some(total_vols), future_json_opt)) = recon {
+            let is_future = future_json_opt
+                .and_then(|j| serde_json::from_str::<Vec<f64>>(&j).ok())
+                .map(|vols| vols.iter().any(|&v| (v - volume_number).abs() < 0.001))
+                .unwrap_or(false);
+
+            if volume_number <= total_vols as f64 && !is_future {
+                target_status = Some("released".to_string());
+            } else if is_future {
+                target_status = Some("upcoming".to_string());
+            }
+        }
+    }
 
     let today_str: String = conn
         .query_row("SELECT date('now', 'localtime')", [], |r| r.get(0))
@@ -710,13 +744,26 @@ pub fn inspect_volume_candidates(
         .query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM series_reconciliations
-                WHERE series_id = ?1 AND owned_volumes_json LIKE '%' || ?2 || '%'
+                WHERE (series_id = ?1 OR series_id = 'manga:' || ?1) AND owned_volumes_json LIKE '%' || ?2 || '%'
             )",
             params![series_id, volume_number],
             |r| r.get(0),
         )
         .unwrap_or(false)
         || is_volume_owned(conn, 0, series_id, volume_number).unwrap_or(false);
+
+    // Active downloading check
+    let is_active_acquiring: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM candidate_approvals
+                WHERE (series_id = ?1 OR series_id = 'manga:' || ?1) AND ABS(volume_number - ?2) < 0.001
+                  AND status IN ('queued', 'running', 'fetching')
+            )",
+            params![series_id, volume_number],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
 
     // 3. Query discovered candidates
     let mut stmt = conn
@@ -801,9 +848,16 @@ pub fn inspect_volume_candidates(
                 }
             };
 
-        let quality_eval = crate::acquisition::quality::evaluate_candidate_quality(
+        let cache_status = cand
+            .info_hash
+            .as_deref()
+            .and_then(|h| cache_map.and_then(|m| m.get(&h.to_ascii_lowercase()).copied()));
+
+        let quality_eval = crate::acquisition::quality::evaluate_candidate_quality_v2(
             cand,
             is_currently_owned,
+            cache_status,
+            is_active_acquiring,
             rejection_reason.clone(),
         );
         quality_evals.push(quality_eval);
@@ -869,11 +923,21 @@ pub fn inspect_volume_candidates(
                 seeders: cand.seeders,
                 leechers: cand.leechers,
                 published_at: cand.published_at,
-                auto_acquire_eligible,
-                rejection_code,
-                rejection_reason,
+                auto_acquire_eligible: eval
+                    .hard_eligibility
+                    .as_ref()
+                    .map_or(auto_acquire_eligible, |h| h.is_eligible),
+                rejection_code: eval
+                    .hard_eligibility
+                    .as_ref()
+                    .and_then(|h| h.rejection_code.clone())
+                    .or(rejection_code),
+                rejection_reason: eval.rejection_reason.clone().or(rejection_reason),
                 sanitized_reference,
-                quality_evaluation: Some(eval),
+                quality_evaluation: Some(eval.clone()),
+                cache_status: eval.cache_status,
+                ranking_breakdown: eval.ranking_breakdown.clone(),
+                hard_eligibility: eval.hard_eligibility.clone(),
             });
         }
     }
@@ -902,19 +966,32 @@ pub fn compare_volume_candidates(
     series_id: &str,
     volume_number: f64,
     profile: &AcquisitionProfile,
+    cache_map: Option<&std::collections::HashMap<String, crate::acquisition::torbox::TorBoxCacheStatus>>,
 ) -> Result<crate::acquisition::quality::CandidateComparisonMatrix> {
     // 1. Check ownership status
     let is_currently_owned: bool = conn
         .query_row(
             "SELECT EXISTS(
                 SELECT 1 FROM series_reconciliations
-                WHERE series_id = ?1 AND owned_volumes_json LIKE '%' || ?2 || '%'
+                WHERE (series_id = ?1 OR series_id = 'manga:' || ?1) AND owned_volumes_json LIKE '%' || ?2 || '%'
             )",
             params![series_id, volume_number],
             |r| r.get(0),
         )
         .unwrap_or(false)
         || is_volume_owned(conn, 0, series_id, volume_number).unwrap_or(false);
+
+    let is_active_acquiring: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM candidate_approvals
+                WHERE (series_id = ?1 OR series_id = 'manga:' || ?1) AND ABS(volume_number - ?2) < 0.001
+                  AND status IN ('queued', 'running', 'fetching')
+            )",
+            params![series_id, volume_number],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
 
     // 2. Query discovered candidates
     let mut stmt = conn
@@ -964,9 +1041,16 @@ pub fn compare_volume_candidates(
             Err(code) => (false, Some(code.as_str().to_string()), Some(code.as_str().to_string())),
         };
 
-        let eval = crate::acquisition::quality::evaluate_candidate_quality(
+        let cache_status = cand
+            .info_hash
+            .as_deref()
+            .and_then(|h| cache_map.and_then(|m| m.get(&h.to_ascii_lowercase()).copied()));
+
+        let eval = crate::acquisition::quality::evaluate_candidate_quality_v2(
             cand,
             is_currently_owned,
+            cache_status,
+            is_active_acquiring,
             rejection_reason,
         );
         quality_evals.push(eval);

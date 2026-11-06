@@ -10,12 +10,26 @@ use crate::acquisition::{
 };
 use crate::error::AppError;
 use reqwest::{Client, StatusCode};
-use serde::Deserialize;
-use std::collections::BTreeMap;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::path::Path;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 pub const DEFAULT_TORBOX_URL: &str = "https://api.torbox.app/v1/api";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TorBoxCacheStatus {
+    Cached,
+    Uncached,
+    Unknown,
+    Unavailable,
+}
+
+static TORBOX_CACHE: LazyLock<Mutex<HashMap<String, (TorBoxCacheStatus, Instant)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TorBoxError {
@@ -229,6 +243,190 @@ impl TorBoxClient {
             .map(|p| p.to_string())
             .unwrap_or_else(|| "standard".to_string());
         Ok(format!("Connected to TorBox as {email} (Plan: {plan_str})"))
+    }
+
+    /// Checks if a torrent hash is cached on TorBox debrid servers without initiating jobs.
+    /// Employs an in-memory TTL cache (10 minutes) to respect rate limits.
+    pub async fn check_cached_torrent(&self, hash: &str) -> TorBoxCacheStatus {
+        let hash_clean = hash.trim().to_ascii_lowercase();
+        if hash_clean.is_empty() {
+            return TorBoxCacheStatus::Unknown;
+        }
+
+        if let Ok(guard) = TORBOX_CACHE.lock() {
+            if let Some((status, ts)) = guard.get(&hash_clean) {
+                if ts.elapsed() < Duration::from_secs(600) {
+                    return *status;
+                }
+            }
+        }
+
+        let token = match self.auth_token() {
+            Ok(t) => t,
+            Err(_) => return TorBoxCacheStatus::Unavailable,
+        };
+
+        let url = format!(
+            "{}/torrents/checkcached?hash={hash_clean}&format=object",
+            self.base_url
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(token)
+            .header("User-Agent", "Mango/1.0 (Acquisition)")
+            .send()
+            .await;
+
+        let status = match resp {
+            Ok(r) => {
+                let code = r.status();
+                if code == StatusCode::UNAUTHORIZED || code == StatusCode::FORBIDDEN {
+                    TorBoxCacheStatus::Unavailable
+                } else if code == StatusCode::TOO_MANY_REQUESTS {
+                    TorBoxCacheStatus::Unknown
+                } else if code.is_success() {
+                    match r
+                        .json::<TorBoxApiResponse<HashMap<String, serde_json::Value>>>()
+                        .await
+                    {
+                        Ok(body) => {
+                            if let Some(map) = body.data {
+                                if let Some(val) = map.get(&hash_clean) {
+                                    if val.is_null() || val.as_bool() == Some(false) {
+                                        TorBoxCacheStatus::Uncached
+                                    } else {
+                                        TorBoxCacheStatus::Cached
+                                    }
+                                } else {
+                                    TorBoxCacheStatus::Uncached
+                                }
+                            } else {
+                                TorBoxCacheStatus::Uncached
+                            }
+                        }
+                        Err(_) => TorBoxCacheStatus::Unknown,
+                    }
+                } else {
+                    TorBoxCacheStatus::Unknown
+                }
+            }
+            Err(_) => TorBoxCacheStatus::Unknown,
+        };
+
+        if let Ok(mut guard) = TORBOX_CACHE.lock() {
+            guard.insert(hash_clean, (status, Instant::now()));
+        }
+
+        status
+    }
+
+    /// Batch checks cache status for multiple torrent hashes.
+    pub async fn check_cached_torrents(
+        &self,
+        hashes: &[String],
+    ) -> HashMap<String, TorBoxCacheStatus> {
+        let mut results = HashMap::new();
+        let mut to_query = Vec::new();
+
+        if let Ok(guard) = TORBOX_CACHE.lock() {
+            for h in hashes {
+                let h_clean = h.trim().to_ascii_lowercase();
+                if h_clean.is_empty() {
+                    continue;
+                }
+                if let Some((status, ts)) = guard.get(&h_clean) {
+                    if ts.elapsed() < Duration::from_secs(600) {
+                        results.insert(h_clean, *status);
+                        continue;
+                    }
+                }
+                to_query.push(h_clean);
+            }
+        }
+
+        if to_query.is_empty() {
+            return results;
+        }
+
+        let token = match self.auth_token() {
+            Ok(t) => t,
+            Err(_) => {
+                for h in to_query {
+                    results.insert(h, TorBoxCacheStatus::Unavailable);
+                }
+                return results;
+            }
+        };
+
+        let hashes_param = to_query.join(",");
+        let url = format!(
+            "{}/torrents/checkcached?hash={hashes_param}&format=object",
+            self.base_url
+        );
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(token)
+            .header("User-Agent", "Mango/1.0 (Acquisition)")
+            .send()
+            .await;
+
+        let now = Instant::now();
+        match resp {
+            Ok(r) => {
+                let code = r.status();
+                if code == StatusCode::UNAUTHORIZED || code == StatusCode::FORBIDDEN {
+                    for h in &to_query {
+                        results.insert(h.clone(), TorBoxCacheStatus::Unavailable);
+                    }
+                } else if code.is_success() {
+                    if let Ok(body) = r
+                        .json::<TorBoxApiResponse<HashMap<String, serde_json::Value>>>()
+                        .await
+                    {
+                        let map = body.data.unwrap_or_default();
+                        for h in &to_query {
+                            let status = if let Some(val) = map.get(h) {
+                                if val.is_null() || val.as_bool() == Some(false) {
+                                    TorBoxCacheStatus::Uncached
+                                } else {
+                                    TorBoxCacheStatus::Cached
+                                }
+                            } else {
+                                TorBoxCacheStatus::Uncached
+                            };
+                            results.insert(h.clone(), status);
+                            if let Ok(mut guard) = TORBOX_CACHE.lock() {
+                                guard.insert(h.clone(), (status, now));
+                            }
+                        }
+                    } else {
+                        for h in &to_query {
+                            results.insert(h.clone(), TorBoxCacheStatus::Unknown);
+                        }
+                    }
+                } else {
+                    for h in &to_query {
+                        results.insert(h.clone(), TorBoxCacheStatus::Unknown);
+                    }
+                }
+            }
+            Err(_) => {
+                for h in &to_query {
+                    results.insert(h.clone(), TorBoxCacheStatus::Unknown);
+                }
+            }
+        }
+
+        results
+    }
+
+    #[cfg(test)]
+    pub fn clear_cache_for_test() {
+        if let Ok(mut guard) = TORBOX_CACHE.lock() {
+            guard.clear();
+        }
     }
 
     /// Submits a torrent to TorBox via magnet link.

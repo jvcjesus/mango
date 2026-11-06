@@ -62,16 +62,16 @@ fn test_quality_scoring_digital_and_trusted_bonuses() {
     assert_eq!(eval.edition, "Digital");
     assert!(eval.size_per_page_kb.is_some());
 
-    // Expected score breakdown:
-    // Match type (exact volume): 50
-    // Digital: 15
-    // Trusted uploader: 20
-    // Preferred language (English): 10
-    // Expected size (150MB): 10
-    // Resolution (2048px): 5
-    // Seeds (>=20): 10
-    // Total: 120.0
-    assert_eq!(eval.total_score, 120.0);
+    // Expected normalized two-stage score breakdown:
+    // Quality (95.0 * 0.35 = 33.25)
+    // Reliability (80.0 * 0.25 = 20.0)
+    // Preference (100.0 * 0.20 = 20.0)
+    // Convenience (50.0 * 0.15 = 7.5)
+    // Storage (100.0 * 0.05 = 5.0)
+    // Final: 85.8
+    assert_eq!(eval.total_score, 85.8);
+    let rb = eval.ranking_breakdown.as_ref().unwrap();
+    assert_eq!(rb.confidence_percent, 90);
     assert_eq!(eval.selection_verdict, "ALTERNATIVE"); // Nyaa is alternative when Madokami is evaluated
 }
 
@@ -113,7 +113,7 @@ fn test_quality_provider_preference_madokami_over_nyaa() {
     // Rank 1 must be Madokami due to provider preference policy
     assert_eq!(evals[0].candidate_id, "cand-mado-1");
     assert_eq!(evals[0].rank, 1);
-    assert_eq!(evals[0].selection_verdict, "PREFERRED");
+    assert_eq!(evals[0].selection_verdict, "RECOMMENDED");
 
     // Rank 2 is Nyaa
     assert_eq!(evals[1].candidate_id, "cand-nyaa-1");
@@ -227,7 +227,7 @@ fn test_scoring_penalties_chapter_size_language() {
     let eval_ch = evaluate_candidate_quality(&cand_ch, false, None);
     assert!(eval_ch.factors.iter().any(|f| f.points == -50.0 && f.name == "Match Type"));
     assert!(eval_ch.warning_badges.contains(&"Chapter only".to_string()));
-    assert_eq!(eval_ch.selection_verdict, "INELIGIBLE");
+    assert_eq!(eval_ch.selection_verdict, "BLOCKED");
 
     // 2. Unwanted language penalty (-50)
     let cand_fr = make_candidate(
@@ -243,7 +243,7 @@ fn test_scoring_penalties_chapter_size_language() {
     let eval_fr = evaluate_candidate_quality(&cand_fr, false, None);
     assert!(eval_fr.factors.iter().any(|f| f.name == "Unwanted Language" && f.points == -50.0));
     assert!(eval_fr.warning_badges.iter().any(|b| b.contains("French")));
-    assert_eq!(eval_fr.selection_verdict, "INELIGIBLE");
+    assert_eq!(eval_fr.selection_verdict, "BLOCKED");
 
     // 3. Extreme size anomaly penalty (-30)
     let mut cand_huge = make_candidate(

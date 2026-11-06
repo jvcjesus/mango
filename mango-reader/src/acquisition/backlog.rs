@@ -1002,6 +1002,7 @@ impl AcquisitionService {
                         confirm_range: None,
                         confirm_pack: None,
                         confirm_review: None,
+                        dry_run: None,
                     },
                 )
                 .await;

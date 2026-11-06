@@ -3576,7 +3576,7 @@ fn test_m6_8_3_title_diagnostics_and_candidate_inspector() {
 
     // Inspect candidates
     let profile = crate::acquisition::profiles::AcquisitionProfile::default();
-    let inspection = crate::sync::diagnostics::inspect_volume_candidates(&conn, "title:kagurabachi", 8.0, &profile).unwrap();
+    let inspection = crate::sync::diagnostics::inspect_volume_candidates(&conn, "title:kagurabachi", 8.0, &profile, None).unwrap();
     assert_eq!(inspection.candidates_count, 2);
 
     let mado_cand = inspection.candidates.iter().find(|c| c.provider == "madokami").unwrap();

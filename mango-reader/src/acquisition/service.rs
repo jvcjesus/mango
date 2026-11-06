@@ -364,6 +364,20 @@ impl AcquisitionService {
             .await
     }
 
+    /// Returns configured TorBox client if enabled and token is present.
+    pub async fn get_torbox_client(&self) -> Option<TorBoxClient> {
+        let (config, has_token) = self.load_internal_config().await.ok()?;
+        if !config.torbox_enabled || !has_token {
+            return None;
+        }
+        let token = self.get_torbox_token().await.ok()??;
+        Some(TorBoxClient::new(
+            self.http.clone(),
+            config.torbox_url,
+            Some(token),
+        ))
+    }
+
     /// Helper to extract configured credentials from the Keiyoushi Madokami extension settings file if present.
     fn load_madokami_extension_credentials() -> (Option<String>, Option<String>) {
         let candidate_paths = [

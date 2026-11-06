@@ -118,6 +118,74 @@ async fn test_manual_approval_exact_nyaa_candidate_queues_successfully() {
 }
 
 #[tokio::test]
+async fn test_manual_approval_dry_run_preview_inhibits_execution() {
+    let (svc, db, temp_dir) = setup_test_service("dry_run_preview");
+
+    db.call(|conn| {
+        conn.execute(
+            "INSERT INTO manga (id, source_id, url, title, in_library) VALUES (1, 1, '/c1', 'Frieren', 1)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO series_reconciliations (series_id, manga_id, mangabaka_id, title, status, total_official_volumes, last_reconciled_at, updated_at)
+             VALUES ('title:frieren', 1, 1001, 'Frieren', 'active', 12, 100, 100)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO discovered_release_candidates (
+                series_id, volume_number, candidate_id, provider, provider_item_id,
+                title, raw_title, match_type, size_bytes, uploader, is_trusted,
+                is_digital, score, score_explanation, download_url, magnet_url,
+                info_hash, seeders, leechers, published_at, discovered_at
+            ) VALUES (
+                'title:frieren', 10.0, 'nyaa:1001', 'nyaa', '1001',
+                'Frieren v10 (Digital)', '[Group] Frieren - Volume 10 (Digital) [CBZ]', 'exact_volume', 150000000,
+                'TrustedGroup', 1, 1, 95.0, 'Exact single volume match (+60); Digital edition (+15); Trusted uploader (+10)',
+                NULL, 'magnet:?xt=urn:btih:abcdef1234567890abcdef1234567890abcdef12',
+                'abcdef1234567890abcdef1234567890abcdef12', 25, 2, 1700000000, 1700000000
+            )",
+            [],
+        )?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let res = svc
+        .approve_candidate(
+            1,
+            10.0,
+            "nyaa:1001",
+            ApproveCandidateRequest {
+                confirm_range: None,
+                confirm_pack: None,
+                confirm_review: None,
+                dry_run: Some(true),
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status, "dry_run_preview");
+    assert!(!res.already_owned);
+    assert!(!res.already_acquiring);
+    assert!(res.execution_id.is_none());
+
+    // Verify downloads queue has 0 rows (execution inhibited)
+    let dl_count: i64 = db
+        .call(|conn| {
+            let count: i64 = conn.query_row("SELECT COUNT(*) FROM downloads", [], |r| r.get(0))?;
+            Ok(count)
+        })
+        .await
+        .unwrap();
+
+    assert_eq!(dl_count, 0);
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
 async fn test_discovery_and_notifications_alone_cannot_enqueue() {
     let (_svc, db, temp_dir) = setup_test_service("inert_discovery");
 

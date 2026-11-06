@@ -3148,3 +3148,76 @@ fn test_madokami_extension_xml_tag_extraction() {
         None
     );
 }
+
+#[tokio::test]
+async fn test_torbox_check_cached_torrent_and_ttl_cache() {
+    use crate::acquisition::torbox::TorBoxCacheStatus;
+    let call_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let call_count_clone = Arc::clone(&call_count);
+
+    let app = Router::new().route(
+        "/torrents/checkcached",
+        get(move |axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>| {
+            let count = Arc::clone(&call_count_clone);
+            async move {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let hash = params.get("hash").cloned().unwrap_or_default();
+                if hash.contains("cached_hash") {
+                    Json(json!({
+                        "success": true,
+                        "data": {
+                            "cached_hash": { "name": "Torrent Cached", "size": 123456 }
+                        }
+                    }))
+                } else {
+                    Json(json!({
+                        "success": true,
+                        "data": {}
+                    }))
+                }
+            }
+        }),
+    );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let http = reqwest::Client::new();
+    TorBoxClient::clear_cache_for_test();
+
+    // 1. Without token -> Unavailable
+    let client_no_token = TorBoxClient::new(http.clone(), Some(format!("http://127.0.0.1:{port}")), None);
+    assert_eq!(
+        client_no_token.check_cached_torrent("cached_hash").await,
+        TorBoxCacheStatus::Unavailable
+    );
+
+    // 2. With token -> Cached
+    let client = TorBoxClient::new(
+        http.clone(),
+        Some(format!("http://127.0.0.1:{port}")),
+        Some("valid_token".to_string()),
+    );
+    assert_eq!(
+        client.check_cached_torrent("cached_hash").await,
+        TorBoxCacheStatus::Cached
+    );
+    assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // 3. Second call within TTL -> Hit in-memory cache, no HTTP call
+    assert_eq!(
+        client.check_cached_torrent("cached_hash").await,
+        TorBoxCacheStatus::Cached
+    );
+    assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    // 4. Uncached hash
+    assert_eq!(
+        client.check_cached_torrent("uncached_hash").await,
+        TorBoxCacheStatus::Uncached
+    );
+    assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 2);
+}

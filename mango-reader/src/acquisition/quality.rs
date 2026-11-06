@@ -8,6 +8,31 @@ use serde::{Deserialize, Serialize};
 
 use crate::acquisition::approval::PersistedCandidate;
 use crate::acquisition::providers::is_known_quality_group;
+use crate::acquisition::torbox::TorBoxCacheStatus;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HardEligibilityResult {
+    pub is_eligible: bool,
+    pub rejection_code: Option<String>,
+    pub rejection_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RankingBreakdown {
+    pub final_score: f64,
+    pub quality_score: f64,
+    pub reliability_score: f64,
+    pub preference_score: f64,
+    pub convenience_score: f64,
+    pub storage_efficiency_score: f64,
+    pub confidence_percent: u32,
+    pub is_provisional: bool,
+    pub explanation: String,
+    pub why_ranks_above: Option<String>,
+    pub missing_evidence: Vec<String>,
+}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -66,6 +91,12 @@ pub struct CandidateQualityEvaluation {
     pub rejection_reason: Option<String>,
     #[serde(default)]
     pub alternate_sources: Vec<AlternateSourceDto>,
+    #[serde(default)]
+    pub cache_status: Option<TorBoxCacheStatus>,
+    #[serde(default)]
+    pub ranking_breakdown: Option<RankingBreakdown>,
+    #[serde(default)]
+    pub hard_eligibility: Option<HardEligibilityResult>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -92,6 +123,12 @@ pub struct CandidateComparisonItem {
     pub alternate_sources: Vec<AlternateSourceDto>,
     pub advantages: Vec<String>,
     pub disadvantages: Vec<String>,
+    #[serde(default)]
+    pub cache_status: Option<TorBoxCacheStatus>,
+    #[serde(default)]
+    pub ranking_breakdown: Option<RankingBreakdown>,
+    #[serde(default)]
+    pub hard_eligibility: Option<HardEligibilityResult>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -230,15 +267,294 @@ pub fn extract_release_fingerprint(cand: &PersistedCandidate) -> String {
     format!("{}:{:.1}:{}", normalized, cand.volume_number, group)
 }
 
-/// Evaluates multi-factor quality intelligence for a candidate release.
-pub fn evaluate_candidate_quality(
+/// Computes explainable normalized 0..100 two-stage candidate score:
+/// Final Score = 0.35 × Quality Evidence + 0.25 × Acquisition Reliability + 0.20 × Preference Match + 0.15 × Acquisition Convenience + 0.05 × Storage Efficiency
+pub fn compute_ranking_breakdown(
+    cand: &PersistedCandidate,
+    cache_status: Option<TorBoxCacheStatus>,
+    is_pre: bool,
+    is_revision: bool,
+    is_quality_grp: bool,
+    resolution: Option<&str>,
+    format: &str,
+    edition: &str,
+) -> RankingBreakdown {
+    let mut missing_evidence = Vec::new();
+
+    // 1. Quality Evidence (0..100, weight 0.35)
+    let mut quality_score: f64 = 0.0;
+    if cand.is_digital || cand.raw_title.to_ascii_lowercase().contains("digital") {
+        quality_score += 40.0;
+    } else {
+        missing_evidence.push("Non-digital or unverified rip".to_string());
+    }
+
+    if cand.is_trusted || is_quality_grp {
+        quality_score += 30.0;
+    }
+
+    if let Some(res) = resolution {
+        if res.contains("2048") {
+            quality_score += 15.0;
+        } else if res.contains("1920") || res.contains("1600") {
+            quality_score += 10.0;
+        } else {
+            quality_score += 5.0;
+        }
+    }
+
+    if format == "CBZ" {
+        quality_score += 10.0;
+    } else if format == "ZIP" || format == "CBR" {
+        quality_score += 5.0;
+    }
+
+    if is_revision {
+        quality_score += 5.0;
+    }
+
+    let quality_score = quality_score.clamp(0.0, 100.0);
+
+    // 2. Acquisition Reliability (0..100, weight 0.25)
+    let reliability_score: f64 = if cand.provider.eq_ignore_ascii_case("madokami") {
+        95.0
+    } else if cand.provider.eq_ignore_ascii_case("nyaa") {
+        match cache_status {
+            Some(TorBoxCacheStatus::Cached) => 95.0,
+            Some(TorBoxCacheStatus::Uncached) | Some(TorBoxCacheStatus::Unknown) | None => {
+                match cand.seeders {
+                    Some(s) if s >= 20 => 80.0,
+                    Some(s) if s >= 5 => 60.0,
+                    Some(s) if s >= 1 => 35.0,
+                    Some(0) => 5.0,
+                    Some(_) => 35.0,
+                    None => 40.0,
+                }
+            }
+            Some(TorBoxCacheStatus::Unavailable) => 15.0,
+        }
+    } else {
+        50.0
+    };
+
+    // 3. Preference Match (0..100, weight 0.20)
+    let mut preference_score: f64 = 0.0;
+    if detect_unwanted_language(&cand.raw_title).is_none() {
+        preference_score += 50.0;
+    }
+    if edition == "Digital" || edition == "Standard" {
+        preference_score += 30.0;
+    }
+    match cand.match_type.as_str() {
+        "exact_match" | "exact_volume" => preference_score += 20.0,
+        "volume_range" | "volume_range_containing_target" => preference_score += 5.0,
+        "series_pack" => preference_score += 5.0,
+        _ => {}
+    }
+    let preference_score = preference_score.clamp(0.0, 100.0);
+
+    // 4. Acquisition Convenience (0..100, weight 0.15)
+    let convenience_score: f64 = if cand.provider.eq_ignore_ascii_case("madokami") {
+        90.0
+    } else if cache_status == Some(TorBoxCacheStatus::Cached) {
+        85.0
+    } else if cand.seeders.unwrap_or(0) > 0 {
+        50.0
+    } else if format == "CBR" || format == "PDF" {
+        20.0
+    } else {
+        10.0
+    };
+
+    // 5. Storage Efficiency (0..100, weight 0.05)
+    let storage_efficiency_score: f64 = if let Some(bytes) = cand.size_bytes {
+        if bytes >= 100_000_000 && bytes <= 350_000_000 {
+            100.0
+        } else if (bytes >= 50_000_000 && bytes < 100_000_000)
+            || (bytes > 350_000_000 && bytes <= 500_000_000)
+        {
+            80.0
+        } else if bytes > 500_000_000 && bytes <= 800_000_000 {
+            60.0
+        } else if bytes > 800_000_000 && bytes <= 1_200_000_000 {
+            40.0
+        } else if bytes > 1_200_000_000 {
+            missing_evidence.push(format!(
+                "Archive size ({:.1} GB) exceeds standard volume boundary",
+                (bytes as f64) / 1e9
+            ));
+            15.0
+        } else {
+            10.0
+        }
+    } else {
+        missing_evidence.push("Release size unknown".to_string());
+        50.0
+    };
+
+    let mut final_score: f64 = (0.35 * quality_score)
+        + (0.25 * reliability_score)
+        + (0.20 * preference_score)
+        + (0.15 * convenience_score)
+        + (0.05 * storage_efficiency_score);
+
+    if is_pre {
+        final_score = (final_score - 15.0).max(0.0);
+    }
+    let final_score = (final_score * 10.0).round() / 10.0;
+
+    let mut confidence_percent = 70u32;
+    if cand.match_type == "exact_match" || cand.match_type == "exact_volume" {
+        confidence_percent += 10;
+    }
+    if cand.size_bytes.is_some() {
+        confidence_percent += 5;
+    }
+    if cand.provider.eq_ignore_ascii_case("madokami") || cache_status.is_some() {
+        confidence_percent += 5;
+    }
+    if cand.is_digital {
+        confidence_percent += 5;
+    }
+    if is_pre {
+        confidence_percent = confidence_percent.saturating_sub(25);
+    }
+    let confidence_percent = confidence_percent.min(95);
+
+    let explanation = format!(
+        "Normalized Score: {:.1}/100 [Quality: {:.0} (35%), Reliability: {:.0} (25%), Preference: {:.0} (20%), Convenience: {:.0} (15%), Storage: {:.0} (5%)] · Confidence: {}%",
+        final_score, quality_score, reliability_score, preference_score, convenience_score, storage_efficiency_score, confidence_percent
+    );
+
+    RankingBreakdown {
+        final_score,
+        quality_score,
+        reliability_score,
+        preference_score,
+        convenience_score,
+        storage_efficiency_score,
+        confidence_percent,
+        is_provisional: is_pre,
+        explanation,
+        why_ranks_above: None,
+        missing_evidence,
+    }
+}
+
+/// Evaluates hard candidate eligibility gates before scoring.
+pub fn evaluate_hard_eligibility(
     cand: &PersistedCandidate,
     is_owned: bool,
+    is_active_acquiring: bool,
+) -> HardEligibilityResult {
+    if is_owned {
+        return HardEligibilityResult {
+            is_eligible: false,
+            rejection_code: Some("ALREADY_OWNED".to_string()),
+            rejection_reason: Some(format!(
+                "Volume {:.0} is already verified owned in Komga library",
+                cand.volume_number
+            )),
+        };
+    }
+    if is_active_acquiring {
+        return HardEligibilityResult {
+            is_eligible: false,
+            rejection_code: Some("ALREADY_ACQUIRING".to_string()),
+            rejection_reason: Some(format!(
+                "Volume {:.0} is already active in download queue",
+                cand.volume_number
+            )),
+        };
+    }
+
+    let raw_lower = cand.raw_title.to_ascii_lowercase();
+    let is_chapter_only = cand.match_type == "chapter"
+        || ((raw_lower.contains("ch.")
+            || raw_lower.contains("chapter ")
+            || raw_lower.contains(" c0")
+            || raw_lower.contains(" c1"))
+            && !raw_lower.contains("vol")
+            && !raw_lower.contains("v0")
+            && !raw_lower.contains("v1"));
+
+    if is_chapter_only {
+        return HardEligibilityResult {
+            is_eligible: false,
+            rejection_code: Some("CHAPTER_ONLY".to_string()),
+            rejection_reason: Some("Chapter-only release is not a full volume".to_string()),
+        };
+    }
+
+    if cand.match_type == "volume_range"
+        || cand.match_type == "volume_range_containing_target"
+    {
+        return HardEligibilityResult {
+            is_eligible: false,
+            rejection_code: Some("RANGE_REQUIRES_MANUAL".to_string()),
+            rejection_reason: Some(
+                "Multi-volume range candidate requires manual confirmation".to_string(),
+            ),
+        };
+    }
+
+    if cand.match_type == "series_pack" {
+        return HardEligibilityResult {
+            is_eligible: false,
+            rejection_code: Some("PACK_REQUIRES_MANUAL".to_string()),
+            rejection_reason: Some(
+                "Series pack candidate requires manual confirmation".to_string(),
+            ),
+        };
+    }
+
+    if let Some(foreign_lang) = detect_unwanted_language(&cand.raw_title) {
+        return HardEligibilityResult {
+            is_eligible: false,
+            rejection_code: Some("UNWANTED_LANGUAGE".to_string()),
+            rejection_reason: Some(format!(
+                "Language detected as {foreign_lang} (expected English)"
+            )),
+        };
+    }
+
+    if cand.match_type == "rejected" {
+        return HardEligibilityResult {
+            is_eligible: false,
+            rejection_code: Some("REJECTED".to_string()),
+            rejection_reason: Some("Candidate was marked as rejected".to_string()),
+        };
+    }
+
+    if cand.provider.eq_ignore_ascii_case("nyaa") && cand.seeders == Some(0) {
+        return HardEligibilityResult {
+            is_eligible: false,
+            rejection_code: Some("DEAD_SWARM".to_string()),
+            rejection_reason: Some(
+                "Torrent swarm has 0 active seeders and cannot be downloaded".to_string(),
+            ),
+        };
+    }
+
+    HardEligibilityResult {
+        is_eligible: true,
+        rejection_code: None,
+        rejection_reason: None,
+    }
+}
+
+/// Evaluates multi-factor quality intelligence for a candidate release with full context.
+pub fn evaluate_candidate_quality_v2(
+    cand: &PersistedCandidate,
+    is_owned: bool,
+    cache_status: Option<TorBoxCacheStatus>,
+    is_active_acquiring: bool,
     mut rejection_reason: Option<String>,
 ) -> CandidateQualityEvaluation {
-    let mut factors = Vec::new();
-    let mut warning_badges = Vec::new();
-    let mut total_score = 0.0;
+    let hard_elig = evaluate_hard_eligibility(cand, is_owned, is_active_acquiring);
+    if !hard_elig.is_eligible && rejection_reason.is_none() {
+        rejection_reason = hard_elig.rejection_reason.clone();
+    }
 
     let raw_lower = cand.raw_title.to_ascii_lowercase();
     let is_pre = raw_lower.contains("(pre)") || raw_lower.contains("[pre]");
@@ -253,238 +569,29 @@ pub fn evaluate_candidate_quality(
     let edition = detect_edition_type(cand);
     let size_per_page_kb = estimate_size_per_page_kb(cand.size_bytes);
 
-    // 1. Match Type Base Score & Multi-volume / Chapter-only checks
+    let mut warning_badges = Vec::new();
+    if !hard_elig.is_eligible {
+        if let Some(ref code) = hard_elig.rejection_code {
+            warning_badges.push(format!("Blocked: {code}"));
+        }
+    }
     let is_chapter_only = cand.match_type == "chapter"
-        || ((raw_lower.contains("ch.") || raw_lower.contains("chapter ") || raw_lower.contains(" c0") || raw_lower.contains(" c1"))
-            && !raw_lower.contains("vol") && !raw_lower.contains("v0") && !raw_lower.contains("v1"));
-
-    let (match_base, match_desc) = if is_chapter_only {
+        || ((raw_lower.contains("ch.")
+            || raw_lower.contains("chapter ")
+            || raw_lower.contains(" c0")
+            || raw_lower.contains(" c1"))
+            && !raw_lower.contains("vol")
+            && !raw_lower.contains("v0")
+            && !raw_lower.contains("v1"));
+    if is_chapter_only {
         warning_badges.push("Chapter only".to_string());
-        if rejection_reason.is_none() {
-            rejection_reason = Some("Chapter-only release (not a full volume)".to_string());
-        }
-        (-50.0, "Chapter-only penalty (-50)")
-    } else {
-        match cand.match_type.as_str() {
-            "exact_match" | "exact_volume" => (50.0, "Exact volume match bonus (+50)"),
-            "volume_range" | "volume_range_containing_target" => {
-                warning_badges.push("Multi-volume range".to_string());
-                if rejection_reason.is_none() {
-                    rejection_reason = Some("Requires multi-volume extraction (currently single-volume mode)".to_string());
-                }
-                (-25.0, "Multi-volume penalty when looking for single volume (-25)")
-            }
-            "series_pack" => {
-                warning_badges.push("Series pack".to_string());
-                if rejection_reason.is_none() {
-                    rejection_reason = Some("Requires multi-volume extraction (currently single-volume mode)".to_string());
-                }
-                (-25.0, "Series pack penalty when looking for single volume (-25)")
-            }
-            "possible_match" => (10.0, "Possible / fuzzy volume match (+10)"),
-            _ => (0.0, "Unclassified match (0)"),
-        }
-    };
-
-    total_score += match_base;
-    factors.push(QualityFactorScore {
-        name: "Match Type".to_string(),
-        points: match_base,
-        is_bonus: match_base > 0.0,
-        description: match_desc.to_string(),
-    });
-
-    // 2. Provider Preference: Madokami Direct HTTP vs Nyaa BitTorrent
-    let is_preferred_provider = cand.provider.eq_ignore_ascii_case("madokami");
-    let (transport, provider_pts, provider_desc) = if is_preferred_provider {
-        (
-            "Direct HTTP (Range resume)".to_string(),
-            10.0,
-            "Preferred transport: Direct HTTP (no torrent swarms or debrid queue) (+10)",
-        )
-    } else {
-        (
-            "TorBox BitTorrent (Debrid)".to_string(),
-            0.0,
-            "Standard transport: BitTorrent via TorBox (0)",
-        )
-    };
-    if provider_pts > 0.0 {
-        total_score += provider_pts;
-        factors.push(QualityFactorScore {
-            name: "Provider Preference".to_string(),
-            points: provider_pts,
-            is_bonus: true,
-            description: provider_desc.to_string(),
-        });
     }
-
-    // 3. Digital Archival Edition Bonus (+15)
-    if cand.is_digital {
-        total_score += 15.0;
-        factors.push(QualityFactorScore {
-            name: "Official Digital".to_string(),
-            points: 15.0,
-            is_bonus: true,
-            description: "Digital edition bonus (+15)".to_string(),
-        });
+    if let Some(lang) = detect_unwanted_language(&cand.raw_title) {
+        warning_badges.push(format!("Language: {lang}"));
     }
-
-    // 4. Trusted Uploader / Quality Group Bonus (+20)
-    if cand.is_trusted || is_quality_grp {
-        total_score += 20.0;
-        factors.push(QualityFactorScore {
-            name: "Trusted Uploader".to_string(),
-            points: 20.0,
-            is_bonus: true,
-            description: "Trusted uploader bonus (+20)".to_string(),
-        });
+    if is_pre {
+        warning_badges.push("Pre-release".to_string());
     }
-
-    // 5. Preferred Language Match (+10) vs Unwanted Language Penalty (-50)
-    if let Some(foreign_lang) = detect_unwanted_language(&cand.raw_title) {
-        total_score -= 50.0;
-        factors.push(QualityFactorScore {
-            name: "Unwanted Language".to_string(),
-            points: -50.0,
-            is_bonus: false,
-            description: format!("Unwanted language penalty: {foreign_lang} (-50)"),
-        });
-        warning_badges.push(format!("Language: {foreign_lang}"));
-        if rejection_reason.is_none() {
-            rejection_reason = Some(format!("Language detected as {foreign_lang} (expected English)"));
-        }
-    } else {
-        total_score += 10.0;
-        factors.push(QualityFactorScore {
-            name: "Preferred Language".to_string(),
-            points: 10.0,
-            is_bonus: true,
-            description: "Preferred language match (+10)".to_string(),
-        });
-    }
-
-    // 6. Expected Size (+10) vs Extreme Size Anomaly Penalty (-30)
-    if let Some(bytes) = cand.size_bytes {
-        let size_mb = (bytes as f64) / (1024.0 * 1024.0);
-        let size_gb = size_mb / 1024.0;
-        if bytes > 1_200_000_000 {
-            total_score -= 30.0;
-            factors.push(QualityFactorScore {
-                name: "Extreme Size Anomaly".to_string(),
-                points: -30.0,
-                is_bonus: false,
-                description: format!("Extreme size anomaly penalty: {:.1} GB exceeds expected volume size (-30)", size_gb),
-            });
-            warning_badges.push("Size anomaly".to_string());
-            if rejection_reason.is_none() {
-                rejection_reason = Some(format!(
-                    "Size {:.1} GB exceeds expected volume size (150-300 MB) by {:.0}x",
-                    size_gb,
-                    (size_gb / 0.25).max(2.0)
-                ));
-            }
-        } else if bytes < 10_000_000 {
-            total_score -= 30.0;
-            factors.push(QualityFactorScore {
-                name: "Extreme Size Anomaly".to_string(),
-                points: -30.0,
-                is_bonus: false,
-                description: format!("Extreme size anomaly penalty: {:.1} MB is suspiciously small (-30)", size_mb),
-            });
-            warning_badges.push("Suspiciously small".to_string());
-            if rejection_reason.is_none() {
-                rejection_reason = Some(format!("Archive size {:.1} MB is suspiciously small for a full volume", size_mb));
-            }
-        } else if bytes >= 40_000_000 && bytes <= 600_000_000 {
-            total_score += 10.0;
-            factors.push(QualityFactorScore {
-                name: "Expected Size".to_string(),
-                points: 10.0,
-                is_bonus: true,
-                description: format!("Size within expected range: {:.0} MB (+10)", size_mb),
-            });
-        }
-    }
-
-    // 7. Resolution / Archival Dimensions
-    if let Some(ref res_lbl) = resolution {
-        let pts = if res_lbl.contains("2048") { 5.0 } else { 3.0 };
-        total_score += pts;
-        factors.push(QualityFactorScore {
-            name: "Resolution".to_string(),
-            points: pts,
-            is_bonus: true,
-            description: format!("{res_lbl} (+{pts:.0})"),
-        });
-    }
-
-    // 8. Revision / Remake
-    if is_revision {
-        total_score += 2.0;
-        factors.push(QualityFactorScore {
-            name: "Revised Edition".to_string(),
-            points: 2.0,
-            is_bonus: true,
-            description: "Revised edition / v2 fix (+2)".to_string(),
-        });
-    }
-
-    // 9. Health & Swarm Metrics / Low seed penalty (-20)
-    let health_rating = if cand.provider.eq_ignore_ascii_case("madokami") {
-        "EXCELLENT".to_string()
-    } else {
-        match cand.seeders {
-            Some(s) if s >= 20 => {
-                total_score += 10.0;
-                factors.push(QualityFactorScore {
-                    name: "Swarm Health".to_string(),
-                    points: 10.0,
-                    is_bonus: true,
-                    description: format!("Well-seeded: {s} seeds (+10)"),
-                });
-                "EXCELLENT".to_string()
-            }
-            Some(s) if s >= 5 => {
-                total_score += 5.0;
-                factors.push(QualityFactorScore {
-                    name: "Swarm Health".to_string(),
-                    points: 5.0,
-                    is_bonus: true,
-                    description: format!("Active seeds: {s} seeds (+5)"),
-                });
-                "GOOD".to_string()
-            }
-            Some(s) if s >= 1 => {
-                total_score += 2.0;
-                factors.push(QualityFactorScore {
-                    name: "Swarm Health".to_string(),
-                    points: 2.0,
-                    is_bonus: true,
-                    description: format!("Low seeds: {s} seeds (+2)"),
-                });
-                warning_badges.push("Low seeders".to_string());
-                "DEGRADED".to_string()
-            }
-            Some(0) => {
-                total_score -= 20.0;
-                factors.push(QualityFactorScore {
-                    name: "Dead Swarm".to_string(),
-                    points: -20.0,
-                    is_bonus: false,
-                    description: "Low seed/leech penalty: 0 seeders (-20)".to_string(),
-                });
-                warning_badges.push("0 Seeders".to_string());
-                if rejection_reason.is_none() {
-                    rejection_reason = Some("Torrent swarm has 0 active seeders".to_string());
-                }
-                "DEAD".to_string()
-            }
-            _ => "UNKNOWN".to_string(),
-        }
-    };
-
-    // 10. Format Warning
     if format == "CBR" {
         warning_badges.push("CBR (Needs conversion)".to_string());
         if rejection_reason.is_none() {
@@ -496,22 +603,153 @@ pub fn evaluate_candidate_quality(
             rejection_reason = Some("File format PDF requires conversion".to_string());
         }
     }
+    if let Some(bytes) = cand.size_bytes {
+        if bytes > 1_200_000_000 {
+            warning_badges.push("Size anomaly".to_string());
+            if rejection_reason.is_none() {
+                rejection_reason = Some(format!(
+                    "Size {:.1} GB exceeds expected volume size (150-300 MB)",
+                    (bytes as f64) / 1e9
+                ));
+            }
+        }
+    }
 
-    // 11. Pre-release / Non-archival penalty
+    let is_preferred_provider = cand.provider.eq_ignore_ascii_case("madokami");
+    let transport = if is_preferred_provider {
+        "Direct HTTP (Range resume)".to_string()
+    } else if cache_status == Some(TorBoxCacheStatus::Cached) {
+        "TorBox BitTorrent (Cached Instant)".to_string()
+    } else {
+        "TorBox BitTorrent (Debrid)".to_string()
+    };
+
+    let health_rating = if is_preferred_provider {
+        "EXCELLENT".to_string()
+    } else if cache_status == Some(TorBoxCacheStatus::Cached) {
+        "EXCELLENT".to_string()
+    } else {
+        match cand.seeders {
+            Some(s) if s >= 20 => "EXCELLENT".to_string(),
+            Some(s) if s >= 5 => "GOOD".to_string(),
+            Some(s) if s >= 1 => "DEGRADED".to_string(),
+            Some(0) => "DEAD".to_string(),
+            _ => "UNKNOWN".to_string(),
+        }
+    };
+
+    let ranking_breakdown = compute_ranking_breakdown(
+        cand,
+        cache_status,
+        is_pre,
+        is_revision,
+        is_quality_grp,
+        resolution.as_deref(),
+        &format,
+        &edition,
+    );
+
+    let total_score = ranking_breakdown.final_score;
+
+    let mut factors = vec![
+        QualityFactorScore {
+            name: "Quality Evidence (35%)".to_string(),
+            points: (ranking_breakdown.quality_score * 0.35 * 10.0).round() / 10.0,
+            is_bonus: ranking_breakdown.quality_score >= 50.0,
+            description: format!(
+                "Intrinsic release quality score: {:.0}/100 (wt 35%)",
+                ranking_breakdown.quality_score
+            ),
+        },
+        QualityFactorScore {
+            name: "Acquisition Reliability (25%)".to_string(),
+            points: (ranking_breakdown.reliability_score * 0.25 * 10.0).round() / 10.0,
+            is_bonus: ranking_breakdown.reliability_score >= 50.0,
+            description: format!(
+                "Source reliability and health score: {:.0}/100 (wt 25%)",
+                ranking_breakdown.reliability_score
+            ),
+        },
+        QualityFactorScore {
+            name: "Preference Match (20%)".to_string(),
+            points: (ranking_breakdown.preference_score * 0.20 * 10.0).round() / 10.0,
+            is_bonus: ranking_breakdown.preference_score >= 50.0,
+            description: format!(
+                "Edition & language match score: {:.0}/100 (wt 20%)",
+                ranking_breakdown.preference_score
+            ),
+        },
+        QualityFactorScore {
+            name: "Acquisition Convenience (15%)".to_string(),
+            points: (ranking_breakdown.convenience_score * 0.15 * 10.0).round() / 10.0,
+            is_bonus: ranking_breakdown.convenience_score >= 50.0,
+            description: format!(
+                "Transport convenience score: {:.0}/100 (wt 15%)",
+                ranking_breakdown.convenience_score
+            ),
+        },
+        QualityFactorScore {
+            name: "Storage Efficiency (5%)".to_string(),
+            points: (ranking_breakdown.storage_efficiency_score * 0.05 * 10.0).round() / 10.0,
+            is_bonus: ranking_breakdown.storage_efficiency_score >= 50.0,
+            description: format!(
+                "File size efficiency score: {:.0}/100 (wt 5%)",
+                ranking_breakdown.storage_efficiency_score
+            ),
+        },
+    ];
+
+    let raw_lower = cand.raw_title.to_ascii_lowercase();
+    let is_chapter_only = cand.match_type == "chapter"
+        || ((raw_lower.contains("ch.")
+            || raw_lower.contains("chapter ")
+            || raw_lower.contains(" c0")
+            || raw_lower.contains(" c1"))
+            && !raw_lower.contains("vol")
+            && !raw_lower.contains("v0")
+            && !raw_lower.contains("v1"));
+    if is_chapter_only {
+        factors.push(QualityFactorScore {
+            name: "Match Type".to_string(),
+            points: -50.0,
+            is_bonus: false,
+            description: "Chapter-only penalty (-50)".to_string(),
+        });
+    }
+
+    if let Some(foreign_lang) = detect_unwanted_language(&cand.raw_title) {
+        factors.push(QualityFactorScore {
+            name: "Unwanted Language".to_string(),
+            points: -50.0,
+            is_bonus: false,
+            description: format!("Unwanted language penalty: {foreign_lang} (-50)"),
+        });
+    }
+
+    if let Some(bytes) = cand.size_bytes {
+        if bytes > 1_200_000_000 {
+            let size_gb = (bytes as f64) / (1024.0 * 1024.0 * 1024.0);
+            factors.push(QualityFactorScore {
+                name: "Extreme Size Anomaly".to_string(),
+                points: -30.0,
+                is_bonus: false,
+                description: format!(
+                    "Extreme size anomaly penalty: {:.1} GB exceeds expected volume size (-30)",
+                    size_gb
+                ),
+            });
+        }
+    }
+
     if is_pre {
-        total_score -= 20.0;
         factors.push(QualityFactorScore {
             name: "Pre-Release Penalty".to_string(),
             points: -20.0,
             is_bonus: false,
-            description: "Pre-release or preliminary rip (-20)".to_string(),
+            description: "Pre-release or preliminary rip penalty (-20)".to_string(),
         });
-        warning_badges.push("Pre-release".to_string());
     }
 
-    total_score = total_score.max(0.0);
-
-    // 12. Upgrade Evaluation & No-Silent-Upgrade Integrity
     let upgrade_evaluation = if is_owned {
         let (eligible, justification) = if cand.is_digital && is_quality_grp {
             (
@@ -529,7 +767,7 @@ pub fn evaluate_candidate_quality(
             is_currently_owned: true,
             upgrade_eligible: eligible,
             upgrade_justification: justification,
-            silent_upgrade_blocked: true, // Non-negotiable invariant
+            silent_upgrade_blocked: true,
         }
     } else {
         UpgradeEvaluation {
@@ -540,16 +778,16 @@ pub fn evaluate_candidate_quality(
         }
     };
 
-    let selection_verdict = if rejection_reason.is_some() {
-        "INELIGIBLE".to_string()
-    } else if is_owned {
+    let selection_verdict = if is_owned {
         if upgrade_evaluation.upgrade_eligible {
             "MANUAL_UPGRADE_ONLY".to_string()
         } else {
             "ALREADY_OWNED".to_string()
         }
+    } else if rejection_reason.is_some() || !hard_elig.is_eligible {
+        "BLOCKED".to_string()
     } else if is_preferred_provider {
-        "PREFERRED".to_string()
+        "RECOMMENDED".to_string()
     } else {
         "ALTERNATIVE".to_string()
     };
@@ -559,7 +797,7 @@ pub fn evaluate_candidate_quality(
         provider: cand.provider.clone(),
         transport,
         total_score,
-        rank: 0, // Assigned after sorting
+        rank: 0,
         selection_verdict,
         factors,
         resolution_label: resolution,
@@ -577,24 +815,36 @@ pub fn evaluate_candidate_quality(
         upgrade_evaluation,
         rejection_reason,
         alternate_sources: Vec::new(),
+        cache_status,
+        ranking_breakdown: Some(ranking_breakdown),
+        hard_eligibility: Some(hard_elig),
     }
+}
+
+/// Evaluates multi-factor quality intelligence for a candidate release.
+pub fn evaluate_candidate_quality(
+    cand: &PersistedCandidate,
+    is_owned: bool,
+    rejection_reason: Option<String>,
+) -> CandidateQualityEvaluation {
+    evaluate_candidate_quality_v2(cand, is_owned, None, false, rejection_reason)
 }
 
 /// Ranks a collection of evaluated candidates by quality and preference:
 /// 1. Eligible > Ineligible
 /// 2. Not Owned > Owned
-/// 3. Preferred Provider (Madokami) > Alternative (Nyaa)
-/// 4. Higher total quality score
-/// 5. Digital > Non-digital
-/// 6. Non-PRE > PRE
+/// 3. Higher normalized two-stage quality score
+/// 4. Digital > Non-digital
+/// 5. Non-PRE > PRE
 pub fn rank_quality_evaluations(evals: &mut [CandidateQualityEvaluation]) {
     evals.sort_by(|a, b| {
-        let a_ineligible = a.rejection_reason.is_some();
-        let b_ineligible = b.rejection_reason.is_some();
+        let a_ineligible = a.rejection_reason.is_some()
+            || a.hard_eligibility.as_ref().map_or(false, |h| !h.is_eligible);
+        let b_ineligible = b.rejection_reason.is_some()
+            || b.hard_eligibility.as_ref().map_or(false, |h| !h.is_eligible);
         a_ineligible
             .cmp(&b_ineligible)
             .then_with(|| a.upgrade_evaluation.is_currently_owned.cmp(&b.upgrade_evaluation.is_currently_owned))
-            .then_with(|| b.is_preferred_provider.cmp(&a.is_preferred_provider))
             .then_with(|| {
                 b.total_score
                     .partial_cmp(&a.total_score)
@@ -606,12 +856,21 @@ pub fn rank_quality_evaluations(evals: &mut [CandidateQualityEvaluation]) {
 
     for (idx, eval) in evals.iter_mut().enumerate() {
         eval.rank = idx + 1;
-        if eval.rejection_reason.is_none() && !eval.upgrade_evaluation.is_currently_owned {
-            if idx == 0 {
-                eval.selection_verdict = "PREFERRED".to_string();
+        let is_ineligible = eval.rejection_reason.is_some()
+            || eval.hard_eligibility.as_ref().map_or(false, |h| !h.is_eligible);
+
+        if is_ineligible {
+            eval.selection_verdict = "BLOCKED".to_string();
+        } else if eval.upgrade_evaluation.is_currently_owned {
+            if eval.upgrade_evaluation.upgrade_eligible {
+                eval.selection_verdict = "MANUAL_UPGRADE_ONLY".to_string();
             } else {
-                eval.selection_verdict = "ALTERNATIVE".to_string();
+                eval.selection_verdict = "ALREADY_OWNED".to_string();
             }
+        } else if idx == 0 {
+            eval.selection_verdict = "RECOMMENDED".to_string();
+        } else {
+            eval.selection_verdict = "ALTERNATIVE".to_string();
         }
     }
 }
@@ -758,6 +1017,9 @@ pub fn build_candidate_comparison_matrix(
             alternate_sources: eval.alternate_sources.clone(),
             advantages,
             disadvantages,
+            cache_status: eval.cache_status,
+            ranking_breakdown: eval.ranking_breakdown.clone(),
+            hard_eligibility: eval.hard_eligibility.clone(),
         });
     }
 
@@ -772,13 +1034,13 @@ pub fn build_candidate_comparison_matrix(
             reasons.push("official digital archival edition".to_string());
         }
         if first.total_score > second.total_score {
-            reasons.push(format!("higher quality score ({:.0} vs {:.0})", first.total_score, second.total_score));
+            reasons.push(format!("higher normalized quality score ({:.1} vs {:.1})", first.total_score, second.total_score));
         }
         if reasons.is_empty() {
-            format!("Candidate #1 ({}) is ranked above Candidate #2 ({}) based on overall release signals.", first.provider, second.provider)
+            format!("Candidate #1 ({}) is recommended and preferred over Candidate #2 ({}) based on overall release signals.", first.provider, second.provider)
         } else {
             format!(
-                "Candidate #1 ({}) is preferred over Candidate #2 ({}) due to {}.",
+                "Candidate #1 ({}) is recommended and preferred over Candidate #2 ({}) due to {}.",
                 first.provider,
                 second.provider,
                 reasons.join(", ")

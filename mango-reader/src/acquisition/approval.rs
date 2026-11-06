@@ -29,6 +29,7 @@ pub struct ApproveCandidateRequest {
     pub confirm_range: Option<bool>,
     pub confirm_pack: Option<bool>,
     pub confirm_review: Option<bool>,
+    pub dry_run: Option<bool>,
 }
 
 /// Unified response from approving a candidate release.
@@ -513,6 +514,20 @@ impl AcquisitionService {
         self.db
             .call(move |conn| crate::acquisition::planner::save_plan(conn, &saved_plan))
             .await?;
+
+        let is_dry_run = req.dry_run.unwrap_or(false);
+        if is_dry_run {
+            return Ok(ApproveCandidateResponse {
+                status: "dry_run_preview".to_string(),
+                message: format!(
+                    "Dry-run plan preview generated for Volume {volume} (execution inhibited)"
+                ),
+                execution_id: None,
+                chapter_ids: vec![],
+                already_owned: false,
+                already_acquiring: false,
+            });
+        }
 
         let approve_req = ApprovePlanRequest {
             plan_id: planned.plan.id.clone(),

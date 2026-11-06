@@ -1644,6 +1644,7 @@ export interface ApproveCandidateRequest {
   confirmRange?: boolean;
   confirmPack?: boolean;
   confirmReview?: boolean;
+  dryRun?: boolean;
 }
 
 export interface ApproveCandidateResponse {
@@ -2124,6 +2125,28 @@ export interface AlternateSourceDto {
   score: number;
 }
 
+export type TorBoxCacheStatus = 'cached' | 'uncached' | 'unknown' | 'unavailable';
+
+export interface HardEligibilityResult {
+  isEligible: boolean;
+  rejectionCode?: string | null;
+  rejectionReason?: string | null;
+}
+
+export interface RankingBreakdown {
+  finalScore: number;
+  qualityScore: number;
+  reliabilityScore: number;
+  preferenceScore: number;
+  convenienceScore: number;
+  storageEfficiencyScore: number;
+  confidencePercent: number;
+  isProvisional: boolean;
+  explanation: string;
+  whyRanksAbove?: string | null;
+  missingEvidence: string[];
+}
+
 export interface CandidateComparisonItem {
   candidateId: string;
   rank: number;
@@ -2146,6 +2169,9 @@ export interface CandidateComparisonItem {
   alternateSources: AlternateSourceDto[];
   advantages: string[];
   disadvantages: string[];
+  cacheStatus?: TorBoxCacheStatus | null;
+  rankingBreakdown?: RankingBreakdown | null;
+  hardEligibility?: HardEligibilityResult | null;
 }
 
 export interface CandidateComparisonMatrix {
@@ -2178,6 +2204,9 @@ export interface CandidateInspectionDto {
   rejectionReason?: string | null;
   sanitizedReference?: string | null;
   qualityEvaluation?: CandidateQualityEvaluationDto | null;
+  cacheStatus?: TorBoxCacheStatus | null;
+  rankingBreakdown?: RankingBreakdown | null;
+  hardEligibility?: HardEligibilityResult | null;
 }
 
 export interface VolumeCandidateInspectionResult {

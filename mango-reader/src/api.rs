@@ -3804,10 +3804,39 @@ async fn get_manga_volume_candidates_inspect(
 
     let profile = app.acquisition.get_manga_profile(id).await.unwrap_or_default();
 
+    let s_id_for_hashes = s_id.clone();
+    let hashes: Vec<String> = app
+        .db
+        .call(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT info_hash FROM discovered_release_candidates
+                 WHERE (series_id = ?1 OR series_id = 'manga:' || ?1)
+                   AND ABS(volume_number - ?2) < 0.001
+                   AND info_hash IS NOT NULL",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![s_id_for_hashes, volume], |r| {
+                r.get::<_, String>(0)
+            })?;
+            Ok(rows.flatten().collect())
+        })
+        .await?;
+
+    let cache_map = if let Some(torbox) = app.acquisition.get_torbox_client().await {
+        torbox.check_cached_torrents(&hashes).await
+    } else {
+        std::collections::HashMap::new()
+    };
+
     let res = app
         .db
         .call(move |conn| {
-            crate::sync::diagnostics::inspect_volume_candidates(conn, &s_id, volume, &profile)
+            crate::sync::diagnostics::inspect_volume_candidates(
+                conn,
+                &s_id,
+                volume,
+                &profile,
+                Some(&cache_map),
+            )
         })
         .await?;
 
@@ -3839,10 +3868,39 @@ async fn get_manga_volume_candidates_compare(
 
     let profile = app.acquisition.get_manga_profile(id).await.unwrap_or_default();
 
+    let s_id_for_hashes = s_id.clone();
+    let hashes: Vec<String> = app
+        .db
+        .call(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT info_hash FROM discovered_release_candidates
+                 WHERE (series_id = ?1 OR series_id = 'manga:' || ?1)
+                   AND ABS(volume_number - ?2) < 0.001
+                   AND info_hash IS NOT NULL",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![s_id_for_hashes, volume], |r| {
+                r.get::<_, String>(0)
+            })?;
+            Ok(rows.flatten().collect())
+        })
+        .await?;
+
+    let cache_map = if let Some(torbox) = app.acquisition.get_torbox_client().await {
+        torbox.check_cached_torrents(&hashes).await
+    } else {
+        std::collections::HashMap::new()
+    };
+
     let res = app
         .db
         .call(move |conn| {
-            crate::sync::diagnostics::compare_volume_candidates(conn, &s_id, volume, &profile)
+            crate::sync::diagnostics::compare_volume_candidates(
+                conn,
+                &s_id,
+                volume,
+                &profile,
+                Some(&cache_map),
+            )
         })
         .await?;
 
