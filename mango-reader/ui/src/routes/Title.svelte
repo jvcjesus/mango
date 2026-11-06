@@ -744,15 +744,36 @@
 
   async function openPlanModal(_dryRun = true) { unifiedAcquisition = {release:'',mode:'missing'}; }
   const ownedVolumeNumbers = $derived.by<number[]>(() => {
-    if (!ownership?.volumes) return [];
-    return ownership.volumes.filter((v) => v.status === 'owned').map((v) => v.volume).sort((a, b) => a - b);
+    const set = new Set<number>();
+    if (ownership?.volumes) {
+      for (const v of ownership.volumes) {
+        if (v.status === 'owned') set.add(Math.round(v.volume));
+      }
+    }
+    if (reconciliation?.ownedVolumes) {
+      for (const v of reconciliation.ownedVolumes) set.add(Math.round(v));
+    }
+    if (libraryState?.ownedVolumes) {
+      for (const v of libraryState.ownedVolumes) set.add(Math.round(v));
+    }
+    return Array.from(set).sort((a, b) => a - b);
   });
 
   const missingVolumeNumbers = $derived.by<number[]>(() => {
-    if (!ownership?.summary?.totalSourceVolumes || !ownership.volumes) return [];
-    const ownedSet = new Set(ownership.volumes.filter((v) => v.status === 'owned').map((v) => Math.round(v.volume)));
+    if (libraryState?.missingReleasedVolumes && libraryState.missingReleasedVolumes.length > 0) {
+      return libraryState.missingReleasedVolumes.map((v) => Math.round(v)).sort((a, b) => a - b);
+    }
+    if (reconciliation?.missingVolumes && reconciliation.missingVolumes.length > 0) {
+      return reconciliation.missingVolumes.map((v) => Math.round(v)).sort((a, b) => a - b);
+    }
+    const total =
+      libraryState?.releasedVolumesCount ??
+      reconciliation?.totalOfficialVolumes ??
+      ownership?.summary?.totalSourceVolumes;
+    if (!total || total <= 0) return [];
+    const ownedSet = new Set(ownedVolumeNumbers);
     const missing: number[] = [];
-    for (let i = 1; i <= ownership.summary.totalSourceVolumes; i++) {
+    for (let i = 1; i <= total; i++) {
       if (!ownedSet.has(i)) missing.push(i);
     }
     return missing;
@@ -880,10 +901,35 @@
       list.push(c);
       map.set(vol, list);
     }
-    // Also include known volumes from Komga ownership or missing content
+    // Also include known volumes from Komga ownership, reconciliation, or library state
     if (ownership?.volumes) {
       for (const v of ownership.volumes) {
         if (!map.has(v.volume)) map.set(v.volume, []);
+      }
+    }
+    if (reconciliation?.ownedVolumes) {
+      for (const v of reconciliation.ownedVolumes) {
+        if (!map.has(v)) map.set(v, []);
+      }
+    }
+    if (reconciliation?.missingVolumes) {
+      for (const v of reconciliation.missingVolumes) {
+        if (!map.has(v)) map.set(v, []);
+      }
+    }
+    if (reconciliation?.totalOfficialVolumes) {
+      for (let i = 1; i <= reconciliation.totalOfficialVolumes; i++) {
+        if (!map.has(i)) map.set(i, []);
+      }
+    }
+    if (libraryState?.releasedVolumes) {
+      for (const v of libraryState.releasedVolumes) {
+        if (!map.has(v)) map.set(v, []);
+      }
+    }
+    if (libraryState?.ownedVolumes) {
+      for (const v of libraryState.ownedVolumes) {
+        if (!map.has(v)) map.set(v, []);
       }
     }
     if (missingContent?.missingVolumes) {

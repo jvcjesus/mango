@@ -1201,6 +1201,12 @@ async fn get_manga_library_state(
     Me(app): Me,
     Path(id): Path<i64>,
 ) -> Result<Json<crate::sync::reconciliation::CanonicalLibraryReleasesSummary>> {
+    let title_view = app.titles.get(id).await?;
+    let ownership = app
+        .pipeline
+        .ownership
+        .get_title_ownership(id, &title_view.title)
+        .await;
     let ot_schedule = if app.opentome.is_enabled().await {
         app.opentome.get_series_schedule(id).await.ok().flatten()
     } else {
@@ -1210,12 +1216,13 @@ async fn get_manga_library_state(
     let summary = app
         .db
         .call(move |conn| {
-            crate::sync::reconciliation::resolve_canonical_library_state(
+            crate::sync::reconciliation::resolve_canonical_library_state_with_ownership(
                 conn,
                 id,
                 ot_schedule.as_ref(),
                 "en",
                 &today,
+                Some(&ownership),
             )
         })
         .await?;
@@ -1266,9 +1273,21 @@ async fn get_manga_volumes_manager(
     Me(app): Me,
     Path(id): Path<i64>,
 ) -> Result<Json<crate::acquisition::volume_manager::VolumeManagerSummary>> {
+    let title_view = app.titles.get(id).await?;
+    let ownership = app
+        .pipeline
+        .ownership
+        .get_title_ownership(id, &title_view.title)
+        .await;
     let res = app
         .db
-        .call(move |conn| crate::acquisition::volume_manager::get_volume_manager_summary(conn, id))
+        .call(move |conn| {
+            crate::acquisition::volume_manager::get_volume_manager_summary_with_ownership(
+                conn,
+                id,
+                Some(&ownership),
+            )
+        })
         .await?;
     Ok(Json(res))
 }
@@ -1278,11 +1297,23 @@ async fn post_manga_volumes_manager_plan(
     Path(id): Path<i64>,
     Json(payload): Json<crate::acquisition::volume_manager::VolumeManagerBatchPlanRequest>,
 ) -> Result<Json<crate::acquisition::volume_manager::VolumeManagerBatchPlanResponse>> {
+    let title_view = app.titles.get(id).await?;
+    let ownership = app
+        .pipeline
+        .ownership
+        .get_title_ownership(id, &title_view.title)
+        .await;
     let profile = app.acquisition.get_manga_profile(id).await.unwrap_or_default();
     let res = app
         .db
         .call(move |conn| {
-            crate::acquisition::volume_manager::plan_volume_manager_batch(conn, id, &payload, &profile)
+            crate::acquisition::volume_manager::plan_volume_manager_batch(
+                conn,
+                id,
+                &payload,
+                &profile,
+                Some(&ownership),
+            )
         })
         .await?;
     Ok(Json(res))

@@ -30,8 +30,11 @@
   let loading = $state(true);
   let error = $state<string | null>(null);
   let viewMode = $state<'grid' | 'list'>('grid');
-  let filter = $state<'all' | 'missing' | 'candidates' | 'owned'>('all');
+  let filter = $state<'all' | 'missing' | 'candidates' | 'owned' | 'upcoming'>('all');
   let selectedVolumes = $state<Set<number>>(new Set());
+
+  // Volume Details inspection modal state
+  let inspectingVolume = $state<VolumeManagerEntry | null>(null);
 
   // Batch plan modal state
   let showPlanModal = $state(false);
@@ -64,6 +67,8 @@
         return summary.volumes.filter((v) => v.candidateCount > 0 && !v.isOwned);
       case 'owned':
         return summary.volumes.filter((v) => v.isOwned);
+      case 'upcoming':
+        return summary.volumes.filter((v) => v.displayStatus === 'unreleased');
       default:
         return summary.volumes;
     }
@@ -292,6 +297,15 @@
         >
           Owned ({summary.ownedCount})
         </button>
+        {#if summary.unreleasedCount > 0}
+          <button
+            class="btn pill sm"
+            class:spot={filter === 'upcoming'}
+            onclick={() => (filter = 'upcoming')}
+          >
+            Upcoming ({summary.unreleasedCount})
+          </button>
+        {/if}
       </div>
 
       <!-- Multi-Selection Tools -->
@@ -331,16 +345,18 @@
             class:is-owned={vol.isOwned}
             class:is-selected={isSelected}
             class:has-candidate={vol.candidateCount > 0 && !vol.isOwned}
-            onclick={() => toggleVolumeSelection(vol.volumeNumber)}
+            onclick={() => (inspectingVolume = vol)}
           >
             <div class="card-top-row">
               <label class="card-checkbox">
                 <input
                   type="checkbox"
                   checked={isSelected}
+                  disabled={vol.isOwned}
                   onclick={(e) => e.stopPropagation()}
-                  onchange={() => toggleVolumeSelection(vol.volumeNumber)}
+                  onchange={() => !vol.isOwned && toggleVolumeSelection(vol.volumeNumber)}
                   aria-label={`Select ${vol.label}`}
+                  title={vol.isOwned ? 'Volume already owned in Komga' : `Select ${vol.label}`}
                 />
               </label>
               <span class="card-vol-num">{vol.label}</span>
@@ -352,15 +368,20 @@
             <div class="card-body">
               <p class="card-status-label">{vol.statusLabel}</p>
 
-              {#if vol.topCandidateTitle}
+              {#if vol.isOwned}
+                <div class="card-storage-box">
+                  <span class="storage-tag">KOMGA VERIFIED</span>
+                  {#if vol.komgaBookName}
+                    <span class="storage-filename" title={vol.komgaBookName}>{vol.komgaBookName}</span>
+                  {:else if vol.canonicalPath}
+                    <span class="storage-filename" title={vol.canonicalPath}>{vol.canonicalPath.split('/').pop()}</span>
+                  {/if}
+                </div>
+              {:else if vol.topCandidateTitle}
                 <div class="card-candidate-box">
                   <span class="cand-provider-tag {vol.topProvider || ''}">{vol.topProvider?.toUpperCase() || 'RELEASE'}</span>
                   <span class="cand-score">{Math.round(vol.topCandidateScore || 0)}% match</span>
                 </div>
-              {:else if vol.isOwned && vol.canonicalPath}
-                <span class="card-storage-info" title={vol.canonicalPath}>
-                  Canonical CBZ: {vol.fileSizeBytes ? formatBytes(vol.fileSizeBytes) : 'Owned'}
-                </span>
               {:else if vol.releaseDate}
                 <span class="card-release-date">Release: {vol.releaseDate}</span>
               {/if}
@@ -374,7 +395,7 @@
                   title="Inspect and compare discovered candidates"
                 >
                   <Icon name="search" size={14} />
-                  {vol.candidateCount} candidate{vol.candidateCount === 1 ? '' : 's'}
+                  {vol.candidateCount} cand.
                 </button>
               {:else if !vol.isOwned}
                 <button
@@ -383,13 +404,21 @@
                   title="Search for candidates"
                 >
                   <Icon name="search" size={14} />
-                  Find Releases
+                  Find
                 </button>
               {:else}
-                <span class="owned-verified-check" title="Verified in Komga">
-                  <Icon name="check" size={14} /> Komga Verified
+                <span class="owned-verified-check" title="Verified in Komga canonical storage">
+                  <Icon name="check" size={14} /> Owned
                 </span>
               {/if}
+              <button
+                class="btn sm subtle icon-btn"
+                onclick={() => (inspectingVolume = vol)}
+                title="View volume details"
+                aria-label="View volume details"
+              >
+                <Icon name="info" size={14} />
+              </button>
             </div>
           </div>
         {/each}
@@ -403,16 +432,16 @@
               <th class="th-check">
                 <input
                   type="checkbox"
-                  checked={selectedVolumes.size > 0 && selectedVolumes.size === filteredVolumes.length}
-                  indeterminate={selectedVolumes.size > 0 && selectedVolumes.size < filteredVolumes.length}
+                  checked={selectedVolumes.size > 0 && selectedVolumes.size === filteredVolumes.filter((v) => !v.isOwned).length}
+                  indeterminate={selectedVolumes.size > 0 && selectedVolumes.size < filteredVolumes.filter((v) => !v.isOwned).length}
                   onchange={(e) => {
                     if (e.currentTarget.checked) {
-                      selectedVolumes = new Set(filteredVolumes.map((v) => v.volumeNumber));
+                      selectedVolumes = new Set(filteredVolumes.filter((v) => !v.isOwned).map((v) => v.volumeNumber));
                     } else {
                       clearSelection();
                     }
                   }}
-                  aria-label="Select all displayed volumes"
+                  aria-label="Select all unowned volumes"
                 />
               </th>
               <th>Volume</th>
@@ -431,8 +460,10 @@
                   <input
                     type="checkbox"
                     checked={isSelected}
-                    onchange={() => toggleVolumeSelection(vol.volumeNumber)}
+                    disabled={vol.isOwned}
+                    onchange={() => !vol.isOwned && toggleVolumeSelection(vol.volumeNumber)}
                     aria-label={`Select ${vol.label}`}
+                    title={vol.isOwned ? 'Volume already owned in Komga' : `Select ${vol.label}`}
                   />
                 </td>
                 <td class="td-vol">
@@ -447,7 +478,9 @@
                   {#if vol.isOwned}
                     <div class="storage-meta">
                       <span class="storage-tag">KOMGA OWNED</span>
-                      {#if vol.canonicalPath}
+                      {#if vol.komgaBookName}
+                        <span class="file-path" title={vol.komgaBookName}>{vol.komgaBookName}</span>
+                      {:else if vol.canonicalPath}
                         <span class="file-path" title={vol.canonicalPath}>
                           {vol.canonicalPath.split('/').pop()}
                         </span>
@@ -475,13 +508,24 @@
                   <span class="muted">{vol.releaseDate || '—'}</span>
                 </td>
                 <td class="td-actions">
-                  <button
-                    class="btn sm pill"
-                    onclick={() => onInspectCandidate?.(vol.volumeNumber)}
-                    title="Inspect candidates for this volume"
-                  >
-                    <Icon name="search" size={14} /> Inspect
-                  </button>
+                  <div class="row-actions">
+                    {#if !vol.isOwned}
+                      <button
+                        class="btn sm pill"
+                        onclick={() => onInspectCandidate?.(vol.volumeNumber)}
+                        title="Inspect candidates for this volume"
+                      >
+                        <Icon name="search" size={14} /> Inspect
+                      </button>
+                    {/if}
+                    <button
+                      class="btn sm subtle"
+                      onclick={() => (inspectingVolume = vol)}
+                      title="View volume details"
+                    >
+                      <Icon name="info" size={14} /> Details
+                    </button>
+                  </div>
                 </td>
               </tr>
             {/each}
@@ -491,6 +535,167 @@
     {/if}
   {/if}
 </div>
+
+<!-- Volume Details Inspection Modal -->
+{#if inspectingVolume}
+  <!-- svelte-ignore a11y_click_events_have_key_events -->
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <div class="modal-backdrop" onclick={() => (inspectingVolume = null)}>
+    <!-- svelte-ignore a11y_click_events_have_key_events -->
+    <!-- svelte-ignore a11y_no_static_element_interactions -->
+    <div class="modal-card volume-details-modal" onclick={(e) => e.stopPropagation()}>
+      <div class="modal-header">
+        <div>
+          <div class="modal-title-row">
+            <h3 class="display">{inspectingVolume.label.toUpperCase()} DETAILS</h3>
+            <span class="card-badge {statusBadgeClass(inspectingVolume.displayStatus)}">
+              {inspectingVolume.isOwned ? 'OWNED IN KOMGA' : inspectingVolume.statusLabel.toUpperCase()}
+            </span>
+          </div>
+          <p class="modal-subtitle">{title} · {summary?.edition.toUpperCase() || 'STANDARD'} EDITION</p>
+        </div>
+        <button class="btn icon subtle" onclick={() => (inspectingVolume = null)} aria-label="Close modal">
+          <Icon name="close" size={18} />
+        </button>
+      </div>
+
+      <div class="modal-body">
+        <!-- Metadata & Release Info -->
+        <div class="details-section">
+          <h4 class="section-heading">Official Edition Metadata</h4>
+          <div class="details-grid">
+            <div class="detail-field">
+              <span class="detail-label">Volume Number</span>
+              <span class="detail-val">Volume {inspectingVolume.volumeNumber}</span>
+            </div>
+            <div class="detail-field">
+              <span class="detail-label">Release Date</span>
+              <span class="detail-val">{inspectingVolume.releaseDate || 'Not specified'}</span>
+            </div>
+            <div class="detail-field">
+              <span class="detail-label">Edition Authority</span>
+              <span class="detail-val">
+                {summary?.isAuthoritative ? 'Authoritative MangaBaka' : 'Uncertain Authority'}
+              </span>
+            </div>
+            <div class="detail-field">
+              <span class="detail-label">Release Status</span>
+              <span class="detail-val">{inspectingVolume.displayStatus.toUpperCase()}</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Komga Ownership / Storage Info -->
+        <div class="details-section">
+          <h4 class="section-heading">Komga Canonical Ownership</h4>
+          <div class="details-grid">
+            <div class="detail-field">
+              <span class="detail-label">Ownership Status</span>
+              <span class="detail-val">
+                {#if inspectingVolume.isOwned}
+                  <span class="owned-tag-solid"><Icon name="check" size={14} /> Owned in Komga</span>
+                {:else if inspectingVolume.publicationReceiptId}
+                  <span class="pending-tag">Publication Receipt Recorded (Scan Pending)</span>
+                {:else}
+                  <span class="missing-tag">Missing from Canonical Media</span>
+                {/if}
+              </span>
+            </div>
+            {#if inspectingVolume.komgaBookId}
+              <div class="detail-field">
+                <span class="detail-label">Komga Book ID</span>
+                <span class="detail-val font-mono">{inspectingVolume.komgaBookId}</span>
+              </div>
+            {/if}
+            {#if inspectingVolume.komgaBookName}
+              <div class="detail-field">
+                <span class="detail-label">Komga Book Name</span>
+                <span class="detail-val">{inspectingVolume.komgaBookName}</span>
+              </div>
+            {/if}
+            {#if summary?.komgaSeriesId}
+              <div class="detail-field">
+                <span class="detail-label">Komga Series ID</span>
+                <span class="detail-val font-mono">{summary.komgaSeriesId}</span>
+              </div>
+            {/if}
+            {#if inspectingVolume.canonicalPath}
+              <div class="detail-field full-width">
+                <span class="detail-label">Canonical Path</span>
+                <span class="detail-val font-mono path-val">{inspectingVolume.canonicalPath}</span>
+              </div>
+            {/if}
+            {#if inspectingVolume.fileSizeBytes}
+              <div class="detail-field">
+                <span class="detail-label">Archive File Size</span>
+                <span class="detail-val">{formatBytes(inspectingVolume.fileSizeBytes)}</span>
+              </div>
+            {/if}
+          </div>
+        </div>
+
+        <!-- Discovered Candidates & Acquisition Intelligence -->
+        <div class="details-section">
+          <h4 class="section-heading">Acquisition Candidates &amp; Releases</h4>
+          {#if inspectingVolume.candidateCount > 0}
+            <div class="candidate-highlight-box">
+              <div class="cand-top-info">
+                <span class="cand-provider-tag {inspectingVolume.topProvider || ''}">
+                  {inspectingVolume.topProvider?.toUpperCase() || 'RELEASE'}
+                </span>
+                <span class="cand-score-pill">
+                  {Math.round(inspectingVolume.topCandidateScore || 0)}% Quality Match
+                </span>
+                <span class="cand-count-badge">
+                  {inspectingVolume.candidateCount} candidate{inspectingVolume.candidateCount === 1 ? '' : 's'} available
+                </span>
+              </div>
+              {#if inspectingVolume.topCandidateTitle}
+                <p class="cand-title-full">{inspectingVolume.topCandidateTitle}</p>
+              {/if}
+            </div>
+          {:else if inspectingVolume.isOwned}
+            <p class="section-empty-msg">This volume is already physically owned and verified in Komga canonical storage.</p>
+          {:else}
+            <p class="section-empty-msg">No verified release candidates currently discovered for Volume {inspectingVolume.volumeNumber}.</p>
+          {/if}
+        </div>
+      </div>
+
+      <div class="modal-footer">
+        <div class="modal-buttons-left">
+          {#if !inspectingVolume.isOwned}
+            <button
+              class="btn subtle"
+              onclick={() => toggleVolumeSelection(inspectingVolume!.volumeNumber)}
+            >
+              <Icon name="check" size={14} />
+              {selectedVolumes.has(inspectingVolume.volumeNumber) ? 'Remove from Selection' : 'Select for Acquisition'}
+            </button>
+          {/if}
+        </div>
+        <div class="modal-buttons">
+          {#if !inspectingVolume.isOwned}
+            <button
+              class="btn spot"
+              onclick={() => {
+                const volNum = inspectingVolume!.volumeNumber;
+                inspectingVolume = null;
+                onInspectCandidate?.(volNum);
+              }}
+            >
+              <Icon name="search" size={14} />
+              {inspectingVolume.candidateCount > 0 ? 'Inspect Candidates' : 'Find Releases'}
+            </button>
+          {/if}
+          <button class="btn subtle" onclick={() => (inspectingVolume = null)}>
+            Close
+          </button>
+        </div>
+      </div>
+    </div>
+  </div>
+{/if}
 
 <!-- Batch Acquisition Planning Preview Modal -->
 {#if showPlanModal}
@@ -616,8 +821,8 @@
     margin-top: 2rem;
     padding: 1.5rem;
     background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 8px;
+    border: 2px solid var(--ink);
+    box-shadow: var(--sh-4);
   }
 
   .vm-header {
@@ -663,14 +868,18 @@
 
   .view-toggle {
     display: inline-flex;
-    border: 1px solid var(--border);
-    border-radius: 6px;
+    border: 2px solid var(--ink);
     overflow: hidden;
   }
 
   .view-toggle .btn {
     border-radius: 0;
     border: none;
+    border-right: 1px solid var(--border);
+  }
+
+  .view-toggle .btn:last-child {
+    border-right: none;
   }
 
   .vm-alert {
@@ -678,31 +887,30 @@
     align-items: flex-start;
     gap: 0.75rem;
     padding: 0.85rem 1rem;
-    border-radius: 6px;
+    border-radius: 4px;
     margin-bottom: 1rem;
     font-size: 0.9rem;
   }
 
   .vm-alert.warn {
     background: rgba(239, 68, 68, 0.1);
-    border: 1px solid rgba(239, 68, 68, 0.3);
-    color: #ef4444;
+    border: 1.5px solid rgba(239, 68, 68, 0.5);
+    color: #991b1b;
   }
 
   .vm-alert.edition-warning {
-    background: rgba(245, 158, 11, 0.1);
-    border: 1px solid rgba(245, 158, 11, 0.4);
-    color: #f59e0b;
+    background: rgba(245, 158, 11, 0.12);
+    border: 1.5px solid rgba(245, 158, 11, 0.6);
+    color: #92400e;
   }
 
   .vm-stats-bar {
     display: flex;
     align-items: center;
     gap: 1.25rem;
-    background: var(--surface-alt, rgba(0, 0, 0, 0.05));
-    border: 1px solid var(--border);
+    background: var(--surface);
+    border: 2px solid var(--ink);
     padding: 0.75rem 1.25rem;
-    border-radius: 6px;
     margin-bottom: 1.25rem;
     overflow-x: auto;
   }
@@ -716,7 +924,8 @@
 
   .stat-value {
     font-size: 1.25rem;
-    font-weight: 700;
+    font-weight: 900;
+    color: var(--ink);
   }
 
   .stat-label {
@@ -724,12 +933,14 @@
     text-transform: uppercase;
     color: var(--muted);
     letter-spacing: 0.05em;
+    font-weight: 700;
   }
 
   .stat-divider {
-    width: 1px;
+    width: 2px;
     height: 1.75rem;
-    background: var(--border);
+    background: var(--ink);
+    opacity: 0.2;
   }
 
   .vm-controls-bar {
@@ -757,35 +968,35 @@
   /* Compact Grid View */
   .vm-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(170px, 1fr));
-    gap: 0.75rem;
+    grid-template-columns: repeat(auto-fill, minmax(190px, 1fr));
+    gap: 0.85rem;
   }
 
   .vm-card {
-    background: var(--surface-raised, rgba(255, 255, 255, 0.03));
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 0.75rem;
+    background: var(--surface);
+    border: 2px solid var(--ink);
+    box-shadow: var(--sh-3);
+    padding: 0.85rem;
     cursor: pointer;
-    transition: transform 0.15s, border-color 0.15s, background 0.15s;
+    transition: transform 0.1s, box-shadow 0.1s;
     display: flex;
     flex-direction: column;
     justify-content: space-between;
-    min-height: 130px;
+    min-height: 140px;
   }
 
   .vm-card:hover {
-    border-color: var(--accent);
+    transform: translate(-1px, -1px);
+    box-shadow: var(--sh-4);
   }
 
   .vm-card.is-selected {
-    border-color: var(--accent);
-    background: rgba(var(--accent-rgb, 255, 225, 53), 0.08);
+    background: color-mix(in srgb, var(--spot) 16%, var(--surface));
+    outline: 2px solid var(--spot);
   }
 
   .vm-card.is-owned {
-    border-color: rgba(34, 197, 94, 0.4);
-    background: rgba(34, 197, 94, 0.04);
+    border-color: var(--ink);
   }
 
   .card-top-row {
@@ -796,55 +1007,62 @@
   }
 
   .card-vol-num {
-    font-weight: 700;
+    font-weight: 800;
     font-size: 0.95rem;
     flex: 1;
     margin-left: 0.35rem;
+    color: var(--ink);
   }
 
   .card-badge {
     font-size: 0.65rem;
-    font-weight: 700;
-    padding: 0.15rem 0.4rem;
-    border-radius: 3px;
+    font-weight: 800;
+    padding: 0.15rem 0.45rem;
+    border-radius: 999px;
     text-transform: uppercase;
-    letter-spacing: 0.04em;
+    letter-spacing: 0.05em;
   }
 
   .badge-owned {
-    background: rgba(34, 197, 94, 0.2);
-    color: #22c55e;
-    border: 1px solid rgba(34, 197, 94, 0.3);
+    background: #dcfce7;
+    color: #166534;
+    border: 1.5px solid #166534;
   }
 
   .badge-published {
-    background: rgba(168, 85, 247, 0.2);
-    color: #a855f7;
-    border: 1px solid rgba(168, 85, 247, 0.3);
+    background: #f3e8ff;
+    color: #6b21a8;
+    border: 1.5px solid #6b21a8;
   }
 
   .badge-downloading {
-    background: rgba(234, 179, 8, 0.2);
-    color: #eab308;
-    border: 1px solid rgba(234, 179, 8, 0.3);
+    background: #fef3c7;
+    color: #92400e;
+    border: 1.5px solid #92400e;
   }
 
   .badge-candidate {
-    background: rgba(6, 182, 212, 0.2);
-    color: #06b6d4;
-    border: 1px solid rgba(6, 182, 212, 0.3);
+    background: #e0f2fe;
+    color: #0369a1;
+    border: 1.5px solid #0369a1;
   }
 
   .badge-missing {
-    background: rgba(239, 68, 68, 0.15);
-    color: #ef4444;
-    border: 1px solid rgba(239, 68, 68, 0.3);
+    background: #fee2e2;
+    color: #991b1b;
+    border: 1.5px solid #991b1b;
   }
 
   .badge-unreleased {
-    background: rgba(148, 163, 184, 0.15);
-    color: #94a3b8;
-    border: 1px solid rgba(148, 163, 184, 0.25);
+    background: #f1f5f9;
+    color: #475569;
+    border: 1.5px solid #475569;
+  }
+
+  .badge-neutral {
+    background: #f1f5f9;
+    color: #334155;
+    border: 1.5px solid #334155;
   }
 
   .card-body {
@@ -855,7 +1073,31 @@
   .card-status-label {
     margin: 0 0 0.35rem 0;
     font-size: 0.8rem;
-    color: var(--fg);
+    font-weight: 600;
+    color: var(--ink);
+  }
+
+  .card-storage-box {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+    font-size: 0.75rem;
+  }
+
+  .storage-tag {
+    font-size: 0.65rem;
+    font-weight: 800;
+    color: #166534;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+
+  .storage-filename {
+    color: var(--muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 100%;
   }
 
   .card-candidate-box {
@@ -867,24 +1109,26 @@
 
   .cand-provider-tag {
     font-size: 0.65rem;
-    font-weight: 700;
-    padding: 0.1rem 0.35rem;
+    font-weight: 800;
+    padding: 0.1rem 0.4rem;
     border-radius: 3px;
-    background: #0ea5e9;
-    color: #fff;
+    background: var(--ink);
+    color: var(--paper);
   }
 
   .cand-provider-tag.madokami {
     background: #ec4899;
+    color: #fff;
   }
 
   .cand-provider-tag.nyaa {
-    background: #3b82f6;
+    background: #2563eb;
+    color: #fff;
   }
 
-  .card-storage-info {
-    font-size: 0.75rem;
-    color: var(--muted);
+  .cand-score {
+    font-weight: 700;
+    color: var(--ink);
   }
 
   .card-release-date {
@@ -893,12 +1137,20 @@
   }
 
   .card-actions {
-    margin-top: 0.25rem;
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    margin-top: 0.5rem;
   }
 
   .cand-btn {
-    width: 100%;
+    flex: 1;
+    font-size: 0.75rem;
     justify-content: center;
+  }
+
+  .icon-btn {
+    padding: 0 0.5rem;
   }
 
   .owned-verified-check {
@@ -906,18 +1158,28 @@
     align-items: center;
     gap: 0.25rem;
     font-size: 0.75rem;
-    color: #22c55e;
+    font-weight: 700;
+    color: #166534;
+    flex: 1;
+  }
+
+  .row-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
   }
 
   /* List Table View */
   .vm-list-wrap {
     overflow-x: auto;
+    border: 2px solid var(--ink);
   }
 
   .vm-table {
     width: 100%;
     border-collapse: collapse;
     font-size: 0.85rem;
+    background: var(--surface);
   }
 
   .vm-table th,
@@ -928,26 +1190,28 @@
   }
 
   .vm-table th {
-    background: var(--surface-alt, rgba(0, 0, 0, 0.03));
+    background: var(--paper);
     font-size: 0.75rem;
     text-transform: uppercase;
-    letter-spacing: 0.04em;
-    color: var(--muted);
+    letter-spacing: 0.05em;
+    font-weight: 800;
+    color: var(--ink);
+    border-bottom: 2px solid var(--ink);
   }
 
   .vm-table tr:hover {
-    background: var(--surface-raised, rgba(255, 255, 255, 0.02));
+    background: color-mix(in srgb, var(--paper) 50%, var(--surface));
   }
 
   .vm-table tr.row-selected {
-    background: rgba(var(--accent-rgb, 255, 225, 53), 0.06);
+    background: color-mix(in srgb, var(--spot) 12%, var(--surface));
   }
 
-  /* Batch Modal Styles */
+  /* Modals: Details & Batch */
   .modal-backdrop {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.75);
+    background: rgba(0, 0, 0, 0.7);
     display: flex;
     align-items: center;
     justify-content: center;
@@ -957,14 +1221,17 @@
 
   .modal-card {
     background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: 8px;
+    border: 2px solid var(--ink);
+    box-shadow: var(--sh-5);
     max-width: 800px;
     width: 100%;
     max-height: 90vh;
     display: flex;
     flex-direction: column;
-    box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.5);
+  }
+
+  .volume-details-modal {
+    max-width: 680px;
   }
 
   .modal-header {
@@ -972,12 +1239,21 @@
     justify-content: space-between;
     align-items: flex-start;
     padding: 1.25rem 1.5rem;
-    border-bottom: 1px solid var(--border);
+    border-bottom: 2px solid var(--ink);
+    background: var(--paper);
+  }
+
+  .modal-title-row {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    flex-wrap: wrap;
   }
 
   .modal-subtitle {
     margin: 0.25rem 0 0 0;
     font-size: 0.85rem;
+    font-weight: 600;
     color: var(--muted);
   }
 
@@ -987,17 +1263,163 @@
     flex: 1;
   }
 
+  .details-section {
+    margin-bottom: 1.25rem;
+    padding-bottom: 1rem;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .details-section:last-child {
+    margin-bottom: 0;
+    padding-bottom: 0;
+    border-bottom: none;
+  }
+
+  .section-heading {
+    font-size: 0.8rem;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+    margin: 0 0 0.75rem 0;
+  }
+
+  .details-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 0.75rem 1.25rem;
+  }
+
+  .detail-field {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+  }
+
+  .detail-field.full-width {
+    grid-column: 1 / -1;
+  }
+
+  .detail-label {
+    font-size: 0.75rem;
+    font-weight: 700;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+  }
+
+  .detail-val {
+    font-size: 0.85rem;
+    font-weight: 700;
+    color: var(--ink);
+  }
+
+  .font-mono {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    font-size: 0.8rem;
+  }
+
+  .path-val {
+    word-break: break-all;
+    background: var(--paper);
+    padding: 0.35rem 0.5rem;
+    border: 1px solid var(--ink);
+  }
+
+  .owned-tag-solid {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    color: #166534;
+    background: #dcfce7;
+    border: 1.5px solid #166534;
+    padding: 0.15rem 0.5rem;
+    border-radius: 999px;
+    font-size: 0.75rem;
+    font-weight: 800;
+  }
+
+  .pending-tag {
+    color: #6b21a8;
+    background: #f3e8ff;
+    border: 1.5px solid #6b21a8;
+    padding: 0.15rem 0.5rem;
+    border-radius: 999px;
+    font-size: 0.75rem;
+    font-weight: 800;
+  }
+
+  .missing-tag {
+    color: #991b1b;
+    background: #fee2e2;
+    border: 1.5px solid #991b1b;
+    padding: 0.15rem 0.5rem;
+    border-radius: 999px;
+    font-size: 0.75rem;
+    font-weight: 800;
+  }
+
+  .candidate-highlight-box {
+    background: var(--paper);
+    border: 2px solid var(--ink);
+    padding: 0.85rem;
+  }
+
+  .cand-top-info {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+    margin-bottom: 0.5rem;
+  }
+
+  .cand-score-pill {
+    font-size: 0.75rem;
+    font-weight: 800;
+    color: #0369a1;
+    background: #e0f2fe;
+    border: 1px solid #0369a1;
+    padding: 0.1rem 0.45rem;
+    border-radius: 999px;
+  }
+
+  .cand-count-badge {
+    font-size: 0.75rem;
+    font-weight: 700;
+    color: var(--muted);
+  }
+
+  .cand-title-full {
+    font-size: 0.85rem;
+    font-weight: 700;
+    color: var(--ink);
+    margin: 0;
+    word-break: break-word;
+  }
+
+  .section-empty-msg {
+    font-size: 0.85rem;
+    color: var(--muted);
+    font-weight: 600;
+    margin: 0;
+  }
+
+  .modal-buttons-left {
+    display: flex;
+    gap: 0.5rem;
+  }
+
   .dry-run-banner {
     display: flex;
     align-items: center;
     gap: 0.5rem;
     background: rgba(59, 130, 246, 0.1);
-    border: 1px solid rgba(59, 130, 246, 0.3);
-    color: #60a5fa;
+    border: 1.5px solid rgba(59, 130, 246, 0.5);
+    color: #1d4ed8;
     padding: 0.65rem 0.85rem;
-    border-radius: 6px;
+    border-radius: 4px;
     font-size: 0.85rem;
-    font-weight: 600;
+    font-weight: 700;
     margin-bottom: 1rem;
   }
 
@@ -1009,36 +1431,37 @@
   }
 
   .metric {
-    background: var(--surface-alt, rgba(0, 0, 0, 0.05));
-    border: 1px solid var(--border);
+    background: var(--paper);
+    border: 2px solid var(--ink);
     padding: 0.75rem;
-    border-radius: 6px;
     text-align: center;
   }
 
   .metric-val {
     display: block;
     font-size: 1.25rem;
-    font-weight: 700;
+    font-weight: 900;
+    color: var(--ink);
   }
 
   .metric-label {
     font-size: 0.75rem;
     color: var(--muted);
     text-transform: uppercase;
+    font-weight: 700;
   }
 
   .plan-items-table-wrap {
     max-height: 320px;
     overflow-y: auto;
-    border: 1px solid var(--border);
-    border-radius: 6px;
+    border: 2px solid var(--ink);
   }
 
   .plan-table {
     width: 100%;
     border-collapse: collapse;
     font-size: 0.8rem;
+    background: var(--surface);
   }
 
   .plan-table th,
@@ -1048,29 +1471,38 @@
     text-align: left;
   }
 
+  .plan-table th {
+    background: var(--paper);
+    font-weight: 800;
+    border-bottom: 2px solid var(--ink);
+  }
+
   .plan-status-badge {
     font-size: 0.7rem;
-    font-weight: 700;
-    padding: 0.15rem 0.4rem;
-    border-radius: 3px;
+    font-weight: 800;
+    padding: 0.15rem 0.45rem;
+    border-radius: 999px;
+    text-transform: uppercase;
   }
 
   .plan-status-badge.eligible {
-    background: rgba(34, 197, 94, 0.2);
-    color: #22c55e;
+    background: #dcfce7;
+    color: #166534;
+    border: 1.5px solid #166534;
   }
 
   .plan-status-badge.blocked {
-    background: rgba(239, 68, 68, 0.15);
-    color: #ef4444;
+    background: #fee2e2;
+    color: #991b1b;
+    border: 1.5px solid #991b1b;
   }
 
   .backend-tag {
     font-size: 0.75rem;
-    background: var(--surface-raised, rgba(255, 255, 255, 0.05));
+    font-weight: 700;
+    background: var(--paper);
     padding: 0.15rem 0.4rem;
-    border-radius: 3px;
-    border: 1px solid var(--border);
+    border: 1px solid var(--ink);
   }
 
   .modal-footer {
@@ -1078,8 +1510,8 @@
     justify-content: space-between;
     align-items: center;
     padding: 1rem 1.5rem;
-    border-top: 1px solid var(--border);
-    background: var(--surface-alt, rgba(0, 0, 0, 0.02));
+    border-top: 2px solid var(--ink);
+    background: var(--paper);
   }
 
   .modal-buttons {

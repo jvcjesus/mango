@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::acquisition::profiles::AcquisitionProfile;
 use crate::db::now;
 use crate::error::{AppError, Result};
+use crate::pipeline::ownership::{OwnershipStatus, TitleOwnership};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -51,6 +52,10 @@ pub struct VolumeManagerEntry {
     pub uncertainty_reason: Option<String>,
     pub display_status: String, // "owned", "published", "downloading", "candidate_available", "missing_released", "unreleased", "uncertain"
     pub status_label: String,
+    #[serde(default)]
+    pub komga_book_id: Option<String>,
+    #[serde(default)]
+    pub komga_book_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -58,6 +63,8 @@ pub struct VolumeManagerEntry {
 pub struct VolumeManagerSummary {
     pub manga_id: i64,
     pub series_id: String,
+    #[serde(default)]
+    pub komga_series_id: Option<String>,
     pub title: String,
     pub mangabaka_id: Option<i64>,
     pub edition: String,
@@ -137,6 +144,15 @@ pub fn get_volume_manager_summary(
     conn: &Connection,
     manga_id: i64,
 ) -> Result<VolumeManagerSummary> {
+    get_volume_manager_summary_with_ownership(conn, manga_id, None)
+}
+
+/// Retrieves comprehensive Volume Manager state with optional real-time Komga ownership.
+pub fn get_volume_manager_summary_with_ownership(
+    conn: &Connection,
+    manga_id: i64,
+    ownership_opt: Option<&TitleOwnership>,
+) -> Result<VolumeManagerSummary> {
     // 1. Fetch title record
     let manga_row: Option<(String, i64, Option<i64>, Option<i64>, Option<i64>)> = conn
         .query_row(
@@ -171,11 +187,12 @@ pub fn get_volume_manager_summary(
         Option<String>,
         Option<String>,
         Option<String>,
+        Option<String>,
     )> = conn
         .query_row(
             "SELECT series_id, mangabaka_id, collection_id, edition, status,
                     total_official_volumes, owned_volumes_json, missing_volumes_json,
-                    future_volumes_json, review_reason
+                    future_volumes_json, review_reason, komga_series_id
              FROM series_reconciliations
              WHERE manga_id = ?1 OR manga_id = ?2 OR (title = ?3 AND ?3 != '')
              ORDER BY (manga_id = ?1) DESC, (manga_id = ?2) DESC, updated_at DESC
@@ -193,6 +210,7 @@ pub fn get_volume_manager_summary(
                     r.get(7)?,
                     r.get(8)?,
                     r.get(9)?,
+                    r.get(10)?,
                 ))
             },
         )
@@ -209,8 +227,9 @@ pub fn get_volume_manager_summary(
         missing_vols_json,
         future_vols_json,
         review_reason,
+        recon_komga_id,
     ) = match recon_row {
-        Some((sid, mb, col, ed, st, tot, own, mis, fut, rev)) => (
+        Some((sid, mb, col, ed, st, tot, own, mis, fut, rev, kid)) => (
             sid,
             mb,
             col,
@@ -221,6 +240,7 @@ pub fn get_volume_manager_summary(
             mis,
             fut,
             rev,
+            kid,
         ),
         None => (
             format!("manga:{effective_catalog_id}"),
@@ -233,8 +253,13 @@ pub fn get_volume_manager_summary(
             None,
             None,
             None,
+            None,
         ),
     };
+
+    let komga_series_id = ownership_opt
+        .and_then(|o| o.series_id.clone())
+        .or(recon_komga_id);
 
     let mb_series_id = recon_mb_id.or(manga_mb_id);
 
@@ -259,6 +284,17 @@ pub fn get_volume_manager_summary(
     let owned_list = parse_json_f64_list(owned_vols_json.as_deref());
     let missing_list = parse_json_f64_list(missing_vols_json.as_deref());
     let future_list = parse_json_f64_list(future_vols_json.as_deref());
+
+    // Build Komga ownership map if ownership is provided
+    let mut komga_ownership_map: HashMap<i64, (Option<String>, Option<String>)> = HashMap::new();
+    if let Some(ownership) = ownership_opt {
+        for vo in &ownership.volumes {
+            if vo.status == OwnershipStatus::Owned {
+                let k = (vo.volume * 1000.0).round() as i64;
+                komga_ownership_map.insert(k, (vo.book_id.clone(), vo.book_name.clone()));
+            }
+        }
+    }
 
     // 3. MangaBaka series cache (cover, genres, summary)
     let cover_url: Option<String> = if let Some(mb_id) = mb_series_id {
@@ -292,6 +328,9 @@ pub fn get_volume_manager_summary(
     }
     for &v in &future_list {
         vol_set.insert((v * 1000.0).round() as i64);
+    }
+    for &k in komga_ownership_map.keys() {
+        vol_set.insert(k);
     }
 
     // Include any release targets recorded
@@ -551,7 +590,10 @@ pub fn get_volume_manager_summary(
         // Ownership
         let in_owned_list = owned_list.iter().any(|&ov| (ov - vol_num).abs() < 0.001);
         let receipt_verified = receipt.map(|r| r.verified_ownership).unwrap_or(false);
-        let is_owned = in_owned_list || receipt_verified;
+        let komga_entry = komga_ownership_map.get(&k);
+        let is_owned = in_owned_list || receipt_verified || komga_entry.is_some();
+        let komga_book_id = komga_entry.and_then(|(bid, _)| bid.clone());
+        let komga_book_name = komga_entry.and_then(|(_, bname)| bname.clone());
 
         // In progress
         let in_progress = active_job.is_some();
@@ -586,12 +628,37 @@ pub fn get_volume_manager_summary(
         let top_candidate_size = cand_info.and_then(|c| c.size_bytes);
         let last_discovery_at = disc.and_then(|d| d.last_discovered_at);
 
-        // Display status
-        let (display_status, status_label) = if is_owned {
+        // Counter calculations:
+        // Candidate availability is an attribute of missing released volumes, not a mutually exclusive state!
+        if is_owned {
             owned_count += 1;
+        } else {
+            if let Some(r) = receipt {
+                if !r.verified_ownership {
+                    published_count += 1;
+                }
+            }
+            if in_progress {
+                in_progress_count += 1;
+            }
+            if is_future {
+                unreleased_count += 1;
+            } else {
+                // Every released unowned volume is missing released
+                missing_released_count += 1;
+            }
+            if candidate_count > 0 {
+                candidate_available_count += 1;
+            }
+        }
+
+        // Display status & status label
+        let (display_status, status_label) = if is_owned {
             ("owned".to_string(), "Owned in Komga".to_string())
+        } else if in_progress {
+            let st = active_job.map(|j| j.stage.as_str()).unwrap_or("queued");
+            ("downloading".to_string(), format!("Acquiring · {st}"))
         } else if let Some(r) = receipt {
-            published_count += 1;
             (
                 "published".to_string(),
                 if r.verified_ownership {
@@ -600,25 +667,17 @@ pub fn get_volume_manager_summary(
                     "Published · Scan Pending".to_string()
                 },
             )
-        } else if in_progress {
-            in_progress_count += 1;
-            let st = active_job.map(|j| j.stage.as_str()).unwrap_or("queued");
-            ("downloading".to_string(), format!("Acquiring · {st}"))
         } else if candidate_count > 0 {
-            candidate_available_count += 1;
             let prov_display = top_provider.as_deref().unwrap_or("Verified");
             (
                 "candidate_available".to_string(),
                 format!("Missing · {prov_display} candidate available"),
             )
         } else if is_future {
-            unreleased_count += 1;
             ("unreleased".to_string(), "Unreleased / Upcoming".to_string())
         } else if !is_authoritative {
-            missing_released_count += 1;
             ("uncertain".to_string(), "Uncertain Authority".to_string())
         } else {
-            missing_released_count += 1;
             ("missing_released".to_string(), "Released · Missing".to_string())
         };
 
@@ -655,6 +714,8 @@ pub fn get_volume_manager_summary(
             uncertainty_reason: uncertainty_reason.clone(),
             display_status,
             status_label,
+            komga_book_id,
+            komga_book_name,
         });
     }
 
@@ -667,6 +728,7 @@ pub fn get_volume_manager_summary(
     Ok(VolumeManagerSummary {
         manga_id,
         series_id,
+        komga_series_id,
         title,
         mangabaka_id: mb_series_id,
         edition,
@@ -692,8 +754,9 @@ pub fn plan_volume_manager_batch(
     manga_id: i64,
     req: &VolumeManagerBatchPlanRequest,
     _profile: &AcquisitionProfile,
+    ownership_opt: Option<&TitleOwnership>,
 ) -> Result<VolumeManagerBatchPlanResponse> {
-    let summary = get_volume_manager_summary(conn, manga_id)?;
+    let summary = get_volume_manager_summary_with_ownership(conn, manga_id, ownership_opt)?;
 
     let is_dry_run = req.is_dry_run.unwrap_or(true);
     let mut items = Vec::new();
@@ -1121,7 +1184,7 @@ mod tests {
         assert_eq!(summary.volumes.len(), 45);
         assert_eq!(summary.owned_count, 0);
         assert_eq!(summary.candidate_available_count, 1);
-        assert_eq!(summary.missing_released_count, 44);
+        assert_eq!(summary.missing_released_count, 45);
         assert!(summary.is_authoritative);
 
         let v1 = &summary.volumes[0];
@@ -1179,7 +1242,7 @@ mod tests {
         };
 
         let profile = AcquisitionProfile::default();
-        let plan = plan_volume_manager_batch(&conn, 1092, &req, &profile).unwrap();
+        let plan = plan_volume_manager_batch(&conn, 1092, &req, &profile, None).unwrap();
 
         assert_eq!(plan.total_selected, 2);
         assert_eq!(plan.eligible_count, 1);
@@ -1229,8 +1292,135 @@ mod tests {
             is_dry_run: Some(true),
         };
         let profile = AcquisitionProfile::default();
-        let plan = plan_volume_manager_batch(&conn, 700, &req, &profile).unwrap();
+        let plan = plan_volume_manager_batch(&conn, 700, &req, &profile, None).unwrap();
         assert!(!plan.can_execute);
         assert!(plan.execution_blocked_reason.is_some());
+    }
+
+    #[test]
+    fn test_volume_manager_komga_ownership_overlay_and_batch_block() {
+        let conn = create_test_db();
+        conn.execute(
+            "INSERT INTO manga (id, title, source_id, mangabaka_id) VALUES (1092, 'Haikyu!!', 0, 8718)",
+            [],
+        ).unwrap();
+
+        let missing_json = serde_json::to_string(
+            &(1..=45).map(|v| v as f64).collect::<Vec<f64>>()
+        ).unwrap();
+
+        conn.execute(
+            "INSERT INTO series_reconciliations (
+                series_id, manga_id, mangabaka_id, collection_id, title, edition,
+                status, is_ongoing, total_official_volumes, owned_volumes_count,
+                missing_volumes_count, owned_volumes_json, missing_volumes_json,
+                future_volumes_json, last_reconciled_at, updated_at
+            ) VALUES (
+                'manga:1092', 1092, 8718, '019e1d1c-8b74-79d5-911a-a1997aa899a7',
+                'Haikyu!!', 'standard', 'missing_volume', 0, 45, 0, 45, '[]', ?1, '[]', 1000, 1000
+            )",
+            [&missing_json],
+        ).unwrap();
+
+        // Synthetic candidate for volume 3
+        conn.execute(
+            "INSERT INTO volume_discovery_status (
+                series_id, volume_number, last_discovered_at, status, candidate_count,
+                top_candidate_id, top_candidate_title, top_candidate_provider, top_candidate_score, providers_checked
+            ) VALUES (
+                'manga:1092', 3.0, 1000, 'candidates_found', 1, 'cand-3', 'Haikyu!! v03', 'madokami', 95.0, '[\"madokami\"]'
+            )",
+            [],
+        ).unwrap();
+
+        // Synthetic real-time Komga ownership overlay for volumes 1 and 2
+        let ownership = TitleOwnership {
+            komga_connected: true,
+            error: None,
+            active_error: None,
+            series_id: Some("0S4XY0P4ZM30Y".to_string()),
+            series_name: Some("Haikyu!!".to_string()),
+            library_id: Some("0RMWEXC3T10TY".to_string()),
+            library_name: Some("English Manga".to_string()),
+            volumes: vec![
+                crate::pipeline::ownership::VolumeOwnership {
+                    volume: 1.0,
+                    status: OwnershipStatus::Owned,
+                    book_id: Some("0S4XY0P4ZM30Z".to_string()),
+                    book_name: Some("Haikyu!! v01".to_string()),
+                    error: None,
+                },
+                crate::pipeline::ownership::VolumeOwnership {
+                    volume: 2.0,
+                    status: OwnershipStatus::Owned,
+                    book_id: Some("0S584GXYQMFBZ".to_string()),
+                    book_name: Some("Haikyu!! v02".to_string()),
+                    error: None,
+                },
+            ],
+            chapters: vec![],
+            summary: crate::pipeline::ownership::OwnershipSummary {
+                owned_volumes_count: 2,
+                total_source_volumes: Some(45),
+                owned_chapters_count: 0,
+                total_source_chapters: None,
+                unknown_books_count: 0,
+                source_release_type: "volume".to_string(),
+                authoritative_total_volumes: Some(45),
+                authoritative_total_chapters: None,
+                explanation: None,
+            },
+            last_refreshed: 1000,
+        };
+
+        let summary = get_volume_manager_summary_with_ownership(&conn, 1092, Some(&ownership)).unwrap();
+        assert_eq!(summary.owned_count, 2);
+        assert_eq!(summary.missing_released_count, 43);
+        assert_eq!(summary.candidate_available_count, 1);
+        assert_eq!(summary.komga_series_id.as_deref(), Some("0S4XY0P4ZM30Y"));
+
+        let v1 = &summary.volumes[0];
+        assert_eq!(v1.volume_number, 1.0);
+        assert!(v1.is_owned);
+        assert_eq!(v1.display_status, "owned");
+        assert_eq!(v1.komga_book_id.as_deref(), Some("0S4XY0P4ZM30Z"));
+        assert_eq!(v1.komga_book_name.as_deref(), Some("Haikyu!! v01"));
+
+        let v2 = &summary.volumes[1];
+        assert_eq!(v2.volume_number, 2.0);
+        assert!(v2.is_owned);
+        assert_eq!(v2.display_status, "owned");
+        assert_eq!(v2.komga_book_id.as_deref(), Some("0S584GXYQMFBZ"));
+
+        // Batch plan selecting Vol 1 (owned), Vol 2 (owned), and Vol 3 (missing with candidate)
+        let req = VolumeManagerBatchPlanRequest {
+            selected_volumes: vec![1.0, 2.0, 3.0],
+            profile_id: None,
+            is_dry_run: Some(true),
+        };
+        let profile = AcquisitionProfile::default();
+        let plan = plan_volume_manager_batch(&conn, 1092, &req, &profile, Some(&ownership)).unwrap();
+
+        assert_eq!(plan.total_selected, 3);
+        assert_eq!(plan.eligible_count, 1); // Only Vol 3 is eligible!
+        assert_eq!(plan.blocked_count, 2);  // Vol 1 and 2 are blocked because already owned!
+
+        let item1 = &plan.items[0];
+        assert_eq!(item1.volume_number, 1.0);
+        assert_eq!(item1.status, "ALREADY_OWNED");
+        assert!(!item1.is_eligible);
+        assert!(item1.is_owned);
+
+        let item2 = &plan.items[1];
+        assert_eq!(item2.volume_number, 2.0);
+        assert_eq!(item2.status, "ALREADY_OWNED");
+        assert!(!item2.is_eligible);
+        assert!(item2.is_owned);
+
+        let item3 = &plan.items[2];
+        assert_eq!(item3.volume_number, 3.0);
+        assert_eq!(item3.status, "ELIGIBLE");
+        assert!(item3.is_eligible);
+        assert!(!item3.is_owned);
     }
 }

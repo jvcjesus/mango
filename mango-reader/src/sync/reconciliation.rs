@@ -398,7 +398,29 @@ pub async fn reconcile_series(
         .call(move |conn| gather_local_owned_volumes(conn, m_id_opt))
         .await?;
 
-    if let (Some(kc), Some(ref k_id)) = (komga_client, &target.komga_series_id) {
+    let resolved_komga_id = if let Some(ref k_id) = target.komga_series_id {
+        Some(k_id.clone())
+    } else if let Some(kc) = komga_client {
+        // Search Komga series by title if komga_series_id was not explicitly supplied
+        if let Ok(candidates) = kc.search_series(&target.title, None).await {
+            let wanted_norm = crate::pipeline::mangabaka::normalize_title(&target.title);
+            let exact: Vec<_> = candidates
+                .into_iter()
+                .filter(|s| crate::pipeline::mangabaka::normalize_title(&s.name) == wanted_norm)
+                .collect();
+            if exact.len() == 1 {
+                Some(exact[0].id.clone())
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    if let (Some(kc), Some(ref k_id)) = (komga_client, &resolved_komga_id) {
         match kc.get_books_in_series(k_id).await {
             Ok(books) => {
                 for b in books {
@@ -1057,7 +1079,7 @@ pub async fn reconcile_series(
     let mut summary = ReconciliationSummary {
         series_id: series_id.clone(),
         manga_id: target.manga_id,
-        komga_series_id: target.komga_series_id.clone(),
+        komga_series_id: resolved_komga_id.clone(),
         mangabaka_id: Some(mb_series_id),
         collection_id: Some(collection_id),
         title: target.title.clone(),
@@ -1759,6 +1781,24 @@ pub fn resolve_canonical_library_state(
     target_market: &str,
     today_str: &str,
 ) -> Result<CanonicalLibraryReleasesSummary> {
+    resolve_canonical_library_state_with_ownership(
+        conn,
+        manga_id,
+        ot_schedule,
+        target_market,
+        today_str,
+        None,
+    )
+}
+
+pub fn resolve_canonical_library_state_with_ownership(
+    conn: &Connection,
+    manga_id: i64,
+    ot_schedule: Option<&OpenTomeSeriesSchedule>,
+    target_market: &str,
+    today_str: &str,
+    ownership_opt: Option<&crate::pipeline::ownership::TitleOwnership>,
+) -> Result<CanonicalLibraryReleasesSummary> {
     let (manga_title, manga_status): (String, i64) = conn
         .query_row(
             "SELECT title, status FROM manga WHERE id = ?1",
@@ -1777,6 +1817,15 @@ pub fn resolve_canonical_library_state(
         for &v in &r.owned_volumes {
             if !owned_volumes.iter().any(|&ov| (ov - v).abs() < 0.001) {
                 owned_volumes.push(v);
+            }
+        }
+    }
+    if let Some(ownership) = ownership_opt {
+        for vo in &ownership.volumes {
+            if vo.status == crate::pipeline::ownership::OwnershipStatus::Owned {
+                if !owned_volumes.iter().any(|&ov| (ov - vo.volume).abs() < 0.001) {
+                    owned_volumes.push(vo.volume);
+                }
             }
         }
     }
@@ -1897,6 +1946,15 @@ pub fn resolve_canonical_library_state(
     for &rt in &releases_today {
         if !released_volumes.iter().any(|&rv| (rv - rt).abs() < 0.001) {
             released_volumes.push(rt);
+        }
+    }
+
+    // Ensure all verified owned volumes are also recognized as released
+    for &v in &owned_volumes {
+        if !upcoming_volumes.iter().any(|&uv| (uv - v).abs() < 0.001) {
+            if !released_volumes.iter().any(|&rv| (rv - v).abs() < 0.001) {
+                released_volumes.push(v);
+            }
         }
     }
 

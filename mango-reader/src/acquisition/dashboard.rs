@@ -77,17 +77,18 @@ pub async fn get_dashboard_summary(
     let optimizer_status = crate::pipeline::duplicates::get_storage_optimizer_status(optimizer_bin).await;
 
     // 2. Database Aggregations
-    let (library, acquisition, release_intel, dup_report) = db
+    let (library, acquisition, release_intel, dup_report, provider_health) = db
         .call(|conn| {
             let lib = compute_library_stats(conn)?;
             let acq = compute_acquisition_stats(conn)?;
             let rel = compute_release_stats(conn)?;
             let dups = crate::pipeline::duplicates::scan_library_duplicates(conn)?;
-            Ok((lib, acq, rel, dups))
+            let prov = compute_provider_health(conn);
+            Ok((lib, acq, rel, dups, prov))
         })
         .await?;
 
-    // 3. Staging directory size probe
+    // 3. Staging directory size probe (bounded recursive walk)
     let staging_bytes = compute_directory_bytes(&downloads_dir_buf);
 
     let storage = DashboardStorageStats {
@@ -96,52 +97,6 @@ pub async fn get_dashboard_summary(
         duplicate_groups_count: dup_report.total_duplicate_groups,
         optimizer_available: optimizer_status.is_available,
     };
-
-    // 4. Provider Health Telemetry
-    let provider_health = vec![
-        DashboardProviderHealthItem {
-            name: "Madokami".to_string(),
-            category: "acquisition".to_string(),
-            status: "AVAILABLE".to_string(),
-            details: "Direct HTTP with byte-range resume enabled".to_string(),
-        },
-        DashboardProviderHealthItem {
-            name: "Nyaa".to_string(),
-            category: "acquisition".to_string(),
-            status: "AVAILABLE".to_string(),
-            details: "Torrent discovery indexer active".to_string(),
-        },
-        DashboardProviderHealthItem {
-            name: "TorBox".to_string(),
-            category: "acquisition".to_string(),
-            status: "CONFIGURED".to_string(),
-            details: "External BitTorrent acquisition and caching backend".to_string(),
-        },
-        DashboardProviderHealthItem {
-            name: "Komga".to_string(),
-            category: "canonical".to_string(),
-            status: "HEALTHY".to_string(),
-            details: "Canonical library authority and preferred reader".to_string(),
-        },
-        DashboardProviderHealthItem {
-            name: "KOMF".to_string(),
-            category: "metadata".to_string(),
-            status: "HEALTHY".to_string(),
-            details: "Automated Komga metadata bridge active".to_string(),
-        },
-        DashboardProviderHealthItem {
-            name: "OpenTome".to_string(),
-            category: "metadata".to_string(),
-            status: "HEALTHY".to_string(),
-            details: "Official release schedule and publication intelligence".to_string(),
-        },
-        DashboardProviderHealthItem {
-            name: "MangaBaka".to_string(),
-            category: "metadata".to_string(),
-            status: "HEALTHY".to_string(),
-            details: "Authoritative manga catalog and edition identity".to_string(),
-        },
-    ];
 
     Ok(DashboardSummaryDto {
         library,
@@ -158,13 +113,23 @@ fn compute_library_stats(conn: &Connection) -> Result<DashboardLibraryStats> {
         .query_row("SELECT COUNT(*) FROM manga", [], |r| r.get(0))
         .unwrap_or(0);
 
-    let total_owned: i64 = conn
+    let receipts_owned: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM publication_receipts",
+            "SELECT COUNT(DISTINCT canonical_path) FROM publication_receipts WHERE canonical_path IS NOT NULL AND canonical_path != ''",
             [],
             |r| r.get(0),
         )
         .unwrap_or(0);
+
+    let recon_owned: i64 = conn
+        .query_row(
+            "SELECT COALESCE(SUM(owned_volumes_count), 0) FROM series_reconciliations",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+
+    let total_owned = std::cmp::max(receipts_owned, recon_owned);
 
     let missing_released: i64 = conn
         .query_row(
@@ -176,7 +141,7 @@ fn compute_library_stats(conn: &Connection) -> Result<DashboardLibraryStats> {
 
     let needing_review: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM series_reconciliations WHERE status = 'REVIEW_REQUIRED'",
+            "SELECT COUNT(*) FROM series_reconciliations WHERE status = 'REVIEW_REQUIRED' OR status = 'review_required'",
             [],
             |r| r.get(0),
         )
@@ -188,6 +153,95 @@ fn compute_library_stats(conn: &Connection) -> Result<DashboardLibraryStats> {
         missing_released_volumes: missing_released.max(0) as usize,
         titles_needing_review: needing_review.max(0) as usize,
     })
+}
+
+fn compute_provider_health(conn: &Connection) -> Vec<DashboardProviderHealthItem> {
+    let komga_enabled = crate::settings::get::<bool>(conn, "pipeline.komga_enabled").unwrap_or(false);
+    let komga_url = crate::settings::get::<String>(conn, "pipeline.komga_url");
+    let komga_status = if komga_enabled && komga_url.is_some() {
+        ("HEALTHY", "Canonical library authority and preferred reader active")
+    } else if komga_enabled {
+        ("CONFIGURED", "Komga enabled; URL pending verification")
+    } else {
+        ("DISABLED", "Komga canonical integration disabled in Settings")
+    };
+
+    let komf_enabled = crate::settings::get::<bool>(conn, "pipeline.komf_enabled").unwrap_or(false);
+    let komf_status = if komf_enabled {
+        ("HEALTHY", "Automated Komga metadata bridge active")
+    } else {
+        ("DISABLED", "KOMF metadata bridge disabled in Settings")
+    };
+
+    let opentome_enabled = crate::settings::get::<bool>(conn, "opentome.enabled").unwrap_or(true);
+    let opentome_status = if opentome_enabled {
+        ("HEALTHY", "Official release schedule and publication intelligence active")
+    } else {
+        ("DISABLED", "OpenTome release tracking disabled in Settings")
+    };
+
+    let mb_enabled = crate::settings::get::<bool>(conn, "pipeline.mangabaka_enabled").unwrap_or(true);
+    let mb_status = if mb_enabled {
+        ("HEALTHY", "Authoritative manga catalog and edition identity active")
+    } else {
+        ("DISABLED", "MangaBaka disabled in Settings")
+    };
+
+    let torbox_configured = crate::db::state(conn, "pipeline.torbox_api_key")
+        .ok()
+        .flatten()
+        .filter(|k| !k.is_empty())
+        .is_some();
+    let torbox_status = if torbox_configured {
+        ("CONFIGURED", "External BitTorrent acquisition and caching backend active")
+    } else {
+        ("UNCONFIGURED", "TorBox API token not configured")
+    };
+
+    vec![
+        DashboardProviderHealthItem {
+            name: "Madokami".to_string(),
+            category: "acquisition".to_string(),
+            status: "AVAILABLE".to_string(),
+            details: "Direct HTTP with byte-range resume enabled".to_string(),
+        },
+        DashboardProviderHealthItem {
+            name: "Nyaa".to_string(),
+            category: "acquisition".to_string(),
+            status: "AVAILABLE".to_string(),
+            details: "Torrent discovery indexer active".to_string(),
+        },
+        DashboardProviderHealthItem {
+            name: "TorBox".to_string(),
+            category: "acquisition".to_string(),
+            status: torbox_status.0.to_string(),
+            details: torbox_status.1.to_string(),
+        },
+        DashboardProviderHealthItem {
+            name: "Komga".to_string(),
+            category: "canonical".to_string(),
+            status: komga_status.0.to_string(),
+            details: komga_status.1.to_string(),
+        },
+        DashboardProviderHealthItem {
+            name: "KOMF".to_string(),
+            category: "metadata".to_string(),
+            status: komf_status.0.to_string(),
+            details: komf_status.1.to_string(),
+        },
+        DashboardProviderHealthItem {
+            name: "OpenTome".to_string(),
+            category: "metadata".to_string(),
+            status: opentome_status.0.to_string(),
+            details: opentome_status.1.to_string(),
+        },
+        DashboardProviderHealthItem {
+            name: "MangaBaka".to_string(),
+            category: "metadata".to_string(),
+            status: mb_status.0.to_string(),
+            details: mb_status.1.to_string(),
+        },
+    ]
 }
 
 fn compute_acquisition_stats(conn: &Connection) -> Result<DashboardAcquisitionStats> {
@@ -256,7 +310,11 @@ fn compute_release_stats(conn: &Connection) -> Result<DashboardReleaseStats> {
 }
 
 fn compute_directory_bytes(dir: &Path) -> u64 {
-    if !dir.exists() {
+    compute_directory_bytes_bounded(dir, 0, 10)
+}
+
+fn compute_directory_bytes_bounded(dir: &Path, depth: usize, max_depth: usize) -> u64 {
+    if depth > max_depth || !dir.exists() {
         return 0;
     }
     let mut total = 0u64;
@@ -265,6 +323,8 @@ fn compute_directory_bytes(dir: &Path) -> u64 {
             if let Ok(meta) = entry.metadata() {
                 if meta.is_file() {
                     total += meta.len();
+                } else if meta.is_dir() {
+                    total += compute_directory_bytes_bounded(&entry.path(), depth + 1, max_depth);
                 }
             }
         }

@@ -2747,11 +2747,14 @@ export interface VolumeManagerEntry {
   uncertaintyReason?: string | null;
   displayStatus: 'owned' | 'published' | 'downloading' | 'candidate_available' | 'missing_released' | 'unreleased' | 'uncertain' | string;
   statusLabel: string;
+  komgaBookId?: string | null;
+  komgaBookName?: string | null;
 }
 
 export interface VolumeManagerSummary {
   mangaId: number;
   seriesId: string;
+  komgaSeriesId?: string | null;
   title: string;
   mangabakaId?: number | null;
   edition: string;

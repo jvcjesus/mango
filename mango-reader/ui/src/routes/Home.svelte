@@ -318,13 +318,13 @@
     font-size: 1.85rem;
     margin: 0 0 0.5rem;
     letter-spacing: -0.02em;
-    color: var(--text-heading, #fff);
+    color: var(--ink);
   }
 
   .hero-subtitle {
     margin: 0;
     font-size: 0.92rem;
-    color: var(--muted, #8b949e);
+    color: var(--muted);
     max-width: 720px;
     line-height: 1.5;
   }
@@ -415,27 +415,28 @@
   }
 
   .dash-card {
-    background: var(--bg-surface, #1e1e24);
-    border: 1px solid var(--border-color, rgba(255, 255, 255, 0.1));
-    border-radius: 10px;
+    background: var(--surface);
+    border: 2px solid var(--ink);
+    border-radius: 8px;
     padding: 1.25rem;
     display: flex;
     flex-direction: column;
     justify-content: space-between;
     gap: 1rem;
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
-    transition: transform 0.15s ease, border-color 0.15s ease;
+    box-shadow: var(--sh-4);
+    transition: transform 0.15s ease, box-shadow 0.15s ease;
   }
 
   .dash-card:hover {
-    border-color: rgba(255, 255, 255, 0.2);
+    transform: translate(-1px, -1px);
+    box-shadow: var(--sh-5);
   }
 
   .card-head {
     display: flex;
     justify-content: space-between;
     align-items: center;
-    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    border-bottom: 1px solid var(--border);
     padding-bottom: 0.65rem;
   }
 
@@ -443,20 +444,20 @@
     display: flex;
     align-items: center;
     gap: 0.45rem;
-    color: var(--spot, #ff7a00);
+    color: var(--spot, #ffc400);
   }
 
   .card-head-title h2 {
     font-size: 1.05rem;
     font-weight: 700;
     margin: 0;
-    color: var(--text-heading, #fff);
+    color: var(--ink);
   }
 
   .icon-link {
     background: transparent;
     border: none;
-    color: var(--muted, #8b949e);
+    color: var(--muted);
     cursor: pointer;
     padding: 4px;
     border-radius: 4px;
@@ -465,8 +466,8 @@
   }
 
   .icon-link:hover {
-    color: #fff;
-    background: rgba(255, 255, 255, 0.08);
+    color: var(--ink);
+    background: rgba(0, 0, 0, 0.05);
   }
 
   .metrics-row {
@@ -485,52 +486,52 @@
     font-size: 1.4rem;
     font-weight: 800;
     line-height: 1.1;
-    color: #f8fafc;
+    color: var(--ink);
   }
 
   .m-lbl {
     font-size: 0.74rem;
-    color: var(--muted, #8b949e);
+    color: var(--muted);
     line-height: 1.3;
   }
 
   .highlight-owned .m-val {
-    color: #86efac;
+    color: #16a34a;
   }
 
   .highlight-missing .m-val {
-    color: #fca5a5;
+    color: #dc2626;
   }
 
   .highlight-review .m-val {
-    color: #fde68a;
+    color: #d97706;
   }
 
   .highlight-warn .m-val {
-    color: #fca5a5;
+    color: #dc2626;
   }
 
   .highlight-recov .m-val {
-    color: #93c5fd;
+    color: #2563eb;
   }
 
   .highlight-awaiting .m-val {
-    color: #fed7aa;
+    color: #d97706;
   }
 
   .highlight-candidate .m-val {
-    color: #86efac;
+    color: #0891b2;
   }
 
   .highlight-reclaim .m-val {
-    color: #c4b5fd;
+    color: #16a34a;
   }
 
   .card-foot {
     display: flex;
     justify-content: space-between;
     align-items: center;
-    border-top: 1px solid rgba(255, 255, 255, 0.06);
+    border-top: 1px solid var(--border);
     padding-top: 0.65rem;
     font-size: 0.78rem;
   }
@@ -539,7 +540,7 @@
     display: flex;
     align-items: center;
     gap: 0.35rem;
-    color: var(--muted, #8b949e);
+    color: var(--muted);
   }
 
   .dot-ok {
@@ -568,9 +569,10 @@
     display: flex;
     flex-direction: column;
     gap: 0.75rem;
-    background: rgba(0, 0, 0, 0.2);
-    border: 1px solid var(--border-color, rgba(255, 255, 255, 0.08));
-    border-radius: 10px;
+    background: var(--surface);
+    border: 2px solid var(--ink);
+    border-radius: 8px;
+    box-shadow: var(--sh-4);
     padding: 1rem 1.25rem;
   }
 
@@ -584,14 +586,14 @@
     display: flex;
     align-items: center;
     gap: 0.4rem;
-    color: var(--spot, #ff7a00);
+    color: var(--spot, #ffc400);
   }
 
   .sec-title h3 {
     margin: 0;
     font-size: 0.95rem;
     font-weight: 700;
-    color: #fff;
+    color: var(--ink);
   }
 
   .provider-cards-grid {
@@ -601,8 +603,8 @@
   }
 
   .provider-pill-card {
-    background: rgba(255, 255, 255, 0.03);
-    border: 1px solid rgba(255, 255, 255, 0.06);
+    background: var(--surface-alt, rgba(0, 0, 0, 0.02));
+    border: 1px solid var(--border);
     border-radius: 6px;
     padding: 0.6rem 0.75rem;
     display: flex;
@@ -619,7 +621,7 @@
   .prov-name {
     font-weight: 700;
     font-size: 0.85rem;
-    color: #f1f5f9;
+    color: var(--ink);
   }
 
   .status-pill {
@@ -632,25 +634,25 @@
   .status-healthy,
   .status-available {
     background: rgba(34, 197, 94, 0.15);
-    color: #86efac;
+    color: #16a34a;
     border: 1px solid rgba(34, 197, 94, 0.3);
   }
 
   .status-configured {
     background: rgba(59, 130, 246, 0.15);
-    color: #93c5fd;
+    color: #2563eb;
     border: 1px solid rgba(59, 130, 246, 0.3);
   }
 
   .status-disabled {
     background: rgba(100, 116, 139, 0.15);
-    color: #cbd5e1;
+    color: #64748b;
   }
 
   .prov-details {
     margin: 0;
     font-size: 0.74rem;
-    color: var(--muted, #8b949e);
+    color: var(--muted);
     line-height: 1.35;
   }
 
