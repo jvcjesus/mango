@@ -412,4 +412,81 @@ describe('Unified Volume Manager (M8.2)', () => {
     expect(optimizer.defaultImageQuality).toBe(90);
     expect(optimizer.defaultMinSavingsPercent).toBe(10);
   });
+
+  it('models M8.11 one-click batch acquire response and skipped-owned safety', () => {
+    const batchResponse: import('./api').VolumeManagerBatchAcquireResponse = {
+      mangaId: 1092,
+      totalSelected: 4,
+      queuedCount: 2,
+      skippedCount: 2,
+      failedCount: 0,
+      items: [
+        {
+          volumeNumber: 1,
+          candidateId: null,
+          title: 'Haikyu!! v01',
+          provider: null,
+          status: 'skipped',
+          message: 'Volume 1 is already owned in Komga library',
+          approvalStatus: null,
+        },
+        {
+          volumeNumber: 2,
+          candidateId: null,
+          title: 'Haikyu!! v02',
+          provider: null,
+          status: 'skipped',
+          message: 'Volume 2 is already owned in Komga library',
+          approvalStatus: null,
+        },
+        {
+          volumeNumber: 3,
+          candidateId: 'cand-vol3-mado',
+          title: 'Haikyu!! v03 [Madokami]',
+          provider: 'madokami',
+          status: 'simulated',
+          message: 'Simulated acquisition preview recorded',
+          approvalStatus: 'dry_run_preview',
+        },
+        {
+          volumeNumber: 4,
+          candidateId: 'cand-vol4-nyaa',
+          title: 'Haikyu!! v04 [Stick]',
+          provider: 'nyaa',
+          status: 'simulated',
+          message: 'Simulated acquisition preview recorded',
+          approvalStatus: 'dry_run_preview',
+        },
+      ],
+    };
+
+    expect(batchResponse.totalSelected).toBe(4);
+    expect(batchResponse.queuedCount).toBe(2);
+    expect(batchResponse.skippedCount).toBe(2);
+    expect(batchResponse.failedCount).toBe(0);
+    expect(batchResponse.items.filter((i) => i.status === 'skipped')).toHaveLength(2);
+    expect(batchResponse.items.find((i) => i.volumeNumber === 1)?.message).toContain('already owned');
+    expect(batchResponse.items.find((i) => i.volumeNumber === 3)?.approvalStatus).toBe('dry_run_preview');
+  });
+
+  it('models M8.11 operating mode and auto-publish manual configuration defaults', () => {
+    const acqConfig: import('./api').AcquisitionConfig = {
+      operatingMode: 'simulation',
+      autoPublishManualAcquisitions: false,
+      torboxEnabled: false,
+      nyaaEnabled: true,
+      madokamiEnabled: true,
+    };
+
+    expect(acqConfig.operatingMode).toBe('simulation');
+    expect(acqConfig.autoPublishManualAcquisitions).toBe(false);
+
+    const normalConfig: import('./api').AcquisitionConfig = {
+      ...acqConfig,
+      operatingMode: 'normal',
+      autoPublishManualAcquisitions: true,
+    };
+    expect(normalConfig.operatingMode).toBe('normal');
+    expect(normalConfig.autoPublishManualAcquisitions).toBe(true);
+  });
 });

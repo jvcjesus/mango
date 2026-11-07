@@ -4,6 +4,7 @@
     compareVolumeCandidates,
     acquireMangaVolumeCandidate,
     getManualAcquisitionReview,
+    getAcquisitionSettings,
     message,
     type VolumeCandidateInspectionResult,
     type CandidateComparisonMatrix,
@@ -14,6 +15,7 @@
   } from './api';
   import Icon from './Icon.svelte';
   import Notice from './Notice.svelte';
+  import { toast } from './toast.svelte';
   import { formatBytes } from './util';
 
   let {
@@ -34,11 +36,13 @@
   let error = $state<string | null>(null);
   let data = $state<VolumeCandidateInspectionResult | null>(null);
 
-  let viewMode = $state<'list' | 'compare'>('list');
+  let viewMode = $state<'dialog' | 'list' | 'compare'>('dialog');
+  let isSimulationMode = $state(true);
   let loadingCompare = $state(false);
   let compareError = $state<string | null>(null);
   let comparisonData = $state<CandidateComparisonMatrix | null>(null);
 
+  let selectedCandidate = $state<CandidateInspectionDto | CandidateComparisonItem | null>(null);
   let reviewingCandidate = $state<CandidateInspectionDto | CandidateComparisonItem | null>(null);
   let reviewDto = $state<ManualAcquisitionReviewDto | null>(null);
   let reviewLoading = $state(false);
@@ -85,13 +89,14 @@
     return { code, reason };
   }
 
-  async function selectCandidateForReview(cand: CandidateInspectionDto | CandidateComparisonItem) {
+  function selectCandidateForReview(cand: CandidateInspectionDto | CandidateComparisonItem) {
+    selectedCandidate = cand;
     reviewingCandidate = cand;
+    viewMode = 'dialog';
     planPreviewResult = null;
     planPreviewError = null;
     executionResult = null;
     executionError = null;
-    await requestReview(cand);
   }
 
   async function requestReview(cand: CandidateInspectionDto | CandidateComparisonItem) {
@@ -121,18 +126,26 @@
   }
 
   async function confirmAcquisitionAction(cand: CandidateInspectionDto | CandidateComparisonItem) {
-    if (!reviewDto?.authorizationToken) return;
     submittingExecution = true;
     executionError = null;
     executionResult = null;
     try {
       const res = await acquireMangaVolumeCandidate(mangaId, volume, cand.candidateId, {
-        dryRun: false,
-        authorizationToken: reviewDto.authorizationToken,
+        dryRun: isSimulationMode,
       });
       executionResult = res;
+      if (res.status === 'queued') {
+        toast.success(`Download queued for Volume ${volume}`);
+      } else if (res.status === 'simulated' || res.status === 'dry_run_preview') {
+        toast.info(res.message);
+      } else if (res.alreadyOwned) {
+        toast.info(`Volume ${volume} is already owned in Komga library`);
+      } else if (res.alreadyAcquiring) {
+        toast.info(`Volume ${volume} is already being acquired`);
+      }
     } catch (e) {
       executionError = message(e);
+      toast.error(executionError);
     } finally {
       submittingExecution = false;
     }
@@ -153,7 +166,19 @@
     loading = true;
     error = null;
     try {
-      data = await inspectVolumeCandidates(mangaId, volume);
+      const [candData, acqCfg] = await Promise.all([
+        inspectVolumeCandidates(mangaId, volume),
+        getAcquisitionSettings().catch(() => null),
+      ]);
+      data = candData;
+      if (acqCfg) {
+        isSimulationMode = acqCfg.operatingMode !== 'normal' || !!acqCfg.autoAcquireDryRun;
+      }
+      if (candData?.topCandidate) {
+        selectedCandidate = candData.topCandidate;
+      } else if (candData?.candidates?.length) {
+        selectedCandidate = candData.candidates[0];
+      }
     } catch (e) {
       error = message(e);
     } finally {
@@ -185,7 +210,8 @@
       comparisonData = null;
       error = null;
       compareError = null;
-      viewMode = 'list';
+      viewMode = 'dialog';
+      selectedCandidate = null;
       clearReviewState();
       blockReasonModalCandidate = null;
     }
@@ -201,37 +227,46 @@
         <div class="head-title">
           <Icon name="search" size={20} />
           <h2>
-            {#if reviewingCandidate}
-              Manual Acquisition Review — Volume {volume}
+            {#if viewMode === 'dialog'}
+              Acquire Volume {volume}
+            {:else if viewMode === 'list'}
+              Select Release — Volume {volume}
             {:else}
-              Candidate Inspector — Volume {volume}
+              Compare Releases — Volume {volume}
             {/if}
           </h2>
         </div>
         <div class="head-actions">
-          {#if !reviewingCandidate}
-            <div class="view-toggle">
-              <button
-                class="toggle-btn"
-                class:active={viewMode === 'list'}
-                onclick={() => (viewMode = 'list')}
-              >
-                <Icon name="list" size={14} />
-                <span>List</span>
-              </button>
-              <button
-                class="toggle-btn"
-                class:active={viewMode === 'compare'}
-                onclick={() => {
-                  viewMode = 'compare';
-                  if (!comparisonData) loadComparison();
-                }}
-              >
-                <Icon name="sliders" size={14} />
-                <span>Compare</span>
-              </button>
-            </div>
-          {/if}
+          <div class="view-toggle">
+            <button
+              class="toggle-btn"
+              class:active={viewMode === 'dialog'}
+              onclick={() => (viewMode = 'dialog')}
+              disabled={!selectedCandidate}
+            >
+              <Icon name="book" size={14} />
+              <span>Recommended</span>
+            </button>
+            <button
+              class="toggle-btn"
+              class:active={viewMode === 'list'}
+              onclick={() => (viewMode = 'list')}
+            >
+              <Icon name="list" size={14} />
+              <span>All Releases</span>
+            </button>
+            <button
+              class="toggle-btn"
+              class:active={viewMode === 'compare'}
+              onclick={() => {
+                viewMode = 'compare';
+                if (!comparisonData) loadComparison();
+              }}
+            >
+              <Icon name="sliders" size={14} />
+              <span>Compare</span>
+            </button>
+          </div>
           <button class="btn icon close-btn" onclick={onClose} aria-label="Close">
             <Icon name="close" size={18} />
           </button>
@@ -247,330 +282,184 @@
         {:else if error}
           <Notice error={error} retry={load} />
         {:else if data}
-          {#if reviewingCandidate}
-            <div class="acquisition-review-pane">
-              <div class="review-header-bar">
-                <button
-                  class="btn ghost btn-sm back-nav-btn"
-                  onclick={clearReviewState}
-                  disabled={submittingExecution}
-                >
-                  <Icon name="back" size={16} />
-                  <span>Back to Candidates</span>
-                </button>
-                <span class="badge review-step-badge">Manual Review & Plan Preview</span>
-              </div>
-
-              <div class="dry-run-banner" class:banner-inactive={reviewDto && !reviewDto.dryRun}>
-                <Icon name="info" size={22} />
-                <div class="dry-run-content">
-                  <span class="dry-run-title">
-                    {reviewDto && !reviewDto.dryRun ? 'GLOBAL DRY-RUN MODE: DISABLED' : 'GLOBAL DRY-RUN SAFETY ACTIVE'}
-                  </span>
-                  <span class="dry-run-desc">
-                    {reviewDto && !reviewDto.dryRun
-                      ? 'Server dry-run mode is disabled. Confirmed authorized execution will dispatch real acquisition tasks to staging.'
-                      : 'Real acquisitions and remote jobs are simulated only. No torrents will be submitted to TorBox and no files will be downloaded.'}
-                  </span>
-                </div>
-              </div>
-
-              {#if reviewLoading && !reviewDto}
-                <div class="review-auth-loading">
-                  <span class="spin"><Icon name="spinner" size={20} stroke={3} /></span>
-                  <span>Generating execution authorization review token…</span>
-                </div>
-              {:else if reviewError}
-                <div class="review-error-block">
-                  <Notice error={reviewError} retry={() => requestReview(reviewingCandidate!)} />
-                </div>
-              {/if}
-
-              <div class="review-details-card">
-                <h3 class="review-card-title">Acquisition Target Specifications</h3>
-
-                <div class="review-specs-grid">
-                  <div class="spec-row">
-                    <span class="spec-label">Target Volume</span>
-                    <span class="spec-val">Volume {volume}</span>
+          {#if viewMode === 'dialog'}
+            <div class="compact-acquisition-dialog">
+              {#if isSimulationMode}
+                <div class="simulation-banner">
+                  <Icon name="info" size={18} />
+                  <div class="banner-text">
+                    <strong>Simulation Mode Active</strong>
+                    <span>Downloads are simulated previews. No files will be retrieved from the network or published to library storage.</span>
                   </div>
-                  <div class="spec-row">
-                    <span class="spec-label">Selected Release</span>
-                    <span class="spec-val highlight-val">{reviewingCandidate.title || reviewingCandidate.rawTitle}</span>
-                  </div>
-                  {#if reviewingCandidate.rawTitle && reviewingCandidate.rawTitle !== reviewingCandidate.title}
-                    <div class="spec-row">
-                      <span class="spec-label">Raw Release Title</span>
-                      <span class="spec-val code-val"><code>{reviewingCandidate.rawTitle}</code></span>
-                    </div>
-                  {/if}
-                  <div class="spec-row">
-                    <span class="spec-label">Provider & Backend</span>
-                    <span class="spec-val">
-                      <span class="badge provider-badge">{reviewDto?.provider || reviewingCandidate.provider}</span>
-                      <span class="badge transport-badge">{reviewDto?.acquisitionBackend || reviewingCandidate.transport}</span>
-                    </span>
-                  </div>
-                  <div class="spec-row">
-                    <span class="spec-label">Source Availability</span>
-                    <span class="spec-val">
-                      {#if getCacheBadge(reviewingCandidate)}
-                        {@const badge = getCacheBadge(reviewingCandidate)!}
-                        <span class="badge {badge.cls}">
-                          <Icon name={badge.icon} size={12} />
-                          {badge.label}
-                        </span>
-                      {:else}
-                        <span class="badge meta-badge">Standard Remote</span>
-                      {/if}
-                    </span>
-                  </div>
-                  {#if reviewingCandidate.sizeBytes}
-                    <div class="spec-row">
-                      <span class="spec-label">Archive Size</span>
-                      <span class="spec-val">{formatBytes(reviewingCandidate.sizeBytes)}</span>
-                    </div>
-                  {/if}
-                  <div class="spec-row">
-                    <span class="spec-label">Komga Ownership Status</span>
-                    <span class="spec-val">
-                      {#if reviewDto?.isCurrentlyOwned || data.isCurrentlyOwned}
-                        <span class="badge owned-tag">Owned in Komga (Upgrade Protected)</span>
-                      {:else}
-                        <span class="badge missing-tag">Not Owned in Komga</span>
-                      {/if}
-                    </span>
-                  </div>
-                  <div class="spec-row">
-                    <span class="spec-label">Expected Staging Destination</span>
-                    <span class="spec-val code-val"><code>{reviewDto?.stagingDestination || `[library_dir]/_staging/vol_${volume}_${reviewingCandidate.candidateId.replace(/[^a-zA-Z0-9_-]/g, '_')}/`}</code></span>
-                  </div>
-                  <div class="spec-row">
-                    <span class="spec-label">Expected Canonical Publication</span>
-                    <span class="spec-val code-val"><code>{reviewDto?.canonicalDestination || `[library_dir]/${data.seriesId.replace(/^title:/, '')} - v${String(volume).padStart(2, '0')}.cbz`}</code></span>
-                  </div>
-                  <div class="spec-row">
-                    <span class="spec-label">Execution Authorization</span>
-                    <span class="spec-val">
-                      {#if reviewDto?.authorizationToken}
-                        <span class="badge token-authorized-badge">
-                          <Icon name="lock" size={12} />
-                          Authorized: {reviewDto.authorizationToken.substring(0, 10)}…
-                        </span>
-                        <span class="token-expiry-hint">Single-use token valid 15m</span>
-                      {:else if reviewLoading}
-                        <span class="badge token-pending-badge">
-                          <span class="spin"><Icon name="spinner" size={12} stroke={3} /></span>
-                          Authorizing…
-                        </span>
-                      {:else}
-                        <span class="badge token-none-badge">
-                          <Icon name="close" size={12} />
-                          Token Required
-                        </span>
-                      {/if}
-                    </span>
-                  </div>
-                  {#if reviewingCandidate.rankingBreakdown}
-                    <div class="spec-row">
-                      <span class="spec-label">Normalized Ranking Score</span>
-                      <span class="spec-val">
-                        <strong>{reviewingCandidate.rankingBreakdown.finalScore.toFixed(1)} / 100</strong>
-                        <span class="confidence-tag">({reviewingCandidate.rankingBreakdown.confidencePercent}% confidence, {reviewingCandidate.rankingBreakdown.evidenceCoveragePercent ?? 0}% evidence)</span>
-                      </span>
-                    </div>
-                  {/if}
-                </div>
-              </div>
-
-              <div class="guard-lifecycle-box">
-                <div class="guard-head">
-                  <Icon name="lock" size={15} />
-                  <strong>Guarded Lifecycle & Publication Architecture</strong>
-                </div>
-                <p>
-                  Execution retrieves files strictly into an isolated staging directory. Once downloaded, Mango performs full CBZ zip archive integrity validation and XML inspection. Canonical publication to the Komga library is a separate guarded action and will <strong>never overwrite existing files</strong>.
-                </p>
-              </div>
-
-              {#if reviewingCandidate.rankingBreakdown}
-                <div class="ranking-breakdown-bar review-ranking-bar">
-                  <div class="breakdown-header">
-                    <span class="breakdown-title">Candidate Evaluation & Evidence Coverage:</span>
-                    <div class="breakdown-header-badges">
-                      {#if reviewingCandidate.rankingBreakdown.isProvisional}
-                        <span class="badge prov-badge" title="Pre-download confidence capped at 80% until archive inspection">Provisional (80% Max)</span>
-                      {/if}
-                      {#if reviewingCandidate.rankingBreakdown.evidenceCoveragePercent != null}
-                        <span class="badge coverage-badge" class:coverage-high={reviewingCandidate.rankingBreakdown.evidenceCoveragePercent >= 70} class:coverage-partial={reviewingCandidate.rankingBreakdown.evidenceCoveragePercent < 70}>
-                          {reviewingCandidate.rankingBreakdown.evidenceCoveragePercent}% Evidence Coverage
-                        </span>
-                      {/if}
-                    </div>
-                  </div>
-                  <div class="breakdown-chips">
-                    <span class="b-chip">Quality: <strong>{reviewingCandidate.rankingBreakdown.qualityScore.toFixed(0)}</strong>/35</span>
-                    <span class="b-chip">Reliability: <strong>{reviewingCandidate.rankingBreakdown.reliabilityScore.toFixed(0)}</strong>/25</span>
-                    <span class="b-chip">Preference: <strong>{reviewingCandidate.rankingBreakdown.preferenceScore.toFixed(0)}</strong>/20</span>
-                    <span class="b-chip">Convenience: <strong>{reviewingCandidate.rankingBreakdown.convenienceScore.toFixed(0)}</strong>/15</span>
-                    <span class="b-chip">Storage: <strong>{reviewingCandidate.rankingBreakdown.storageEfficiencyScore.toFixed(0)}</strong>/5</span>
-                  </div>
-                  {#if (reviewingCandidate.rankingBreakdown.verifiedEvidence && reviewingCandidate.rankingBreakdown.verifiedEvidence.length > 0) || (reviewingCandidate.rankingBreakdown.heuristicEstimates && reviewingCandidate.rankingBreakdown.heuristicEstimates.length > 0)}
-                    <div class="evidence-honesty-row">
-                      {#if reviewingCandidate.rankingBreakdown.verifiedEvidence && reviewingCandidate.rankingBreakdown.verifiedEvidence.length > 0}
-                        <div class="evidence-group">
-                          <span class="evidence-label verified"><Icon name="check" size={11} /> Verified:</span>
-                          {#each reviewingCandidate.rankingBreakdown.verifiedEvidence as item}
-                            <span class="badge evidence-verified-tag">{item}</span>
-                          {/each}
-                        </div>
-                      {/if}
-                      {#if reviewingCandidate.rankingBreakdown.heuristicEstimates && reviewingCandidate.rankingBreakdown.heuristicEstimates.length > 0}
-                        <div class="evidence-group">
-                          <span class="evidence-label heuristic"><Icon name="info" size={11} /> Heuristic:</span>
-                          {#each reviewingCandidate.rankingBreakdown.heuristicEstimates as item}
-                            <span class="badge evidence-heuristic-tag">{item}</span>
-                          {/each}
-                        </div>
-                      {/if}
-                    </div>
-                  {/if}
-                  {#if reviewingCandidate.rankingBreakdown.whyRanksAbove}
-                    <div class="why-ranks-above-box">
-                      <Icon name="check" size={13} />
-                      <span>{reviewingCandidate.rankingBreakdown.whyRanksAbove}</span>
-                    </div>
-                  {/if}
-                </div>
-              {/if}
-
-              {#if planPreviewError}
-                <div class="plan-preview-error">
-                  <Notice error={planPreviewError} />
-                </div>
-              {/if}
-
-              {#if executionError}
-                <div class="execution-error-box">
-                  <Notice error={executionError} />
-                </div>
-              {/if}
-
-              {#if planPreviewResult}
-                <div class="plan-preview-box">
-                  <div class="preview-box-head">
-                    <div class="status-indicator">
-                      <Icon name="check" size={18} />
-                      <strong>Plan Preview Generated ({planPreviewResult.status})</strong>
-                    </div>
-                    <span class="badge dry-run-pill">Dry-Run Validated</span>
-                  </div>
-                  <p class="preview-msg">{planPreviewResult.message}</p>
-                  <div class="preview-meta-rows">
-                    <div class="p-meta">
-                      <span class="p-k">Already Owned:</span>
-                      <span class="p-v">{planPreviewResult.alreadyOwned ? 'Yes' : 'No'}</span>
-                    </div>
-                    <div class="p-meta">
-                      <span class="p-k">Already Acquiring:</span>
-                      <span class="p-v">{planPreviewResult.alreadyAcquiring ? 'Yes' : 'No'}</span>
-                    </div>
-                    <div class="p-meta">
-                      <span class="p-k">Execution ID:</span>
-                      <span class="p-v">{planPreviewResult.executionId || 'Inhibited (dry-run preview only)'}</span>
-                    </div>
-                  </div>
-                  <p class="preview-safety-footer">
-                    <Icon name="clock" size={13} />
-                    <span>Execution was inhibited. No remote download task or TorBox cache job was dispatched.</span>
-                  </p>
                 </div>
               {/if}
 
               {#if executionResult}
-                <div class="plan-preview-box execution-success-box">
-                  <div class="preview-box-head">
-                    <div class="status-indicator exec-success-ind">
-                      <Icon name="check" size={18} />
-                      <strong>Acquisition Submitted ({executionResult.status})</strong>
-                    </div>
-                    <span class="badge exec-success-pill">Submitted to Staging</span>
+                <div class="result-banner" class:success={executionResult.status === 'queued'} class:sim={executionResult.status === 'simulated' || executionResult.status === 'dry_run_preview'}>
+                  <Icon name="check" size={20} />
+                  <div>
+                    <strong>{executionResult.status === 'queued' ? 'Acquisition Queued' : 'Download Simulated'}</strong>
+                    <p>{executionResult.message}</p>
                   </div>
-                  <p class="preview-msg">{executionResult.message}</p>
-                  <div class="preview-meta-rows">
-                    <div class="p-meta">
-                      <span class="p-k">Status:</span>
-                      <span class="p-v">{executionResult.status}</span>
-                    </div>
-                    {#if executionResult.executionId}
-                      <div class="p-meta">
-                        <span class="p-k">Execution ID:</span>
-                        <span class="p-v">{executionResult.executionId}</span>
-                      </div>
-                    {/if}
-                  </div>
-                  <p class="preview-safety-footer exec-safety-footer">
-                    <Icon name="lock" size={13} />
-                    <span>Archive will be downloaded to staging and verified before canonical publication approval.</span>
-                  </p>
                 </div>
               {/if}
 
-              <div class="review-actions-bar">
-                <button
-                  class="btn secondary preview-btn"
-                  onclick={() => previewPlanAction(reviewingCandidate!)}
-                  disabled={previewingPlan || submittingExecution}
-                >
-                  {#if previewingPlan}
-                    <span class="spin"><Icon name="spinner" size={15} stroke={3} /></span>
-                    <span>Generating Preview Plan…</span>
-                  {:else}
-                    <Icon name="book" size={16} />
-                    <span>Preview Plan</span>
-                  {/if}
-                </button>
+              {#if executionError}
+                <div class="error-banner">
+                  <Notice error={executionError} />
+                </div>
+              {/if}
 
-                <button
-                  class="btn secondary auth-btn"
-                  onclick={() => requestReview(reviewingCandidate!)}
-                  disabled={reviewLoading || submittingExecution}
-                  title="Generate or refresh single-use authorization token for this specific candidate"
-                >
-                  {#if reviewLoading}
-                    <span class="spin"><Icon name="spinner" size={15} stroke={3} /></span>
-                    <span>Authorizing…</span>
-                  {:else}
-                    <Icon name="lock" size={16} />
-                    <span>{reviewDto?.authorizationToken ? 'Refresh Authorization' : 'Request Manual Execution'}</span>
-                  {/if}
-                </button>
+              {#if !selectedCandidate}
+                <div class="empty-candidates">
+                  <Icon name="search" size={32} />
+                  <p>No candidates have been discovered for Volume {volume}.</p>
+                </div>
+              {:else}
+                <div class="release-card">
+                  <div class="release-header">
+                    <div class="release-title-col">
+                      <span class="release-target-label">Volume {volume} · {title || data.seriesId.replace(/^title:/, '')}</span>
+                      <h3 class="release-name">{selectedCandidate.title || selectedCandidate.rawTitle}</h3>
+                    </div>
+                    <div class="score-pill-wrap">
+                      <span class="score-pill">
+                        {selectedCandidate.rankingBreakdown ? selectedCandidate.rankingBreakdown.finalScore.toFixed(0) : ('totalScore' in selectedCandidate ? selectedCandidate.totalScore.toFixed(0) : ('score' in selectedCandidate ? selectedCandidate.score.toFixed(0) : '0'))}% Match
+                      </span>
+                    </div>
+                  </div>
 
-                <button
-                  class="btn primary confirm-acquire-btn"
-                  onclick={() => confirmAcquisitionAction(reviewingCandidate!)}
-                  disabled={!reviewDto?.authorizationToken || submittingExecution || reviewLoading || (reviewDto != null && (reviewDto.isCurrentlyOwned || !reviewDto.isEligible))}
-                  title={!reviewDto?.authorizationToken ? 'Requires valid authorization token. Click Request Manual Execution first.' : reviewDto?.isCurrentlyOwned ? 'Volume already owned in Komga.' : !reviewDto?.isEligible ? (reviewDto.eligibilityReason || 'Candidate ineligible') : 'Confirm and execute acquisition'}
-                >
-                  {#if submittingExecution}
-                    <span class="spin"><Icon name="spinner" size={15} stroke={3} /></span>
-                    <span>Executing Acquisition…</span>
-                  {:else}
-                    <Icon name="download" size={16} />
-                    <span>Confirm This Acquisition</span>
-                  {/if}
-                </button>
+                  <div class="release-specs-grid">
+                    <div class="spec-item">
+                      <span class="spec-k">Provider</span>
+                      <span class="spec-v">
+                        <span class="badge provider-badge {selectedCandidate.provider}">{selectedCandidate.provider === 'nyaa' ? 'TorBox Debrid' : 'Madokami HTTP'}</span>
+                      </span>
+                    </div>
+                    <div class="spec-item">
+                      <span class="spec-k">Format</span>
+                      <span class="spec-v">{('isDigital' in selectedCandidate && selectedCandidate.isDigital) || ('format' in selectedCandidate && selectedCandidate.format?.toLowerCase().includes('digital')) ? 'Digital CBZ' : 'CBZ Archive'}</span>
+                    </div>
+                    <div class="spec-item">
+                      <span class="spec-k">Language</span>
+                      <span class="spec-v">English</span>
+                    </div>
+                    <div class="spec-item">
+                      <span class="spec-k">Size</span>
+                      <span class="spec-v">{selectedCandidate.sizeBytes ? formatBytes(selectedCandidate.sizeBytes) : '—'}</span>
+                    </div>
+                    <div class="spec-item">
+                      <span class="spec-k">Availability</span>
+                      <span class="spec-v">
+                        {#if getCacheBadge(selectedCandidate)}
+                          {@const badge = getCacheBadge(selectedCandidate)!}
+                          <span class="badge {badge.cls}"><Icon name={badge.icon} size={11} /> {badge.label}</span>
+                        {:else}
+                          <span class="badge meta-badge">Available</span>
+                        {/if}
+                      </span>
+                    </div>
+                    <div class="spec-item">
+                      <span class="spec-k">Library Ownership</span>
+                      <span class="spec-v">
+                        {#if data.isCurrentlyOwned}
+                          <span class="badge owned-tag"><Icon name="check" size={11} /> Owned in Komga</span>
+                        {:else}
+                          <span class="badge missing-tag">Missing (Ready to Acquire)</span>
+                        {/if}
+                      </span>
+                    </div>
+                  </div>
 
-                <button
-                  class="btn ghost cancel-review-btn"
-                  onclick={clearReviewState}
-                  disabled={submittingExecution}
-                >
-                  Cancel
-                </button>
-              </div>
+                  <!-- Advanced Details Collapsible -->
+                  <details class="advanced-collapsible">
+                    <summary class="advanced-summary">
+                      <Icon name="sliders" size={13} />
+                      <span>Advanced Details</span>
+                    </summary>
+                    <div class="advanced-content">
+                      {#if selectedCandidate.rawTitle}
+                        <div class="adv-row">
+                          <span class="adv-label">Raw Release Title:</span>
+                          <code class="adv-code">{selectedCandidate.rawTitle}</code>
+                        </div>
+                      {/if}
+                      {#if selectedCandidate.rankingBreakdown}
+                        <div class="adv-row">
+                          <span class="adv-label">Scoring Breakdown:</span>
+                          <div class="breakdown-chips">
+                            <span class="b-chip">Quality: {selectedCandidate.rankingBreakdown.qualityScore.toFixed(0)}/35</span>
+                            <span class="b-chip">Reliability: {selectedCandidate.rankingBreakdown.reliabilityScore.toFixed(0)}/25</span>
+                            <span class="b-chip">Preference: {selectedCandidate.rankingBreakdown.preferenceScore.toFixed(0)}/20</span>
+                            <span class="b-chip">Convenience: {selectedCandidate.rankingBreakdown.convenienceScore.toFixed(0)}/15</span>
+                            <span class="b-chip">Storage: {selectedCandidate.rankingBreakdown.storageEfficiencyScore.toFixed(0)}/5</span>
+                          </div>
+                        </div>
+                        {#if selectedCandidate.rankingBreakdown.verifiedEvidence && selectedCandidate.rankingBreakdown.verifiedEvidence.length > 0}
+                          <div class="adv-row">
+                            <span class="adv-label">Verified Signals:</span>
+                            <div class="evidence-pills">
+                              {#each selectedCandidate.rankingBreakdown.verifiedEvidence as item}
+                                <span class="badge evidence-tag">{item}</span>
+                              {/each}
+                            </div>
+                          </div>
+                        {/if}
+                      {/if}
+                      <div class="adv-row">
+                        <span class="adv-label">Canonical Publication Target:</span>
+                        <code class="adv-code">[library_dir]/{data.seriesId.replace(/^title:/, '')}/{data.seriesId.replace(/^title:/, '')} - v{String(volume).padStart(2, '0')}.cbz</code>
+                      </div>
+                    </div>
+                  </details>
+                </div>
+
+                <!-- Dialog Actions -->
+                <div class="dialog-actions-bar">
+                  {#if data.isCurrentlyOwned}
+                    <button class="btn disabled" disabled title="This volume is already verified and owned in your Komga permanent library">
+                      <Icon name="check" size={16} />
+                      <span>Already Owned in Komga</span>
+                    </button>
+                  {:else}
+                    <button
+                      class="btn primary download-main-btn"
+                      disabled={submittingExecution}
+                      onclick={() => confirmAcquisitionAction(selectedCandidate!)}
+                    >
+                      {#if submittingExecution}
+                        <span class="spin"><Icon name="spinner" size={15} stroke={3} /></span>
+                        <span>Queuing Download…</span>
+                      {:else}
+                        <Icon name={isSimulationMode ? 'eye' : 'download'} size={16} />
+                        <span>{isSimulationMode ? 'Simulate Download' : 'Download'} Volume {volume}</span>
+                      {/if}
+                    </button>
+                  {/if}
+
+                  <button
+                    class="btn secondary change-release-btn"
+                    onclick={() => (viewMode = 'list')}
+                    disabled={submittingExecution}
+                  >
+                    <Icon name="sliders" size={15} />
+                    <span>Change Release ({data.candidates.length})</span>
+                  </button>
+
+                  <button class="btn ghost cancel-btn" onclick={onClose} disabled={submittingExecution}>
+                    Cancel
+                  </button>
+                </div>
+              {/if}
             </div>
           {:else}
+            <div class="releases-browse-header">
+              <button class="btn ghost btn-sm" onclick={() => (viewMode = 'dialog')}>
+                <Icon name="back" size={14} />
+                <span>Back to Recommended Release</span>
+              </button>
+              <span class="subtext">Showing {data.candidates.length} discovered release(s) for Volume {volume}</span>
+            </div>
             <div class="target-summary-box">
               <div class="target-stat">
                 <span class="label">Target</span>

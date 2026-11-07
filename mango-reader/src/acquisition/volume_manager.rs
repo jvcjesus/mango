@@ -13,7 +13,8 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::acquisition::profiles::AcquisitionProfile;
-use crate::db::now;
+use crate::acquisition::service::AcquisitionService;
+use crate::db::{now, Db};
 use crate::error::{AppError, Result};
 use crate::pipeline::ownership::{OwnershipStatus, TitleOwnership};
 
@@ -124,6 +125,34 @@ pub struct VolumeManagerBatchPlanResponse {
     pub can_execute: bool,
     pub execution_blocked_reason: Option<String>,
     pub is_dry_run: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VolumeManagerBatchAcquireRequest {
+    pub selected_volumes: Vec<f64>,
+    pub dry_run: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BatchAcquireItemResult {
+    pub volume_number: f64,
+    pub status: String,
+    pub message: String,
+    pub execution_id: Option<String>,
+    pub candidate_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VolumeManagerBatchAcquireResponse {
+    pub manga_id: i64,
+    pub queued_count: usize,
+    pub simulated_count: usize,
+    pub skipped_count: usize,
+    pub results: Vec<BatchAcquireItemResult>,
+    pub message: String,
 }
 
 fn format_volume_label(vol: f64) -> String {
@@ -942,6 +971,128 @@ pub fn plan_volume_manager_batch(
         can_execute,
         execution_blocked_reason,
         is_dry_run,
+    })
+}
+
+/// Executes one-click batch acquisition for selected volumes.
+/// Skips already-owned or in-flight volumes and queues/simulates eligible releases.
+pub async fn acquire_volume_manager_batch(
+    db: &Db,
+    acquisition: &AcquisitionService,
+    titles: &crate::titles::Titles,
+    manga_id: i64,
+    req: VolumeManagerBatchAcquireRequest,
+    user_id: Option<i64>,
+) -> Result<VolumeManagerBatchAcquireResponse> {
+    let title_view = titles.get(manga_id).await?;
+    let ownership = if let Some(pipeline) = &acquisition.pipeline {
+        Some(pipeline.ownership.get_title_ownership(manga_id, &title_view.title).await)
+    } else {
+        None
+    };
+    let profile = acquisition.get_manga_profile(manga_id).await.unwrap_or_default();
+
+    let plan_req = VolumeManagerBatchPlanRequest {
+        selected_volumes: req.selected_volumes.clone(),
+        profile_id: None,
+        is_dry_run: req.dry_run,
+    };
+
+    let plan = db
+        .call(move |conn| {
+            plan_volume_manager_batch(
+                conn,
+                manga_id,
+                &plan_req,
+                &profile,
+                ownership.as_ref(),
+            )
+        })
+        .await?;
+
+    let mut results = Vec::new();
+    let mut queued_count = 0;
+    let mut simulated_count = 0;
+    let mut skipped_count = 0;
+
+    for item in plan.items {
+        if !item.is_eligible || item.candidate_id.is_none() {
+            skipped_count += 1;
+            results.push(BatchAcquireItemResult {
+                volume_number: item.volume_number,
+                status: item.status,
+                message: item.reason,
+                execution_id: None,
+                candidate_id: item.candidate_id,
+            });
+            continue;
+        }
+
+        let cand_id = item.candidate_id.as_ref().unwrap();
+        let approve_req = crate::acquisition::approval::ApproveCandidateRequest {
+            dry_run: req.dry_run,
+            authorization_token: None, // one-click invisible authorization!
+            user_id,
+            confirm_review: Some(true),
+            confirm_range: Some(true),
+            confirm_pack: Some(true),
+        };
+
+        match acquisition
+            .approve_candidate(manga_id, item.volume_number, cand_id, approve_req)
+            .await
+        {
+            Ok(resp) => {
+                let status = resp.status.clone();
+                if status == "queued" {
+                    queued_count += 1;
+                } else if status == "simulated" || status == "dry_run_preview" {
+                    simulated_count += 1;
+                } else {
+                    skipped_count += 1;
+                }
+                results.push(BatchAcquireItemResult {
+                    volume_number: item.volume_number,
+                    status: resp.status,
+                    message: resp.message,
+                    execution_id: resp.execution_id,
+                    candidate_id: item.candidate_id,
+                });
+            }
+            Err(e) => {
+                skipped_count += 1;
+                results.push(BatchAcquireItemResult {
+                    volume_number: item.volume_number,
+                    status: "error".to_string(),
+                    message: e.to_string(),
+                    execution_id: None,
+                    candidate_id: item.candidate_id,
+                });
+            }
+        }
+    }
+
+    let message = if simulated_count > 0 {
+        format!(
+            "Simulated batch acquisition for {} volume(s) ({} skipped/ineligible)",
+            simulated_count, skipped_count
+        )
+    } else if queued_count > 0 {
+        format!(
+            "Queued {} volume(s) for acquisition ({} skipped/ineligible)",
+            queued_count, skipped_count
+        )
+    } else {
+        format!("No volumes were queued ({} skipped/ineligible)", skipped_count)
+    };
+
+    Ok(VolumeManagerBatchAcquireResponse {
+        manga_id,
+        queued_count,
+        simulated_count,
+        skipped_count,
+        results,
+        message,
     })
 }
 

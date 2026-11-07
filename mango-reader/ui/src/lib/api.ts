@@ -899,6 +899,8 @@ export interface AcquisitionConfig {
   torboxStatusMessage?: string | null;
   autoAcquireEnabled?: boolean;
   autoAcquireDryRun?: boolean;
+  operatingMode?: 'simulation' | 'normal' | string;
+  autoPublishManualAcquisitions?: boolean;
   madokamiEnabled?: boolean;
   madokamiUrl?: string | null;
   hasMadokamiCredentials?: boolean;
@@ -913,6 +915,8 @@ export interface AcquisitionConfigPatch {
   torboxToken?: string;
   autoAcquireEnabled?: boolean;
   autoAcquireDryRun?: boolean;
+  operatingMode?: string;
+  autoPublishManualAcquisitions?: boolean;
   madokamiEnabled?: boolean;
   madokamiUrl?: string;
   madokamiUsername?: string;
@@ -2880,6 +2884,31 @@ export const getVolumeManager = (mangaId: number) =>
 
 export const planVolumeManagerBatch = (mangaId: number, payload: VolumeManagerBatchPlanRequest) =>
   send<VolumeManagerBatchPlanResponse>('POST', `/manga/${mangaId}/volumes-manager/plan`, payload);
+
+export interface VolumeManagerBatchAcquireRequest {
+  selectedVolumes: number[];
+  dryRun?: boolean;
+}
+
+export interface BatchAcquireItemResult {
+  volumeNumber: number;
+  status: string;
+  message: string;
+  executionId?: string | null;
+  candidateId?: string | null;
+}
+
+export interface VolumeManagerBatchAcquireResponse {
+  mangaId: number;
+  queuedCount: number;
+  simulatedCount: number;
+  skippedCount: number;
+  results: BatchAcquireItemResult[];
+  message: string;
+}
+
+export const acquireVolumeManagerBatch = (mangaId: number, payload: VolumeManagerBatchAcquireRequest) =>
+  send<VolumeManagerBatchAcquireResponse>('POST', `/manga/${mangaId}/volumes-manager/acquire`, payload);
 
 export interface DownloadRecoveryInfo {
   chapterId: number;

@@ -1,12 +1,16 @@
 <script lang="ts">
   import { onMount } from 'svelte';
   import Icon from './Icon.svelte';
+  import { toast } from './toast.svelte';
   import {
     getVolumeManager,
     planVolumeManagerBatch,
+    acquireVolumeManagerBatch,
+    getAcquisitionSettings,
     type VolumeManagerSummary,
     type VolumeManagerEntry,
     type VolumeManagerBatchPlanResponse,
+    type VolumeManagerBatchAcquireResponse,
   } from './api';
   import { formatBytes } from './util';
 
@@ -110,6 +114,9 @@
     selectedVolumes = new Set();
   }
 
+  let executingBatch = $state(false);
+  let isSimulationMode = $state(true);
+
   async function handleOpenBatchPlan() {
     if (selectedVolumes.size === 0) return;
     planningBatch = true;
@@ -117,14 +124,47 @@
     showPlanModal = true;
     try {
       const vols = Array.from(selectedVolumes).sort((a, b) => a - b);
-      planResponse = await planVolumeManagerBatch(mangaId, {
-        selectedVolumes: vols,
-        isDryRun: true,
-      });
+      const [volsPlan, acqCfg] = await Promise.all([
+        planVolumeManagerBatch(mangaId, {
+          selectedVolumes: vols,
+          isDryRun: true,
+        }),
+        getAcquisitionSettings().catch(() => null),
+      ]);
+      planResponse = volsPlan;
+      if (acqCfg) {
+        isSimulationMode = acqCfg.operatingMode !== 'normal' || !!acqCfg.autoAcquireDryRun;
+      }
     } catch (e: any) {
       planError = e?.message || 'Failed to generate batch acquisition plan';
     } finally {
       planningBatch = false;
+    }
+  }
+
+  async function handleExecuteBatch() {
+    if (!planResponse || planResponse.eligibleCount === 0 || executingBatch) return;
+    executingBatch = true;
+    planError = null;
+    try {
+      const vols = Array.from(selectedVolumes).sort((a, b) => a - b);
+      const res = await acquireVolumeManagerBatch(mangaId, {
+        selectedVolumes: vols,
+      });
+      if (res.queuedCount > 0) {
+        toast.success(res.message);
+      } else if (res.simulatedCount > 0) {
+        toast.info(res.message);
+      } else {
+        toast.warn(res.message);
+      }
+      showPlanModal = false;
+      clearSelection();
+      await load();
+    } catch (e: any) {
+      planError = e?.message || 'Failed to execute batch acquisition';
+    } finally {
+      executingBatch = false;
     }
   }
 
@@ -716,10 +756,17 @@
       </div>
 
       <div class="modal-body">
-        <div class="dry-run-banner">
-          <Icon name="info" size={16} />
-          <span>DRY-RUN PREVIEW ACTIVE: No real media downloads or TorBox jobs will be executed.</span>
-        </div>
+        {#if isSimulationMode}
+          <div class="dry-run-banner">
+            <Icon name="info" size={16} />
+            <span>SIMULATION MODE ACTIVE: Evaluates candidate matching and plan preview without downloading files.</span>
+          </div>
+        {:else}
+          <div class="dry-run-banner" style="background: rgba(46, 204, 113, 0.1); border-color: rgba(46, 204, 113, 0.4); color: #2ecc71;">
+            <Icon name="download" size={16} />
+            <span>ONE-CLICK BATCH DOWNLOAD: Eligible releases will be queued into downloads. Owned volumes are protected.</span>
+          </div>
+        {/if}
 
         {#if planningBatch}
           <div class="loading-state">
@@ -801,14 +848,25 @@
 
       <div class="modal-footer">
         <span class="subtext">
-          Draft Plan ID: {planResponse?.draftJobId || 'Pending'}
+          {isSimulationMode ? 'Simulation Mode' : 'Normal Execution Mode'} · {planResponse?.eligibleCount ?? 0} ready to acquire
         </span>
         <div class="modal-buttons">
-          <button class="btn subtle" onclick={() => (showPlanModal = false)}>
+          <button class="btn subtle" onclick={() => (showPlanModal = false)} disabled={executingBatch}>
             Close
           </button>
-          <button class="btn spot" disabled={!planResponse?.canExecute} title="Batch execution is review-first only in M8.2">
-            Confirm &amp; Save Draft Plan
+          <button
+            class="btn spot"
+            disabled={!planResponse?.canExecute || executingBatch}
+            onclick={handleExecuteBatch}
+            title={planResponse?.canExecute ? (isSimulationMode ? `Simulate acquisition of ${planResponse.eligibleCount} volume(s)` : `Download ${planResponse.eligibleCount} volume(s)`) : 'No eligible volumes selected'}
+          >
+            {#if executingBatch}
+              <span class="spin"><Icon name="spinner" size={14} stroke={3} /></span>
+              <span>Queuing Downloads…</span>
+            {:else}
+              <Icon name={isSimulationMode ? 'eye' : 'download'} size={14} />
+              <span>{isSimulationMode ? 'Simulate' : 'Download'} {planResponse?.eligibleCount ?? 0} Volume{planResponse?.eligibleCount === 1 ? '' : 's'}</span>
+            {/if}
           </button>
         </div>
       </div>

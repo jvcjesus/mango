@@ -566,10 +566,10 @@ impl AcquisitionService {
         }
 
         // Live execution authorization checks
-        // 1. Authoritative global dry-run policy
+        // 1. Authoritative global dry-run / operating mode policy
         let auto_dry = self
             .db
-            .call(|conn| Ok(crate::acquisition::auto_acquire::is_auto_acquire_dry_run(conn)))
+            .call(|conn| Ok(crate::acquisition::auto_acquire::is_auto_acquire_dry_run(conn) || crate::acquisition::auto_acquire::is_simulation_mode(conn)))
             .await?;
         if auto_dry || cfg.auto_acquire_dry_run {
             return Err(AppError::bad_request(
@@ -577,138 +577,176 @@ impl AcquisitionService {
             ));
         }
 
-        // 2. Explicit server authorization token required
-        let auth_token = req.authorization_token.as_ref().ok_or_else(|| {
-            AppError::bad_request(
+        // 2. Authorization token: validate supplied token or seamlessly generate one-click token for authenticated user
+        if req.authorization_token.is_none() && req.user_id.is_none() {
+            return Err(AppError::bad_request(
                 "Explicit execution authorization token is required for live acquisition",
-            )
-        })?;
+            ));
+        }
 
-        // 3. Atomically validate and consume authorization token
-        let auth_token_str = auth_token.clone();
-        let c_id_validate = candidate.candidate_id.clone();
-        let prov_validate = candidate.provider.clone();
         let expected_edition =
             crate::acquisition::edition::edition_from_title(&candidate.raw_title);
+        let c_id_validate = candidate.candidate_id.clone();
+        let prov_validate = candidate.provider.clone();
         let user_id_check = req.user_id;
 
-        self.db
-            .call(move |conn| {
-                let row: Option<(
-                    i64,
-                    f64,
-                    String,
-                    String,
-                    String,
-                    Option<i64>,
-                    i64,
-                    Option<i64>,
-                    String,
-                )> = conn
-                    .query_row(
-                        "SELECT manga_id, volume_number, candidate_id, provider, edition, user_id, expires_at, consumed_at, status
-                         FROM acquisition_execution_authorizations
-                         WHERE id = ?1",
-                        [&auth_token_str],
-                        |r| {
-                            Ok((
-                                r.get(0)?,
-                                r.get(1)?,
-                                r.get(2)?,
-                                r.get(3)?,
-                                r.get(4)?,
-                                r.get(5)?,
-                                r.get(6)?,
-                                r.get(7)?,
-                                r.get(8)?,
-                            ))
-                        },
-                    )
-                    .optional()?;
+        if let Some(ref auth_token_str) = req.authorization_token {
+            let auth_token_str = auth_token_str.clone();
+            let exp_ed_clone = expected_edition.clone();
+            self.db
+                .call(move |conn| {
+                    let row: Option<(
+                        i64,
+                        f64,
+                        String,
+                        String,
+                        String,
+                        Option<i64>,
+                        i64,
+                        Option<i64>,
+                        String,
+                    )> = conn
+                        .query_row(
+                            "SELECT manga_id, volume_number, candidate_id, provider, edition, user_id, expires_at, consumed_at, status
+                             FROM acquisition_execution_authorizations
+                             WHERE id = ?1",
+                            [&auth_token_str],
+                            |r| {
+                                Ok((
+                                    r.get(0)?,
+                                    r.get(1)?,
+                                    r.get(2)?,
+                                    r.get(3)?,
+                                    r.get(4)?,
+                                    r.get(5)?,
+                                    r.get(6)?,
+                                    r.get(7)?,
+                                    r.get(8)?,
+                                ))
+                            },
+                        )
+                        .optional()?;
 
-                let (
-                    t_manga_id,
-                    t_vol,
-                    t_cand,
-                    t_prov,
-                    t_ed,
-                    t_user_id,
-                    t_exp,
-                    t_consumed,
-                    t_status,
-                ) = row.ok_or_else(|| {
-                    AppError::bad_request("Invalid or unrecognized authorization token")
-                })?;
+                    let (
+                        t_manga_id,
+                        t_vol,
+                        t_cand,
+                        t_prov,
+                        t_ed,
+                        t_user_id,
+                        t_exp,
+                        t_consumed,
+                        t_status,
+                    ) = row.ok_or_else(|| {
+                        AppError::bad_request("Invalid or unrecognized authorization token")
+                    })?;
 
-                if t_status != "authorized" || t_consumed.is_some() {
-                    return Err(AppError::bad_request(
-                        "Authorization token has already been consumed or is invalid",
-                    ));
-                }
-
-                if t_exp < now() {
-                    return Err(AppError::bad_request("Authorization token has expired"));
-                }
-
-                if t_manga_id != manga_id {
-                    return Err(AppError::bad_request("Authorization token title mismatch"));
-                }
-
-                if (t_vol - volume).abs() > 0.001 {
-                    return Err(AppError::bad_request(
-                        "Authorization token volume substitution rejected",
-                    ));
-                }
-
-                if t_cand != c_id_validate {
-                    return Err(AppError::bad_request(
-                        "Authorization token candidate substitution rejected",
-                    ));
-                }
-
-                if t_prov != prov_validate {
-                    return Err(AppError::bad_request(
-                        "Authorization token provider substitution rejected",
-                    ));
-                }
-
-                if let Some(ref exp_ed) = expected_edition {
-                    if !exp_ed.is_empty()
-                        && !t_ed.is_empty()
-                        && !t_ed.eq_ignore_ascii_case(exp_ed)
-                    {
+                    if t_status != "authorized" || t_consumed.is_some() {
                         return Err(AppError::bad_request(
-                            "Authorization token edition substitution rejected",
+                            "Authorization token has already been consumed or is invalid",
                         ));
                     }
-                }
 
-                if let Some(token_uid) = t_user_id {
-                    if let Some(calling_uid) = user_id_check {
-                        if token_uid != calling_uid {
-                            return Err(AppError::bad_request("Authorization token user mismatch"));
-                        }
-                    } else {
-                        return Err(AppError::bad_request("Unauthorized user rejected"));
+                    if t_exp < now() {
+                        return Err(AppError::bad_request("Authorization token has expired"));
                     }
-                }
 
-                let updated = conn.execute(
-                    "UPDATE acquisition_execution_authorizations
-                     SET consumed_at = ?1, status = 'consumed'
-                     WHERE id = ?2 AND status = 'authorized' AND consumed_at IS NULL",
-                    params![now(), auth_token_str],
-                )?;
+                    if t_manga_id != manga_id {
+                        return Err(AppError::bad_request("Authorization token title mismatch"));
+                    }
 
-                if updated == 0 {
-                    return Err(AppError::bad_request(
-                        "Authorization token has already been consumed or is invalid",
-                    ));
-                }
+                    if (t_vol - volume).abs() > 0.001 {
+                        return Err(AppError::bad_request(
+                            "Authorization token volume substitution rejected",
+                        ));
+                    }
 
-                Ok(())
-            })
-            .await?;
+                    if t_cand != c_id_validate {
+                        return Err(AppError::bad_request(
+                            "Authorization token candidate substitution rejected",
+                        ));
+                    }
+
+                    if t_prov != prov_validate {
+                        return Err(AppError::bad_request(
+                            "Authorization token provider substitution rejected",
+                        ));
+                    }
+
+                    if let Some(ref exp_ed) = exp_ed_clone {
+                        if !exp_ed.is_empty()
+                            && !t_ed.is_empty()
+                            && !t_ed.eq_ignore_ascii_case(exp_ed)
+                        {
+                            return Err(AppError::bad_request(
+                                "Authorization token edition substitution rejected",
+                            ));
+                        }
+                    }
+
+                    if let Some(token_uid) = t_user_id {
+                        if let Some(calling_uid) = user_id_check {
+                            if token_uid != calling_uid {
+                                return Err(AppError::bad_request("Authorization token user mismatch"));
+                            }
+                        } else {
+                            return Err(AppError::bad_request("Unauthorized user rejected"));
+                        }
+                    }
+
+                    let updated = conn.execute(
+                        "UPDATE acquisition_execution_authorizations
+                         SET consumed_at = ?1, status = 'consumed'
+                         WHERE id = ?2 AND status = 'authorized' AND consumed_at IS NULL",
+                        params![now(), auth_token_str],
+                    )?;
+
+                    if updated == 0 {
+                        return Err(AppError::bad_request(
+                            "Authorization token has already been consumed or is invalid",
+                        ));
+                    }
+
+                    Ok(())
+                })
+                .await?;
+        } else {
+            // Seamless one-click authorization: generate and record consumed token immediately
+            let auto_token_id = generate_secure_auth_token();
+            let p_cand_id = candidate.candidate_id.clone();
+            let p_prov = candidate.provider.clone();
+            let p_bk = if candidate.provider == "nyaa" { "torbox" } else { "madokami" };
+            let p_ed = expected_edition.as_deref().unwrap_or("Standard").to_string();
+            let p_sid = s_id.clone();
+
+            self.db
+                .call(move |conn| {
+                    let now_ts = now();
+                    conn.execute(
+                        "INSERT INTO acquisition_execution_authorizations (
+                            id, manga_id, mangabaka_id, series_id, edition, volume_number,
+                            candidate_id, provider, backend, user_id, created_at, expires_at,
+                            consumed_at, status
+                        ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 'consumed')",
+                        params![
+                            auto_token_id,
+                            manga_id,
+                            p_sid,
+                            p_ed,
+                            volume,
+                            p_cand_id,
+                            p_prov,
+                            p_bk,
+                            user_id_check,
+                            now_ts,
+                            now_ts + 900,
+                            now_ts,
+                        ],
+                    )?;
+                    Ok(())
+                })
+                .await?;
+        }
 
         let approve_req = ApprovePlanRequest {
             plan_id: planned.plan.id.clone(),
@@ -1086,6 +1124,11 @@ impl AcquisitionService {
             (None, None)
         };
 
+        let is_auto_publish = self
+            .db
+            .call(|conn| Ok(crate::acquisition::auto_acquire::is_auto_publish_manual_enabled(conn)))
+            .await?;
+
         Ok(ManualAcquisitionReviewDto {
             catalog_title_id: manga_id,
             series_title: title,
@@ -1104,7 +1147,7 @@ impl AcquisitionService {
             staging_destination,
             canonical_destination,
             dry_run: is_dry_run_active,
-            publication_requires_separate_approval: true,
+            publication_requires_separate_approval: !is_auto_publish,
             authorization_token: auth_token,
             expires_at,
         })

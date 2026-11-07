@@ -228,6 +228,10 @@ pub fn default_true() -> bool {
     true
 }
 
+pub fn default_simulation_mode() -> String {
+    "simulation".to_string()
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AcquisitionConfigPatch {
@@ -241,6 +245,8 @@ pub struct AcquisitionConfigPatch {
     pub auto_acquire_enabled: Option<bool>,
     #[serde(default)]
     pub auto_acquire_dry_run: Option<bool>,
+    pub operating_mode: Option<String>,
+    pub auto_publish_manual_acquisitions: Option<bool>,
     #[serde(default)]
     pub madokami_enabled: Option<bool>,
     pub madokami_url: Option<String>,
@@ -322,6 +328,10 @@ impl AcquisitionService {
                     super::auto_acquire::is_global_auto_acquire_enabled(conn);
                 let auto_acquire_dry_run =
                     super::auto_acquire::is_auto_acquire_dry_run(conn);
+                let operating_mode =
+                    super::auto_acquire::get_operating_mode(conn);
+                let auto_publish_manual_acquisitions =
+                    super::auto_acquire::is_auto_publish_manual_enabled(conn);
 
                 let madokami_enabled = crate::db::state(conn, "acquisition.madokami_enabled")?
                     .and_then(|v| v.parse::<bool>().ok())
@@ -347,6 +357,8 @@ impl AcquisitionService {
                         torbox_status_message,
                         auto_acquire_enabled,
                         auto_acquire_dry_run,
+                        operating_mode,
+                        auto_publish_manual_acquisitions,
                         madokami_enabled,
                         madokami_url,
                         has_madokami_credentials,
@@ -459,6 +471,12 @@ impl AcquisitionService {
                 }
                 if let Some(dry_run) = patch.auto_acquire_dry_run {
                     super::auto_acquire::set_auto_acquire_dry_run(conn, dry_run)?;
+                }
+                if let Some(mode) = patch.operating_mode {
+                    super::auto_acquire::set_operating_mode(conn, &mode)?;
+                }
+                if let Some(auto_pub) = patch.auto_publish_manual_acquisitions {
+                    super::auto_acquire::set_auto_publish_manual_enabled(conn, auto_pub)?;
                 }
                 if let Some(token) = patch.torbox_token {
                     let trimmed = token.trim();

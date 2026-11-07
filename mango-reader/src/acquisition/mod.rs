@@ -346,6 +346,10 @@ pub struct AcquisitionConfig {
     pub auto_acquire_enabled: bool,
     #[serde(default = "service::default_true")]
     pub auto_acquire_dry_run: bool,
+    #[serde(default = "service::default_simulation_mode")]
+    pub operating_mode: String,
+    #[serde(default)]
+    pub auto_publish_manual_acquisitions: bool,
     #[serde(default = "service::default_true")]
     pub madokami_enabled: bool,
     pub madokami_url: Option<String>,
@@ -366,6 +370,8 @@ impl Default for AcquisitionConfig {
             torbox_status_message: None,
             auto_acquire_enabled: false,
             auto_acquire_dry_run: true,
+            operating_mode: "simulation".to_string(),
+            auto_publish_manual_acquisitions: false,
             madokami_enabled: true,
             madokami_url: Some(madokami::DEFAULT_MADOKAMI_URL.to_string()),
             has_madokami_credentials: false,

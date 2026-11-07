@@ -741,6 +741,22 @@
   let madokamiUsernameInput = $state('');
   let madokamiPasswordInput = $state('');
 
+  let operatingModeInput = $state<'simulation' | 'normal'>('simulation');
+  let autoPublishManualInput = $state(false);
+
+  async function toggleOperatingMode(target: 'simulation' | 'normal') {
+    if (target === 'normal' && operatingModeInput !== 'normal') {
+      const ok = await confirm({
+        title: 'Switch to Normal Acquisition Mode?',
+        message: 'In Normal Mode, explicit user-initiated downloads will initiate real network retrieval and TorBox/Madokami downloads. Automatic background acquisition remains governed by its separate kill switch.',
+        confirmText: 'Enable Normal Mode',
+        danger: true,
+      });
+      if (!ok) return;
+    }
+    operatingModeInput = target;
+  }
+
   // Notifications tab state
   let ntfyConfig = $state<NtfyConfig | null>(null);
   let ntfyLoading = $state(false);
@@ -919,6 +935,8 @@
         madokamiUrlInput = acq.madokamiUrl ?? 'https://manga.madokami.al';
         madokamiUsernameInput = acq.hasMadokamiCredentials ? '********' : '';
         madokamiPasswordInput = acq.hasMadokamiCredentials ? '********' : '';
+        operatingModeInput = (acq.operatingMode === 'normal' ? 'normal' : 'simulation');
+        autoPublishManualInput = acq.autoPublishManualAcquisitions ?? false;
       }
 
       loadProfiles();
@@ -1355,6 +1373,8 @@
         madokamiUrl: madokamiUrlInput.trim() || undefined,
         madokamiUsername: madokamiUsernameInput === 'CLEAR' ? '' : (madokamiUsernameInput && madokamiUsernameInput !== '********' ? madokamiUsernameInput.trim() : undefined),
         madokamiPassword: madokamiPasswordInput === 'CLEAR' ? '' : (madokamiPasswordInput && madokamiPasswordInput !== '********' ? madokamiPasswordInput.trim() : undefined),
+        operatingMode: operatingModeInput,
+        autoPublishManualAcquisitions: autoPublishManualInput,
       };
       await Promise.all([
         send('PUT', '/pipeline/config', patch),
@@ -2572,16 +2592,52 @@
           </section>
 
           <section class="card">
-            <h3>Guarded Auto-Acquisition</h3>
+            <h3>Acquisition Operating Mode & Automation</h3>
             <span class="muted">
-              Conservative, policy-governed automation for newly released manga volumes. M6.4 Candidate Approval Bridge remains the sole acquisition executor.
+              Configure system-wide acquisition safety, simulation behavior, and publication automation.
             </span>
+
+            <div class="set">
+              <div class="what">
+                <strong>Operating Mode</strong>
+                <span>
+                  <strong>Simulation Mode:</strong> All download requests generate simulated previews without network activity, remote API jobs, or storage modifications.<br />
+                  <strong>Normal Mode:</strong> Explicit user-initiated downloads retrieve real archives from TorBox or Madokami after validation.
+                </span>
+              </div>
+              <div class="how">
+                <div class="seg" role="group" aria-label="Acquisition Operating Mode">
+                  <button
+                    aria-pressed={operatingModeInput === 'simulation'}
+                    onclick={() => { operatingModeInput = 'simulation'; }}
+                  >Simulation Mode</button>
+                  <button
+                    aria-pressed={operatingModeInput === 'normal'}
+                    onclick={() => toggleOperatingMode('normal')}
+                  >Normal Mode</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="set">
+              <div class="what">
+                <strong>Automatic Safe Publication</strong>
+                <span>
+                  When enabled, validated exact-volume manual acquisitions automatically publish into Komga library folders. When disabled, acquisitions remain safely staged until separate publication approval.
+                </span>
+              </div>
+              <div class="how">
+                {@render toggle(autoPublishManualInput, 'Auto-publish manual acquisitions', () => {
+                  autoPublishManualInput = !autoPublishManualInput;
+                })}
+              </div>
+            </div>
 
             <div class="set">
               <div class="what">
                 <strong>Global Automatic Acquisition Master Switch</strong>
                 <span>
-                  Master kill switch. When disabled, all automatic acquisition is completely halted across all titles.
+                  Master kill switch. When disabled, background automated acquisition is completely halted across all titles.
                 </span>
               </div>
               <div class="how">
@@ -2589,26 +2645,26 @@
               </div>
             </div>
 
-            <div class="set">
-              <div class="what">
-                <strong>Simulation / Dry-Run Mode</strong>
-                <span>
-                  When enabled, evaluated releases record <code>WOULD_AUTO_ACQUIRE</code> decisions without submitting any remote download jobs to TorBox.
-                </span>
-              </div>
-              <div class="how">
-                {@render toggle(autoAcquireSettings.dryRun, 'Auto-acquire dry-run', toggleAutoAcquireDryRun)}
-              </div>
-            </div>
-
-            <div class="path-status-row" style="margin-top: 0.75rem;">
-              <span class="status-badge status-{autoAcquireSettings.enabled ? (autoAcquireSettings.dryRun ? 'not_configured' : 'valid') : 'failed'}">
-                {#if !autoAcquireSettings.enabled}
-                  Master Switch: OFF · Safe state
-                {:else if autoAcquireSettings.dryRun}
-                  Master Switch: ON · Dry-Run Simulation Active
+            <div class="path-status-row" style="margin-top: 0.75rem; display: flex; flex-wrap: wrap; gap: 0.5rem;">
+              <span class="status-badge status-{operatingModeInput === 'simulation' ? 'not_configured' : 'valid'}">
+                {#if operatingModeInput === 'simulation'}
+                  Mode: Simulation (Protected)
                 {:else}
-                  Master Switch: ON · Live Auto-Acquisition Active
+                  Mode: Normal (Live Downloads Active)
+                {/if}
+              </span>
+              <span class="status-badge status-{autoPublishManualInput ? 'valid' : 'not_configured'}">
+                {#if autoPublishManualInput}
+                  Publication: Auto-Publish
+                {:else}
+                  Publication: Staging Only (Approval Required)
+                {/if}
+              </span>
+              <span class="status-badge status-{autoAcquireSettings.enabled ? 'valid' : 'failed'}">
+                {#if autoAcquireSettings.enabled}
+                  Auto-Acquisition: Master Switch ON
+                {:else}
+                  Auto-Acquisition: Master Switch OFF
                 {/if}
               </span>
             </div>

@@ -695,3 +695,148 @@ async fn test_physical_acquisition_complete_decoupled_from_komf() {
 
     let _ = fs::remove_dir_all(&temp_dir);
 }
+
+fn seed_manga_and_candidate(db: &Db, manga_id: i64, volume: f64, candidate_id: &str) {
+    db.now(move |conn| {
+        conn.execute(
+            "INSERT OR IGNORE INTO manga (id, source_id, url, title, in_library) VALUES (?1, 1, '/manga/test', 'Frieren', 1)",
+            [manga_id],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO series_reconciliations (series_id, manga_id, mangabaka_id, title, status, total_official_volumes, edition, last_reconciled_at, updated_at)
+             VALUES ('title:frieren', ?1, 1001, 'Frieren', 'active', 12, 'Standard', 100, 100)",
+            [manga_id],
+        )?;
+        conn.execute(
+            "INSERT OR REPLACE INTO discovered_release_candidates (
+                series_id, volume_number, candidate_id, provider, provider_item_id,
+                title, raw_title, match_type, size_bytes, uploader, is_trusted,
+                is_digital, score, score_explanation, download_url, magnet_url,
+                info_hash, seeders, leechers, published_at, discovered_at
+            ) VALUES (
+                'title:frieren', ?1, ?2, 'nyaa', 'item_1',
+                'Frieren v10 (Digital)', '[Group] Frieren - Volume 10 (Digital) [CBZ]', 'exact_volume', 150000000,
+                'TrustedGroup', 1, 1, 95.0, 'Exact single volume match',
+                NULL, 'magnet:?xt=urn:btih:abcdef1234567890abcdef1234567890abcdef12',
+                'abcdef1234567890abcdef1234567890abcdef12', 25, 2, 1700000000, 1700000000
+            )",
+            params![volume, candidate_id],
+        )?;
+        Ok(())
+    }).unwrap();
+}
+
+#[tokio::test]
+async fn test_m8_11_operating_mode_fail_closed_and_switching() {
+    let (_svc, db, temp_dir) = setup_test_service("m8_11_op_mode");
+
+    db.call(|conn| {
+        // Default mode is simulation
+        assert!(crate::acquisition::auto_acquire::is_simulation_mode(conn));
+        assert_eq!(crate::acquisition::auto_acquire::get_operating_mode(conn), "simulation");
+
+        // Setting garbage fails closed to simulation
+        crate::acquisition::auto_acquire::set_operating_mode(conn, "invalid_mode")?;
+        assert!(crate::acquisition::auto_acquire::is_simulation_mode(conn));
+        assert_eq!(crate::acquisition::auto_acquire::get_operating_mode(conn), "simulation");
+
+        // Explicit "normal" mode enables Normal mode
+        crate::acquisition::auto_acquire::set_operating_mode(conn, "normal")?;
+        assert!(!crate::acquisition::auto_acquire::is_simulation_mode(conn));
+        assert_eq!(crate::acquisition::auto_acquire::get_operating_mode(conn), "normal");
+
+        // Switching back to simulation mode
+        crate::acquisition::auto_acquire::set_operating_mode(conn, "simulation")?;
+        assert!(crate::acquisition::auto_acquire::is_simulation_mode(conn));
+        assert_eq!(crate::acquisition::auto_acquire::get_operating_mode(conn), "simulation");
+
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_m8_11_one_click_invisible_authorization_for_authenticated_user() {
+    let (svc, db, temp_dir) = setup_test_service("m8_11_one_click");
+    seed_manga_and_candidate(&db, 10, 10.0, "nyaa:item_exact_1");
+
+    // Set normal mode
+    db.call(|conn| {
+        crate::acquisition::auto_acquire::set_operating_mode(conn, "normal")?;
+        crate::acquisition::auto_acquire::set_auto_acquire_dry_run(conn, false)?;
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    // Authenticated user (user_id = Some(42)) triggers one-click download without authorization_token
+    let res = svc
+        .approve_candidate(
+            10,
+            10.0,
+            "nyaa:item_exact_1",
+            ApproveCandidateRequest {
+                dry_run: Some(false),
+                authorization_token: None, // NO token supplied!
+                user_id: Some(42),          // Authenticated user
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(res.status, "queued");
+    assert!(res.execution_id.is_some());
+    assert!(!res.chapter_ids.is_empty());
+
+    // Verify auto-token was securely created and consumed in DB
+    db.call(|conn| {
+        let (token_count, status, user_id): (i64, String, Option<i64>) = conn.query_row(
+            "SELECT COUNT(*), status, user_id FROM acquisition_execution_authorizations WHERE manga_id = 10 AND volume_number = 10.0",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )?;
+        assert_eq!(token_count, 1);
+        assert_eq!(status, "consumed");
+        assert_eq!(user_id, Some(42));
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}
+
+#[tokio::test]
+async fn test_m8_11_auto_publish_manual_setting_toggle() {
+    let (svc, db, temp_dir) = setup_test_service("m8_11_auto_pub");
+    seed_manga_and_candidate(&db, 11, 10.0, "nyaa:item_exact_1");
+
+    // 1. By default, auto_publish_manual is false
+    db.call(|conn| {
+        assert!(!crate::acquisition::auto_acquire::is_auto_publish_manual_enabled(conn));
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let review1 = svc.request_manual_acquisition_review(11, 10.0, "nyaa:item_exact_1", Some(1)).await.unwrap();
+    assert!(review1.publication_requires_separate_approval, "Requires separate approval when auto-publish is off");
+
+    // 2. Enable auto-publish for manual acquisitions
+    db.call(|conn| {
+        crate::acquisition::auto_acquire::set_auto_publish_manual_enabled(conn, true)?;
+        assert!(crate::acquisition::auto_acquire::is_auto_publish_manual_enabled(conn));
+        Ok(())
+    })
+    .await
+    .unwrap();
+
+    let review2 = svc.request_manual_acquisition_review(11, 10.0, "nyaa:item_exact_1", Some(1)).await.unwrap();
+    assert!(!review2.publication_requires_separate_approval, "Publication proceeds automatically when auto-publish is on");
+
+    let _ = fs::remove_dir_all(&temp_dir);
+}

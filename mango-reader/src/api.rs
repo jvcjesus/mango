@@ -144,6 +144,8 @@ pub fn router(state: Spaces) -> Router {
         .route("/titles/{id}/volumes-manager", get(get_manga_volumes_manager))
         .route("/manga/{id}/volumes-manager/plan", post(post_manga_volumes_manager_plan))
         .route("/titles/{id}/volumes-manager/plan", post(post_manga_volumes_manager_plan))
+        .route("/manga/{id}/volumes-manager/acquire", post(post_manga_volumes_manager_acquire))
+        .route("/titles/{id}/volumes-manager/acquire", post(post_manga_volumes_manager_acquire))
         .route(
             "/manga/{id}/volumes/{volume}/candidates/inspect",
             get(get_manga_volume_candidates_inspect),
@@ -1317,6 +1319,24 @@ async fn post_manga_volumes_manager_plan(
             )
         })
         .await?;
+    Ok(Json(res))
+}
+
+async fn post_manga_volumes_manager_acquire(
+    Me(app): Me,
+    Path(id): Path<i64>,
+    Json(payload): Json<crate::acquisition::volume_manager::VolumeManagerBatchAcquireRequest>,
+) -> Result<Json<crate::acquisition::volume_manager::VolumeManagerBatchAcquireResponse>> {
+    let user_id = if app.me.id > 0 { Some(app.me.id) } else { None };
+    let res = crate::acquisition::volume_manager::acquire_volume_manager_batch(
+        &app.db,
+        &app.acquisition,
+        &app.titles,
+        id,
+        payload,
+        user_id,
+    )
+    .await?;
     Ok(Json(res))
 }
 

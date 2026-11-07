@@ -31,6 +31,8 @@ use crate::pipeline::ownership::OwnershipStatus;
 /// Global settings keys
 pub const SETTING_AUTO_ACQUIRE_ENABLED: &str = "acquisition.auto_acquire_enabled";
 pub const SETTING_AUTO_ACQUIRE_DRY_RUN: &str = "acquisition.auto_acquire_dry_run";
+pub const SETTING_OPERATING_MODE: &str = "acquisition.operating_mode";
+pub const SETTING_AUTO_PUBLISH_MANUAL: &str = "acquisition.auto_publish_manual_acquisitions";
 
 /// Default safety bounds
 pub const DEFAULT_MIN_SIZE_BYTES: u64 = 10 * 1024 * 1024; // 10 MB
@@ -142,6 +144,48 @@ pub fn set_global_auto_acquire(conn: &Connection, enabled: bool) -> Result<()> {
 /// Set global auto-acquire dry run mode
 pub fn set_auto_acquire_dry_run(conn: &Connection, dry_run: bool) -> Result<()> {
     crate::settings::set(conn, SETTING_AUTO_ACQUIRE_DRY_RUN, &serde_json::json!(dry_run))
+}
+
+/// Operating Mode: "simulation" (default) or "normal"
+pub fn get_operating_mode(conn: &Connection) -> String {
+    crate::settings::get::<String>(conn, SETTING_OPERATING_MODE)
+        .unwrap_or_else(|| "simulation".to_string())
+}
+
+/// Returns true if the system is in Simulation Mode (default, safe).
+/// Fails closed to simulation mode if unknown or unset.
+pub fn is_simulation_mode(conn: &Connection) -> bool {
+    let mode = get_operating_mode(conn);
+    if mode.eq_ignore_ascii_case("normal") {
+        return false;
+    }
+    let auto_dry = crate::settings::get::<bool>(conn, SETTING_AUTO_ACQUIRE_DRY_RUN);
+    if auto_dry == Some(false) {
+        return false;
+    }
+    true
+}
+
+/// Set operating mode. Fails closed: only explicit "normal" enables Normal Mode.
+pub fn set_operating_mode(conn: &Connection, mode: &str) -> Result<()> {
+    let normalized = if mode.eq_ignore_ascii_case("normal") {
+        "normal"
+    } else {
+        "simulation"
+    };
+    crate::settings::set(conn, SETTING_OPERATING_MODE, &serde_json::json!(normalized))?;
+    crate::settings::set(conn, SETTING_AUTO_ACQUIRE_DRY_RUN, &serde_json::json!(normalized != "normal"))?;
+    Ok(())
+}
+
+/// Auto-publish for manual acquisitions query helper (defaults strictly to false)
+pub fn is_auto_publish_manual_enabled(conn: &Connection) -> bool {
+    crate::settings::get::<bool>(conn, SETTING_AUTO_PUBLISH_MANUAL).unwrap_or(false)
+}
+
+/// Set auto-publish for manual acquisitions
+pub fn set_auto_publish_manual_enabled(conn: &Connection, enabled: bool) -> Result<()> {
+    crate::settings::set(conn, SETTING_AUTO_PUBLISH_MANUAL, &serde_json::json!(enabled))
 }
 
 /// Get per-title auto-acquire opt-in state and activation timestamp
