@@ -1003,6 +1003,8 @@ impl AcquisitionService {
                         confirm_pack: None,
                         confirm_review: None,
                         dry_run: None,
+                        authorization_token: None,
+                        user_id: None,
                     },
                 )
                 .await;

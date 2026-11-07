@@ -117,6 +117,12 @@ fn make_synthetic_valid_cbz(path: &Path, series: &str, volume: f64) {
 async fn test_e2e_approval_publication_receipt_and_restart_recovery_lifecycle() {
     let env = TestEnv::new("e2e_lifecycle");
 
+    // Turn off global dry run for live execution test
+    env.db.call(|conn| {
+        crate::acquisition::auto_acquire::set_auto_acquire_dry_run(conn, false)?;
+        Ok(())
+    }).await.unwrap();
+
     // 1. Setup Pipeline with isolated library destination and Komga scan configured (pointing to dummy URL)
     let pipeline = Arc::new(Pipeline::new(env.db.clone()));
     let mut pipe_cfg = PipelineConfig::default();
@@ -177,9 +183,20 @@ async fn test_e2e_approval_publication_receipt_and_restart_recovery_lifecycle() 
         .await
         .unwrap();
 
-    // Step 1: Candidate is approved
+    // Step 1: Candidate is approved with execution authorization
+    let review = service
+        .request_manual_acquisition_review(manga_id, volume_number, "cand:101:v1", Some(1))
+        .await
+        .unwrap();
+    let auth_token = review.authorization_token.expect("review token generated");
+
     let approval_res = service
-        .approve_candidate(manga_id, volume_number, "cand:101:v1", ApproveCandidateRequest::default())
+        .approve_candidate(manga_id, volume_number, "cand:101:v1", ApproveCandidateRequest {
+            dry_run: Some(false),
+            authorization_token: Some(auth_token),
+            user_id: Some(1),
+            ..Default::default()
+        })
         .await
         .unwrap();
     assert_eq!(approval_res.status, "queued");
@@ -477,6 +494,13 @@ async fn test_invalid_archive_in_staging_rejected_before_publication() {
 #[tokio::test]
 async fn test_duplicate_concurrent_candidate_approval_is_deduplicated() {
     let env = TestEnv::new("dedup_approval");
+
+    // Turn off global dry run for live execution test
+    env.db.call(|conn| {
+        crate::acquisition::auto_acquire::set_auto_acquire_dry_run(conn, false)?;
+        Ok(())
+    }).await.unwrap();
+
     let svc = AcquisitionService::new(env.db.clone(), reqwest::Client::new(), None, None);
 
     let manga_id = 401;
@@ -514,9 +538,27 @@ async fn test_duplicate_concurrent_candidate_approval_is_deduplicated() {
         .await
         .unwrap();
 
+    // Request review tokens concurrently before execution starts
+    let review1 = svc
+        .request_manual_acquisition_review(manga_id, 1.0, "cand:401:v1", Some(1))
+        .await
+        .unwrap();
+    let auth_token1 = review1.authorization_token.expect("review token 1 generated");
+
+    let review2 = svc
+        .request_manual_acquisition_review(manga_id, 1.0, "cand:401:v1", Some(1))
+        .await
+        .unwrap();
+    let auth_token2 = review2.authorization_token.expect("review token 2 generated");
+
     // First approval queues
     let res1 = svc
-        .approve_candidate(manga_id, 1.0, "cand:401:v1", ApproveCandidateRequest::default())
+        .approve_candidate(manga_id, 1.0, "cand:401:v1", ApproveCandidateRequest {
+            dry_run: Some(false),
+            authorization_token: Some(auth_token1),
+            user_id: Some(1),
+            ..Default::default()
+        })
         .await
         .unwrap();
     assert_eq!(res1.status, "queued");
@@ -524,7 +566,12 @@ async fn test_duplicate_concurrent_candidate_approval_is_deduplicated() {
 
     // Second approval while download is queued returns already_acquiring
     let res2 = svc
-        .approve_candidate(manga_id, 1.0, "cand:401:v1", ApproveCandidateRequest::default())
+        .approve_candidate(manga_id, 1.0, "cand:401:v1", ApproveCandidateRequest {
+            dry_run: Some(false),
+            authorization_token: Some(auth_token2),
+            user_id: Some(1),
+            ..Default::default()
+        })
         .await
         .unwrap();
     assert_eq!(res2.status, "already_acquiring");

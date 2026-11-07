@@ -3,12 +3,14 @@
     inspectVolumeCandidates,
     compareVolumeCandidates,
     acquireMangaVolumeCandidate,
+    getManualAcquisitionReview,
     message,
     type VolumeCandidateInspectionResult,
     type CandidateComparisonMatrix,
     type CandidateInspectionDto,
     type CandidateComparisonItem,
     type ApproveCandidateResponse,
+    type ManualAcquisitionReviewDto,
   } from './api';
   import Icon from './Icon.svelte';
   import Notice from './Notice.svelte';
@@ -38,9 +40,18 @@
   let comparisonData = $state<CandidateComparisonMatrix | null>(null);
 
   let reviewingCandidate = $state<CandidateInspectionDto | CandidateComparisonItem | null>(null);
+  let reviewDto = $state<ManualAcquisitionReviewDto | null>(null);
+  let reviewLoading = $state(false);
+  let reviewError = $state<string | null>(null);
+
   let previewingPlan = $state(false);
   let planPreviewResult = $state<ApproveCandidateResponse | null>(null);
   let planPreviewError = $state<string | null>(null);
+
+  let submittingExecution = $state(false);
+  let executionResult = $state<ApproveCandidateResponse | null>(null);
+  let executionError = $state<string | null>(null);
+
   let blockReasonModalCandidate = $state<CandidateInspectionDto | CandidateComparisonItem | null>(null);
 
   function getCacheBadge(cand: CandidateInspectionDto | CandidateComparisonItem): { label: string; cls: string; icon: 'check' | 'clock' | 'info' | 'download' } | null {
@@ -74,6 +85,27 @@
     return { code, reason };
   }
 
+  async function selectCandidateForReview(cand: CandidateInspectionDto | CandidateComparisonItem) {
+    reviewingCandidate = cand;
+    planPreviewResult = null;
+    planPreviewError = null;
+    executionResult = null;
+    executionError = null;
+    await requestReview(cand);
+  }
+
+  async function requestReview(cand: CandidateInspectionDto | CandidateComparisonItem) {
+    reviewLoading = true;
+    reviewError = null;
+    try {
+      reviewDto = await getManualAcquisitionReview(mangaId, volume, cand.candidateId);
+    } catch (e) {
+      reviewError = message(e);
+    } finally {
+      reviewLoading = false;
+    }
+  }
+
   async function previewPlanAction(cand: CandidateInspectionDto | CandidateComparisonItem) {
     previewingPlan = true;
     planPreviewError = null;
@@ -86,6 +118,34 @@
     } finally {
       previewingPlan = false;
     }
+  }
+
+  async function confirmAcquisitionAction(cand: CandidateInspectionDto | CandidateComparisonItem) {
+    if (!reviewDto?.authorizationToken) return;
+    submittingExecution = true;
+    executionError = null;
+    executionResult = null;
+    try {
+      const res = await acquireMangaVolumeCandidate(mangaId, volume, cand.candidateId, {
+        dryRun: false,
+        authorizationToken: reviewDto.authorizationToken,
+      });
+      executionResult = res;
+    } catch (e) {
+      executionError = message(e);
+    } finally {
+      submittingExecution = false;
+    }
+  }
+
+  function clearReviewState() {
+    reviewingCandidate = null;
+    reviewDto = null;
+    reviewError = null;
+    planPreviewResult = null;
+    planPreviewError = null;
+    executionResult = null;
+    executionError = null;
   }
 
   async function load() {
@@ -126,9 +186,7 @@
       error = null;
       compareError = null;
       viewMode = 'list';
-      reviewingCandidate = null;
-      planPreviewResult = null;
-      planPreviewError = null;
+      clearReviewState();
       blockReasonModalCandidate = null;
     }
   });
@@ -194,11 +252,8 @@
               <div class="review-header-bar">
                 <button
                   class="btn ghost btn-sm back-nav-btn"
-                  onclick={() => {
-                    reviewingCandidate = null;
-                    planPreviewResult = null;
-                    planPreviewError = null;
-                  }}
+                  onclick={clearReviewState}
+                  disabled={submittingExecution}
                 >
                   <Icon name="back" size={16} />
                   <span>Back to Candidates</span>
@@ -206,15 +261,30 @@
                 <span class="badge review-step-badge">Manual Review & Plan Preview</span>
               </div>
 
-              <div class="dry-run-banner">
+              <div class="dry-run-banner" class:banner-inactive={reviewDto && !reviewDto.dryRun}>
                 <Icon name="info" size={22} />
                 <div class="dry-run-content">
-                  <span class="dry-run-title">DRY-RUN SAFETY ACTIVE</span>
+                  <span class="dry-run-title">
+                    {reviewDto && !reviewDto.dryRun ? 'GLOBAL DRY-RUN MODE: DISABLED' : 'GLOBAL DRY-RUN SAFETY ACTIVE'}
+                  </span>
                   <span class="dry-run-desc">
-                    Real acquisitions and remote jobs are simulated only. No torrents will be submitted to TorBox and no files will be downloaded.
+                    {reviewDto && !reviewDto.dryRun
+                      ? 'Server dry-run mode is disabled. Confirmed authorized execution will dispatch real acquisition tasks to staging.'
+                      : 'Real acquisitions and remote jobs are simulated only. No torrents will be submitted to TorBox and no files will be downloaded.'}
                   </span>
                 </div>
               </div>
+
+              {#if reviewLoading && !reviewDto}
+                <div class="review-auth-loading">
+                  <span class="spin"><Icon name="spinner" size={20} stroke={3} /></span>
+                  <span>Generating execution authorization review token…</span>
+                </div>
+              {:else if reviewError}
+                <div class="review-error-block">
+                  <Notice error={reviewError} retry={() => requestReview(reviewingCandidate!)} />
+                </div>
+              {/if}
 
               <div class="review-details-card">
                 <h3 class="review-card-title">Acquisition Target Specifications</h3>
@@ -237,8 +307,8 @@
                   <div class="spec-row">
                     <span class="spec-label">Provider & Backend</span>
                     <span class="spec-val">
-                      <span class="badge provider-badge">{reviewingCandidate.provider}</span>
-                      <span class="badge transport-badge">{reviewingCandidate.transport}</span>
+                      <span class="badge provider-badge">{reviewDto?.provider || reviewingCandidate.provider}</span>
+                      <span class="badge transport-badge">{reviewDto?.acquisitionBackend || reviewingCandidate.transport}</span>
                     </span>
                   </div>
                   <div class="spec-row">
@@ -262,10 +332,10 @@
                     </div>
                   {/if}
                   <div class="spec-row">
-                    <span class="spec-label">Current Komga State</span>
+                    <span class="spec-label">Komga Ownership Status</span>
                     <span class="spec-val">
-                      {#if data.isCurrentlyOwned}
-                        <span class="badge owned-tag">Owned in Komga</span>
+                      {#if reviewDto?.isCurrentlyOwned || data.isCurrentlyOwned}
+                        <span class="badge owned-tag">Owned in Komga (Upgrade Protected)</span>
                       {:else}
                         <span class="badge missing-tag">Not Owned in Komga</span>
                       {/if}
@@ -273,27 +343,116 @@
                   </div>
                   <div class="spec-row">
                     <span class="spec-label">Expected Staging Destination</span>
-                    <span class="spec-val code-val"><code>[library_dir]/_staging/vol_{volume}_{reviewingCandidate.candidateId.replace(/[^a-zA-Z0-9_-]/g, '_')}/</code></span>
+                    <span class="spec-val code-val"><code>{reviewDto?.stagingDestination || `[library_dir]/_staging/vol_${volume}_${reviewingCandidate.candidateId.replace(/[^a-zA-Z0-9_-]/g, '_')}/`}</code></span>
                   </div>
                   <div class="spec-row">
                     <span class="spec-label">Expected Canonical Publication</span>
-                    <span class="spec-val code-val"><code>[library_dir]/{data.seriesId.replace(/^title:/, '')} - v{String(volume).padStart(2, '0')}.cbz</code></span>
+                    <span class="spec-val code-val"><code>{reviewDto?.canonicalDestination || `[library_dir]/${data.seriesId.replace(/^title:/, '')} - v${String(volume).padStart(2, '0')}.cbz`}</code></span>
+                  </div>
+                  <div class="spec-row">
+                    <span class="spec-label">Execution Authorization</span>
+                    <span class="spec-val">
+                      {#if reviewDto?.authorizationToken}
+                        <span class="badge token-authorized-badge">
+                          <Icon name="lock" size={12} />
+                          Authorized: {reviewDto.authorizationToken.substring(0, 10)}…
+                        </span>
+                        <span class="token-expiry-hint">Single-use token valid 15m</span>
+                      {:else if reviewLoading}
+                        <span class="badge token-pending-badge">
+                          <span class="spin"><Icon name="spinner" size={12} stroke={3} /></span>
+                          Authorizing…
+                        </span>
+                      {:else}
+                        <span class="badge token-none-badge">
+                          <Icon name="close" size={12} />
+                          Token Required
+                        </span>
+                      {/if}
+                    </span>
                   </div>
                   {#if reviewingCandidate.rankingBreakdown}
                     <div class="spec-row">
                       <span class="spec-label">Normalized Ranking Score</span>
                       <span class="spec-val">
                         <strong>{reviewingCandidate.rankingBreakdown.finalScore.toFixed(1)} / 100</strong>
-                        <span class="confidence-tag">({reviewingCandidate.rankingBreakdown.confidencePercent}% confidence)</span>
+                        <span class="confidence-tag">({reviewingCandidate.rankingBreakdown.confidencePercent}% confidence, {reviewingCandidate.rankingBreakdown.evidenceCoveragePercent ?? 0}% evidence)</span>
                       </span>
                     </div>
                   {/if}
                 </div>
               </div>
 
+              <div class="guard-lifecycle-box">
+                <div class="guard-head">
+                  <Icon name="lock" size={15} />
+                  <strong>Guarded Lifecycle & Publication Architecture</strong>
+                </div>
+                <p>
+                  Execution retrieves files strictly into an isolated staging directory. Once downloaded, Mango performs full CBZ zip archive integrity validation and XML inspection. Canonical publication to the Komga library is a separate guarded action and will <strong>never overwrite existing files</strong>.
+                </p>
+              </div>
+
+              {#if reviewingCandidate.rankingBreakdown}
+                <div class="ranking-breakdown-bar review-ranking-bar">
+                  <div class="breakdown-header">
+                    <span class="breakdown-title">Candidate Evaluation & Evidence Coverage:</span>
+                    <div class="breakdown-header-badges">
+                      {#if reviewingCandidate.rankingBreakdown.isProvisional}
+                        <span class="badge prov-badge" title="Pre-download confidence capped at 80% until archive inspection">Provisional (80% Max)</span>
+                      {/if}
+                      {#if reviewingCandidate.rankingBreakdown.evidenceCoveragePercent != null}
+                        <span class="badge coverage-badge" class:coverage-high={reviewingCandidate.rankingBreakdown.evidenceCoveragePercent >= 70} class:coverage-partial={reviewingCandidate.rankingBreakdown.evidenceCoveragePercent < 70}>
+                          {reviewingCandidate.rankingBreakdown.evidenceCoveragePercent}% Evidence Coverage
+                        </span>
+                      {/if}
+                    </div>
+                  </div>
+                  <div class="breakdown-chips">
+                    <span class="b-chip">Quality: <strong>{reviewingCandidate.rankingBreakdown.qualityScore.toFixed(0)}</strong>/35</span>
+                    <span class="b-chip">Reliability: <strong>{reviewingCandidate.rankingBreakdown.reliabilityScore.toFixed(0)}</strong>/25</span>
+                    <span class="b-chip">Preference: <strong>{reviewingCandidate.rankingBreakdown.preferenceScore.toFixed(0)}</strong>/20</span>
+                    <span class="b-chip">Convenience: <strong>{reviewingCandidate.rankingBreakdown.convenienceScore.toFixed(0)}</strong>/15</span>
+                    <span class="b-chip">Storage: <strong>{reviewingCandidate.rankingBreakdown.storageEfficiencyScore.toFixed(0)}</strong>/5</span>
+                  </div>
+                  {#if (reviewingCandidate.rankingBreakdown.verifiedEvidence && reviewingCandidate.rankingBreakdown.verifiedEvidence.length > 0) || (reviewingCandidate.rankingBreakdown.heuristicEstimates && reviewingCandidate.rankingBreakdown.heuristicEstimates.length > 0)}
+                    <div class="evidence-honesty-row">
+                      {#if reviewingCandidate.rankingBreakdown.verifiedEvidence && reviewingCandidate.rankingBreakdown.verifiedEvidence.length > 0}
+                        <div class="evidence-group">
+                          <span class="evidence-label verified"><Icon name="check" size={11} /> Verified:</span>
+                          {#each reviewingCandidate.rankingBreakdown.verifiedEvidence as item}
+                            <span class="badge evidence-verified-tag">{item}</span>
+                          {/each}
+                        </div>
+                      {/if}
+                      {#if reviewingCandidate.rankingBreakdown.heuristicEstimates && reviewingCandidate.rankingBreakdown.heuristicEstimates.length > 0}
+                        <div class="evidence-group">
+                          <span class="evidence-label heuristic"><Icon name="info" size={11} /> Heuristic:</span>
+                          {#each reviewingCandidate.rankingBreakdown.heuristicEstimates as item}
+                            <span class="badge evidence-heuristic-tag">{item}</span>
+                          {/each}
+                        </div>
+                      {/if}
+                    </div>
+                  {/if}
+                  {#if reviewingCandidate.rankingBreakdown.whyRanksAbove}
+                    <div class="why-ranks-above-box">
+                      <Icon name="check" size={13} />
+                      <span>{reviewingCandidate.rankingBreakdown.whyRanksAbove}</span>
+                    </div>
+                  {/if}
+                </div>
+              {/if}
+
               {#if planPreviewError}
                 <div class="plan-preview-error">
                   <Notice error={planPreviewError} />
+                </div>
+              {/if}
+
+              {#if executionError}
+                <div class="execution-error-box">
+                  <Notice error={executionError} />
                 </div>
               {/if}
 
@@ -328,11 +487,40 @@
                 </div>
               {/if}
 
+              {#if executionResult}
+                <div class="plan-preview-box execution-success-box">
+                  <div class="preview-box-head">
+                    <div class="status-indicator exec-success-ind">
+                      <Icon name="check" size={18} />
+                      <strong>Acquisition Submitted ({executionResult.status})</strong>
+                    </div>
+                    <span class="badge exec-success-pill">Submitted to Staging</span>
+                  </div>
+                  <p class="preview-msg">{executionResult.message}</p>
+                  <div class="preview-meta-rows">
+                    <div class="p-meta">
+                      <span class="p-k">Status:</span>
+                      <span class="p-v">{executionResult.status}</span>
+                    </div>
+                    {#if executionResult.executionId}
+                      <div class="p-meta">
+                        <span class="p-k">Execution ID:</span>
+                        <span class="p-v">{executionResult.executionId}</span>
+                      </div>
+                    {/if}
+                  </div>
+                  <p class="preview-safety-footer exec-safety-footer">
+                    <Icon name="lock" size={13} />
+                    <span>Archive will be downloaded to staging and verified before canonical publication approval.</span>
+                  </p>
+                </div>
+              {/if}
+
               <div class="review-actions-bar">
                 <button
                   class="btn secondary preview-btn"
                   onclick={() => previewPlanAction(reviewingCandidate!)}
-                  disabled={previewingPlan}
+                  disabled={previewingPlan || submittingExecution}
                 >
                   {#if previewingPlan}
                     <span class="spin"><Icon name="spinner" size={15} stroke={3} /></span>
@@ -344,23 +532,41 @@
                 </button>
 
                 <button
-                  class="btn primary disabled-action-btn"
-                  disabled
-                  title="Disabled: Dry-run safety mode is active. Real acquisitions and remote jobs are disabled."
+                  class="btn secondary auth-btn"
+                  onclick={() => requestReview(reviewingCandidate!)}
+                  disabled={reviewLoading || submittingExecution}
+                  title="Generate or refresh single-use authorization token for this specific candidate"
                 >
-                  <Icon name="download" size={16} />
-                  <span>Submit Acquisition</span>
+                  {#if reviewLoading}
+                    <span class="spin"><Icon name="spinner" size={15} stroke={3} /></span>
+                    <span>Authorizing…</span>
+                  {:else}
+                    <Icon name="lock" size={16} />
+                    <span>{reviewDto?.authorizationToken ? 'Refresh Authorization' : 'Request Manual Execution'}</span>
+                  {/if}
+                </button>
+
+                <button
+                  class="btn primary confirm-acquire-btn"
+                  onclick={() => confirmAcquisitionAction(reviewingCandidate!)}
+                  disabled={!reviewDto?.authorizationToken || submittingExecution || reviewLoading || (reviewDto != null && (reviewDto.isCurrentlyOwned || !reviewDto.isEligible))}
+                  title={!reviewDto?.authorizationToken ? 'Requires valid authorization token. Click Request Manual Execution first.' : reviewDto?.isCurrentlyOwned ? 'Volume already owned in Komga.' : !reviewDto?.isEligible ? (reviewDto.eligibilityReason || 'Candidate ineligible') : 'Confirm and execute acquisition'}
+                >
+                  {#if submittingExecution}
+                    <span class="spin"><Icon name="spinner" size={15} stroke={3} /></span>
+                    <span>Executing Acquisition…</span>
+                  {:else}
+                    <Icon name="download" size={16} />
+                    <span>Confirm This Acquisition</span>
+                  {/if}
                 </button>
 
                 <button
                   class="btn ghost cancel-review-btn"
-                  onclick={() => {
-                    reviewingCandidate = null;
-                    planPreviewResult = null;
-                    planPreviewError = null;
-                  }}
+                  onclick={clearReviewState}
+                  disabled={submittingExecution}
                 >
-                  Back to Candidates
+                  Cancel
                 </button>
               </div>
             </div>
@@ -464,9 +670,16 @@
                         <div class="ranking-breakdown-bar">
                           <div class="breakdown-header">
                             <span class="breakdown-title">Two-Stage Scoring Breakdown:</span>
-                            {#if cand.rankingBreakdown.isProvisional}
-                              <span class="badge prov-badge">Provisional</span>
-                            {/if}
+                            <div class="breakdown-header-badges">
+                              {#if cand.rankingBreakdown.isProvisional}
+                                <span class="badge prov-badge" title="Pre-download confidence capped at 80% until archive inspection">Provisional (80% Max)</span>
+                              {/if}
+                              {#if cand.rankingBreakdown.evidenceCoveragePercent != null}
+                                <span class="badge coverage-badge" class:coverage-high={cand.rankingBreakdown.evidenceCoveragePercent >= 70} class:coverage-partial={cand.rankingBreakdown.evidenceCoveragePercent < 70}>
+                                  {cand.rankingBreakdown.evidenceCoveragePercent}% Evidence Coverage
+                                </span>
+                              {/if}
+                            </div>
                           </div>
                           <div class="breakdown-chips">
                             <span class="b-chip" title="Quality Signals (bonus/penalty): max 35 pts">Quality: <strong>{cand.rankingBreakdown.qualityScore.toFixed(0)}</strong>/35</span>
@@ -475,6 +688,26 @@
                             <span class="b-chip" title="Acquisition Convenience (cached/direct): max 15 pts">Convenience: <strong>{cand.rankingBreakdown.convenienceScore.toFixed(0)}</strong>/15</span>
                             <span class="b-chip" title="Storage Efficiency: max 5 pts">Storage: <strong>{cand.rankingBreakdown.storageEfficiencyScore.toFixed(0)}</strong>/5</span>
                           </div>
+                          {#if (cand.rankingBreakdown.verifiedEvidence && cand.rankingBreakdown.verifiedEvidence.length > 0) || (cand.rankingBreakdown.heuristicEstimates && cand.rankingBreakdown.heuristicEstimates.length > 0)}
+                            <div class="evidence-honesty-row">
+                              {#if cand.rankingBreakdown.verifiedEvidence && cand.rankingBreakdown.verifiedEvidence.length > 0}
+                                <div class="evidence-group">
+                                  <span class="evidence-label verified"><Icon name="check" size={11} /> Verified:</span>
+                                  {#each cand.rankingBreakdown.verifiedEvidence as item}
+                                    <span class="badge evidence-verified-tag">{item}</span>
+                                  {/each}
+                                </div>
+                              {/if}
+                              {#if cand.rankingBreakdown.heuristicEstimates && cand.rankingBreakdown.heuristicEstimates.length > 0}
+                                <div class="evidence-group">
+                                  <span class="evidence-label heuristic"><Icon name="info" size={11} /> Heuristic:</span>
+                                  {#each cand.rankingBreakdown.heuristicEstimates as item}
+                                    <span class="badge evidence-heuristic-tag">{item}</span>
+                                  {/each}
+                                </div>
+                              {/if}
+                            </div>
+                          {/if}
                           {#if cand.rankingBreakdown.whyRanksAbove}
                             <div class="why-ranks-above-box">
                               <Icon name="check" size={13} />
@@ -581,11 +814,7 @@
                         {#if isCandidateEligible(cand)}
                           <button
                             class="btn primary btn-sm select-cand-btn"
-                            onclick={() => {
-                              reviewingCandidate = cand;
-                              planPreviewResult = null;
-                              planPreviewError = null;
-                            }}
+                            onclick={() => selectCandidateForReview(cand)}
                           >
                             <Icon name="arrow" size={14} />
                             <span>Review Acquisition</span>
@@ -731,11 +960,7 @@
                           {#if isCandidateEligible(cand)}
                             <button
                               class="btn primary btn-sm select-cand-btn"
-                              onclick={() => {
-                                reviewingCandidate = cand;
-                                planPreviewResult = null;
-                                planPreviewError = null;
-                              }}
+                              onclick={() => selectCandidateForReview(cand)}
                             >
                               <Icon name="arrow" size={14} />
                               <span>Review Acquisition</span>
@@ -1580,6 +1805,101 @@
     line-height: 1.4;
   }
 
+  .dry-run-banner.banner-inactive {
+    background: rgba(34, 197, 94, 0.12);
+    border: 1px solid rgba(34, 197, 94, 0.35);
+    color: #dcfce7;
+  }
+
+  .dry-run-banner.banner-inactive .dry-run-title {
+    color: #86efac;
+  }
+
+  .dry-run-banner.banner-inactive .dry-run-desc {
+    color: #bbf7d0;
+  }
+
+  .review-auth-loading {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    font-size: 0.85rem;
+    color: #93c5fd;
+    padding: 0.5rem 0.75rem;
+    background: rgba(59, 130, 246, 0.08);
+    border: 1px solid rgba(59, 130, 246, 0.25);
+    border-radius: 6px;
+  }
+
+  .review-error-block {
+    margin-bottom: 0.5rem;
+  }
+
+  .token-authorized-badge {
+    background: rgba(34, 197, 94, 0.18);
+    color: #86efac;
+    border: 1px solid rgba(34, 197, 94, 0.4);
+    font-weight: 600;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+  }
+
+  .token-pending-badge {
+    background: rgba(245, 158, 11, 0.18);
+    color: #fde68a;
+    border: 1px solid rgba(245, 158, 11, 0.4);
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+  }
+
+  .token-none-badge {
+    background: rgba(239, 68, 68, 0.18);
+    color: #fca5a5;
+    border: 1px solid rgba(239, 68, 68, 0.4);
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+  }
+
+  .token-expiry-hint {
+    display: block;
+    font-size: 0.72rem;
+    color: #94a3b8;
+    margin-top: 0.2rem;
+  }
+
+  .guard-lifecycle-box {
+    background: rgba(99, 102, 241, 0.08);
+    border: 1px solid rgba(99, 102, 241, 0.3);
+    border-radius: 8px;
+    padding: 0.85rem 1rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.4rem;
+  }
+
+  .guard-head {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.84rem;
+    color: #c7d2fe;
+    font-weight: 600;
+  }
+
+  .guard-lifecycle-box p {
+    margin: 0;
+    font-size: 0.8rem;
+    color: #e0e7ff;
+    line-height: 1.45;
+  }
+
+  .review-ranking-bar {
+    margin-top: 0;
+  }
+
   .review-details-card {
     background: rgba(255, 255, 255, 0.03);
     border: 1px solid var(--border-color, rgba(255, 255, 255, 0.1));
@@ -1776,6 +2096,113 @@
     display: flex;
     justify-content: space-between;
     align-items: center;
+  }
+
+  .breakdown-header-badges {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+
+  .coverage-badge {
+    font-size: 0.68rem;
+    font-weight: 600;
+  }
+
+  .coverage-high {
+    background: rgba(34, 197, 94, 0.2);
+    color: #86efac;
+    border: 1px solid rgba(34, 197, 94, 0.4);
+  }
+
+  .coverage-partial {
+    background: rgba(245, 158, 11, 0.2);
+    color: #fde68a;
+    border: 1px solid rgba(245, 158, 11, 0.4);
+  }
+
+  .evidence-honesty-row {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+    padding-top: 0.25rem;
+    border-top: 1px solid rgba(255, 255, 255, 0.05);
+  }
+
+  .evidence-group {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    flex-wrap: wrap;
+    font-size: 0.75rem;
+  }
+
+  .evidence-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    font-weight: 600;
+    font-size: 0.72rem;
+  }
+
+  .evidence-label.verified {
+    color: #86efac;
+  }
+
+  .evidence-label.heuristic {
+    color: #93c5fd;
+  }
+
+  .evidence-verified-tag {
+    background: rgba(34, 197, 94, 0.12);
+    color: #86efac;
+    border: 1px solid rgba(34, 197, 94, 0.3);
+    font-size: 0.7rem;
+    padding: 0.1rem 0.35rem;
+  }
+
+  .evidence-heuristic-tag {
+    background: rgba(59, 130, 246, 0.12);
+    color: #93c5fd;
+    border: 1px solid rgba(59, 130, 246, 0.3);
+    font-size: 0.7rem;
+    padding: 0.1rem 0.35rem;
+  }
+
+  .execution-success-box {
+    background: rgba(34, 197, 94, 0.12);
+    border: 1px solid rgba(34, 197, 94, 0.45);
+  }
+
+  .exec-success-ind {
+    color: #86efac;
+  }
+
+  .exec-success-pill {
+    background: rgba(34, 197, 94, 0.25);
+    color: #86efac;
+    font-weight: 600;
+  }
+
+  .exec-safety-footer {
+    color: #86efac;
+  }
+
+  .execution-error-box,
+  .plan-preview-error {
+    margin-top: 0.25rem;
+  }
+
+  .auth-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+
+  .confirm-acquire-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
   }
 
   .breakdown-title {

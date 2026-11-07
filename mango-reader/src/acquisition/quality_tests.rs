@@ -71,7 +71,10 @@ fn test_quality_scoring_digital_and_trusted_bonuses() {
     // Final: 85.8
     assert_eq!(eval.total_score, 85.8);
     let rb = eval.ranking_breakdown.as_ref().unwrap();
-    assert_eq!(rb.confidence_percent, 90);
+    assert_eq!(rb.confidence_percent, 80);
+    assert_eq!(rb.evidence_coverage_percent, 80);
+    assert!(!rb.verified_evidence.is_empty());
+    assert!(!rb.heuristic_estimates.is_empty());
     assert_eq!(eval.selection_verdict, "ALTERNATIVE"); // Nyaa is alternative when Madokami is evaluated
 }
 

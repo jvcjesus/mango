@@ -32,6 +32,11 @@ pub struct RankingBreakdown {
     pub explanation: String,
     pub why_ranks_above: Option<String>,
     pub missing_evidence: Vec<String>,
+    pub evidence_coverage_percent: u32,
+    #[serde(default)]
+    pub verified_evidence: Vec<String>,
+    #[serde(default)]
+    pub heuristic_estimates: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -279,18 +284,25 @@ pub fn compute_ranking_breakdown(
     format: &str,
     edition: &str,
 ) -> RankingBreakdown {
+    let mut verified_evidence = Vec::new();
+    let mut heuristic_estimates = Vec::new();
     let mut missing_evidence = Vec::new();
+
+    let mut verified_dims = 0u32;
+    let total_dims = 5u32;
 
     // 1. Quality Evidence (0..100, weight 0.35)
     let mut quality_score: f64 = 0.0;
     if cand.is_digital || cand.raw_title.to_ascii_lowercase().contains("digital") {
         quality_score += 40.0;
+        heuristic_estimates.push("Digital release indicated by provider metadata (internal archive image fidelity unverified pre-download)".to_string());
     } else {
-        missing_evidence.push("Non-digital or unverified rip".to_string());
+        missing_evidence.push("Non-digital or unverified rip (archive contents uninspected)".to_string());
     }
 
     if cand.is_trusted || is_quality_grp {
         quality_score += 30.0;
+        heuristic_estimates.push("Release group reputation / trusted flag (heuristic observation, not archive checksum verification)".to_string());
     }
 
     if let Some(res) = resolution {
@@ -301,39 +313,74 @@ pub fn compute_ranking_breakdown(
         } else {
             quality_score += 5.0;
         }
+        heuristic_estimates.push(format!("Resolution label '{}' estimated from release title", res));
     }
 
     if format == "CBZ" {
         quality_score += 10.0;
+        verified_evidence.push("Standard CBZ container verified by filename extension".to_string());
+        verified_dims += 1;
     } else if format == "ZIP" || format == "CBR" {
         quality_score += 5.0;
+        heuristic_estimates.push(format!("Container format '{}' may require conversion to CBZ", format));
+    } else {
+        missing_evidence.push(format!("Non-standard container format '{}'", format));
     }
 
     if is_revision {
         quality_score += 5.0;
+        heuristic_estimates.push("Revision tag (v2/remake) detected in title".to_string());
     }
 
     let quality_score = quality_score.clamp(0.0, 100.0);
+    missing_evidence.push("Archive image compression, internal dimensions, and CBZ integrity uninspected prior to download".to_string());
 
     // 2. Acquisition Reliability (0..100, weight 0.25)
+    let mut is_provisional = false;
     let reliability_score: f64 = if cand.provider.eq_ignore_ascii_case("madokami") {
+        // Madokami telemetry: When live server historical telemetry is unmeasured, label provisional
+        is_provisional = true;
+        heuristic_estimates.push("Madokami direct HTTP reliability assumed provisional (no historical volume telemetry)".to_string());
         95.0
     } else if cand.provider.eq_ignore_ascii_case("nyaa") {
         match cache_status {
-            Some(TorBoxCacheStatus::Cached) => 95.0,
+            Some(TorBoxCacheStatus::Cached) => {
+                verified_evidence.push("TorBox debrid instant cache verified via API".to_string());
+                verified_dims += 1;
+                95.0
+            }
             Some(TorBoxCacheStatus::Uncached) | Some(TorBoxCacheStatus::Unknown) | None => {
+                is_provisional = true;
                 match cand.seeders {
-                    Some(s) if s >= 20 => 80.0,
-                    Some(s) if s >= 5 => 60.0,
-                    Some(s) if s >= 1 => 35.0,
-                    Some(0) => 5.0,
-                    Some(_) => 35.0,
-                    None => 40.0,
+                    Some(s) if s >= 20 => {
+                        heuristic_estimates.push(format!("Active swarm health estimated from provider seeder count ({s} seeders)"));
+                        80.0
+                    }
+                    Some(s) if s >= 5 => {
+                        heuristic_estimates.push(format!("Moderate swarm health estimated from provider seeder count ({s} seeders)"));
+                        60.0
+                    }
+                    Some(s) if s >= 1 => {
+                        heuristic_estimates.push(format!("Low swarm health estimated from provider seeder count ({s} seeders)"));
+                        35.0
+                    }
+                    Some(0) => {
+                        missing_evidence.push("P2P swarm has 0 reported seeders".to_string());
+                        5.0
+                    }
+                    _ => {
+                        heuristic_estimates.push("Swarm seeder count unknown (provisional estimate)".to_string());
+                        40.0
+                    }
                 }
             }
-            Some(TorBoxCacheStatus::Unavailable) => 15.0,
+            Some(TorBoxCacheStatus::Unavailable) => {
+                missing_evidence.push("TorBox service unavailable or unconfigured".to_string());
+                15.0
+            }
         }
     } else {
+        is_provisional = true;
         50.0
     };
 
@@ -341,14 +388,26 @@ pub fn compute_ranking_breakdown(
     let mut preference_score: f64 = 0.0;
     if detect_unwanted_language(&cand.raw_title).is_none() {
         preference_score += 50.0;
+        verified_evidence.push("English language verified by absence of foreign language tags".to_string());
+        verified_dims += 1;
     }
     if edition == "Digital" || edition == "Standard" {
         preference_score += 30.0;
     }
     match cand.match_type.as_str() {
-        "exact_match" | "exact_volume" => preference_score += 20.0,
-        "volume_range" | "volume_range_containing_target" => preference_score += 5.0,
-        "series_pack" => preference_score += 5.0,
+        "exact_match" | "exact_volume" => {
+            preference_score += 20.0;
+            verified_evidence.push(format!("Exact volume {:.0} match verified from release title", cand.volume_number));
+            verified_dims += 1;
+        }
+        "volume_range" | "volume_range_containing_target" => {
+            preference_score += 5.0;
+            heuristic_estimates.push("Multi-volume range candidate (requires volume extraction)".to_string());
+        }
+        "series_pack" => {
+            preference_score += 5.0;
+            heuristic_estimates.push("Series pack candidate (requires volume extraction)".to_string());
+        }
         _ => {}
     }
     let preference_score = preference_score.clamp(0.0, 100.0);
@@ -369,14 +428,20 @@ pub fn compute_ranking_breakdown(
     // 5. Storage Efficiency (0..100, weight 0.05)
     let storage_efficiency_score: f64 = if let Some(bytes) = cand.size_bytes {
         if bytes >= 100_000_000 && bytes <= 350_000_000 {
+            verified_evidence.push(format!("Release payload size ({:.1} MB) verified within optimal volume range", (bytes as f64) / 1e6));
+            verified_dims += 1;
             100.0
         } else if (bytes >= 50_000_000 && bytes < 100_000_000)
             || (bytes > 350_000_000 && bytes <= 500_000_000)
         {
+            verified_evidence.push(format!("Release payload size ({:.1} MB) verified within acceptable volume range", (bytes as f64) / 1e6));
+            verified_dims += 1;
             80.0
         } else if bytes > 500_000_000 && bytes <= 800_000_000 {
+            heuristic_estimates.push(format!("Release size ({:.1} MB) larger than normal volume range", (bytes as f64) / 1e6));
             60.0
         } else if bytes > 800_000_000 && bytes <= 1_200_000_000 {
+            heuristic_estimates.push(format!("Release size ({:.1} MB) significantly exceeds normal volume range", (bytes as f64) / 1e6));
             40.0
         } else if bytes > 1_200_000_000 {
             missing_evidence.push(format!(
@@ -403,6 +468,8 @@ pub fn compute_ranking_breakdown(
     }
     let final_score = (final_score * 10.0).round() / 10.0;
 
+    let evidence_coverage_percent = ((verified_dims as f64 / total_dims as f64) * 100.0).round() as u32;
+
     let mut confidence_percent = 70u32;
     if cand.match_type == "exact_match" || cand.match_type == "exact_volume" {
         confidence_percent += 10;
@@ -419,11 +486,12 @@ pub fn compute_ranking_breakdown(
     if is_pre {
         confidence_percent = confidence_percent.saturating_sub(25);
     }
-    let confidence_percent = confidence_percent.min(95);
+    // Honest confidence cap: prior to download and archive validation, confidence is capped at 80%
+    let confidence_percent = confidence_percent.min(80);
 
     let explanation = format!(
-        "Normalized Score: {:.1}/100 [Quality: {:.0} (35%), Reliability: {:.0} (25%), Preference: {:.0} (20%), Convenience: {:.0} (15%), Storage: {:.0} (5%)] · Confidence: {}%",
-        final_score, quality_score, reliability_score, preference_score, convenience_score, storage_efficiency_score, confidence_percent
+        "Normalized Score: {:.1}/100 [Quality: {:.0} (35%), Reliability: {:.0} (25%), Preference: {:.0} (20%), Convenience: {:.0} (15%), Storage: {:.0} (5%)] · Confidence: {}% (Evidence coverage: {}%)",
+        final_score, quality_score, reliability_score, preference_score, convenience_score, storage_efficiency_score, confidence_percent, evidence_coverage_percent
     );
 
     RankingBreakdown {
@@ -434,10 +502,13 @@ pub fn compute_ranking_breakdown(
         convenience_score,
         storage_efficiency_score,
         confidence_percent,
-        is_provisional: is_pre,
+        is_provisional,
         explanation,
         why_ranks_above: None,
         missing_evidence,
+        evidence_coverage_percent,
+        verified_evidence,
+        heuristic_estimates,
     }
 }
 

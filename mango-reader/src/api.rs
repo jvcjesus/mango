@@ -153,6 +153,7 @@ pub fn router(state: Spaces) -> Router {
             get(get_manga_volume_candidates_compare),
         )
         .route("/manga/{id}/volumes/{volume}/candidates/{candidate_id}/acquire", post(post_manga_volume_candidate_acquire))
+        .route("/manga/{id}/volumes/{volume}/candidates/{candidate_id}/review", get(get_manga_volume_candidate_review))
         .route("/manga/{id}/volumes/{volume}/discover", post(post_manga_volume_discover))
         .route("/manga/{id}/discover-missing", post(post_manga_discover_missing))
         .route("/manga/{id}/discovery", get(get_manga_series_discovery))
@@ -1346,14 +1347,27 @@ async fn get_manga_volume_candidates(
     Ok(Json(res))
 }
 
+async fn get_manga_volume_candidate_review(
+    Me(app): Me,
+    Path((id, volume, candidate_id)): Path<(i64, f64, String)>,
+) -> Result<Json<crate::acquisition::approval::ManualAcquisitionReviewDto>> {
+    let res = app
+        .acquisition
+        .request_manual_acquisition_review(id, volume, &candidate_id, Some(app.me.id))
+        .await?;
+    Ok(Json(res))
+}
+
 async fn post_manga_volume_candidate_acquire(
     Me(app): Me,
     Path((id, volume, candidate_id)): Path<(i64, f64, String)>,
     Json(payload): Json<Option<crate::acquisition::approval::ApproveCandidateRequest>>,
 ) -> Result<Json<crate::acquisition::approval::ApproveCandidateResponse>> {
+    let mut req = payload.unwrap_or_default();
+    req.user_id = Some(app.me.id);
     let res = app
         .acquisition
-        .approve_candidate(id, volume, &candidate_id, payload.unwrap_or_default())
+        .approve_candidate(id, volume, &candidate_id, req)
         .await?;
     Ok(Json(res))
 }
@@ -2712,7 +2726,7 @@ async fn post_title_plan(
     Path(id): Path<i64>,
     Json(payload): Json<Option<TitlePlanPayload>>,
 ) -> Result<Json<crate::acquisition::planner::AcquisitionPlan>> {
-    let dry_run = payload.and_then(|p| p.dry_run).unwrap_or(false);
+    let dry_run = payload.and_then(|p| p.dry_run).unwrap_or(true);
     let plan = app
         .acquisition
         .plan_title_missing_content(id, dry_run)

@@ -1645,7 +1645,41 @@ export interface ApproveCandidateRequest {
   confirmPack?: boolean;
   confirmReview?: boolean;
   dryRun?: boolean;
+  authorizationToken?: string;
+  userId?: number;
 }
+
+export interface ManualAcquisitionReviewDto {
+  catalogTitleId: number;
+  seriesTitle: string;
+  mangabakaId?: number | null;
+  officialEdition: string;
+  officialVolumeNumber: number;
+  candidateId: string;
+  candidateTitle: string;
+  provider: string;
+  acquisitionBackend: string;
+  ownershipStatus: string;
+  isCurrentlyOwned: boolean;
+  isEligible: boolean;
+  eligibilityCode?: string | null;
+  eligibilityReason?: string | null;
+  stagingDestination: string;
+  canonicalDestination: string;
+  dryRun: boolean;
+  publicationRequiresSeparateApproval: boolean;
+  authorizationToken?: string | null;
+  expiresAt?: number | null;
+}
+
+export const getManualAcquisitionReview = (
+  id: number,
+  volume: number,
+  candidateId: string
+) =>
+  get<ManualAcquisitionReviewDto>(
+    `/manga/${id}/volumes/${volume}/candidates/${encodeURIComponent(candidateId)}/review`
+  );
 
 export interface ApproveCandidateResponse {
   status: string;
@@ -2145,6 +2179,9 @@ export interface RankingBreakdown {
   explanation: string;
   whyRanksAbove?: string | null;
   missingEvidence: string[];
+  evidenceCoveragePercent: number;
+  verifiedEvidence?: string[];
+  heuristicEstimates?: string[];
 }
 
 export interface CandidateComparisonItem {

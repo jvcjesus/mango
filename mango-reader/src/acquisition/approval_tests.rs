@@ -73,8 +73,25 @@ async fn test_manual_approval_exact_nyaa_candidate_queues_successfully() {
     .await
     .unwrap();
 
+    db.call(|conn| crate::acquisition::auto_acquire::set_auto_acquire_dry_run(conn, false)).await.unwrap();
+    let review = svc
+        .request_manual_acquisition_review(1, 10.0, "nyaa:1001", None)
+        .await
+        .unwrap();
+    assert!(review.is_eligible);
+    assert!(review.authorization_token.is_some());
+
     let res = svc
-        .approve_candidate(1, 10.0, "nyaa:1001", ApproveCandidateRequest::default())
+        .approve_candidate(
+            1,
+            10.0,
+            "nyaa:1001",
+            ApproveCandidateRequest {
+                dry_run: Some(false),
+                authorization_token: review.authorization_token,
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
 
@@ -161,6 +178,7 @@ async fn test_manual_approval_dry_run_preview_inhibits_execution() {
                 confirm_pack: None,
                 confirm_review: None,
                 dry_run: Some(true),
+                ..Default::default()
             },
         )
         .await
@@ -464,7 +482,12 @@ async fn test_range_and_pack_confirmation_and_owned_protection() {
         .unwrap_err();
     assert!(err.message.contains("Series pack requires explicit confirmation"));
 
-    // 2. With confirm_pack: true, approval succeeds
+    // 2. With confirm_pack: true, valid authorization token, and dry_run: false, approval succeeds
+    db.call(|conn| crate::acquisition::auto_acquire::set_auto_acquire_dry_run(conn, false)).await.unwrap();
+    let review = svc
+        .request_manual_acquisition_review(1, 10.0, "nyaa:pack", None)
+        .await
+        .unwrap();
     let res = svc
         .approve_candidate(
             1,
@@ -472,6 +495,8 @@ async fn test_range_and_pack_confirmation_and_owned_protection() {
             "nyaa:pack",
             ApproveCandidateRequest {
                 confirm_pack: Some(true),
+                dry_run: Some(false),
+                authorization_token: review.authorization_token,
                 ..Default::default()
             },
         )

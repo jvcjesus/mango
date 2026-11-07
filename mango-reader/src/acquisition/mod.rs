@@ -40,6 +40,8 @@ pub mod quality_tests;
 #[cfg(test)]
 pub mod release_discovery_tests;
 #[cfg(test)]
+pub mod security_tests;
+#[cfg(test)]
 pub mod tests;
 pub mod torbox;
 #[cfg(test)]
