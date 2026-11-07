@@ -36,6 +36,23 @@ pub struct KomgaBookMetadata {
     pub number_sort: Option<f64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct KomgaBookMetadataUpdate {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title_lock: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub number: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub number_lock: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub number_sort: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub number_sort_lock: Option<bool>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct KomgaReadProgress {
@@ -439,6 +456,72 @@ impl KomgaClient {
         }
 
         tracing::info!("KOMGA: series metadata refresh triggered ({series_id})");
+        Ok(())
+    }
+
+    /// Fetches a single book by ID from Komga.
+    pub async fn get_book(&self, book_id: &str) -> Result<KomgaBook> {
+        let endpoint = format!("/api/v1/books/{book_id}");
+        let resp = self
+            .request_builder(reqwest::Method::GET, &endpoint)
+            .send()
+            .await
+            .map_err(|e| {
+                AppError::new(
+                    502,
+                    "komga_offline",
+                    format!("Failed to get Komga book: {e}"),
+                )
+            })?;
+
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(AppError::new(
+                status.as_u16(),
+                "komga_error",
+                format!("Komga get book failed with HTTP {status}: {body}"),
+            ));
+        }
+
+        let book: KomgaBook = resp
+            .json()
+            .await
+            .map_err(|_| AppError::bad_request("Invalid Komga book response"))?;
+        Ok(book)
+    }
+
+    /// Updates book metadata in Komga via PATCH /api/v1/books/{book_id}/metadata.
+    pub async fn update_book_metadata(
+        &self,
+        book_id: &str,
+        patch: &KomgaBookMetadataUpdate,
+    ) -> Result<()> {
+        let endpoint = format!("/api/v1/books/{book_id}/metadata");
+        let resp = self
+            .request_builder(reqwest::Method::PATCH, &endpoint)
+            .json(patch)
+            .send()
+            .await
+            .map_err(|e| {
+                AppError::new(
+                    502,
+                    "komga_offline",
+                    format!("Failed to update Komga book metadata: {e}"),
+                )
+            })?;
+
+        if !resp.status().is_success() && resp.status() != reqwest::StatusCode::NO_CONTENT {
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            return Err(AppError::new(
+                status.as_u16(),
+                "komga_error",
+                format!("Komga update book metadata failed with HTTP {status}: {body}"),
+            ));
+        }
+
+        tracing::info!("KOMGA: book metadata updated ({book_id})");
         Ok(())
     }
 

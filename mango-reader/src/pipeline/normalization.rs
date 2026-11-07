@@ -344,7 +344,20 @@ fn proposed_metadata(
         .is_none_or(|v| v.trim().is_empty())
     {
         if let Some(title) = old.get("Title") {
-            proposed.insert("Title".into(), title.clone());
+            let s_title = enrichment.series_title.as_deref().unwrap_or("");
+            let norm = crate::pipeline::naming::normalize_book_naming(title, s_title, true, Some(volume));
+            if norm.is_already_canonical
+                || (norm.conformity == crate::pipeline::naming::NamingConformity::InconsistentTitle && norm.subtitle.is_none())
+            {
+                proposed.insert("Title".into(), norm.title);
+            } else {
+                proposed.insert("Title".into(), title.clone());
+            }
+        } else {
+            proposed.insert(
+                "Title".into(),
+                crate::pipeline::naming::format_canonical_volume_title(volume),
+            );
         }
     }
     if enrichment

@@ -2297,25 +2297,37 @@ pub fn generate_comic_info_xml(
     }
 
     // Title
-    let default_title = if params.is_volume {
-        params
-            .volume
-            .or_else(|| enrichment.map(|e| e.volume))
-            .map(|v| {
-                if v.fract() == 0.0 {
-                    format!("Volume {}", v as i64)
-                } else {
-                    format!("Volume {v}")
-                }
-            })
+    let title_str = if params.is_volume {
+        let vol_num = params.volume.or_else(|| enrichment.map(|e| e.volume));
+        if let Some(v) = vol_num {
+            if let Some(wt) = enrichment.and_then(|e| e.work_title.as_deref()) {
+                let norm = crate::pipeline::naming::normalize_book_naming(wt, series_str, true, Some(v));
+                norm.title
+            } else if let Some(pt) = params.title {
+                let norm = crate::pipeline::naming::normalize_book_naming(pt, series_str, true, Some(v));
+                norm.title
+            } else {
+                crate::pipeline::naming::format_canonical_volume_title(v)
+            }
+        } else {
+            params.title.map(|s| s.to_string()).unwrap_or_else(|| "Volume".to_string())
+        }
     } else {
-        params.title.map(|s| s.to_string())
+        let ch_num = params.number.or_else(|| params.volume);
+        if let Some(num) = ch_num {
+            let candidate_title = enrichment.and_then(|e| e.work_title.as_deref()).or(params.title);
+            let norm = crate::pipeline::naming::normalize_book_naming(
+                candidate_title.unwrap_or(""),
+                series_str,
+                false,
+                Some(num),
+            );
+            norm.title
+        } else {
+            params.title.map(|s| s.to_string()).unwrap_or_else(|| "Chapter".to_string())
+        }
     };
-    let title_str = enrichment
-        .and_then(|e| e.work_title.as_deref())
-        .or(params.title)
-        .or(default_title.as_deref());
-    field("Title", title_str);
+    field("Title", Some(&title_str));
 
     // Summary
     let summary = enrichment.and_then(|e| e.summary.as_deref());

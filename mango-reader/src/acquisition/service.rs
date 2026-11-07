@@ -888,7 +888,7 @@ impl AcquisitionService {
             ))
             .map_err(|e| AppError::internal(e.to_string()))?;
             let ch_url = format!("nyaa:{}:{v_idx}", req.release.source_item_id);
-            let ch_name = format!("Volume {v_idx}");
+            let ch_name = crate::pipeline::naming::format_canonical_volume_title(v_idx as f64);
             let up_clone = uploader.clone();
             let ext_jid = external_job_id.clone();
             let col_id = collection_id.clone();
@@ -2367,15 +2367,16 @@ impl AcquisitionService {
             } else {
                 ch_url
             };
-            let ch_name = format!(
-                "{} {}",
-                if matches!(requested_unit, AcquisitionReleaseUnit::Chapter(_)) {
-                    "Chapter"
-                } else {
-                    "Volume"
-                },
-                item.expected_units.first().copied().unwrap_or(1.0)
-            );
+            let ch_name = if matches!(requested_unit, AcquisitionReleaseUnit::Chapter(_)) {
+                crate::pipeline::naming::format_canonical_chapter_title(
+                    item.expected_units.first().copied().unwrap_or(1.0),
+                    None,
+                )
+            } else {
+                crate::pipeline::naming::format_canonical_volume_title(
+                    item.expected_units.first().copied().unwrap_or(1.0),
+                )
+            };
             let ch_name = if cand.provider_metadata["inspectPayload"] == true {
                 cand.title.clone()
             } else {

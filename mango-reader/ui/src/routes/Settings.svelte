@@ -73,6 +73,16 @@
     type StagingItem,
     type StorageOptimizerStatusDto,
     type LibraryDuplicateReportDto,
+    runNamingAudit,
+    getLatestNamingAudit,
+    applyNamingCorrections,
+    rollbackNamingBatch,
+    getNamingBackups,
+    type NamingAuditReport,
+    type NamingAuditItem,
+    type NamingCorrectionBackup,
+    type NamingCorrectionResult,
+    type NamingRollbackResult,
   } from '../lib/api';
   import { confirm } from '../lib/confirm.svelte';
   import { COVERS, display, MENUS, setDisplay, SIZES } from '../lib/display.svelte';
@@ -1039,6 +1049,103 @@
       toast.error(`OpenTome update failed: ${e?.message ?? e}`);
     } finally {
       openTomeUpdating = false;
+    }
+  }
+
+  // ---------- Library Naming Standardization & Audit ----------
+  let namingLibraryId = $state<string>('');
+  let namingAuditing = $state<boolean>(false);
+  let namingApplying = $state<boolean>(false);
+  let namingRollingBack = $state<string | null>(null);
+  let namingReport = $state<NamingAuditReport | null>(null);
+  let selectedNamingBookIds = $state<Set<string>>(new Set());
+  let namingBackups = $state<NamingCorrectionBackup[]>([]);
+  let namingBackupsLoading = $state<boolean>(false);
+  let namingError = $state<string | null>(null);
+  let namingApplyDryRun = $state<boolean>(false);
+  let namingUpdateCbz = $state<boolean>(false);
+
+  async function loadNamingBackups() {
+    namingBackupsLoading = true;
+    try {
+      namingBackups = await getNamingBackups();
+    } catch (e) {
+      console.warn('Failed to load naming backups:', e);
+    } finally {
+      namingBackupsLoading = false;
+    }
+  }
+
+  async function handleRunNamingAudit() {
+    namingAuditing = true;
+    namingError = null;
+    namingReport = null;
+    selectedNamingBookIds = new Set();
+    try {
+      namingReport = await runNamingAudit(namingLibraryId || undefined);
+      // Pre-select all safe items that are not already canonical
+      const safeIds = new Set<string>();
+      if (namingReport && namingReport.items) {
+        for (const item of namingReport.items) {
+          if (item.isSafe && !item.isAlreadyCanonical) {
+            safeIds.add(item.bookId);
+          }
+        }
+      }
+      selectedNamingBookIds = safeIds;
+      toast.success(`Naming audit complete: ${namingReport.totalBooks} books analyzed.`);
+      await loadNamingBackups();
+    } catch (e: any) {
+      const msg = e?.message || 'Failed to execute naming audit.';
+      namingError = msg;
+      toast.error(msg);
+    } finally {
+      namingAuditing = false;
+    }
+  }
+
+  async function handleApplyNamingCorrections() {
+    if (!namingReport) return;
+    if (selectedNamingBookIds.size === 0) {
+      toast.error('No books selected for correction.');
+      return;
+    }
+    namingApplying = true;
+    namingError = null;
+    try {
+      const res = await applyNamingCorrections(
+        namingReport.auditId,
+        Array.from(selectedNamingBookIds),
+        namingUpdateCbz,
+        namingApplyDryRun,
+      );
+      if (res.isDryRun) {
+        toast.info(`Dry run verified: ${res.totalRequested} books would be corrected.`);
+      } else {
+        toast.success(`Successfully applied and verified ${res.verifiedCount} book titles in Komga!`);
+        await handleRunNamingAudit();
+        await loadNamingBackups();
+      }
+    } catch (e: any) {
+      const msg = e?.message || 'Failed to apply naming corrections.';
+      namingError = msg;
+      toast.error(msg);
+    } finally {
+      namingApplying = false;
+    }
+  }
+
+  async function handleRollbackNaming(backupId: string) {
+    namingRollingBack = backupId;
+    try {
+      const res = await rollbackNamingBatch(backupId);
+      toast.success(`Rolled back ${res.rolledBackCount} book titles in Komga.`);
+      await loadNamingBackups();
+      await handleRunNamingAudit();
+    } catch (e: any) {
+      toast.error(e?.message || 'Failed to rollback naming batch.');
+    } finally {
+      namingRollingBack = null;
     }
   }
 
@@ -3024,6 +3131,224 @@
                   {/each}
                 </div>
               {/if}
+            </div>
+          </section>
+
+          <!-- Library-Wide Manga Naming Standardization & Audit -->
+          <section class="card">
+            <div class="card-header-row">
+              <div>
+                <h3>Library Naming Standardization & Audit</h3>
+                <span class="muted">Read-only audit and approved metadata correction for canonical book titles (Volume 01, Volume 02, etc.)</span>
+              </div>
+            </div>
+
+            <div class="set stack">
+              <div class="what">
+                <strong>Select Komga Library</strong>
+                <span>Audit existing Komga titles against fork canonical standards without modifying files.</span>
+              </div>
+              <div class="how wide">
+                <div class="library-select-row">
+                  <select class="field grow" bind:value={namingLibraryId}>
+                    <option value="">All Configured Manga Libraries</option>
+                    {#if komgaLibraries.length > 0}
+                      {#each komgaLibraries as lib}
+                        <option value={lib.id}>{lib.name} ({lib.root})</option>
+                      {/each}
+                    {/if}
+                  </select>
+                  <button
+                    class="btn spot"
+                    onclick={handleRunNamingAudit}
+                    disabled={namingAuditing || namingApplying}
+                  >
+                    <Icon name={namingAuditing ? 'spinner' : 'search'} size={16} />
+                    {namingAuditing ? 'Auditing…' : 'Run Naming Audit'}
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {#if namingError}
+              <div class="set stack">
+                <Notice error={namingError} />
+              </div>
+            {/if}
+
+            {#if namingReport}
+              <p class="muted">READ-ONLY AUDIT — {namingReport.totalBooks} books across {namingReport.totalSeries} series inspected. No files modified.</p>
+              
+              <!-- Metric Badges -->
+              <div class="analysis-summary-grid">
+                <div class="summary-metric-card">
+                  <div class="metric-value">{namingReport.totalBooks}</div>
+                  <div class="metric-label">Total Books</div>
+                </div>
+                <div class="summary-metric-card highlight-green">
+                  <div class="metric-value">{namingReport.canonicalCount}</div>
+                  <div class="metric-label">Already Canonical</div>
+                </div>
+                <div class="summary-metric-card highlight-amber">
+                  <div class="metric-value">{namingReport.inconsistentTitleCount}</div>
+                  <div class="metric-label">Inconsistent Titles</div>
+                </div>
+                <div class="summary-metric-card highlight-amber">
+                  <div class="metric-value">{namingReport.inconsistentNumberCount}</div>
+                  <div class="metric-label">Inconsistent Numbers</div>
+                </div>
+                <div class="summary-metric-card highlight-blue">
+                  <div class="metric-value">{namingReport.safeCorrectionCount}</div>
+                  <div class="metric-label">Safe to Standardize</div>
+                </div>
+                {#if namingReport.duplicateNumberCount > 0}
+                  <div class="summary-metric-card highlight-red">
+                    <div class="metric-value">{namingReport.duplicateNumberCount}</div>
+                    <div class="metric-label">Duplicate Numbers</div>
+                  </div>
+                {/if}
+              </div>
+
+              <!-- Action Toolbar -->
+              <div class="normalization-action-bar">
+                <div class="action-bar-left">
+                  <span class="selection-count">
+                    <strong>{selectedNamingBookIds.size}</strong> of {namingReport.items.length} books selected
+                  </span>
+                  <label class="checkbox-label" style="margin-left: 1rem; display: inline-flex; align-items: center; gap: 0.5rem;">
+                    <input type="checkbox" bind:checked={namingApplyDryRun} />
+                    <span>Dry run only</span>
+                  </label>
+                  <label class="checkbox-label" style="margin-left: 1rem; display: inline-flex; align-items: center; gap: 0.5rem;">
+                    <input type="checkbox" bind:checked={namingUpdateCbz} />
+                    <span>Update CBZ ComicInfo inside files</span>
+                  </label>
+                </div>
+                <div class="action-bar-right">
+                  <button
+                    class="btn spot"
+                    onclick={handleApplyNamingCorrections}
+                    disabled={namingApplying || selectedNamingBookIds.size === 0}
+                  >
+                    <Icon name={namingApplying ? 'spinner' : 'check'} size={16} />
+                    {namingApplying ? 'Applying…' : (namingApplyDryRun ? 'Dry-Run Selected' : 'Apply Approved Corrections')}
+                  </button>
+                </div>
+              </div>
+
+              <!-- Audit Preview Table -->
+              <div class="table-container" style="max-height: 400px; overflow-y: auto; margin-top: 1rem;">
+                <table class="table striped font-small" style="width: 100%;">
+                  <thead>
+                    <tr>
+                      <th style="width: 40px;">
+                        <input
+                          type="checkbox"
+                          checked={selectedNamingBookIds.size > 0 && selectedNamingBookIds.size === (namingReport?.items.filter(i => i.isSafe && !i.isAlreadyCanonical).length ?? 0)}
+                          onchange={(e) => {
+                            if ((e.target as HTMLInputElement).checked && namingReport) {
+                              selectedNamingBookIds = new Set(namingReport.items.filter(i => i.isSafe && !i.isAlreadyCanonical).map(i => i.bookId));
+                            } else {
+                              selectedNamingBookIds = new Set();
+                            }
+                          }}
+                        />
+                      </th>
+                      <th>Series</th>
+                      <th>Book ID</th>
+                      <th>Existing Title</th>
+                      <th>Proposed Title</th>
+                      <th>Number</th>
+                      <th>Status</th>
+                      <th>Confidence</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {#each namingReport.items as item}
+                      <tr>
+                        <td>
+                          <input
+                            type="checkbox"
+                            checked={selectedNamingBookIds.has(item.bookId)}
+                            disabled={!item.isSafe || item.isAlreadyCanonical}
+                            onchange={(e) => {
+                              const checked = (e.target as HTMLInputElement).checked;
+                              const next = new Set(selectedNamingBookIds);
+                              if (checked) next.add(item.bookId);
+                              else next.delete(item.bookId);
+                              selectedNamingBookIds = next;
+                            }}
+                          />
+                        </td>
+                        <td><strong>{item.seriesTitle}</strong></td>
+                        <td><code class="font-small">{item.bookId}</code></td>
+                        <td><span class="muted">{item.existingTitle}</span></td>
+                        <td>
+                          <strong style="color: var(--theme-accent, #3b82f6);">{item.proposedTitle}</strong>
+                        </td>
+                        <td>{item.proposedNumber}</td>
+                        <td>
+                          {#if item.isAlreadyCanonical}
+                            <span class="badge green">Canonical</span>
+                          {:else if item.conflictType}
+                            <span class="badge red">{item.conflictType}</span>
+                          {:else if item.conformity === 'INCONSISTENT_TITLE'}
+                            <span class="badge amber">Inconsistent Title</span>
+                          {:else}
+                            <span class="badge">{item.conformity}</span>
+                          {/if}
+                        </td>
+                        <td>
+                          <span class="badge {item.confidence === 'HIGH' ? 'green' : (item.confidence === 'MEDIUM' ? 'amber' : 'red')}">
+                            {item.confidence}
+                          </span>
+                        </td>
+                      </tr>
+                    {/each}
+                  </tbody>
+                </table>
+              </div>
+            {/if}
+
+            <!-- Naming Correction Backups / Rollback Section -->
+            <div class="set stack" style="margin-top: 1.5rem;">
+              <div class="what">
+                <strong>Metadata Correction History & Rollback</strong>
+                <span>Durable audit backups of all applied Komga metadata corrections. Roll back anytime to restore original titles.</span>
+              </div>
+              <div class="how wide">
+                {#if namingBackupsLoading}
+                  <div class="muted">Loading backups…</div>
+                {:else if namingBackups.length === 0}
+                  <div class="muted">No metadata corrections have been applied yet.</div>
+                {:else}
+                  <div class="history-list" style="margin-top: 0.5rem;">
+                    {#each namingBackups.slice(0, 10) as b}
+                      <div class="history-item-row" style="display: flex; justify-content: space-between; align-items: center; padding: 0.5rem 0; border-bottom: 1px solid var(--border-color, #333);">
+                        <div>
+                          <strong>{b.seriesTitle}</strong>: 
+                          <span class="muted">{b.originalTitle || '(none)'}</span> &rarr; <strong>{b.newTitle}</strong>
+                          <div class="font-small muted">
+                            Batch: <code>{b.backupId}</code> &middot; Status: <span class="badge {b.status === 'verified' ? 'green' : (b.status === 'rolled_back' ? 'muted' : 'amber')}">{b.status}</span> &middot; {ago(b.createdAt * 1000)}
+                          </div>
+                        </div>
+                        {#if b.status === 'applied' || b.status === 'verified'}
+                          <button
+                            class="btn small"
+                            onclick={() => handleRollbackNaming(b.backupId)}
+                            disabled={namingRollingBack === b.backupId}
+                          >
+                            <Icon name="refresh" size={14} />
+                            {namingRollingBack === b.backupId ? 'Reverting…' : 'Rollback Batch'}
+                          </button>
+                        {:else if b.status === 'rolled_back'}
+                          <span class="font-small muted">✓ Rolled back {b.rolledBackAt ? ago(b.rolledBackAt * 1000) : ''}</span>
+                        {/if}
+                      </div>
+                    {/each}
+                  </div>
+                {/if}
+              </div>
             </div>
           </section>
 

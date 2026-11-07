@@ -13,6 +13,8 @@ pub mod komf;
 pub mod komga;
 pub mod mangabaka;
 pub mod metadata;
+pub mod naming;
+pub mod naming_audit;
 pub mod normalization;
 pub mod optimizer;
 pub mod ownership;

@@ -397,6 +397,11 @@ pub fn router(state: Spaces) -> Router {
             post(retry_komga_download),
         )
         .route("/pipeline/repair-cbz", post(repair_pipeline_cbz))
+        .route("/pipeline/naming/audit", post(post_naming_audit))
+        .route("/pipeline/naming/audit/latest", get(get_naming_audit_latest))
+        .route("/pipeline/naming/apply", post(post_naming_apply))
+        .route("/pipeline/naming/rollback", post(post_naming_rollback))
+        .route("/pipeline/naming/backups", get(get_naming_backups))
         .route(
             "/pipeline/maintenance/dry-run",
             post(post_maintenance_dry_run),
@@ -4816,6 +4821,276 @@ async fn get_acquisition_operations_summary(
         auto_acquire_opted_in_count: opt_count,
         free_disk_bytes,
     }))
+}
+
+async fn post_naming_audit(
+    Me(app): Me,
+    Json(req): Json<crate::pipeline::naming_audit::NamingAuditRequest>,
+) -> Result<Json<crate::pipeline::naming_audit::NamingAuditReport>> {
+    app.me.admin()?;
+    let (cfg, _, komga_key) = app.pipeline.load_internal_config().await?;
+    if !cfg.komga_enabled {
+        return Err(AppError::bad_request("Komga integration is disabled"));
+    }
+    let komga_client = crate::pipeline::komga::KomgaClient::new(
+        app.pipeline.http.clone(),
+        cfg.komga_url.clone(),
+        komga_key,
+    );
+    let target_lib = req.library_id.as_deref().or(cfg.komga_library_id.as_deref());
+    let library_id = target_lib.ok_or_else(|| AppError::bad_request("Komga library ID is not configured"))?;
+
+    let report = crate::pipeline::naming_audit::execute_naming_audit(
+        &komga_client,
+        library_id,
+        req.series_id.as_deref(),
+    ).await?;
+
+    let report_clone = report.clone();
+    app.db.call(move |conn| {
+        crate::pipeline::naming_audit::save_naming_audit(conn, &report_clone)
+    }).await?;
+
+    Ok(Json(report))
+}
+
+async fn get_naming_audit_latest(
+    Me(app): Me,
+) -> Result<Json<Option<crate::pipeline::naming_audit::NamingAuditReport>>> {
+    app.me.admin()?;
+    let report = app.db.call(|conn| {
+        crate::pipeline::naming_audit::get_latest_naming_audit(conn)
+    }).await?;
+    Ok(Json(report))
+}
+
+async fn post_naming_apply(
+    Me(app): Me,
+    Json(req): Json<crate::pipeline::naming_audit::NamingApplyRequest>,
+) -> Result<Json<crate::pipeline::naming_audit::NamingCorrectionResult>> {
+    app.me.admin()?;
+    let (cfg, _, komga_key) = app.pipeline.load_internal_config().await?;
+    if !cfg.komga_enabled {
+        return Err(AppError::bad_request("Komga integration is disabled"));
+    }
+    let komga_client = crate::pipeline::komga::KomgaClient::new(
+        app.pipeline.http.clone(),
+        cfg.komga_url.clone(),
+        komga_key,
+    );
+
+    let audit_id = req.audit_id.clone();
+    let report = app.db.call(move |conn| {
+        crate::pipeline::naming_audit::get_naming_audit_by_id(conn, &audit_id)
+    }).await?.ok_or_else(|| AppError::not_found("Audit report not found"))?;
+
+    let backup_id = {
+        let mut random = [0u8; 16];
+        let _ = getrandom::getrandom(&mut random);
+        format!("batch_{}", hex::encode(random))
+    };
+
+    let filter_set: Option<std::collections::HashSet<String>> = req.book_ids.map(|ids| ids.into_iter().collect());
+
+    let items_to_process: Vec<crate::pipeline::naming_audit::NamingAuditItem> = report.items.into_iter()
+        .filter(|item| {
+            if item.is_already_canonical {
+                return false;
+            }
+            if let Some(ref set) = filter_set {
+                set.contains(&item.book_id)
+            } else {
+                item.is_safe
+            }
+        })
+        .collect();
+
+    let total_requested = items_to_process.len();
+    if req.dry_run {
+        return Ok(Json(crate::pipeline::naming_audit::NamingCorrectionResult {
+            backup_id,
+            is_dry_run: true,
+            total_requested,
+            applied_count: 0,
+            verified_count: 0,
+            failed_count: 0,
+            errors: Vec::new(),
+        }));
+    }
+
+    let mut applied_count = 0;
+    let mut verified_count = 0;
+    let mut failed_count = 0;
+    let mut errors = Vec::new();
+
+    for item in items_to_process {
+        // 1. Fetch current book from Komga for reliable backup
+        let current_book = match komga_client.get_book(&item.book_id).await {
+            Ok(b) => b,
+            Err(e) => {
+                errors.push(format!("Failed to fetch book {}: {}", item.book_id, e.message));
+                failed_count += 1;
+                continue;
+            }
+        };
+
+        let orig_meta = current_book.metadata;
+        let orig_title = orig_meta.as_ref().and_then(|m| m.title.clone());
+        let orig_number = orig_meta.as_ref().and_then(|m| m.number.clone());
+        let orig_number_sort = orig_meta.as_ref().and_then(|m| m.number_sort);
+
+        // 2. Insert durable backup record before making any changes
+        let b_id = backup_id.clone();
+        let it = item.clone();
+        let ot = orig_title.clone();
+        let on = orig_number.clone();
+        let ons = orig_number_sort;
+        let cbz_up = req.update_cbz;
+
+        if let Err(e) = app.db.call(move |conn| {
+            crate::pipeline::naming_audit::record_backup_entry(
+                conn,
+                &b_id,
+                &it.book_id,
+                &it.series_id,
+                &it.series_title,
+                ot.as_deref(),
+                on.as_deref(),
+                ons,
+                &it.proposed_title,
+                &it.proposed_number,
+                it.proposed_number_sort,
+                cbz_up,
+            )
+        }).await {
+            errors.push(format!("Failed to store backup for book {}: {e}", item.book_id));
+            failed_count += 1;
+            continue;
+        }
+
+        // 3. Apply PATCH to Komga
+        let patch = crate::pipeline::komga::KomgaBookMetadataUpdate {
+            title: Some(item.proposed_title.clone()),
+            title_lock: Some(true),
+            number: Some(item.proposed_number.clone()),
+            number_lock: Some(true),
+            number_sort: Some(item.proposed_number_sort),
+            number_sort_lock: Some(true),
+        };
+
+        if let Err(e) = komga_client.update_book_metadata(&item.book_id, &patch).await {
+            errors.push(format!("Komga PATCH failed for book {}: {}", item.book_id, e.message));
+            failed_count += 1;
+            let b_id = backup_id.clone();
+            let b_book_id = item.book_id.clone();
+            let _ = app.db.call(move |conn| {
+                crate::pipeline::naming_audit::update_backup_status(conn, &b_id, &b_book_id, "failed")
+            }).await;
+            continue;
+        }
+
+        applied_count += 1;
+
+        // 4. Verify the update in Komga
+        match komga_client.get_book(&item.book_id).await {
+            Ok(verified_book) => {
+                let matches_title = verified_book.metadata.as_ref()
+                    .and_then(|m| m.title.as_deref()) == Some(&item.proposed_title);
+                if matches_title {
+                    verified_count += 1;
+                    let b_id = backup_id.clone();
+                    let b_book_id = item.book_id.clone();
+                    let _ = app.db.call(move |conn| {
+                        crate::pipeline::naming_audit::update_backup_status(conn, &b_id, &b_book_id, "verified")
+                    }).await;
+                } else {
+                    errors.push(format!("Post-verification title mismatch for book {}", item.book_id));
+                }
+            }
+            Err(e) => {
+                errors.push(format!("Post-verification get failed for book {}: {}", item.book_id, e.message));
+            }
+        }
+    }
+
+    Ok(Json(crate::pipeline::naming_audit::NamingCorrectionResult {
+        backup_id,
+        is_dry_run: false,
+        total_requested,
+        applied_count,
+        verified_count,
+        failed_count,
+        errors,
+    }))
+}
+
+async fn post_naming_rollback(
+    Me(app): Me,
+    Json(req): Json<crate::pipeline::naming_audit::NamingRollbackRequest>,
+) -> Result<Json<crate::pipeline::naming_audit::NamingRollbackResult>> {
+    app.me.admin()?;
+    let (cfg, _, komga_key) = app.pipeline.load_internal_config().await?;
+    if !cfg.komga_enabled {
+        return Err(AppError::bad_request("Komga integration is disabled"));
+    }
+    let komga_client = crate::pipeline::komga::KomgaClient::new(
+        app.pipeline.http.clone(),
+        cfg.komga_url.clone(),
+        komga_key,
+    );
+
+    let backup_id = req.backup_id.clone();
+    let filter = req.book_ids.clone();
+    let rows = app.db.call(move |conn| {
+        crate::pipeline::naming_audit::get_backups_for_rollback(conn, &backup_id, filter.as_deref())
+    }).await?;
+
+    let total_requested = rows.len();
+    let mut rolled_back_count = 0;
+    let mut failed_count = 0;
+    let mut errors = Vec::new();
+
+    for row in rows {
+        let patch = crate::pipeline::komga::KomgaBookMetadataUpdate {
+            title: row.original_title.clone(),
+            title_lock: Some(false),
+            number: row.original_number.clone(),
+            number_lock: Some(false),
+            number_sort: row.original_number_sort,
+            number_sort_lock: Some(false),
+        };
+
+        if let Err(e) = komga_client.update_book_metadata(&row.book_id, &patch).await {
+            errors.push(format!("Rollback failed for book {}: {}", row.book_id, e.message));
+            failed_count += 1;
+            continue;
+        }
+
+        let row_id = row.id;
+        let _ = app.db.call(move |conn| {
+            crate::pipeline::naming_audit::mark_backup_rolled_back(conn, row_id)
+        }).await;
+
+        rolled_back_count += 1;
+    }
+
+    Ok(Json(crate::pipeline::naming_audit::NamingRollbackResult {
+        backup_id: req.backup_id,
+        total_requested,
+        rolled_back_count,
+        failed_count,
+        errors,
+    }))
+}
+
+async fn get_naming_backups(
+    Me(app): Me,
+) -> Result<Json<Vec<crate::pipeline::naming_audit::NamingCorrectionBackup>>> {
+    app.me.admin()?;
+    let backups = app.db.call(|conn| {
+        crate::pipeline::naming_audit::list_naming_backups(conn)
+    }).await?;
+    Ok(Json(backups))
 }
 
 

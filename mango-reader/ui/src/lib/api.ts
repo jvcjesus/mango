@@ -1399,6 +1399,93 @@ export const getNormalizationHistory = (limit: number = 50) =>
 export const rollbackNormalizationRecord = (id: string) =>
   send<NormalizationHistoryRecord>('POST', `/pipeline/maintenance/rollback/${encodeURIComponent(id)}`, {});
 
+export interface NamingAuditItem {
+  seriesId: string;
+  seriesTitle: string;
+  bookId: string;
+  bookName: string;
+  existingTitle: string;
+  proposedTitle: string;
+  existingNumber: string;
+  proposedNumber: string;
+  proposedNumberSort: number;
+  isVolume: boolean;
+  conformity: 'CANONICAL' | 'INCONSISTENT_TITLE' | 'INCONSISTENT_NUMBER' | 'RANGE' | 'SPECIAL' | 'ONE_SHOT' | 'AMBIGUOUS';
+  metadataSource: string;
+  confidence: string;
+  isSafe: boolean;
+  isAlreadyCanonical: boolean;
+  reason: string;
+  conflictType?: string;
+}
+
+export interface NamingAuditReport {
+  auditId: string;
+  libraryId: string;
+  seriesIdFilter?: string;
+  totalSeries: number;
+  totalBooks: number;
+  canonicalCount: number;
+  inconsistentTitleCount: number;
+  inconsistentNumberCount: number;
+  duplicateNumberCount: number;
+  ambiguousCount: number;
+  safeCorrectionCount: number;
+  items: NamingAuditItem[];
+  createdAt: number;
+}
+
+export interface NamingCorrectionBackup {
+  id: number;
+  backupId: string;
+  bookId: string;
+  seriesId: string;
+  seriesTitle: string;
+  originalTitle?: string;
+  originalNumber?: string;
+  originalNumberSort?: number;
+  newTitle: string;
+  newNumber: string;
+  newNumberSort: number;
+  status: string;
+  cbzUpdated: boolean;
+  createdAt: number;
+  rolledBackAt?: number;
+}
+
+export interface NamingCorrectionResult {
+  backupId: string;
+  isDryRun: boolean;
+  totalRequested: number;
+  appliedCount: number;
+  verifiedCount: number;
+  failedCount: number;
+  errors: string[];
+}
+
+export interface NamingRollbackResult {
+  backupId: string;
+  totalRequested: number;
+  rolledBackCount: number;
+  failedCount: number;
+  errors: string[];
+}
+
+export const runNamingAudit = (libraryId?: string, seriesId?: string) =>
+  send<NamingAuditReport>('POST', '/pipeline/naming/audit', { libraryId, seriesId });
+
+export const getLatestNamingAudit = () =>
+  get<NamingAuditReport | null>('/pipeline/naming/audit/latest');
+
+export const applyNamingCorrections = (auditId: string, bookIds?: string[], updateCbz: boolean = false, dryRun: boolean = false) =>
+  send<NamingCorrectionResult>('POST', '/pipeline/naming/apply', { auditId, bookIds, updateCbz, dryRun });
+
+export const rollbackNamingBatch = (backupId: string, bookIds?: string[]) =>
+  send<NamingRollbackResult>('POST', '/pipeline/naming/rollback', { backupId, bookIds });
+
+export const getNamingBackups = () =>
+  get<NamingCorrectionBackup[]>('/pipeline/naming/backups');
+
 export interface StagingItem {
   filePath: string;
   fileName: string;
