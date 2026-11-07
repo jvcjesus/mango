@@ -1999,11 +1999,18 @@ impl Downloads {
         let tracker = self.tracker.clone();
         let transfer_cfg = crate::transfer::TransferConfig::default();
 
-        let http = self
-            .pipeline
-            .as_ref()
-            .map(|p| p.http.clone())
-            .unwrap_or_else(reqwest::Client::new);
+        // Dedicated HTTP client for large Madokami archive transfers.
+        // Do not inherit Pipeline's 30-second whole-request timeout.
+        // transfer.rs independently enforces a 45-second inactivity timeout
+        // on both response establishment and each streamed chunk.
+        let http = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .build()
+            .map_err(|e| {
+                AppError::internal(format!(
+                    "Failed to create Madokami transfer HTTP client: {e}"
+                ))
+            })?;
 
         // Update live stage
         *self.live_stage.lock().unwrap_or_else(|e| e.into_inner()) = Some(AcquisitionLiveState {
