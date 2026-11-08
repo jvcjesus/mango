@@ -433,7 +433,7 @@ async fn test_run_watcher_tick_atomic_lease() {
 
     // Call run_watcher_tick
     let http = reqwest::Client::new();
-    let _ = run_watcher_tick(&db, http).await;
+    let _ = run_watcher_tick(&db, http, None).await;
 
     // Check that the watcher was leased: next_check_at must be leased forward
     db.call(move |conn| {

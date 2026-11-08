@@ -58,6 +58,10 @@
     getAutoAcquireSettings,
     putAutoAcquireSettings,
     type AutoAcquireSettings,
+    getMonitoringSettings,
+    updateMonitoringSettings,
+    type MonitoringSettings,
+    type AutomationMode,
     getNotificationsHistory,
     resolveNotificationEvent,
     type NotificationEventItem,
@@ -954,6 +958,7 @@
       loadNormalizationHistory();
       loadOpenTome();
       loadAutoAcquireSettings();
+      loadMonitoringSettings();
       runIntegrityAudit();
     } catch (e) {
       pipelineError = message(e);
@@ -1008,6 +1013,69 @@
       toast.success(nextVal ? 'Dry-run simulation mode enabled' : 'Live acquisition mode enabled');
     } catch (e) {
       toast.error(`Failed to update dry-run mode: ${message(e)}`);
+    }
+  }
+
+  // ---------- M10.1 / M11: Monitoring & Automation Settings ----------
+  let monitoringSettings = $state<MonitoringSettings>({
+    automationMode: 'monitor_only',
+    intervalHours: 12,
+    trackedStatuses: ['reading', 'planning'],
+    lastCycleAt: null,
+    autoAcquireEnabled: false,
+    operatingMode: 'simulation',
+    autoPublishManual: false,
+  });
+
+  async function loadMonitoringSettings() {
+    try {
+      monitoringSettings = await getMonitoringSettings();
+    } catch {
+      // Keep defaults
+    }
+  }
+
+  async function updateAutomationMode(mode: AutomationMode) {
+    if (mode === 'automatic_acquisition') {
+      const ok = await confirm({
+        title: 'Enable Mode C — Automatic Acquisition?',
+        message: 'Mode C will allow high-confidence, verified English releases for opted-in titles to be queued automatically. Global auto-acquire master switch must also be enabled.',
+        confirmText: 'Enable Automatic Acquisition',
+        danger: true,
+      });
+      if (!ok) return;
+    }
+    try {
+      monitoringSettings = await updateMonitoringSettings({ automationMode: mode });
+      toast.success(`Automation mode set to ${mode}`);
+    } catch (e) {
+      toast.error(`Failed to update automation mode: ${message(e)}`);
+    }
+  }
+
+  async function toggleTrackedStatus(status: string) {
+    const current = new Set(monitoringSettings.trackedStatuses);
+    if (current.has(status)) {
+      current.delete(status);
+    } else {
+      current.add(status);
+    }
+    const updated = Array.from(current);
+    try {
+      monitoringSettings = await updateMonitoringSettings({ trackedStatuses: updated });
+      toast.success('Tracked list filters updated');
+    } catch (e) {
+      toast.error(`Failed to update tracked list filters: ${message(e)}`);
+    }
+  }
+
+  async function updateMonitoringInterval(hours: number) {
+    if (hours < 1 || hours > 168) return;
+    try {
+      monitoringSettings = await updateMonitoringSettings({ intervalHours: hours });
+      toast.success(`Monitoring interval set to ${hours} hours`);
+    } catch (e) {
+      toast.error(`Failed to update interval: ${message(e)}`);
     }
   }
 
@@ -2752,7 +2820,81 @@
               </div>
             </div>
 
+            <div class="set">
+              <div class="what">
+                <strong>Automation Operating Policy</strong>
+                <span>
+                  <strong>Mode A — Monitor Only (Default):</strong> Monitor followed titles, discover releases, score candidates, and record availability without queueing or downloading.<br />
+                  <strong>Mode B — Review Before Acquisition:</strong> Propose discovered releases into the Acquisition Review Queue for operator confirmation.<br />
+                  <strong>Mode C — Automatic Acquisition:</strong> Opt-in autonomous queueing of high-confidence, verified English releases (requires master switch ON).
+                </span>
+              </div>
+              <div class="how">
+                <div class="seg" role="group" aria-label="Automation Policy Mode">
+                  <button
+                    aria-pressed={monitoringSettings.automationMode === 'monitor_only'}
+                    onclick={() => updateAutomationMode('monitor_only')}
+                  >Mode A (Monitor Only)</button>
+                  <button
+                    aria-pressed={monitoringSettings.automationMode === 'review_before_acquisition'}
+                    onclick={() => updateAutomationMode('review_before_acquisition')}
+                  >Mode B (Review Queue)</button>
+                  <button
+                    aria-pressed={monitoringSettings.automationMode === 'automatic_acquisition'}
+                    onclick={() => updateAutomationMode('automatic_acquisition')}
+                  >Mode C (Auto-Acquire)</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="set">
+              <div class="what">
+                <strong>Monitored Followed Lists</strong>
+                <span>
+                  Select which personal tracking lists are monitored for missing volumes and release discovery.
+                </span>
+              </div>
+              <div class="how">
+                <div class="pill-group" role="group" aria-label="Monitored lists">
+                  {#each ['reading', 'planning', 'completed', 'paused', 'dropped'] as status}
+                    <button
+                      type="button"
+                      class="pill mini"
+                      class:active={monitoringSettings.trackedStatuses.includes(status)}
+                      onclick={() => toggleTrackedStatus(status)}
+                    >
+                      {status.charAt(0).toUpperCase() + status.slice(1)}
+                    </button>
+                  {/each}
+                </div>
+              </div>
+            </div>
+
+            <div class="set">
+              <div class="what">
+                <strong>Monitoring Check Interval</strong>
+                <span>
+                  Frequency in hours for evaluating followed titles, missing content, and candidate releases.
+                </span>
+              </div>
+              <div class="how">
+                <label class="field" style="width: 140px;">
+                  <input
+                    type="number"
+                    min="1"
+                    max="168"
+                    value={monitoringSettings.intervalHours}
+                    onchange={(e) => updateMonitoringInterval(parseInt(e.currentTarget.value) || 12)}
+                  />
+                  <span class="muted font-small">hours</span>
+                </label>
+              </div>
+            </div>
+
             <div class="path-status-row" style="margin-top: 0.75rem; display: flex; flex-wrap: wrap; gap: 0.5rem;">
+              <span class="status-badge status-{monitoringSettings.automationMode === 'monitor_only' ? 'valid' : monitoringSettings.automationMode === 'review_before_acquisition' ? 'not_configured' : 'failed'}">
+                Policy: {monitoringSettings.automationMode === 'monitor_only' ? 'Mode A (Monitor Only)' : monitoringSettings.automationMode === 'review_before_acquisition' ? 'Mode B (Review Before Acquisition)' : 'Mode C (Automatic Acquisition)'}
+              </span>
               <span class="status-badge status-{operatingModeInput === 'simulation' ? 'not_configured' : 'valid'}">
                 {#if operatingModeInput === 'simulation'}
                   Mode: Simulation (Protected)

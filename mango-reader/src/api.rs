@@ -278,6 +278,38 @@ pub fn router(state: Spaces) -> Router {
             post(post_availability_watcher_refresh),
         )
         .route(
+            "/monitoring/settings",
+            get(get_monitoring_settings).post(post_monitoring_settings),
+        )
+        .route(
+            "/monitoring/refresh",
+            post(post_monitoring_refresh),
+        )
+        .route(
+            "/monitoring/review-queue",
+            get(get_monitoring_review_queue),
+        )
+        .route(
+            "/monitoring/review-queue/{id}/approve",
+            post(post_review_queue_approve),
+        )
+        .route(
+            "/monitoring/review-queue/{id}/reject",
+            post(post_review_queue_reject),
+        )
+        .route(
+            "/monitoring/review-queue/{id}/skip",
+            post(post_review_queue_skip),
+        )
+        .route(
+            "/monitoring/review-queue/batch-approve",
+            post(post_review_queue_batch_approve),
+        )
+        .route(
+            "/monitoring/activity",
+            get(get_monitoring_activity),
+        )
+        .route(
             "/titles/{id}/availability",
             get(get_title_availability).patch(patch_title_availability),
         )
@@ -4457,7 +4489,7 @@ async fn post_title_availability_refresh(
 ) -> Result<Json<Vec<crate::acquisition::watcher::ReleaseAvailabilityWatcher>>> {
     app.me.admin()?;
     let http = reqwest::Client::new();
-    let res = crate::acquisition::watcher::refresh_title_watchers(&app.db, http, id).await?;
+    let res = crate::acquisition::watcher::refresh_title_watchers(&app.db, http, Some(&app.acquisition), id).await?;
     Ok(Json(res))
 }
 
@@ -4524,7 +4556,7 @@ async fn post_availability_watcher_refresh(
 ) -> Result<Json<Option<crate::acquisition::watcher::ReleaseAvailabilityWatcher>>> {
     app.me.admin()?;
     let http = reqwest::Client::new();
-    let res = crate::acquisition::watcher::refresh_watcher_by_id(&app.db, http, id).await?;
+    let res = crate::acquisition::watcher::refresh_watcher_by_id(&app.db, http, Some(&app.acquisition), id).await?;
     Ok(Json(res))
 }
 
@@ -5198,6 +5230,181 @@ async fn get_naming_backups(
         crate::pipeline::naming_audit::list_naming_backups(conn)
     }).await?;
     Ok(Json(backups))
+}
+
+async fn get_monitoring_settings(
+    Me(app): Me,
+) -> Result<Json<crate::acquisition::monitoring::MonitoringSettings>> {
+    app.me.admin()?;
+    let settings = app.db.call(|conn| crate::acquisition::monitoring::get_monitoring_settings(conn)).await?;
+    Ok(Json(settings))
+}
+
+async fn post_monitoring_settings(
+    Me(app): Me,
+    Json(settings): Json<crate::acquisition::monitoring::MonitoringSettings>,
+) -> Result<Json<crate::acquisition::monitoring::MonitoringSettings>> {
+    app.me.admin()?;
+    app.db.call(move |conn| crate::acquisition::monitoring::update_monitoring_settings(conn, &settings)).await?;
+    let updated = app.db.call(|conn| crate::acquisition::monitoring::get_monitoring_settings(conn)).await?;
+    Ok(Json(updated))
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MonitoringRefreshResponse {
+    synced_watchers: usize,
+    message: String,
+}
+
+async fn post_monitoring_refresh(
+    Me(app): Me,
+) -> Result<Json<MonitoringRefreshResponse>> {
+    app.me.admin()?;
+    let http = reqwest::Client::new();
+    let synced = crate::acquisition::monitoring::run_monitored_series_cycle(&app.db, http).await?;
+    Ok(Json(MonitoringRefreshResponse {
+        synced_watchers: synced,
+        message: format!("Successfully refreshed monitoring cycle: synced {synced} missing volume watchers."),
+    }))
+}
+
+#[derive(Deserialize)]
+struct ReviewQueueQuery {
+    status: Option<String>,
+}
+
+async fn get_monitoring_review_queue(
+    Me(app): Me,
+    Query(q): Query<ReviewQueueQuery>,
+) -> Result<Json<Vec<crate::acquisition::monitoring::ReviewQueueItem>>> {
+    app.me.admin()?;
+    let status_opt = q.status;
+    let items = app.db.call(move |conn| {
+        crate::acquisition::monitoring::list_review_queue(conn, status_opt.as_deref())
+    }).await?;
+    Ok(Json(items))
+}
+
+async fn post_review_queue_approve(
+    Me(app): Me,
+    Path(id): Path<i64>,
+) -> Result<Json<crate::acquisition::volume_manager::BatchAcquireItemResult>> {
+    app.me.admin()?;
+    let user_id = Some(app.me.id);
+    let res = crate::acquisition::monitoring::approve_review_queue_item(
+        &app.db,
+        &app.acquisition,
+        id,
+        user_id,
+    ).await?;
+    Ok(Json(res))
+}
+
+#[derive(Deserialize)]
+struct ReviewActionRequest {
+    reason: Option<String>,
+}
+
+async fn post_review_queue_reject(
+    Me(app): Me,
+    Path(id): Path<i64>,
+    Json(req): Json<ReviewActionRequest>,
+) -> Result<StatusCode> {
+    app.me.admin()?;
+    app.db.call(move |conn| {
+        crate::acquisition::monitoring::reject_review_queue_item(conn, id, req.reason.as_deref())
+    }).await?;
+    Ok(StatusCode::OK)
+}
+
+async fn post_review_queue_skip(
+    Me(app): Me,
+    Path(id): Path<i64>,
+    Json(req): Json<ReviewActionRequest>,
+) -> Result<StatusCode> {
+    app.me.admin()?;
+    app.db.call(move |conn| {
+        crate::acquisition::monitoring::skip_review_queue_item(conn, id, req.reason.as_deref())
+    }).await?;
+    Ok(StatusCode::OK)
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchApproveRequest {
+    item_ids: Vec<i64>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BatchApproveResponse {
+    total_requested: usize,
+    approved_count: usize,
+    failed_count: usize,
+    results: Vec<crate::acquisition::volume_manager::BatchAcquireItemResult>,
+    message: String,
+}
+
+async fn post_review_queue_batch_approve(
+    Me(app): Me,
+    Json(req): Json<BatchApproveRequest>,
+) -> Result<Json<BatchApproveResponse>> {
+    app.me.admin()?;
+    let user_id = Some(app.me.id);
+    let mut results = Vec::new();
+    let mut approved_count = 0;
+    let mut failed_count = 0;
+    let total_requested = req.item_ids.len();
+
+    for id in req.item_ids {
+        match crate::acquisition::monitoring::approve_review_queue_item(
+            &app.db,
+            &app.acquisition,
+            id,
+            user_id,
+        ).await {
+            Ok(item_res) => {
+                approved_count += 1;
+                results.push(item_res);
+            }
+            Err(e) => {
+                failed_count += 1;
+                results.push(crate::acquisition::volume_manager::BatchAcquireItemResult {
+                    volume_number: 0.0,
+                    status: "error".to_string(),
+                    message: e.to_string(),
+                    execution_id: None,
+                    candidate_id: None,
+                });
+            }
+        }
+    }
+
+    Ok(Json(BatchApproveResponse {
+        total_requested,
+        approved_count,
+        failed_count,
+        results,
+        message: format!("Approved {approved_count} item(s) (failed: {failed_count})"),
+    }))
+}
+
+#[derive(Deserialize)]
+struct MonitoringActivityQuery {
+    limit: Option<usize>,
+}
+
+async fn get_monitoring_activity(
+    Me(app): Me,
+    Query(q): Query<MonitoringActivityQuery>,
+) -> Result<Json<Vec<crate::acquisition::monitoring::MonitoringActivityEntry>>> {
+    app.me.admin()?;
+    let limit = q.limit.unwrap_or(50).clamp(1, 200);
+    let activity = app.db.call(move |conn| {
+        crate::acquisition::monitoring::list_monitoring_activity(conn, limit)
+    }).await?;
+    Ok(Json(activity))
 }
 
 

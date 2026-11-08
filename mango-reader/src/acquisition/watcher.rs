@@ -17,11 +17,19 @@ use reqwest::Client;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
-use crate::acquisition::approval::PersistedCandidate;
-use crate::acquisition::auto_acquire::is_candidate_auto_eligible;
+use crate::acquisition::approval::{ApproveCandidateRequest, PersistedCandidate};
+use crate::acquisition::auto_acquire::{
+    get_title_auto_acquire, is_candidate_auto_eligible, is_global_auto_acquire_enabled,
+    is_simulation_mode,
+};
 use crate::acquisition::discovery::discover_for_volume;
+use crate::acquisition::monitoring::{
+    add_or_update_review_queue_item, get_automation_mode, log_monitoring_activity_internal,
+    AutomationMode,
+};
 use crate::acquisition::profiles::AcquisitionProfile;
 use crate::acquisition::release_discovery::is_volume_owned;
+use crate::acquisition::service::AcquisitionService;
 use crate::db::{now, Db};
 use crate::error::{AppError, Result};
 use crate::sync::reconciliation::{get_reconciliation, record_event_full, ReconciliationStatus};
@@ -658,9 +666,10 @@ pub fn list_all_watchers(
 pub async fn refresh_watcher_by_id(
     db: &Db,
     http: Client,
+    acquisition: Option<&AcquisitionService>,
     watcher_id: i64,
 ) -> Result<Option<ReleaseAvailabilityWatcher>> {
-    evaluate_watcher_check(db, http, watcher_id).await
+    evaluate_watcher_check(db, http, acquisition, watcher_id).await
 }
 
 /// Evaluates a single watcher record against discovery providers and updates state.
@@ -673,6 +682,7 @@ pub async fn refresh_watcher_by_id(
 pub async fn evaluate_watcher_check(
     db: &Db,
     http: Client,
+    acquisition: Option<&AcquisitionService>,
     watcher_id: i64,
 ) -> Result<Option<ReleaseAvailabilityWatcher>> {
     let watcher = db
@@ -967,11 +977,277 @@ pub async fn evaluate_watcher_check(
         })
         .await?;
 
+    // 9. Automation Policy Execution (M10.1 + M11)
+    if let Some(ref elig) = eligible_candidate {
+        let wid = watcher.id;
+        let mid_opt = watcher.manga_id;
+        let s_id = watcher.series_id.clone();
+        let s_title = watcher.series_title.clone();
+        let vol = volume_number;
+
+        let (mode, title_auto, global_auto, is_sim) = db
+            .call(move |conn| {
+                let global_mode = get_automation_mode(conn);
+                let per_title_mode: Option<String> = if let Some(mid) = mid_opt {
+                    conn.query_row("SELECT automation_mode FROM manga WHERE id = ?1", [mid], |r| r.get(0))
+                        .optional()
+                        .unwrap_or(None)
+                        .flatten()
+                } else {
+                    None
+                };
+                let effective_mode = per_title_mode
+                    .map(|s| AutomationMode::from_str(&s))
+                    .unwrap_or(global_mode);
+
+                let title_auto = if let Some(mid) = mid_opt {
+                    get_title_auto_acquire(conn, mid)
+                        .map(|(en, _)| en)
+                        .unwrap_or(false)
+                } else {
+                    false
+                };
+                let global_auto = is_global_auto_acquire_enabled(conn);
+                let sim = is_simulation_mode(conn);
+
+                Ok((effective_mode, title_auto, global_auto, sim))
+            })
+            .await?;
+
+        let destination = format!("{}/Volume {:02}.cbz", s_title, vol.round() as i64);
+        let alternatives: Vec<_> = discovery_res
+            .candidates
+            .iter()
+            .filter(|c| c.candidate_id != elig.candidate_id)
+            .cloned()
+            .collect();
+
+        let conf_str = elig.confidence.as_deref().unwrap_or("high").to_string();
+
+        match mode {
+            AutomationMode::MonitorOnly => {
+                let prov = elig.provider.clone();
+                let conf = conf_str.clone();
+                let score = elig.score;
+                db.call(move |conn| {
+                    log_monitoring_activity_internal(
+                        conn,
+                        mid_opt,
+                        &s_title,
+                        vol,
+                        "discovered",
+                        &prov,
+                        &conf,
+                        Some(score),
+                        Some("MONITOR_ONLY"),
+                        &format!("Eligible release discovered for {} Vol. {}", s_title, vol),
+                        current_time,
+                    )
+                })
+                .await?;
+            }
+            AutomationMode::ReviewBeforeAcquisition => {
+                let elig_c = elig.clone();
+                let dest_c = destination.clone();
+                let alts_c = alternatives.clone();
+                let conf = conf_str.clone();
+                db.call(move |conn| {
+                    let _ = add_or_update_review_queue_item(
+                        conn,
+                        mid_opt,
+                        &s_id,
+                        &s_title,
+                        vol,
+                        &elig_c,
+                        &alts_c,
+                        Some(&dest_c),
+                    )?;
+                    log_monitoring_activity_internal(
+                        conn,
+                        mid_opt,
+                        &s_title,
+                        vol,
+                        "plan_proposed",
+                        &elig_c.provider,
+                        &conf,
+                        Some(elig_c.score),
+                        Some("AWAITING_OPERATOR_REVIEW"),
+                        &format!(
+                            "Acquisition proposed for operator review: {} Vol. {}",
+                            s_title, vol
+                        ),
+                        current_time,
+                    )
+                })
+                .await?;
+            }
+            AutomationMode::AutomaticAcquisition => {
+                let is_high_confidence = elig
+                    .confidence
+                    .as_deref()
+                    .map_or(false, |c| c.eq_ignore_ascii_case("high"));
+                let is_english = elig
+                    .language
+                    .as_deref()
+                    .map_or(true, |l| l.eq_ignore_ascii_case("en"))
+                    && crate::acquisition::matching::detect_foreign_language(&elig.raw_title, "en")
+                        .is_none();
+
+                let auto_allowed =
+                    global_auto && title_auto && is_high_confidence && is_english;
+
+                if auto_allowed {
+                    if is_sim {
+                        let prov = elig.provider.clone();
+                        let conf = conf_str.clone();
+                        let score = elig.score;
+                        db.call(move |conn| {
+                            log_monitoring_activity_internal(
+                                conn,
+                                mid_opt,
+                                &s_title,
+                                vol,
+                                "simulated",
+                                &prov,
+                                &conf,
+                                Some(score),
+                                Some("WOULD_AUTO_ACQUIRE"),
+                                &format!(
+                                    "Simulation Mode: Would auto-acquire {} Vol. {} from {}",
+                                    s_title, vol, prov
+                                ),
+                                current_time,
+                            )
+                        })
+                        .await?;
+                    } else if let Some(acq) = acquisition {
+                        if let Some(mid) = mid_opt {
+                            let approve_req = ApproveCandidateRequest {
+                                dry_run: Some(false),
+                                authorization_token: None,
+                                user_id: None,
+                                confirm_review: Some(true),
+                                confirm_range: Some(true),
+                                confirm_pack: Some(true),
+                            };
+                            match acq
+                                .approve_candidate(mid, vol, &elig.candidate_id, approve_req)
+                                .await
+                            {
+                                Ok(_) => {
+                                    let prov = elig.provider.clone();
+                                    let conf = conf_str.clone();
+                                    let score = elig.score;
+                                    db.call(move |conn| {
+                                        conn.execute(
+                                            "UPDATE release_availability_watchers SET state = 'ACQUIRED', updated_at = ?1 WHERE id = ?2",
+                                            params![current_time, wid],
+                                        )?;
+                                        log_monitoring_activity_internal(
+                                            conn,
+                                            Some(mid),
+                                            &s_title,
+                                            vol,
+                                            "auto_acquired",
+                                            &prov,
+                                            &conf,
+                                            Some(score),
+                                            Some("AUTO_ACQUISITION_EXECUTED"),
+                                            &format!(
+                                                "Automatically initiated acquisition for {} Vol. {}",
+                                                s_title, vol
+                                            ),
+                                            current_time,
+                                        )
+                                    })
+                                    .await?;
+                                }
+                                Err(e) => {
+                                    let prov = elig.provider.clone();
+                                    let conf = conf_str.clone();
+                                    let score = elig.score;
+                                    let err_str = e.to_string();
+                                    db.call(move |conn| {
+                                        log_monitoring_activity_internal(
+                                            conn,
+                                            Some(mid),
+                                            &s_title,
+                                            vol,
+                                            "failed",
+                                            &prov,
+                                            &conf,
+                                            Some(score),
+                                            Some("EXECUTION_ERROR"),
+                                            &format!(
+                                                "Failed to auto-acquire {} Vol. {}: {}",
+                                                s_title, vol, err_str
+                                            ),
+                                            current_time,
+                                        )
+                                    })
+                                    .await?;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    let decision_code = if !global_auto {
+                        "GLOBAL_AUTO_DISABLED"
+                    } else if !title_auto {
+                        "TITLE_AUTO_DISABLED"
+                    } else if !is_high_confidence {
+                        "CONFIDENCE_NOT_HIGH"
+                    } else {
+                        "LANGUAGE_NOT_ENGLISH"
+                    };
+
+                    let elig_c = elig.clone();
+                    let dest_c = destination.clone();
+                    let alts_c = alternatives.clone();
+                    let conf = conf_str.clone();
+                    db.call(move |conn| {
+                        let _ = add_or_update_review_queue_item(
+                            conn,
+                            mid_opt,
+                            &s_id,
+                            &s_title,
+                            vol,
+                            &elig_c,
+                            &alts_c,
+                            Some(&dest_c),
+                        )?;
+                        log_monitoring_activity_internal(
+                            conn,
+                            mid_opt,
+                            &s_title,
+                            vol,
+                            "plan_proposed",
+                            &elig_c.provider,
+                            &conf,
+                            Some(elig_c.score),
+                            Some(decision_code),
+                            &format!(
+                                "Auto-acquire blocked ({decision_code}); queued for review: {} Vol. {}",
+                                s_title, vol
+                            ),
+                            current_time,
+                        )
+                    })
+                    .await?;
+                }
+            }
+        }
+    }
+
     Ok(updated)
 }
 
 /// Runs a single polling tick across due availability watchers.
-pub async fn run_watcher_tick(db: &Db, http: Client) -> Result<usize> {
+pub async fn run_watcher_tick(
+    db: &Db,
+    http: Client,
+    acquisition: Option<&AcquisitionService>,
+) -> Result<usize> {
     let current_time = now();
 
     let due_ids: Vec<i64> = db
@@ -1016,7 +1292,7 @@ pub async fn run_watcher_tick(db: &Db, http: Client) -> Result<usize> {
 
     let mut processed = 0;
     for wid in due_ids {
-        if let Ok(Some(_)) = evaluate_watcher_check(db, http.clone(), wid).await {
+        if let Ok(Some(_)) = evaluate_watcher_check(db, http.clone(), acquisition, wid).await {
             processed += 1;
         }
     }
@@ -1028,6 +1304,7 @@ pub async fn run_watcher_tick(db: &Db, http: Client) -> Result<usize> {
 pub async fn refresh_title_watchers(
     db: &Db,
     http: Client,
+    acquisition: Option<&AcquisitionService>,
     manga_id: i64,
 ) -> Result<Vec<ReleaseAvailabilityWatcher>> {
     // Fetch watcher IDs for this manga
@@ -1048,7 +1325,7 @@ pub async fn refresh_title_watchers(
         .await?;
 
     for wid in watcher_ids {
-        let _ = evaluate_watcher_check(db, http.clone(), wid).await?;
+        let _ = evaluate_watcher_check(db, http.clone(), acquisition, wid).await?;
     }
 
     let result = db
@@ -1136,9 +1413,30 @@ pub fn get_title_monitoring_settings(
 }
 
 /// Background worker loop for processing due availability watchers periodically.
-pub async fn run_watcher_worker_forever(db: Db, http: Client) {
+pub async fn run_watcher_worker_forever(
+    db: Db,
+    http: Client,
+    acquisition: Option<std::sync::Arc<AcquisitionService>>,
+) {
+    let mut last_followed_sync: i64 = 0;
     loop {
-        if let Err(e) = run_watcher_tick(&db, http.clone()).await {
+        let current_time = now();
+        let interval_hours = db
+            .call(|conn| Ok(crate::acquisition::monitoring::get_monitoring_interval_hours(conn)))
+            .await
+            .unwrap_or(12);
+        let interval_secs = (interval_hours * 3600).max(300);
+
+        if current_time - last_followed_sync >= interval_secs {
+            if let Err(e) =
+                crate::acquisition::monitoring::run_monitored_series_cycle(&db, http.clone()).await
+            {
+                tracing::warn!("Monitored series synchronization cycle error: {e}");
+            }
+            last_followed_sync = current_time;
+        }
+
+        if let Err(e) = run_watcher_tick(&db, http.clone(), acquisition.as_deref()).await {
             tracing::warn!("Availability watcher tick encountered error: {e}");
         }
         tokio::time::sleep(tokio::time::Duration::from_secs(60)).await;

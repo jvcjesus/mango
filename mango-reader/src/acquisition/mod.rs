@@ -21,6 +21,7 @@ pub mod keiyoushi;
 pub mod madokami;
 pub mod matching;
 pub mod missing;
+pub mod monitoring;
 pub mod nyaa;
 pub mod physical;
 pub mod planner;
@@ -49,6 +50,8 @@ pub mod tests;
 pub mod torbox;
 #[cfg(test)]
 pub mod m10_tests;
+#[cfg(test)]
+pub mod m11_tests;
 #[cfg(test)]
 pub mod watcher_tests;
 

@@ -5,12 +5,21 @@
     getWatchersDashboard,
     refreshWatcherById,
     executeWatchersBulkAction,
+    getReviewQueue,
+    approveReviewQueueItem,
+    rejectReviewQueueItem,
+    skipReviewQueueItem,
+    batchApproveReviewQueue,
+    getMonitoringActivity,
+    triggerMonitoringRefresh,
     message,
     send,
     type ReleaseCalendarItem,
     type UpdateItem,
     type Updates,
     type WatchersDashboardResponseDto,
+    type ReviewQueueItem,
+    type MonitoringActivityEntry,
   } from '../lib/api';
   import CandidateInspectorModal from '../lib/CandidateInspectorModal.svelte';
   import Icon from '../lib/Icon.svelte';
@@ -20,7 +29,127 @@
   import { ago, dayKey, dayLabel } from '../lib/util';
 
   // Navigation mode
-  let activeTab = $state<'chapters' | 'calendar' | 'watchers'>('chapters');
+  let activeTab = $state<'chapters' | 'calendar' | 'watchers' | 'review' | 'activity'>('chapters');
+
+  // Review Queue state (M10.1 / M11 Mode B)
+  let reviewItems = $state<ReviewQueueItem[]>([]);
+  let reviewLoading = $state(false);
+  let reviewError = $state<string | null>(null);
+  let reviewStatusFilter = $state<string>('pending');
+  let selectedReviewIds = $state(new Set<number>());
+  let reviewActionBusy = $state(false);
+  let rejectingItemId = $state<number | null>(null);
+  let rejectReasonInput = $state('');
+
+  // Activity History state (M10.1 / M11)
+  let activityEntries = $state<MonitoringActivityEntry[]>([]);
+  let activityLoading = $state(false);
+  let activityError = $state<string | null>(null);
+
+  async function loadReviewQueue() {
+    reviewLoading = true;
+    reviewError = null;
+    try {
+      reviewItems = await getReviewQueue(reviewStatusFilter === 'all' ? undefined : reviewStatusFilter);
+    } catch (e) {
+      reviewError = message(e);
+      toast.error(reviewError);
+    } finally {
+      reviewLoading = false;
+    }
+  }
+
+  async function handleApproveReviewItem(id: number) {
+    reviewActionBusy = true;
+    try {
+      const res = await approveReviewQueueItem(id);
+      toast.success(res.queued ? 'Approved and queued for acquisition' : 'Approved');
+      await loadReviewQueue();
+    } catch (e) {
+      toast.error(message(e));
+    } finally {
+      reviewActionBusy = false;
+    }
+  }
+
+  async function handleRejectReviewItem(id: number, reason?: string) {
+    reviewActionBusy = true;
+    try {
+      await rejectReviewQueueItem(id, reason);
+      toast.info('Release candidate rejected');
+      rejectingItemId = null;
+      rejectReasonInput = '';
+      await loadReviewQueue();
+    } catch (e) {
+      toast.error(message(e));
+    } finally {
+      reviewActionBusy = false;
+    }
+  }
+
+  async function handleSkipReviewItem(id: number, reason?: string) {
+    reviewActionBusy = true;
+    try {
+      await skipReviewQueueItem(id, reason);
+      toast.info('Release candidate skipped');
+      await loadReviewQueue();
+    } catch (e) {
+      toast.error(message(e));
+    } finally {
+      reviewActionBusy = false;
+    }
+  }
+
+  async function handleBatchApprove() {
+    const ids = Array.from(selectedReviewIds);
+    if (ids.length === 0) return;
+    reviewActionBusy = true;
+    try {
+      const res = await batchApproveReviewQueue(ids);
+      toast.success(`Approved ${res.approved} of ${res.total} candidates`);
+      selectedReviewIds.clear();
+      await loadReviewQueue();
+    } catch (e) {
+      toast.error(message(e));
+    } finally {
+      reviewActionBusy = false;
+    }
+  }
+
+  async function handleRefreshMonitoring() {
+    reviewActionBusy = true;
+    try {
+      const res = await triggerMonitoringRefresh();
+      toast.success(res.message);
+      if (activeTab === 'review') await loadReviewQueue();
+      if (activeTab === 'activity') await loadActivityHistory();
+    } catch (e) {
+      toast.error(message(e));
+    } finally {
+      reviewActionBusy = false;
+    }
+  }
+
+  async function loadActivityHistory() {
+    activityLoading = true;
+    activityError = null;
+    try {
+      activityEntries = await getMonitoringActivity(50);
+    } catch (e) {
+      activityError = message(e);
+      toast.error(activityError);
+    } finally {
+      activityLoading = false;
+    }
+  }
+
+  function toggleReviewSelect(id: number, checked: boolean) {
+    if (checked) {
+      selectedReviewIds.add(id);
+    } else {
+      selectedReviewIds.delete(id);
+    }
+  }
 
   // Chapters tab state
   const kept = recall<Updates>('updates');
@@ -283,6 +412,30 @@
           aria-selected={activeTab === 'watchers'}
         >
           <Icon name="bell" size={14} /> Availability Watchers
+        </button>
+        <button
+          class="pill"
+          class:active={activeTab === 'review'}
+          onclick={() => {
+            activeTab = 'review';
+            loadReviewQueue();
+          }}
+          role="tab"
+          aria-selected={activeTab === 'review'}
+        >
+          <Icon name="check" size={14} /> Review Queue
+        </button>
+        <button
+          class="pill"
+          class:active={activeTab === 'activity'}
+          onclick={() => {
+            activeTab = 'activity';
+            loadActivityHistory();
+          }}
+          role="tab"
+          aria-selected={activeTab === 'activity'}
+        >
+          <Icon name="list" size={14} /> Activity History
         </button>
       </div>
     </div>
@@ -687,6 +840,258 @@
             {/each}
           </div>
         {/if}
+      {/if}
+    {/if}
+
+  {:else if activeTab === 'review'}
+    <!-- ACQUISITION REVIEW QUEUE (M10.1 / M11 Mode B) -->
+    <div class="review-queue-header">
+      <div class="review-queue-info">
+        <h3>Proposed Acquisitions</h3>
+        <p class="muted">
+          Under <strong>Review Before Acquisition (Mode B)</strong>, releases matching followed series are queued here for operator confirmation before download and publication.
+        </p>
+      </div>
+      <div class="review-queue-actions">
+        <button class="btn mini flat icon-text" onclick={handleRefreshMonitoring} disabled={reviewActionBusy}>
+          <Icon name="refresh" size={14} /> Refresh Cycle
+        </button>
+        {#if selectedReviewIds.size > 0}
+          <button class="btn mini spot icon-text" onclick={handleBatchApprove} disabled={reviewActionBusy}>
+            <Icon name="check" size={14} /> Approve Selected ({selectedReviewIds.size})
+          </button>
+          <button class="btn mini text" onclick={() => selectedReviewIds.clear()}>
+            Clear
+          </button>
+        {/if}
+      </div>
+    </div>
+
+    <!-- Status filter tabs -->
+    <div class="review-status-filter-bar">
+      <div class="pill-group" role="group" aria-label="Review status filter">
+        <button
+          class="pill mini"
+          class:active={reviewStatusFilter === 'pending'}
+          onclick={() => { reviewStatusFilter = 'pending'; loadReviewQueue(); }}
+        >
+          Pending
+        </button>
+        <button
+          class="pill mini"
+          class:active={reviewStatusFilter === 'approved'}
+          onclick={() => { reviewStatusFilter = 'approved'; loadReviewQueue(); }}
+        >
+          Approved
+        </button>
+        <button
+          class="pill mini"
+          class:active={reviewStatusFilter === 'rejected'}
+          onclick={() => { reviewStatusFilter = 'rejected'; loadReviewQueue(); }}
+        >
+          Rejected
+        </button>
+        <button
+          class="pill mini"
+          class:active={reviewStatusFilter === 'skipped'}
+          onclick={() => { reviewStatusFilter = 'skipped'; loadReviewQueue(); }}
+        >
+          Skipped
+        </button>
+        <button
+          class="pill mini"
+          class:active={reviewStatusFilter === 'all'}
+          onclick={() => { reviewStatusFilter = 'all'; loadReviewQueue(); }}
+        >
+          All
+        </button>
+      </div>
+    </div>
+
+    <Notice loading={reviewLoading} error={reviewError} retry={loadReviewQueue} />
+
+    {#if !reviewLoading && !reviewError}
+      {#if reviewItems.length === 0}
+        <div class="panel empty-watchers-panel">
+          <p class="muted">No proposed acquisitions found in status "{reviewStatusFilter}".</p>
+        </div>
+      {:else}
+        <div class="review-items-list">
+          {#each reviewItems as item (item.id)}
+            <div class="review-card status-{item.status}">
+              <div class="review-main-row">
+                {#if item.status === 'pending'}
+                  <label class="watcher-checkbox-label" title="Select for batch approval">
+                    <input
+                      type="checkbox"
+                      checked={selectedReviewIds.has(item.id)}
+                      onchange={(e) => toggleReviewSelect(item.id, e.currentTarget.checked)}
+                    />
+                  </label>
+                {/if}
+                <div class="review-target-info">
+                  <div class="review-title-row">
+                    <span class="series-title"><strong>{item.seriesTitle}</strong></span>
+                    <span class="vol-num font-mono">Vol. {item.volumeNumber}</span>
+                    <span class="status-pill status-{item.status}">{item.status.toUpperCase()}</span>
+                    {#if item.confidence}
+                      <span class="conf-pill conf-{item.confidence.toLowerCase()}">{item.confidence.toUpperCase()} CONFIDENCE</span>
+                    {/if}
+                  </div>
+                  <div class="review-candidate-title font-mono font-small">
+                    {item.rawTitle || item.title}
+                  </div>
+                  <div class="review-meta-row font-small muted">
+                    <span class="provider-pill">{item.provider}</span>
+                    <span>Quality Score: <strong>{Math.round(item.qualityScore)}/100</strong></span>
+                    {#if item.fileSizeBytes}
+                      <span>Size: {Math.round(item.fileSizeBytes / (1024 * 1024))} MB</span>
+                    {/if}
+                    {#if item.publicationDestination}
+                      <span class="dest-path font-mono">Destination: {item.publicationDestination}</span>
+                    {/if}
+                  </div>
+                  {#if item.statusReason}
+                    <div class="review-reason-note font-small muted">
+                      Note: {item.statusReason}
+                    </div>
+                  {/if}
+                </div>
+
+                <div class="review-actions-cell">
+                  {#if item.status === 'pending'}
+                    <button
+                      class="btn mini spot icon-text"
+                      onclick={() => handleApproveReviewItem(item.id)}
+                      disabled={reviewActionBusy}
+                      title="Approve candidate and queue for acquisition"
+                    >
+                      <Icon name="check" size={13} /> Approve
+                    </button>
+                    {#if rejectingItemId === item.id}
+                      <div class="inline-reject-box">
+                        <input
+                          type="text"
+                          class="field mini"
+                          placeholder="Rejection reason…"
+                          bind:value={rejectReasonInput}
+                          onkeydown={(e) => { if (e.key === 'Enter') handleRejectReviewItem(item.id, rejectReasonInput); }}
+                        />
+                        <button class="btn mini flat" onclick={() => handleRejectReviewItem(item.id, rejectReasonInput)}>
+                          Confirm
+                        </button>
+                        <button class="btn mini text" onclick={() => { rejectingItemId = null; rejectReasonInput = ''; }}>
+                          Cancel
+                        </button>
+                      </div>
+                    {:else}
+                      <button
+                        class="btn mini flat"
+                        onclick={() => { rejectingItemId = item.id; rejectReasonInput = ''; }}
+                        disabled={reviewActionBusy}
+                        title="Reject candidate"
+                      >
+                        Reject
+                      </button>
+                    {/if}
+                    <button
+                      class="btn mini text"
+                      onclick={() => handleSkipReviewItem(item.id, 'Operator skipped')}
+                      disabled={reviewActionBusy}
+                      title="Skip candidate"
+                    >
+                      Skip
+                    </button>
+                  {/if}
+                  {#if item.mangaId}
+                    <button
+                      class="btn mini flat icon-text"
+                      onclick={() => { inspectingVolumeTarget = { mangaId: item.mangaId!, volume: item.volumeNumber }; }}
+                      title="Inspect candidates and transports"
+                    >
+                      <Icon name="eye" size={13} /> Inspect
+                    </button>
+                    <a class="btn mini flat" href="#/title/{item.mangaId}">
+                      Title <Icon name="arrow" size={13} />
+                    </a>
+                  {/if}
+                </div>
+              </div>
+            </div>
+          {/each}
+        </div>
+      {/if}
+    {/if}
+
+  {:else if activeTab === 'activity'}
+    <!-- MONITORING & AUTOMATION ACTIVITY HISTORY (M10.1 / M11) -->
+    <div class="review-queue-header">
+      <div class="review-queue-info">
+        <h3>Monitoring Activity History</h3>
+        <p class="muted">
+          Chronological audit trail of release discovery, review queue proposals, operator approvals, simulation decisions, and background checks.
+        </p>
+      </div>
+      <div class="review-queue-actions">
+        <button class="btn mini flat icon-text" onclick={loadActivityHistory} disabled={activityLoading}>
+          <Icon name="refresh" size={14} /> Refresh
+        </button>
+      </div>
+    </div>
+
+    <Notice loading={activityLoading} error={activityError} retry={loadActivityHistory} />
+
+    {#if !activityLoading && !activityError}
+      {#if activityEntries.length === 0}
+        <div class="panel empty-watchers-panel">
+          <p class="muted">No monitoring activity recorded yet. Run a monitoring check cycle or refresh followed series.</p>
+        </div>
+      {:else}
+        <div class="activity-table-wrapper">
+          <table class="activity-table font-small">
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Series & Target</th>
+                <th>Action</th>
+                <th>Provider</th>
+                <th>Confidence</th>
+                <th>Decision Code</th>
+                <th>Details</th>
+              </tr>
+            </thead>
+            <tbody>
+              {#each activityEntries as entry (entry.id)}
+                <tr>
+                  <td class="nowrap muted">{ago(entry.createdAt)}</td>
+                  <td>
+                    {#if entry.mangaId}
+                      <a href="#/title/{entry.mangaId}"><strong>{entry.seriesTitle}</strong></a>
+                    {:else}
+                      <strong>{entry.seriesTitle}</strong>
+                    {/if}
+                    <span class="muted"> Vol. {entry.volumeNumber}</span>
+                  </td>
+                  <td>
+                    <span class="action-badge action-{entry.action}">{entry.action}</span>
+                  </td>
+                  <td><span class="provider-pill">{entry.source}</span></td>
+                  <td>
+                    <span class="conf-pill conf-{entry.confidence.toLowerCase()}">{entry.confidence}</span>
+                  </td>
+                  <td>
+                    {#if entry.decisionCode}
+                      <code class="decision-code font-mono font-small">{entry.decisionCode}</code>
+                    {:else}
+                      <span class="muted">-</span>
+                    {/if}
+                  </td>
+                  <td class="activity-details-cell">{entry.details}</td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+        </div>
       {/if}
     {/if}
   {/if}
@@ -1312,5 +1717,264 @@
     width: 15px;
     height: 15px;
     accent-color: var(--accent, #6366f1);
+  }
+
+  .review-queue-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 1rem;
+    margin-bottom: 1rem;
+    flex-wrap: wrap;
+  }
+
+  .review-queue-info h3 {
+    margin: 0 0 0.25rem 0;
+    font-size: 1.1rem;
+  }
+
+  .review-queue-info p {
+    margin: 0;
+    font-size: 0.85rem;
+  }
+
+  .review-queue-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .review-status-filter-bar {
+    margin-bottom: 1rem;
+  }
+
+  .review-items-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+  }
+
+  .review-card {
+    background: var(--surface, #1e293b);
+    border: 1px solid var(--border, #334155);
+    border-radius: 8px;
+    padding: 1rem;
+    transition: border-color 0.15s;
+  }
+
+  .review-card:hover {
+    border-color: var(--border-hover, #475569);
+  }
+
+  .review-card.status-approved {
+    border-left: 3px solid #10b981;
+  }
+
+  .review-card.status-rejected {
+    border-left: 3px solid #ef4444;
+    opacity: 0.75;
+  }
+
+  .review-card.status-skipped {
+    border-left: 3px solid #f59e0b;
+    opacity: 0.75;
+  }
+
+  .review-main-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 0.75rem;
+  }
+
+  .review-target-info {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+  }
+
+  .review-title-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+  }
+
+  .review-title-row .series-title {
+    font-size: 1rem;
+  }
+
+  .status-pill {
+    font-size: 0.65rem;
+    font-weight: 700;
+    padding: 0.15rem 0.4rem;
+    border-radius: 4px;
+    letter-spacing: 0.05em;
+  }
+
+  .status-pill.status-pending {
+    background: rgba(245, 158, 11, 0.2);
+    color: #f59e0b;
+    border: 1px solid rgba(245, 158, 11, 0.4);
+  }
+
+  .status-pill.status-approved {
+    background: rgba(16, 185, 129, 0.2);
+    color: #10b981;
+    border: 1px solid rgba(16, 185, 129, 0.4);
+  }
+
+  .status-pill.status-rejected {
+    background: rgba(239, 68, 68, 0.2);
+    color: #ef4444;
+    border: 1px solid rgba(239, 68, 68, 0.4);
+  }
+
+  .status-pill.status-skipped {
+    background: rgba(148, 163, 184, 0.2);
+    color: #94a3b8;
+    border: 1px solid rgba(148, 163, 184, 0.4);
+  }
+
+  .conf-pill {
+    font-size: 0.65rem;
+    font-weight: 700;
+    padding: 0.15rem 0.4rem;
+    border-radius: 4px;
+  }
+
+  .conf-pill.conf-high {
+    background: rgba(16, 185, 129, 0.15);
+    color: #10b981;
+  }
+
+  .conf-pill.conf-medium {
+    background: rgba(245, 158, 11, 0.15);
+    color: #f59e0b;
+  }
+
+  .conf-pill.conf-low {
+    background: rgba(239, 68, 68, 0.15);
+    color: #ef4444;
+  }
+
+  .review-candidate-title {
+    word-break: break-all;
+    color: var(--fg, #f8fafc);
+  }
+
+  .review-meta-row {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    flex-wrap: wrap;
+  }
+
+  .dest-path {
+    max-width: 300px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .review-reason-note {
+    background: rgba(0, 0, 0, 0.2);
+    padding: 0.25rem 0.5rem;
+    border-radius: 4px;
+    border-left: 2px solid var(--muted, #64748b);
+  }
+
+  .review-actions-cell {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    flex-wrap: wrap;
+  }
+
+  .inline-reject-box {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+  }
+
+  .inline-reject-box input {
+    width: 140px;
+  }
+
+  .activity-table-wrapper {
+    overflow-x: auto;
+    background: var(--surface, #1e293b);
+    border: 1px solid var(--border, #334155);
+    border-radius: 8px;
+  }
+
+  .activity-table {
+    width: 100%;
+    border-collapse: collapse;
+  }
+
+  .activity-table th,
+  .activity-table td {
+    padding: 0.6rem 0.8rem;
+    text-align: left;
+    border-bottom: 1px solid var(--border, #334155);
+  }
+
+  .activity-table th {
+    background: rgba(0, 0, 0, 0.15);
+    color: var(--muted, #8b949e);
+    font-weight: 600;
+  }
+
+  .action-badge {
+    font-size: 0.7rem;
+    font-weight: 700;
+    padding: 0.15rem 0.45rem;
+    border-radius: 4px;
+    text-transform: uppercase;
+  }
+
+  .action-badge.action-discovered {
+    background: rgba(59, 130, 246, 0.15);
+    color: #3b82f6;
+  }
+
+  .action-badge.action-plan_proposed {
+    background: rgba(245, 158, 11, 0.15);
+    color: #f59e0b;
+  }
+
+  .action-badge.action-approved {
+    background: rgba(16, 185, 129, 0.15);
+    color: #10b981;
+  }
+
+  .action-badge.action-rejected {
+    background: rgba(239, 68, 68, 0.15);
+    color: #ef4444;
+  }
+
+  .action-badge.action-simulated {
+    background: rgba(168, 85, 247, 0.15);
+    color: #a855f7;
+  }
+
+  .action-badge.action-auto_acquired {
+    background: rgba(16, 185, 129, 0.25);
+    color: #10b981;
+    font-weight: 800;
+  }
+
+  .decision-code {
+    background: rgba(0, 0, 0, 0.25);
+    padding: 0.15rem 0.4rem;
+    border-radius: 3px;
+    font-size: 0.75rem;
+  }
+
+  .activity-details-cell {
+    max-width: 350px;
+    word-break: break-word;
   }
 </style>

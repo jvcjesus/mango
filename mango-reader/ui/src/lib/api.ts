@@ -3132,3 +3132,95 @@ export interface PublicationPreview {
 export const getPublicationPreview = (chapterId: number) =>
   get<PublicationPreview>(`/pipeline/publication/preview/${chapterId}`);
 
+// ============================================================================
+// M10.1 + M11: Followed-Series Monitoring & Acquisition Automation
+// ============================================================================
+
+export type AutomationMode = 'monitor_only' | 'review_before_acquisition' | 'automatic_acquisition';
+
+export interface MonitoringSettings {
+  automationMode: AutomationMode;
+  intervalHours: number;
+  trackedStatuses: string[];
+  lastCycleAt: number | null;
+  autoAcquireEnabled: boolean;
+  operatingMode: string;
+  autoPublishManual: boolean;
+}
+
+export interface ReviewQueueItem {
+  id: number;
+  mangaId: number | null;
+  seriesId: string;
+  seriesTitle: string;
+  volumeNumber: number;
+  recommendedCandidateId: string;
+  provider: string;
+  title: string;
+  rawTitle: string;
+  qualityScore: number;
+  confidence: string;
+  confidenceReason?: string | null;
+  fileSizeBytes?: number | null;
+  publicationDestination?: string | null;
+  status: 'pending' | 'approved' | 'rejected' | 'skipped' | 'simulated';
+  statusReason?: string | null;
+  alternativesJson?: string | null;
+  rankingBreakdownJson?: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+export interface MonitoringActivityEntry {
+  id: number;
+  mangaId: number | null;
+  seriesTitle: string;
+  volumeNumber: number;
+  action: string;
+  source: string;
+  confidence: string;
+  qualityScore?: number | null;
+  decisionCode?: string | null;
+  details: string;
+  createdAt: number;
+}
+
+export interface BatchApproveReviewQueueResponse {
+  total: number;
+  approved: number;
+  failed: number;
+  results: Array<{
+    candidateId: string;
+    volumeNumber: number;
+    queued: boolean;
+    error?: string | null;
+  }>;
+}
+
+export const getMonitoringSettings = () =>
+  get<MonitoringSettings>('/monitoring/settings');
+
+export const updateMonitoringSettings = (settings: Partial<MonitoringSettings>) =>
+  send<MonitoringSettings>('POST', '/monitoring/settings', settings);
+
+export const triggerMonitoringRefresh = () =>
+  send<{ message: string; cycleAt: number }>('POST', '/monitoring/refresh', {});
+
+export const getReviewQueue = (status?: string) =>
+  get<ReviewQueueItem[]>(status ? `/monitoring/review-queue?status=${encodeURIComponent(status)}` : '/monitoring/review-queue');
+
+export const approveReviewQueueItem = (id: number) =>
+  send<{ candidateId: string; volumeNumber: number; queued: boolean }>('POST', `/monitoring/review-queue/${id}/approve`, {});
+
+export const rejectReviewQueueItem = (id: number, reason?: string) =>
+  send<{ success: boolean; id: number; status: string }>('POST', `/monitoring/review-queue/${id}/reject`, { reason });
+
+export const skipReviewQueueItem = (id: number, reason?: string) =>
+  send<{ success: boolean; id: number; status: string }>('POST', `/monitoring/review-queue/${id}/skip`, { reason });
+
+export const batchApproveReviewQueue = (ids: number[]) =>
+  send<BatchApproveReviewQueueResponse>('POST', '/monitoring/review-queue/batch-approve', { ids });
+
+export const getMonitoringActivity = (limit = 50) =>
+  get<MonitoringActivityEntry[]>(`/monitoring/activity?limit=${limit}`);
+
