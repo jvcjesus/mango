@@ -62,6 +62,19 @@ pub struct KomgaReadProgress {
     pub read_date: Option<String>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct KomgaBookMedia {
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub media_type: Option<String>,
+    #[serde(default)]
+    pub pages_count: Option<i64>,
+    #[serde(default)]
+    pub comment: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KomgaBook {
@@ -73,6 +86,8 @@ pub struct KomgaBook {
     pub number: f64,
     #[serde(default)]
     pub metadata: Option<KomgaBookMetadata>,
+    #[serde(default)]
+    pub media: Option<KomgaBookMedia>,
     #[serde(default)]
     pub read_progress: Option<KomgaReadProgress>,
     #[serde(default)]

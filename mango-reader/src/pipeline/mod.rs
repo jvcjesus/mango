@@ -18,6 +18,7 @@ pub mod naming_audit;
 pub mod normalization;
 pub mod optimizer;
 pub mod ownership;
+pub mod publication_metadata;
 pub mod publisher;
 pub mod receipts;
 pub mod recovery;
@@ -28,6 +29,7 @@ use crate::db::Db;
 use crate::error::{AppError, Result};
 use komga::KomgaClient;
 use mangabaka::MangaBakaClient;
+use rusqlite::OptionalExtension;
 #[allow(unused_imports)]
 pub use optimizer::{
     BUNDLED_OPTIMIZER_PATH, DEFAULT_IMAGE_QUALITY, DEFAULT_MIN_SAVINGS_PERCENT,
@@ -721,6 +723,80 @@ impl Pipeline {
         }
     }
 
+    /// Returns the pre-publication metadata and safety preview for a queued or staged acquisition.
+    pub async fn get_publication_preview(
+        &self,
+        chapter_id: i64,
+        komga_client: Option<&KomgaClient>,
+        downloads_dir: &Path,
+    ) -> Result<publication_metadata::PublicationMetadata> {
+        let (config, _, _) = self.load_internal_config().await?;
+        let path: Option<String> = self.db.call(move |conn| {
+            let res: Option<Option<String>> = conn.query_row(
+                "SELECT download_path FROM chapters WHERE id = ?1",
+                [chapter_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+            Ok(res.flatten())
+        }).await?;
+        let staging_file = path.map(|p| downloads_dir.join(p));
+
+        publication_metadata::resolve_publication_metadata(
+            &self.db,
+            komga_client,
+            chapter_id,
+            staging_file.as_deref(),
+            &config,
+        ).await
+    }
+
+    /// Polls Komga with bounded backoff and validates canonical book reconciliation (title, page count, media status).
+    pub async fn poll_verify_release_reconciled(
+        &self,
+        komga_client: &KomgaClient,
+        pub_meta: &publication_metadata::PublicationMetadata,
+        policy: VerificationPolicy,
+    ) -> Result<publication_metadata::KomgaReconciliationOutcome> {
+        let start = std::time::Instant::now();
+        let mut interval = policy.initial_delay;
+
+        // Initial delay to allow Komga to receive and queue the scan
+        tokio::time::sleep(interval).await;
+
+        while start.elapsed() < policy.timeout {
+            match publication_metadata::reconcile_published_book(komga_client, pub_meta).await {
+                Ok(outcome) if outcome.is_verified || outcome.needs_review => {
+                    return Ok(outcome);
+                }
+                Ok(_) => {
+                    tracing::debug!(
+                        "KOMGA: release {} not yet fully reconciled, waiting...",
+                        pub_meta.canonical_filename
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "KOMGA: error checking release reconciliation: {e}"
+                    );
+                }
+            }
+
+            interval = Duration::from_secs_f64(
+                (interval.as_secs_f64() * policy.backoff_factor)
+                    .min(policy.max_interval.as_secs_f64()),
+            );
+            let remaining = policy.timeout.saturating_sub(start.elapsed());
+            if remaining.is_zero() {
+                break;
+            }
+            tokio::time::sleep(interval.min(remaining)).await;
+        }
+
+        // Final check
+        publication_metadata::reconcile_published_book(komga_client, pub_meta).await
+    }
+
     /// Polls Komga with bounded backoff until the release is indexed or timeout expires.
     pub async fn poll_verify_release(
         &self,
@@ -1251,7 +1327,54 @@ impl Pipeline {
             }
         }
 
-        // 4. Authoritative ComicInfo.xml Generation & Safe CBZ Rewrite (before canonical publication)
+        // 4. Centralized Publication Metadata Resolution & Pre-Publication Validation
+        let komga_client_pre = if config.komga_enabled {
+            Some(KomgaClient::new(self.http.clone(), config.komga_url.clone(), komga_key.clone()))
+        } else {
+            None
+        };
+        let pub_meta = publication_metadata::resolve_publication_metadata_for_job(
+            job,
+            Some(source_cbz),
+            &config,
+            komga_client_pre.as_ref(),
+            resolved_enrichment.as_ref(),
+        ).await?;
+
+        // Fail-closed pre-publication validation
+        if !pub_meta.is_safe_to_publish {
+            let reason = if pub_meta.ownership_status == publication_metadata::PrePublicationOwnership::DestinationConflict {
+                format!("Destination conflict: {} already exists on disk with different contents", pub_meta.canonical_destination.display())
+            } else if pub_meta.ownership_status == publication_metadata::PrePublicationOwnership::OmnibusConflict {
+                format!("Omnibus conflict: existing Komga book covers volume {}", release_num)
+            } else if !pub_meta.warnings.is_empty() {
+                pub_meta.warnings.join("; ")
+            } else {
+                "Pre-publication validation safety gates failed".to_string()
+            };
+            tracing::warn!("PIPELINE: Pre-publication validation failed: {reason}");
+            self.record_event(PipelineEvent {
+                id: format!("{}-{}", job.chapter, now),
+                timestamp: now,
+                chapter_id: job.chapter,
+                series: job.title.clone(),
+                release_name: release_name.clone(),
+                is_volume,
+                number: release_num,
+                outcome: "conflict".to_string(),
+                destination: None,
+                mangabaka_status: mangabaka_status.clone(),
+                optimizer_status: optimizer_status.clone(),
+                komga_status: "skipped".to_string(),
+                error: Some(reason.clone()),
+                mangabaka_id: resolved_mangabaka_id,
+                anilist_id,
+                requested_unit: Some(requested_unit.clone()),
+            });
+            return Err(AppError::new(409, "destination_conflict", reason));
+        }
+
+        // Authoritative ComicInfo.xml Generation & Safe CBZ Rewrite (before canonical publication)
         on_stage("metadata", "Writing ComicInfo.xml metadata...", None);
         let override_notes = format!(
             "User override · {} · Source release: {} · Group: {}",
@@ -1260,14 +1383,12 @@ impl Pipeline {
             job.uploader.as_deref().unwrap_or("unknown")
         );
         let comic_params = mangabaka::ComicInfoParams {
-            series: &publication_title,
-            volume: job
-                .volume
-                .or_else(|| if is_volume { Some(release_num) } else { None }),
-            number: if is_volume { None } else { Some(release_num) },
-            is_volume,
-            title: Some(&job.name),
-            scanlator: job.scanlator.as_deref().or(job.uploader.as_deref()),
+            series: &pub_meta.publication_series_title,
+            volume: pub_meta.volume_number,
+            number: pub_meta.chapter_number,
+            is_volume: pub_meta.is_volume,
+            title: Some(&pub_meta.canonical_reader_title),
+            scanlator: pub_meta.release_group.as_deref().or(job.uploader.as_deref()),
             notes: if identity_override {
                 Some(&override_notes)
             } else {
@@ -1666,19 +1787,15 @@ impl Pipeline {
             });
         }
 
-        let verified = self
-            .poll_verify_release(
+        let reconciliation = self
+            .poll_verify_release_reconciled(
                 &komga_client,
-                &publication_title,
-                target_library_id,
-                is_volume,
-                release_num,
+                &pub_meta,
                 policy,
             )
-            .await
-            .unwrap_or(false);
+            .await?;
 
-        if verified {
+        if reconciliation.is_verified {
             self.ownership.invalidate(job.manga_id);
             let _ = self
                 .ownership
@@ -1705,11 +1822,22 @@ impl Pipeline {
             });
 
             let p_str_ver = canonical_dest_str.clone();
+            let b_id_ver = reconciliation.book_id.clone();
+            let t_disp_ver = reconciliation.displayed_title.clone();
+            let det_ver = reconciliation.details.clone();
             let _ = self
                 .db
                 .call(move |conn| {
                     crate::acquisition::service::complete_queued_publication(conn, chapter_id)?;
-                    let _ = receipts::update_receipt_ownership_verified(conn, &p_str_ver, true);
+                    let _ = receipts::update_receipt_verification(
+                        conn,
+                        &p_str_ver,
+                        true,
+                        b_id_ver.as_deref(),
+                        t_disp_ver.as_deref(),
+                        "verified",
+                        Some(&det_ver),
+                    );
                     Ok(())
                 })
                 .await;
@@ -1720,6 +1848,55 @@ impl Pipeline {
                 Some(canonical_dest_str),
             );
             Ok(AcquisitionOutcome::Complete(canonical_dest))
+        } else if reconciliation.needs_review {
+            let review_msg = format!("Published — Review required: {}", reconciliation.details);
+            tracing::warn!("PIPELINE: Komga reconciliation flagged for review: {}", reconciliation.details);
+
+            self.record_event(PipelineEvent {
+                id: format!("{}-{}", job.chapter, now),
+                timestamp: now,
+                chapter_id: job.chapter,
+                series: job.title.clone(),
+                release_name,
+                is_volume,
+                number: release_num,
+                outcome: outcome_str.to_string(),
+                destination: Some(canonical_dest_str.clone()),
+                mangabaka_status,
+                optimizer_status,
+                komga_status: format!("review required: {}", reconciliation.details),
+                error: Some(review_msg.clone()),
+                mangabaka_id: resolved_mangabaka_id,
+                anilist_id,
+                requested_unit: Some(requested_unit.clone()),
+            });
+
+            let p_str_flagged = canonical_dest_str.clone();
+            let b_id_flagged = reconciliation.book_id.clone();
+            let t_disp_flagged = reconciliation.displayed_title.clone();
+            let det_flagged = reconciliation.details.clone();
+            let err_clone = review_msg.clone();
+            let _ = self.db.call(move |conn| {
+                conn.execute(
+                    "UPDATE downloads SET state = 'verifying', error = ?2 WHERE chapter_id = ?1",
+                    rusqlite::params![chapter_id, err_clone],
+                )?;
+                let _ = receipts::update_receipt_verification(
+                    conn,
+                    &p_str_flagged,
+                    false,
+                    b_id_flagged.as_deref(),
+                    t_disp_flagged.as_deref(),
+                    "review_required",
+                    Some(&det_flagged),
+                );
+                Ok(())
+            }).await;
+
+            Ok(AcquisitionOutcome::PublishedScanFailed {
+                destination: canonical_dest,
+                error: review_msg,
+            })
         } else {
             // Indexing not visible yet within bounded timeout:
             // Persist pending verification state (NOT corruption, NOT download failure)
@@ -2004,6 +2181,8 @@ impl Pipeline {
 mod receipts_tests;
 #[cfg(test)]
 mod recovery_tests;
+#[cfg(test)]
+mod publication_tests;
 
 #[cfg(test)]
 mod tests {

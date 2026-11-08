@@ -50,7 +50,7 @@ pub struct ProviderHealth {
 }
 
 /// Conservative match classification for a release candidate relative to a logical target.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum CandidateMatchType {
     /// Exact single volume matching target (e.g. Target 10 == Candidate Vol 10).
@@ -60,6 +60,7 @@ pub enum CandidateMatchType {
     /// A full series batch or large pack containing target (e.g. Vols 1-20).
     SeriesPack,
     /// Plausible/fuzzy volume candidate lacking unambiguous markers.
+    #[default]
     PossibleMatch,
     /// Anime, chapters, wrong volume numbers, or unparseable releases.
     Rejected,
@@ -88,7 +89,7 @@ impl CandidateMatchType {
 }
 
 /// Unified, source-agnostic candidate discovered for a logical target.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct ReleaseCandidate {
     pub candidate_id: String,
@@ -111,6 +112,22 @@ pub struct ReleaseCandidate {
     pub seeders: Option<u32>,
     pub leechers: Option<u32>,
     pub published_at: Option<i64>,
+    #[serde(default)]
+    pub confidence: Option<String>,
+    #[serde(default)]
+    pub confidence_reason: Option<String>,
+    #[serde(default)]
+    pub language: Option<String>,
+    #[serde(default)]
+    pub edition: Option<String>,
+    #[serde(default)]
+    pub format: Option<String>,
+    #[serde(default)]
+    pub resolution: Option<String>,
+    #[serde(default)]
+    pub publisher: Option<String>,
+    #[serde(default)]
+    pub ranking_breakdown: Option<crate::acquisition::quality::RankingBreakdown>,
 }
 
 /// Release query specification for a logical missing volume/chapter.
@@ -487,6 +504,7 @@ impl ReleaseProvider for NyaaReleaseProvider {
                     seeders: Some(r.seeders),
                     leechers: Some(r.leechers),
                     published_at: r.published_at,
+                    ..Default::default()
                 };
                 candidates.push(candidate);
             }

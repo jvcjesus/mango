@@ -58,6 +58,10 @@ pub fn compute_file_sha256(path: &Path) -> Result<(u64, String)> {
     Ok((total_bytes, hash_str))
 }
 
+fn default_verification_status() -> String {
+    "unverified".to_string()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PublicationReceipt {
@@ -80,6 +84,14 @@ pub struct PublicationReceipt {
     pub verified_at: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
+    #[serde(default)]
+    pub komga_book_id: Option<String>,
+    #[serde(default)]
+    pub komga_title: Option<String>,
+    #[serde(default = "default_verification_status")]
+    pub verification_status: String,
+    #[serde(default)]
+    pub verification_details: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -202,19 +214,20 @@ pub fn record_publication_receipt(
         .ok_or_else(|| AppError::internal("Failed to retrieve recorded publication receipt"))
 }
 
+pub const RECEIPT_COLUMNS: &str = "id, chapter_id, manga_id, series_title, volume_number, chapter_number,
+        is_volume, canonical_path, file_size_bytes, file_sha256, published_at,
+        komga_notified, komga_library_id, metadata_status, metadata_error,
+        verified_ownership, verified_at, created_at, updated_at,
+        komga_book_id, komga_title, verification_status, verification_details";
+
 /// Retrieves a publication receipt by canonical path.
 pub fn get_publication_receipt_by_path(
     conn: &Connection,
     canonical_path: &str,
 ) -> Result<Option<PublicationReceipt>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, chapter_id, manga_id, series_title, volume_number, chapter_number,
-                is_volume, canonical_path, file_size_bytes, file_sha256, published_at,
-                komga_notified, komga_library_id, metadata_status, metadata_error,
-                verified_ownership, verified_at, created_at, updated_at
-         FROM publication_receipts
-         WHERE canonical_path = ?1",
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {RECEIPT_COLUMNS} FROM publication_receipts WHERE canonical_path = ?1"
+    ))?;
 
     stmt.query_row([canonical_path], map_receipt_row).optional().map_err(|e| {
         AppError::internal(format!("Failed to query publication receipt by path: {e}"))
@@ -226,15 +239,9 @@ pub fn get_publication_receipt_by_chapter(
     conn: &Connection,
     chapter_id: i64,
 ) -> Result<Option<PublicationReceipt>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, chapter_id, manga_id, series_title, volume_number, chapter_number,
-                is_volume, canonical_path, file_size_bytes, file_sha256, published_at,
-                komga_notified, komga_library_id, metadata_status, metadata_error,
-                verified_ownership, verified_at, created_at, updated_at
-         FROM publication_receipts
-         WHERE chapter_id = ?1
-         ORDER BY id DESC LIMIT 1",
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {RECEIPT_COLUMNS} FROM publication_receipts WHERE chapter_id = ?1 ORDER BY id DESC LIMIT 1"
+    ))?;
 
     stmt.query_row([chapter_id], map_receipt_row).optional().map_err(|e| {
         AppError::internal(format!("Failed to query publication receipt by chapter: {e}"))
@@ -246,14 +253,9 @@ pub fn get_publication_receipt(
     conn: &Connection,
     receipt_id: &str,
 ) -> Result<Option<PublicationReceipt>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, chapter_id, manga_id, series_title, volume_number, chapter_number,
-                is_volume, canonical_path, file_size_bytes, file_sha256, published_at,
-                komga_notified, komga_library_id, metadata_status, metadata_error,
-                verified_ownership, verified_at, created_at, updated_at
-         FROM publication_receipts
-         WHERE id = ?1",
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {RECEIPT_COLUMNS} FROM publication_receipts WHERE id = ?1"
+    ))?;
 
     stmt.query_row([receipt_id], map_receipt_row).optional().map_err(|e| {
         AppError::internal(format!("Failed to query publication receipt: {e}"))
@@ -265,15 +267,9 @@ pub fn list_publication_receipts(
     conn: &Connection,
     limit: usize,
 ) -> Result<Vec<PublicationReceipt>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, chapter_id, manga_id, series_title, volume_number, chapter_number,
-                is_volume, canonical_path, file_size_bytes, file_sha256, published_at,
-                komga_notified, komga_library_id, metadata_status, metadata_error,
-                verified_ownership, verified_at, created_at, updated_at
-         FROM publication_receipts
-         ORDER BY published_at DESC
-         LIMIT ?1",
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {RECEIPT_COLUMNS} FROM publication_receipts ORDER BY published_at DESC LIMIT ?1"
+    ))?;
 
     let rows = stmt.query_map([limit as i64], map_receipt_row)?;
     let mut list = Vec::new();
@@ -288,15 +284,9 @@ pub fn list_receipts_for_manga(
     conn: &Connection,
     manga_id: i64,
 ) -> Result<Vec<PublicationReceipt>> {
-    let mut stmt = conn.prepare(
-        "SELECT id, chapter_id, manga_id, series_title, volume_number, chapter_number,
-                is_volume, canonical_path, file_size_bytes, file_sha256, published_at,
-                komga_notified, komga_library_id, metadata_status, metadata_error,
-                verified_ownership, verified_at, created_at, updated_at
-         FROM publication_receipts
-         WHERE manga_id = ?1
-         ORDER BY volume_number ASC, chapter_number ASC",
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {RECEIPT_COLUMNS} FROM publication_receipts WHERE manga_id = ?1 ORDER BY volume_number ASC, chapter_number ASC"
+    ))?;
 
     let rows = stmt.query_map([manga_id], map_receipt_row)?;
     let mut list = Vec::new();
@@ -430,6 +420,40 @@ pub fn verify_publication_receipt_on_disk(
     })
 }
 
+/// Updates verified ownership and detailed reconciliation status on a receipt once confirmed in Komga.
+pub fn update_receipt_verification(
+    conn: &Connection,
+    canonical_path: &str,
+    verified_ownership: bool,
+    komga_book_id: Option<&str>,
+    komga_title: Option<&str>,
+    verification_status: &str,
+    verification_details: Option<&str>,
+) -> Result<()> {
+    let current_time = now();
+    conn.execute(
+        "UPDATE publication_receipts
+         SET verified_ownership = ?1,
+             verified_at = CASE WHEN ?1 = 1 THEN ?2 ELSE verified_at END,
+             komga_book_id = COALESCE(?3, komga_book_id),
+             komga_title = COALESCE(?4, komga_title),
+             verification_status = ?5,
+             verification_details = ?6,
+             updated_at = ?2
+         WHERE canonical_path = ?7",
+        params![
+            if verified_ownership { 1 } else { 0 },
+            current_time,
+            komga_book_id,
+            komga_title,
+            verification_status,
+            verification_details,
+            canonical_path,
+        ],
+    )?;
+    Ok(())
+}
+
 fn map_receipt_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PublicationReceipt> {
     Ok(PublicationReceipt {
         id: r.get(0)?,
@@ -451,5 +475,9 @@ fn map_receipt_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<PublicationReceipt
         verified_at: r.get(16)?,
         created_at: r.get(17)?,
         updated_at: r.get(18)?,
+        komga_book_id: r.get(19).ok(),
+        komga_title: r.get(20).ok(),
+        verification_status: r.get(21).unwrap_or_else(|_| "unverified".to_string()),
+        verification_details: r.get(22).ok(),
     })
 }

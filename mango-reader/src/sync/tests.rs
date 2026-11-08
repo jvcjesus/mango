@@ -62,6 +62,7 @@ fn test_evaluate_volume_series_progress() {
                 completed: true,
                 read_date: Some("2024-01-01T00:00:00Z".into()),
             }),
+            media: None,
             url: None,
         },
         KomgaBook {
@@ -80,6 +81,7 @@ fn test_evaluate_volume_series_progress() {
                 completed: true,
                 read_date: Some("2024-01-02T00:00:00Z".into()),
             }),
+            media: None,
             url: None,
         },
         KomgaBook {
@@ -98,6 +100,7 @@ fn test_evaluate_volume_series_progress() {
                 completed: false,
                 read_date: None,
             }),
+            media: None,
             url: None,
         },
     ];
@@ -133,6 +136,7 @@ fn test_evaluate_chapter_series_completed() {
                 completed: true,
                 read_date: Some("2024-02-01T00:00:00Z".into()),
             }),
+            media: None,
             url: None,
         },
         KomgaBook {
@@ -147,6 +151,7 @@ fn test_evaluate_chapter_series_completed() {
                 completed: true,
                 read_date: Some("2024-02-02T00:00:00Z".into()),
             }),
+            media: None,
             url: None,
         },
     ];

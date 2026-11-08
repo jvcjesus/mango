@@ -1698,6 +1698,14 @@ export interface DiscoveredCandidate {
   seeders?: number;
   leechers?: number;
   publishedAt?: number;
+  confidence?: 'high' | 'medium' | 'low' | 'ambiguous' | string | null;
+  confidenceReason?: string | null;
+  language?: string | null;
+  edition?: string | null;
+  format?: string | null;
+  resolution?: string | null;
+  publisher?: string | null;
+  rankingBreakdown?: RankingBreakdown | null;
 }
 
 export interface VolumeDiscoveryResult {
@@ -1722,14 +1730,53 @@ export interface SeriesDiscoverySummary {
 export const getVolumeCandidates = (id: number, volume: number) =>
   get<VolumeDiscoveryResult | null>(`/manga/${id}/volumes/${volume}/candidates`);
 
-export const discoverVolumeCandidates = (id: number, volume: number) =>
-  send<VolumeDiscoveryResult>('POST', `/manga/${id}/volumes/${volume}/discover`, {});
+export const discoverVolumeCandidates = (id: number, volume: number, forceRefresh = false) =>
+  send<VolumeDiscoveryResult>(
+    'POST',
+    `/manga/${id}/volumes/${volume}/discover${forceRefresh ? '?forceRefresh=true' : ''}`,
+    {}
+  );
 
 export const discoverAllMissingCandidates = (id: number) =>
   send<SeriesDiscoverySummary>('POST', `/manga/${id}/discover-missing`, {});
 
 export const getSeriesDiscovery = (id: number) =>
   get<VolumeDiscoveryResult[]>(`/manga/${id}/discovery`);
+
+export const getVolumeRankingBreakdown = (mangaId: number, volume: number, candidateId: string) =>
+  get<RankingBreakdown | null>(
+    `/manga/${mangaId}/volumes/${volume}/ranking-breakdown/${encodeURIComponent(candidateId)}`
+  );
+
+export interface FallbackEvaluation {
+  chapterId: number;
+  mangaId: number;
+  seriesTitle: string;
+  volumeNumber?: number | null;
+  failedCandidateId?: string | null;
+  failedProvider?: string | null;
+  failedReason?: string | null;
+  hasFallbackCandidates: boolean;
+  recommendedFallback?: DiscoveredCandidate | null;
+  fallbackCandidates: DiscoveredCandidate[];
+  diagnostics: string[];
+}
+
+export interface FallbackSwitchResult {
+  success: boolean;
+  chapterId: number;
+  previousProvider: string;
+  newProvider: string;
+  newCandidateId: string;
+  newTitle: string;
+  message: string;
+}
+
+export const getDownloadFallbackCandidates = (chapterId: number) =>
+  get<FallbackEvaluation>(`/downloads/${chapterId}/fallback-candidates`);
+
+export const switchDownloadFallback = (chapterId: number, candidateId: string) =>
+  send<FallbackSwitchResult>('POST', `/downloads/${chapterId}/fallback-switch`, { candidateId });
 
 export interface ApproveCandidateRequest {
   confirmRange?: boolean;
@@ -2948,6 +2995,11 @@ export interface BatchPlanItemDto {
   candidateScore?: number | null;
   sizeBytes?: number | null;
   isDigital?: boolean | null;
+  confidence?: 'high' | 'medium' | 'low' | 'ambiguous' | string | null;
+  recommendedRelease?: string | null;
+  alternativeReleases?: string[];
+  publicationDestination?: string | null;
+  rankingBreakdown?: RankingBreakdown | null;
 }
 
 export interface VolumeManagerBatchPlanResponse {
@@ -3040,8 +3092,43 @@ export const recoverDownloadJob = (chapterId: number) =>
     {}
   );
 
+export interface PublicationPreview {
+  chapterId: number;
+  mangaId: number;
+  seriesTitle: string;
+  publicationSeriesTitle: string;
+  isVolume: boolean;
+  volumeNumber?: number | null;
+  chapterNumber?: number | null;
+  formattedNumber: string;
+  canonicalReaderTitle: string;
+  canonicalFilename: string;
+  comicInfoVolume?: string | null;
+  comicInfoNumber?: string | null;
+  mangabakaSeriesId?: number | null;
+  mangabakaVolume?: number | null;
+  mangabakaReleaseId?: string | null;
+  anilistId?: number | null;
+  edition?: string | null;
+  language: string;
+  sourceType: string;
+  backendType: string;
+  releaseGroup?: string | null;
+  uploader?: string | null;
+  rawTitle: string;
+  targetLibraryRoot: string;
+  targetLibraryId?: string | null;
+  canonicalDestination: string;
+  ownershipStatus: 'NOT_OWNED' | 'ALREADY_PUBLISHED' | 'DESTINATION_CONFLICT' | 'ALREADY_OWNED_IN_KOMGA' | 'OMNIBUS_CONFLICT' | 'ACQUIRING' | 'UNKNOWN';
+  existingPath?: string | null;
+  existingBookId?: string | null;
+  confidence: string;
+  archiveStatus: string;
+  pageCount: number;
+  warnings: string[];
+  isSafeToPublish: boolean;
+}
 
-
-
-
+export const getPublicationPreview = (chapterId: number) =>
+  get<PublicationPreview>(`/pipeline/publication/preview/${chapterId}`);
 

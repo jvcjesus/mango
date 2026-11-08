@@ -545,6 +545,7 @@ mod tests {
                     number_sort: Some(1.0),
                 }),
                 read_progress: None,
+                media: None,
                 url: None,
             },
             KomgaBook {
@@ -559,6 +560,7 @@ mod tests {
                     number_sort: Some(2.0),
                 }),
                 read_progress: None,
+                media: None,
                 url: None,
             },
             KomgaBook {
@@ -573,6 +575,7 @@ mod tests {
                     number_sort: Some(3.0),
                 }),
                 read_progress: None,
+                media: None,
                 url: None,
             },
         ];

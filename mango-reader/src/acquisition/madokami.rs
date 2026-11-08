@@ -219,6 +219,7 @@ impl MadokamiClient {
                 seeders: None,
                 leechers: None,
                 published_at: file.mtime_epoch,
+                ..Default::default()
             };
 
             candidates.push(candidate);

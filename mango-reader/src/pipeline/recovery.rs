@@ -374,7 +374,11 @@ mod tests {
                 verified_ownership INTEGER NOT NULL DEFAULT 0,
                 verified_at INTEGER NULL,
                 created_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
+                updated_at INTEGER NOT NULL,
+                komga_book_id TEXT NULL,
+                komga_title TEXT NULL,
+                verification_status TEXT NOT NULL DEFAULT 'verified',
+                verification_details TEXT NULL
             );"
         ).unwrap();
         conn

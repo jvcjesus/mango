@@ -107,6 +107,16 @@ pub struct BatchPlanItemDto {
     pub candidate_score: Option<f64>,
     pub size_bytes: Option<u64>,
     pub is_digital: Option<bool>,
+    #[serde(default)]
+    pub confidence: Option<String>,
+    #[serde(default)]
+    pub recommended_release: Option<String>,
+    #[serde(default)]
+    pub alternative_releases: Vec<String>,
+    #[serde(default)]
+    pub publication_destination: Option<String>,
+    #[serde(default)]
+    pub ranking_breakdown: Option<crate::acquisition::quality::RankingBreakdown>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -930,6 +940,45 @@ pub fn plan_volume_manager_batch(
             blocked_count += 1;
         }
 
+        let mut confidence = None;
+        let mut recommended_release = None;
+        let mut alternative_releases = Vec::new();
+        let mut publication_destination = None;
+        let mut ranking_breakdown = None;
+
+        if is_eligible {
+            publication_destination = Some(format!("{}/Volume {:02}.cbz", summary.title, vol.round() as i64));
+
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT title, score, confidence, ranking_breakdown_json
+                 FROM discovered_release_candidates
+                 WHERE (series_id = ?1 OR series_id = 'manga:' || ?2) AND ABS(volume_number - ?3) < 0.001
+                 ORDER BY score DESC",
+            ) {
+                if let Ok(rows) = stmt.query_map(params![summary.series_id, manga_id, vol], |r| {
+                    let t: String = r.get(0)?;
+                    let sc: f64 = r.get(1)?;
+                    let conf: Option<String> = r.get(2)?;
+                    let rb_j: Option<String> = r.get(3)?;
+                    Ok((t, sc, conf, rb_j))
+                }) {
+                    let mut first = true;
+                    for row in rows.flatten() {
+                        if first {
+                            first = false;
+                            recommended_release = Some(row.0.clone());
+                            confidence = row.2.or_else(|| Some("high".to_string()));
+                            if let Some(j) = row.3 {
+                                ranking_breakdown = serde_json::from_str(&j).ok();
+                            }
+                        } else {
+                            alternative_releases.push(format!("{} (Score: {:.0})", row.0, row.1));
+                        }
+                    }
+                }
+            }
+        }
+
         items.push(BatchPlanItemDto {
             volume_number: vol,
             is_owned,
@@ -943,6 +992,11 @@ pub fn plan_volume_manager_batch(
             candidate_score,
             size_bytes,
             is_digital,
+            confidence,
+            recommended_release,
+            alternative_releases,
+            publication_destination,
+            ranking_breakdown,
         });
     }
 

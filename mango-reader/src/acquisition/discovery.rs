@@ -74,7 +74,8 @@ pub fn get_volume_discovery(
         .prepare(
             "SELECT candidate_id, provider, provider_item_id, title, raw_title, match_type,
                     size_bytes, uploader, is_trusted, is_digital, score, score_explanation,
-                    download_url, magnet_url, info_hash, seeders, leechers, published_at
+                    download_url, magnet_url, info_hash, seeders, leechers, published_at,
+                    confidence, confidence_reason, language, edition, format, resolution, publisher, ranking_breakdown_json
              FROM discovered_release_candidates
              WHERE series_id = ?1 AND ABS(volume_number - ?2) < 0.001
              ORDER BY score DESC",
@@ -84,6 +85,8 @@ pub fn get_volume_discovery(
     let candidates: Vec<ReleaseCandidate> = stmt
         .query_map(params![series_id, volume_number], |r| {
             let match_str: String = r.get(5)?;
+            let rb_json: Option<String> = r.get(25)?;
+            let ranking_breakdown = rb_json.and_then(|j| serde_json::from_str(&j).ok());
             Ok(ReleaseCandidate {
                 candidate_id: r.get(0)?,
                 provider: r.get(1)?,
@@ -105,6 +108,14 @@ pub fn get_volume_discovery(
                 seeders: r.get(15)?,
                 leechers: r.get(16)?,
                 published_at: r.get(17)?,
+                confidence: r.get(18)?,
+                confidence_reason: r.get(19)?,
+                language: r.get(20)?,
+                edition: r.get(21)?,
+                format: r.get(22)?,
+                resolution: r.get(23)?,
+                publisher: r.get(24)?,
+                ranking_breakdown,
             })
         })
         .map_err(|e| AppError::internal(format!("Failed to query candidates: {e}")))?
@@ -209,7 +220,32 @@ pub async fn discover_for_volume(
     series_id: &str,
     volume_number: f64,
 ) -> Result<VolumeDiscoveryResult> {
+    discover_for_volume_with_opts(db, http, series_id, volume_number, false).await
+}
+
+/// Discovers release candidates with optional cache bypass.
+pub async fn discover_for_volume_with_opts(
+    db: &Db,
+    http: Client,
+    series_id: &str,
+    volume_number: f64,
+    force_refresh: bool,
+) -> Result<VolumeDiscoveryResult> {
     let s_id = series_id.to_string();
+
+    // Cache check: if within 3600s TTL and not forced, return cached candidate pool
+    if !force_refresh {
+        let s_id_cached = series_id.to_string();
+        let cached = db
+            .call(move |conn| get_volume_discovery(conn, &s_id_cached, volume_number))
+            .await?;
+        if let Some(cached_res) = cached {
+            let age = now() - cached_res.last_discovered_at;
+            if age >= 0 && age < 3600 && cached_res.status != "no_candidates" {
+                return Ok(cached_res);
+            }
+        }
+    }
 
     // 1. Fetch reconciliation summary to enforce pre-flight invariants
     let reconciliation = db
@@ -308,7 +344,7 @@ pub async fn discover_for_volume(
     }
 
     // 2. Query configured providers
-    let (nyaa_enabled, nyaa_url, nyaa_cat, mado_enabled, mado_url, mado_user, mado_pass) = db
+    let (nyaa_enabled, nyaa_url, nyaa_cat, mado_enabled, mado_url, mado_user, mado_pass, keiyoushi_enabled) = db
         .call(|conn| {
             let n_enabled = crate::db::state(conn, "acquisition.nyaa_enabled")?
                 .map(|s| s.parse::<bool>().unwrap_or(true))
@@ -325,7 +361,11 @@ pub async fn discover_for_volume(
             let m_pass = crate::db::state(conn, "acquisition.madokami_password")?
                 .or_else(|| std::env::var("MADOKAMI_PASSWORD").ok());
 
-            Ok((n_enabled, n_url, n_cat, m_enabled, m_url, m_user, m_pass))
+            let k_enabled = crate::db::state(conn, "acquisition.keiyoushi_enabled")?
+                .map(|s| s.parse::<bool>().unwrap_or(true))
+                .unwrap_or(true);
+
+            Ok((n_enabled, n_url, n_cat, m_enabled, m_url, m_user, m_pass, k_enabled))
         })
         .await?;
 
@@ -337,6 +377,7 @@ pub async fn discover_for_volume(
         mado_pass,
         mado_enabled,
     );
+    let keiyoushi_provider = crate::acquisition::keiyoushi::KeiyoushiReleaseProvider::new(db.clone(), keiyoushi_enabled);
 
     let query = ReleaseQuery {
         series_title: series_title.clone(),
@@ -350,9 +391,10 @@ pub async fn discover_for_volume(
     let mut provider_errors = HashMap::new();
 
     // Query providers concurrently
-    let (nyaa_res, mado_res) = tokio::join!(
+    let (nyaa_res, mado_res, keiyo_res) = tokio::join!(
         nyaa_provider.search_releases(&query),
-        madokami_provider.search_releases(&query)
+        madokami_provider.search_releases(&query),
+        keiyoushi_provider.search_releases(&query)
     );
 
     providers_checked.push("nyaa".to_string());
@@ -381,6 +423,16 @@ pub async fn discover_for_volume(
         }
     }
 
+    providers_checked.push("keiyoushi".to_string());
+    match keiyo_res {
+        Ok(res) => {
+            candidates.extend(res);
+        }
+        Err(e) => {
+            provider_errors.insert("keiyoushi".to_string(), e.to_string());
+        }
+    }
+
     // Deduplicate candidates across providers (e.g. by candidate_id or info_hash)
     let mut deduped: Vec<ReleaseCandidate> = Vec::new();
     let mut seen_keys = std::collections::HashSet::new();
@@ -395,6 +447,62 @@ pub async fn discover_for_volume(
     }
 
     super::providers::score_and_rank_candidates(&mut deduped, Some(volume_number));
+
+    // Evaluate M10 confidence classification and quality ranking breakdown for each candidate
+    let s_id_cand = series_id.to_string();
+    for c in &mut deduped {
+        let (conf, conf_reason) = super::matching::evaluate_candidate_confidence(
+            &c.raw_title,
+            &series_title,
+            &[],
+            Some(volume_number),
+            c.match_type,
+            c.is_digital,
+            c.is_trusted,
+            &c.provider,
+            c.seeders,
+            "en",
+        );
+        c.confidence = Some(conf.as_str().to_string());
+        c.confidence_reason = Some(conf_reason);
+
+        let lang = if let Some(foreign) = super::matching::detect_foreign_language(&c.raw_title, "en") {
+            foreign.to_string()
+        } else {
+            "en".to_string()
+        };
+        c.language = Some(lang);
+
+        let persisted = crate::acquisition::approval::PersistedCandidate {
+            series_id: s_id_cand.clone(),
+            volume_number,
+            candidate_id: c.candidate_id.clone(),
+            provider: c.provider.clone(),
+            provider_item_id: c.provider_item_id.clone(),
+            title: c.title.clone(),
+            raw_title: c.raw_title.clone(),
+            match_type: c.match_type.as_str().to_string(),
+            size_bytes: c.size_bytes,
+            uploader: c.uploader.clone(),
+            is_trusted: c.is_trusted,
+            is_digital: c.is_digital,
+            score: c.score,
+            score_explanation: c.score_explanation.clone(),
+            download_url: c.download_url.clone(),
+            magnet_url: c.magnet_url.clone(),
+            info_hash: c.info_hash.clone(),
+            seeders: c.seeders,
+            leechers: c.leechers,
+            published_at: c.published_at,
+        };
+
+        let qual = super::quality::evaluate_candidate_quality_v2(&persisted, false, None, false, None);
+        c.edition = Some(qual.edition);
+        c.format = Some(qual.format);
+        c.resolution = qual.resolution_label;
+        c.publisher = c.uploader.clone();
+        c.ranking_breakdown = qual.ranking_breakdown;
+    }
 
     let candidate_count = deduped.len();
     let top_candidate = deduped.first().cloned();
@@ -432,19 +540,29 @@ pub async fn discover_for_volume(
 
         // Insert fresh candidates
         for c in &res_c.candidates {
+            let rb_json = c.ranking_breakdown.as_ref().and_then(|rb| serde_json::to_string(rb).ok());
             conn.execute(
                 "INSERT INTO discovered_release_candidates (
                     series_id, volume_number, candidate_id, provider, provider_item_id,
                     title, raw_title, match_type, size_bytes, uploader, is_trusted,
                     is_digital, score, score_explanation, download_url, magnet_url,
-                    info_hash, seeders, leechers, published_at, discovered_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
+                    info_hash, seeders, leechers, published_at, discovered_at,
+                    confidence, confidence_reason, language, edition, format, resolution, publisher, ranking_breakdown_json
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)
                 ON CONFLICT(series_id, volume_number, candidate_id) DO UPDATE SET
                     score = excluded.score,
                     score_explanation = excluded.score_explanation,
                     seeders = excluded.seeders,
                     leechers = excluded.leechers,
-                    discovered_at = excluded.discovered_at",
+                    discovered_at = excluded.discovered_at,
+                    confidence = excluded.confidence,
+                    confidence_reason = excluded.confidence_reason,
+                    language = excluded.language,
+                    edition = excluded.edition,
+                    format = excluded.format,
+                    resolution = excluded.resolution,
+                    publisher = excluded.publisher,
+                    ranking_breakdown_json = excluded.ranking_breakdown_json",
                 params![
                     s_id_save,
                     volume_number,
@@ -467,6 +585,14 @@ pub async fn discover_for_volume(
                     c.leechers.map(|s| s as i64),
                     c.published_at,
                     current_time,
+                    c.confidence.as_deref().unwrap_or("high"),
+                    c.confidence_reason,
+                    c.language.as_deref().unwrap_or("en"),
+                    c.edition,
+                    c.format,
+                    c.resolution,
+                    c.publisher,
+                    rb_json,
                 ],
             )?;
         }
@@ -939,6 +1065,7 @@ mod tests {
             seeders: Some(25),
             leechers: Some(2),
             published_at: Some(1000),
+            ..Default::default()
         };
 
         let mut candidate_range = ReleaseCandidate {
@@ -962,6 +1089,7 @@ mod tests {
             seeders: Some(3),
             leechers: Some(1),
             published_at: Some(900),
+            ..Default::default()
         };
 
         score_candidate(&mut candidate_exact, Some(10.0));
@@ -1006,6 +1134,7 @@ mod tests {
             seeders: Some(0),
             leechers: Some(0),
             published_at: Some(500),
+            ..Default::default()
         };
 
         score_candidate(&mut dead_candidate, Some(10.0));

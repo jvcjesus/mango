@@ -157,6 +157,10 @@ pub fn router(state: Spaces) -> Router {
         .route("/manga/{id}/volumes/{volume}/candidates/{candidate_id}/acquire", post(post_manga_volume_candidate_acquire))
         .route("/manga/{id}/volumes/{volume}/candidates/{candidate_id}/review", get(get_manga_volume_candidate_review))
         .route("/manga/{id}/volumes/{volume}/discover", post(post_manga_volume_discover))
+        .route(
+            "/manga/{id}/volumes/{volume}/ranking-breakdown/{candidate_id}",
+            get(get_manga_volume_ranking_breakdown),
+        )
         .route("/manga/{id}/discover-missing", post(post_manga_discover_missing))
         .route("/manga/{id}/discovery", get(get_manga_series_discovery))
         .route("/notifications/config", get(get_notification_config).post(post_notification_config))
@@ -340,6 +344,8 @@ pub fn router(state: Spaces) -> Router {
         .route("/downloads/{chapter}/retry", post(retry_download))
         .route("/downloads/{chapter}/recover", post(recover_download))
         .route("/downloads/{chapter}/recovery-info", get(get_download_recovery_info))
+        .route("/downloads/{chapter}/fallback-candidates", get(get_download_fallback_candidates))
+        .route("/downloads/{chapter}/fallback-switch", post(post_download_fallback_switch))
         .route("/downloads/recovery-summary", get(get_downloads_recovery_summary))
         .route(
             "/downloads/{chapter}/retry-metadata",
@@ -397,6 +403,10 @@ pub fn router(state: Spaces) -> Router {
             post(retry_komga_download),
         )
         .route("/pipeline/repair-cbz", post(repair_pipeline_cbz))
+        .route(
+            "/pipeline/publication/preview/{chapter}",
+            get(get_publication_preview),
+        )
         .route("/pipeline/naming/audit", post(post_naming_audit))
         .route("/pipeline/naming/audit/latest", get(get_naming_audit_latest))
         .route("/pipeline/naming/apply", post(post_naming_apply))
@@ -1424,9 +1434,16 @@ async fn get_manga_series_discovery(
     Ok(Json(results))
 }
 
+#[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscoverParams {
+    pub force_refresh: Option<bool>,
+}
+
 async fn post_manga_volume_discover(
     Me(app): Me,
     Path((id, volume)): Path<(i64, f64)>,
+    Query(params): Query<DiscoverParams>,
 ) -> Result<Json<crate::acquisition::discovery::VolumeDiscoveryResult>> {
     let existing = app
         .db
@@ -1452,15 +1469,46 @@ async fn post_manga_volume_discover(
         summary.series_id
     };
 
-    let result = crate::acquisition::discovery::discover_for_volume(
+    let force = params.force_refresh.unwrap_or(false);
+    let result = crate::acquisition::discovery::discover_for_volume_with_opts(
         &app.db,
         app.acquisition.http.clone(),
         &series_id,
         volume,
+        force,
     )
     .await?;
 
     Ok(Json(result))
+}
+
+async fn get_manga_volume_ranking_breakdown(
+    Me(app): Me,
+    Path((_id, volume, candidate_id)): Path<(i64, f64, String)>,
+) -> Result<Json<Option<crate::acquisition::quality::RankingBreakdown>>> {
+    let breakdown = app
+        .db
+        .call(move |conn| {
+            let row: Option<Option<String>> = conn
+                .query_row(
+                    "SELECT ranking_breakdown_json FROM discovered_release_candidates
+                     WHERE candidate_id = ?1 AND ABS(volume_number - ?2) < 0.001",
+                    rusqlite::params![candidate_id, volume],
+                    |r| r.get(0),
+                )
+                .optional()?;
+
+            if let Some(Some(json_str)) = row {
+                let rb: Option<crate::acquisition::quality::RankingBreakdown> =
+                    serde_json::from_str(&json_str).ok();
+                Ok(rb)
+            } else {
+                Ok(None)
+            }
+        })
+        .await?;
+
+    Ok(Json(breakdown))
 }
 
 async fn post_manga_discover_missing(
@@ -2221,6 +2269,28 @@ async fn repair_pipeline_cbz(
         .await?;
 
     Ok(Json(outcome))
+}
+
+async fn get_publication_preview(
+    Me(app): Me,
+    Path(chapter): Path<i64>,
+) -> Result<Json<crate::pipeline::publication_metadata::PublicationMetadata>> {
+    let (config, _, komga_key) = app.pipeline.load_internal_config().await?;
+    let komga_client = if config.komga_enabled {
+        Some(crate::pipeline::komga::KomgaClient::new(
+            app.pipeline.http.clone(),
+            config.komga_url.clone(),
+            komga_key,
+        ))
+    } else {
+        None
+    };
+    let downloads_dir = app.downloads.dir().to_path_buf();
+    let preview = app
+        .pipeline
+        .get_publication_preview(chapter, komga_client.as_ref(), &downloads_dir)
+        .await?;
+    Ok(Json(preview))
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -4647,6 +4717,43 @@ async fn get_downloads_recovery_summary(
         .call(move |conn| crate::pipeline::recovery::list_all_recovery_info(conn))
         .await?;
     Ok(Json(summary))
+}
+
+async fn get_download_fallback_candidates(
+    Me(app): Me,
+    Path(chapter): Path<i64>,
+) -> Result<Json<crate::acquisition::fallback::FallbackEvaluation>> {
+    app.me.admin()?;
+    let eval = app
+        .db
+        .call(move |conn| crate::acquisition::fallback::get_fallback_candidates(conn, chapter))
+        .await?;
+    Ok(Json(eval))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FallbackSwitchRequest {
+    pub candidate_id: String,
+}
+
+async fn post_download_fallback_switch(
+    Me(app): Me,
+    Path(chapter): Path<i64>,
+    Json(payload): Json<FallbackSwitchRequest>,
+) -> Result<Json<crate::acquisition::fallback::FallbackSwitchResult>> {
+    app.me.admin()?;
+    let res = app
+        .db
+        .call(move |conn| {
+            crate::acquisition::fallback::apply_acquisition_fallback(
+                conn,
+                chapter,
+                &payload.candidate_id,
+            )
+        })
+        .await?;
+    Ok(Json(res))
 }
 
 // -----------------------------------------------------------------------------

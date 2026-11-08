@@ -14,9 +14,12 @@ pub mod dashboard;
 pub mod discovery;
 pub mod edition;
 pub mod execution;
+pub mod fallback;
 pub mod intelligence;
 pub mod interactive;
+pub mod keiyoushi;
 pub mod madokami;
+pub mod matching;
 pub mod missing;
 pub mod nyaa;
 pub mod physical;
@@ -44,6 +47,8 @@ pub mod security_tests;
 #[cfg(test)]
 pub mod tests;
 pub mod torbox;
+#[cfg(test)]
+pub mod m10_tests;
 #[cfg(test)]
 pub mod watcher_tests;
 

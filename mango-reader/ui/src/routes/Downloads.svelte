@@ -9,7 +9,10 @@
     verifyPublicationReceipt,
     getAcquisitionOperationsSummary,
     getDownloadRecoveryInfo,
+    getDownloadFallbackCandidates,
+    switchDownloadFallback,
     type DownloadRecoveryInfo,
+    type FallbackEvaluation,
     type PipelineEvent,
     type Queue,
     type Queued,
@@ -85,18 +88,37 @@
     }
   }
 
-  // Recovery Inspection State (M8.3)
+  // Recovery Inspection State (M8.3 / M10 Fallback)
   let inspectingRecovery = $state<DownloadRecoveryInfo | null>(null);
   let loadingRecovery = $state(false);
+  let fallbackEval = $state<FallbackEvaluation | null>(null);
+  let switchingFallback = $state(false);
 
   async function openRecoveryInspector(chapterId: number) {
     loadingRecovery = true;
+    fallbackEval = null;
     try {
       inspectingRecovery = await getDownloadRecoveryInfo(chapterId);
+      fallbackEval = await getDownloadFallbackCandidates(chapterId).catch(() => null);
     } catch (e) {
       toast.error(message(e));
     } finally {
       loadingRecovery = false;
+    }
+  }
+
+  async function handleSwitchFallback(chapterId: number, candidateId: string) {
+    switchingFallback = true;
+    try {
+      const res = await switchDownloadFallback(chapterId, candidateId);
+      toast.success(res.message);
+      inspectingRecovery = null;
+      fallbackEval = null;
+      await load();
+    } catch (e) {
+      toast.error(message(e));
+    } finally {
+      switchingFallback = false;
     }
   }
 
@@ -1370,6 +1392,47 @@
             {/if}
           </p>
         </div>
+
+        {#if fallbackEval && fallbackEval.hasFallbackCandidates}
+          <div class="fallback-section">
+            <div class="fallback-header">
+              <Icon name="search" size={16} />
+              <strong>Compatible Fallback Releases Across Sources (M10):</strong>
+            </div>
+            <p class="fallback-desc">
+              If this release remains unavailable or failing, you can safely switch to a verified alternative release below without losing diagnostic history:
+            </p>
+            <div class="fallback-list">
+              {#each fallbackEval.fallbackCandidates as cand}
+                <div class="fallback-card">
+                  <div class="fallback-info">
+                    <div class="fallback-badges">
+                      <span class="tag spot">{cand.provider.toUpperCase()}</span>
+                      {#if cand.confidence}
+                        <span class="tag {cand.confidence === 'high' ? 'spot' : 'warning'}">{cand.confidence.toUpperCase()} CONFIDENCE</span>
+                      {/if}
+                      {#if cand.isDigital}
+                        <span class="tag">DIGITAL</span>
+                      {/if}
+                      {#if cand.seeders !== undefined && cand.seeders !== null}
+                        <span class="tag muted">{cand.seeders} seeds</span>
+                      {/if}
+                    </div>
+                    <div class="fallback-title" title={cand.rawTitle}>{cand.title}</div>
+                    <div class="fallback-meta">Score: {cand.score.toFixed(0)} · {cand.scoreExplanation}</div>
+                  </div>
+                  <button
+                    class="btn spot small"
+                    disabled={switchingFallback}
+                    onclick={() => handleSwitchFallback(inspectingRecovery!.chapterId, cand.candidateId)}
+                  >
+                    Switch & Re-queue
+                  </button>
+                </div>
+              {/each}
+            </div>
+          </div>
+        {/if}
       </div>
 
       <div class="recovery-modal-footer">
@@ -2110,5 +2173,74 @@
     gap: 0.5rem;
     padding: 1rem 1.5rem;
     border-top: 1px solid var(--border);
+  }
+
+  .fallback-section {
+    margin-top: 1rem;
+    padding: 0.85rem 1rem;
+    background: var(--surface-alt, rgba(0, 0, 0, 0.02));
+    border: 1px solid var(--border);
+    border-radius: 6px;
+  }
+
+  .fallback-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.85rem;
+    color: var(--fg);
+    margin-bottom: 0.25rem;
+  }
+
+  .fallback-desc {
+    font-size: 0.8rem;
+    color: var(--muted);
+    margin: 0 0 0.75rem 0;
+    line-height: 1.4;
+  }
+
+  .fallback-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+
+  .fallback-card {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.6rem 0.75rem;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+  }
+
+  .fallback-info {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    min-width: 0;
+    flex: 1;
+  }
+
+  .fallback-badges {
+    display: flex;
+    gap: 0.35rem;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+
+  .fallback-title {
+    font-size: 0.85rem;
+    font-weight: 600;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .fallback-meta {
+    font-size: 0.75rem;
+    color: var(--muted);
   }
 </style>

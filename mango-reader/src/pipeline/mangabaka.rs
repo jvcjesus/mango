@@ -2408,6 +2408,7 @@ pub fn generate_comic_info_xml(
 
     if let Some(trans) = params.scanlator {
         field("Translator", Some(trans));
+        field("ScanInformation", Some(trans));
     }
 
     if !has_existing_notes {
@@ -2425,7 +2426,7 @@ pub fn generate_comic_info_xml(
     if let Some(raw) = existing_xml {
         for line in raw.lines() {
             let trimmed = line.trim();
-            if trimmed.starts_with("<ScanInformation>")
+            if (trimmed.starts_with("<ScanInformation>") && params.scanlator.is_none())
                 || trimmed.starts_with("<Colorist>")
                 || trimmed.starts_with("<Letterer>")
                 || trimmed.starts_with("<Editor>")
