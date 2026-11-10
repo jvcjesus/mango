@@ -66,25 +66,25 @@
       <span>QUICK ACTIONS</span>
     </div>
     <div class="actions-group">
-      <button class="btn mini flat icon-text" onclick={() => go('/downloads')}>
-        <Icon name="download" size={14} />
-        <span>Downloads & Queue</span>
+      <button class="btn mini flat icon-text" onclick={() => go('/activity?tab=inbox')}>
+        <Icon name="bookmark" size={14} />
+        <span>Acquisition Inbox</span>
       </button>
-      <button class="btn mini flat icon-text" onclick={() => go('/updates')}>
+      <button class="btn mini flat icon-text" onclick={() => go('/activity?tab=downloads')}>
+        <Icon name="download" size={14} />
+        <span>Downloads &amp; Queue</span>
+      </button>
+      <button class="btn mini flat icon-text" onclick={() => go('/activity?tab=monitoring')}>
         <Icon name="bell" size={14} />
         <span>Release Watchers</span>
-      </button>
-      <button class="btn mini flat icon-text" onclick={() => go('/settings/pipeline')}>
-        <Icon name="search" size={14} />
-        <span>Scan & Maintenance</span>
-      </button>
-      <button class="btn mini flat icon-text" onclick={() => go('/lists')}>
-        <Icon name="bookmark" size={14} />
-        <span>Tracked Catalog</span>
       </button>
       <button class="btn mini flat icon-text" onclick={() => go('/library')}>
         <Icon name="book" size={14} />
         <span>Canonical Library</span>
+      </button>
+      <button class="btn mini flat icon-text" onclick={() => go('/settings/pipeline')}>
+        <Icon name="search" size={14} />
+        <span>Scan &amp; Maintenance</span>
       </button>
     </div>
   </nav>
@@ -145,26 +145,26 @@
             <Icon name="download" size={18} />
             <h2>Acquisition Pipeline</h2>
           </div>
-          <button class="btn icon-link" onclick={() => go('/downloads')} title="Open Downloads">
+          <button class="btn icon-link" onclick={() => go('/activity?tab=downloads')} title="Open Downloads &amp; Queue">
             <Icon name="forward" size={16} />
           </button>
         </div>
         <div class="metrics-row">
-          <button type="button" class="metric-block metric-btn" onclick={() => go('/downloads')} title="View active downloads">
+          <button type="button" class="metric-block metric-btn" onclick={() => go('/activity?tab=downloads')} title="View active downloads">
             <span class="m-val">{summary.acquisition.activeDownloads}</span>
             <span class="m-lbl">In-Flight Downloads</span>
           </button>
           {#if summary.acquisition.pendingApprovals > 0}
-            <button type="button" class="metric-block metric-btn highlight-review" onclick={() => go('/updates')} title="Review proposed acquisitions">
+            <button type="button" class="metric-block metric-btn highlight-review" onclick={() => go('/activity?tab=inbox')} title="Review proposed acquisitions">
               <span class="m-val">{summary.acquisition.pendingApprovals}</span>
               <span class="m-lbl">Pending Review</span>
             </button>
           {/if}
-          <button type="button" class="metric-block metric-btn highlight-warn" onclick={() => go('/downloads')} title="Inspect failed downloads">
+          <button type="button" class="metric-block metric-btn highlight-warn" onclick={() => go('/activity?tab=downloads')} title="Inspect failed downloads">
             <span class="m-val">{summary.acquisition.failedJobs}</span>
             <span class="m-lbl">Failed Jobs</span>
           </button>
-          <button type="button" class="metric-block metric-btn highlight-recov" onclick={() => go('/downloads')} title="Inspect recoverable downloads">
+          <button type="button" class="metric-block metric-btn highlight-recov" onclick={() => go('/activity?tab=downloads')} title="Inspect recoverable downloads">
             <span class="m-val">{summary.acquisition.recoverableJobs}</span>
             <span class="m-lbl">Recoverable</span>
           </button>
@@ -179,7 +179,7 @@
               <span class="dot-ok"></span> All downloads healthy
             </span>
           {/if}
-          <button class="btn mini flat" onclick={() => go('/downloads')}>Manage Queue</button>
+          <button class="btn mini flat" onclick={() => go('/activity?tab=downloads')}>Manage Queue</button>
         </div>
       </section>
 
@@ -190,20 +190,20 @@
             <Icon name="bell" size={18} />
             <h2>Release Watchers</h2>
           </div>
-          <button class="btn icon-link" onclick={() => go('/updates')} title="Open Updates">
+          <button class="btn icon-link" onclick={() => go('/activity?tab=monitoring')} title="Open Watchers &amp; Monitoring">
             <Icon name="forward" size={16} />
           </button>
         </div>
         <div class="metrics-row">
-          <button type="button" class="metric-block metric-btn" onclick={() => go('/updates')} title="View scheduled releases">
+          <button type="button" class="metric-block metric-btn" onclick={() => go('/activity?tab=monitoring')} title="View scheduled releases">
             <span class="m-val">{summary.releaseIntelligence.upcomingReleasesCount}</span>
             <span class="m-lbl">Upcoming Releases</span>
           </button>
-          <button type="button" class="metric-block metric-btn highlight-awaiting" onclick={() => go('/updates')} title="View releases awaiting upload">
+          <button type="button" class="metric-block metric-btn highlight-awaiting" onclick={() => go('/activity?tab=monitoring')} title="View releases awaiting upload">
             <span class="m-val">{summary.releaseIntelligence.releasedAwaitingCount}</span>
             <span class="m-lbl">Awaiting Upload</span>
           </button>
-          <button type="button" class="metric-block metric-btn highlight-candidate" onclick={() => go('/updates')} title="View discovered candidates">
+          <button type="button" class="metric-block metric-btn highlight-candidate" onclick={() => go('/activity?tab=monitoring')} title="View discovered candidates">
             <span class="m-val">{summary.releaseIntelligence.candidateFoundCount}</span>
             <span class="m-lbl">Candidates Found</span>
           </button>
@@ -212,7 +212,7 @@
           <span class="status-indicator ok">
             <span class="dot-ok"></span> OpenTome Tracking Active
           </span>
-          <button class="btn mini flat" onclick={() => go('/updates')}>View Watchers</button>
+          <button class="btn mini flat" onclick={() => go('/activity?tab=monitoring')}>View Watchers</button>
         </div>
       </section>
 

@@ -824,3 +824,27 @@ select.btn {
   opacity: 0.4;
   cursor: not-allowed;
 }
+
+/* ============================================================================
+   MANGO M13 CONSOLIDATION TOKENS & UTILITIES
+   ============================================================================ */
+
+.volume-collection-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 16px;
+}
+
+@media (max-width: 640px) {
+  .volume-collection-grid {
+    grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+    gap: 10px;
+  }
+}
+
+@media (min-width: 1920px) {
+  .volume-collection-grid {
+    grid-template-columns: repeat(auto-fill, minmax(200px, 1fr));
+    gap: 20px;
+  }
+}

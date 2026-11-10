@@ -12,6 +12,7 @@
   import { loadVersion, version } from './lib/version.svelte';
   import Home from './routes/Home.svelte';
   import SignIn from './routes/SignIn.svelte';
+  import Activity from './routes/Activity.svelte';
   import Downloads from './routes/Downloads.svelte';
   import UpdatesScreen from './routes/Updates.svelte';
   import Browse from './routes/Browse.svelte';
@@ -29,15 +30,12 @@
   import Title from './routes/Title.svelte';
   import Welcome from './routes/Welcome.svelte';
 
-  // `under` lists the first path segments that light the entry up.
+  // 4 Primary destinations (M13.3)
   const NAV: { to: string; label: string; icon: IconName; under: string[] }[] = [
     { to: '/', label: 'Home', icon: 'grid', under: ['', 'home'] },
-    { to: '/library', label: 'Library', icon: 'book', under: ['library'] },
-    { to: '/lists', label: 'Lists', icon: 'bookmark', under: ['lists'] },
-    { to: '/updates', label: 'Updates', icon: 'refresh', under: ['updates'] },
-    { to: '/browse', label: 'Browse', icon: 'globe', under: ['browse', 'source', 'search', 'extensions', 'extension'] },
-    { to: '/downloads', label: 'Downloads', icon: 'download', under: ['downloads'] },
-    { to: '/history', label: 'History', icon: 'clock', under: ['history'] },
+    { to: '/library', label: 'Library', icon: 'book', under: ['library', 'lists'] },
+    { to: '/browse', label: 'Discover', icon: 'globe', under: ['browse', 'source', 'search', 'extensions', 'extension'] },
+    { to: '/activity', label: 'Activity', icon: 'refresh', under: ['activity', 'updates', 'downloads', 'history'] },
   ];
 
   const parts = $derived(route.path.split('/').filter(Boolean));
@@ -94,12 +92,17 @@
       return;
     }
 
-    // Number keys '1' through '7' switch tabs
+    // Number keys '1' through '4' switch primary destinations, '5' opens Settings (M13.3)
     if (!e.ctrlKey && !e.metaKey && !e.altKey) {
       const num = parseInt(e.key, 10);
       if (num >= 1 && num <= NAV.length) {
         e.preventDefault();
         go(NAV[num - 1].to);
+        return;
+      }
+      if (num === 5) {
+        e.preventDefault();
+        go('/settings');
         return;
       }
     }
@@ -145,7 +148,7 @@
                 <a href="#{item.to}" aria-current={item.under.includes(area) ? 'page' : undefined}>
                   <Icon name={item.icon} size={15} />
                   <span>{item.label}</span>
-                  {#if item.to === '/updates'}{@render badge()}{/if}
+                  {#if item.to === '/activity' || item.to === '/updates'}{@render badge()}{/if}
                 </a>
               {/each}
             </nav>
@@ -170,14 +173,27 @@
           {#if area === 'library'}
             <span class="bc-current" aria-current="page">Library</span>
           {:else if area === 'lists'}
+            <a href="#/library" class="bc-link">Library</a>
+            <span class="bc-sep" aria-hidden="true">/</span>
             <span class="bc-current" aria-current="page">Lists</span>
-          {:else if area === 'updates'}
-            <span class="bc-current" aria-current="page">Updates</span>
+          {:else if area === 'activity' || area === 'updates'}
+            <a href="#/activity" class="bc-link">Activity</a>
+            {#if route.query.get('tab') && route.query.get('tab') !== 'inbox'}
+              <span class="bc-sep" aria-hidden="true">/</span>
+              <span class="bc-current" aria-current="page">{route.query.get('tab')?.toUpperCase()}</span>
+            {:else}
+              <span class="bc-sep" aria-hidden="true">/</span>
+              <span class="bc-current" aria-current="page">Inbox</span>
+            {/if}
           {:else if area === 'browse'}
-            <span class="bc-current" aria-current="page">Browse</span>
+            <span class="bc-current" aria-current="page">Discover</span>
           {:else if area === 'downloads'}
+            <a href="#/activity" class="bc-link">Activity</a>
+            <span class="bc-sep" aria-hidden="true">/</span>
             <span class="bc-current" aria-current="page">Downloads</span>
           {:else if area === 'history'}
+            <a href="#/activity" class="bc-link">Activity</a>
+            <span class="bc-sep" aria-hidden="true">/</span>
             <span class="bc-current" aria-current="page">History</span>
           {:else if area === 'settings'}
             {#if parts[1]}
@@ -190,17 +206,17 @@
           {:else if (area === 'title' || area === 'manga') && parts[1]}
             <a href="#/library" class="bc-link">Library</a>
             <span class="bc-sep" aria-hidden="true">/</span>
-            <span class="bc-current" aria-current="page">Series #{parts[1]}</span>
+            <span class="bc-current" aria-current="page">Series Workspace #{parts[1]}</span>
           {:else if area === 'source' && parts[1]}
-            <a href="#/browse" class="bc-link">Browse</a>
+            <a href="#/browse" class="bc-link">Discover</a>
             <span class="bc-sep" aria-hidden="true">/</span>
             <span class="bc-current" aria-current="page">Source ({parts[1]})</span>
           {:else if area === 'extension' && parts[1]}
-            <a href="#/browse" class="bc-link">Browse</a>
+            <a href="#/browse" class="bc-link">Discover</a>
             <span class="bc-sep" aria-hidden="true">/</span>
             <span class="bc-current" aria-current="page">Extension ({parts[1]})</span>
           {:else if area === 'search'}
-            <a href="#/browse" class="bc-link">Browse</a>
+            <a href="#/browse" class="bc-link">Discover</a>
             <span class="bc-sep" aria-hidden="true">/</span>
             <span class="bc-current" aria-current="page">Search</span>
           {:else}
@@ -219,8 +235,10 @@
         <Lists />
       {:else if area === 'browse'}
         <Browse />
+      {:else if area === 'activity'}
+        <Activity />
       {:else if area === 'updates'}
-        <UpdatesScreen />
+        <Activity />
       {:else if area === 'downloads'}
         <Downloads />
       {:else if area === 'history'}
@@ -265,7 +283,7 @@
           <a href="#{item.to}" aria-current={item.under.includes(area) ? 'page' : undefined} onclick={(e) => again(e, item.to)}>
             <Icon name={item.icon} size={22} />
             <span class="label">{item.label}</span>
-            {#if item.to === '/updates'}{@render badge()}{/if}
+            {#if item.to === '/activity' || item.to === '/updates'}{@render badge()}{/if}
           </a>
         {/each}
       </nav>

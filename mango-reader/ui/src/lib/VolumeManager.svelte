@@ -13,6 +13,12 @@
     type VolumeManagerBatchAcquireResponse,
   } from './api';
   import { formatBytes } from './util';
+  import {
+    resolveVolumeCollectionState,
+    calculateNextMissingVolume,
+    type VolumeCollectionStateInfo,
+  } from './volumeStatus';
+  import LifecycleTimeline from './LifecycleTimeline.svelte';
 
   interface Props {
     mangaId: number;
@@ -77,6 +83,16 @@
         return summary.volumes;
     }
   });
+
+  const missingSeq = $derived.by(() => {
+    if (!summary?.volumes) return null;
+    const owned = summary.volumes.filter((v) => v.isOwned).map((v) => v.volumeNumber);
+    return calculateNextMissingVolume(owned, summary.totalOfficialVolumes);
+  });
+
+  function volumeState(vol: VolumeManagerEntry): VolumeCollectionStateInfo {
+    return resolveVolumeCollectionState(vol);
+  }
 
   function toggleVolumeSelection(vol: number) {
     const next = new Set(selectedVolumes);
@@ -305,6 +321,26 @@
       {/if}
     </div>
 
+    <!-- Next Missing Volume Sequence Banner (M13.1) -->
+    {#if missingSeq && !missingSeq.isComplete && missingSeq.nextMissingVolume != null}
+      <div class="next-missing-banner" data-testid="next-missing-banner">
+        <div class="nmb-content">
+          <span class="nmb-badge"><Icon name="arrow" size={13} /> NEXT MISSING IN SEQUENCE</span>
+          <strong class="nmb-title">Volume {missingSeq.nextMissingVolume}</strong>
+          <span class="nmb-desc">{missingSeq.explanation}</span>
+        </div>
+        <div class="nmb-actions">
+          <button
+            class="btn sm spot"
+            onclick={() => onInspectCandidate?.(missingSeq.nextMissingVolume!)}
+            title={`Search candidates for Volume ${missingSeq.nextMissingVolume}`}
+          >
+            <Icon name="search" size={14} /> Find Volume {missingSeq.nextMissingVolume}
+          </button>
+        </div>
+      </div>
+    {/if}
+
     <!-- Controls & Selection Bar -->
     <div class="vm-controls-bar">
       <!-- Filter Tabs -->
@@ -378,12 +414,15 @@
       <div class="vm-grid">
         {#each filteredVolumes as vol (vol.volumeNumber)}
           {@const isSelected = selectedVolumes.has(vol.volumeNumber)}
+          {@const st = volumeState(vol)}
+          {@const isNextMissing = missingSeq?.nextMissingVolume === vol.volumeNumber && !vol.isOwned}
           <!-- svelte-ignore a11y_click_events_have_key_events -->
           <!-- svelte-ignore a11y_no_static_element_interactions -->
           <div
-            class="vm-card"
+            class="vm-card {st.badgeClass}"
             class:is-owned={vol.isOwned}
             class:is-selected={isSelected}
+            class:is-next-missing={isNextMissing}
             class:has-candidate={vol.candidateCount > 0 && !vol.isOwned}
             onclick={() => (inspectingVolume = vol)}
           >
@@ -399,13 +438,23 @@
                   title={vol.isOwned ? 'Volume already owned in Komga' : `Select ${vol.label}`}
                 />
               </label>
-              <span class="card-vol-num">{vol.label}</span>
-              <span class="card-badge {statusBadgeClass(vol.displayStatus)}">
-                {vol.isOwned ? 'OWNED' : vol.candidateCount > 0 ? 'CANDIDATE' : vol.displayStatus.toUpperCase()}
+              <div class="card-vol-identity">
+                <span class="card-vol-num">{vol.label}</span>
+                {#if isNextMissing}
+                  <span class="next-in-line-pill">Next</span>
+                {/if}
+              </div>
+              <span class="card-badge {st.badgeClass}">
+                {st.label.toUpperCase()}
               </span>
             </div>
 
             <div class="card-body">
+              {#if vol.coverUrl}
+                <div class="card-thumb-wrap">
+                  <img src={vol.coverUrl} alt={vol.label} class="card-thumb" loading="lazy" />
+                </div>
+              {/if}
               <p class="card-status-label">{vol.statusLabel}</p>
 
               {#if vol.isOwned}
@@ -495,7 +544,9 @@
           <tbody>
             {#each filteredVolumes as vol (vol.volumeNumber)}
               {@const isSelected = selectedVolumes.has(vol.volumeNumber)}
-              <tr class:row-selected={isSelected} class:row-owned={vol.isOwned}>
+              {@const st = volumeState(vol)}
+              {@const isNextMissing = missingSeq?.nextMissingVolume === vol.volumeNumber && !vol.isOwned}
+              <tr class:row-selected={isSelected} class:row-owned={vol.isOwned} class:row-next-missing={isNextMissing}>
                 <td class="td-check">
                   <input
                     type="checkbox"
@@ -507,11 +558,16 @@
                   />
                 </td>
                 <td class="td-vol">
-                  <strong>{vol.label}</strong>
+                  <div class="table-vol-id">
+                    <strong>{vol.label}</strong>
+                    {#if isNextMissing}
+                      <span class="next-in-line-pill">Next</span>
+                    {/if}
+                  </div>
                 </td>
                 <td>
-                  <span class="card-badge {statusBadgeClass(vol.displayStatus)}">
-                    {vol.statusLabel}
+                  <span class="card-badge {st.badgeClass}">
+                    {st.label.toUpperCase()}
                   </span>
                 </td>
                 <td class="td-storage">
@@ -578,6 +634,7 @@
 
 <!-- Volume Details Inspection Modal -->
 {#if inspectingVolume}
+  {@const inspectingState = volumeState(inspectingVolume)}
   <!-- svelte-ignore a11y_click_events_have_key_events -->
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div class="modal-backdrop" onclick={() => (inspectingVolume = null)}>
@@ -588,8 +645,8 @@
         <div>
           <div class="modal-title-row">
             <h3 class="display">{inspectingVolume.label.toUpperCase()} DETAILS</h3>
-            <span class="card-badge {statusBadgeClass(inspectingVolume.displayStatus)}">
-              {inspectingVolume.isOwned ? 'OWNED IN KOMGA' : inspectingVolume.statusLabel.toUpperCase()}
+            <span class="card-badge {inspectingState.badgeClass}">
+              {inspectingState.label.toUpperCase()}
             </span>
           </div>
           <p class="modal-subtitle">{title} · {summary?.edition.toUpperCase() || 'STANDARD'} EDITION</p>
@@ -672,6 +729,20 @@
               </div>
             {/if}
           </div>
+        </div>
+
+        <!-- Acquisition Lifecycle Timeline (M13.1) -->
+        <div class="details-section">
+          <h4 class="section-heading">Acquisition Lifecycle</h4>
+          <LifecycleTimeline
+            timelineInputs={{
+              discoveredAt: inspectingVolume.lastDiscoveryAt,
+              publishedAt: inspectingVolume.publishedAt,
+              verifiedAt: inspectingVolume.verifiedAt,
+              currentStage: inspectingVolume.activeStage || (inspectingVolume.isOwned ? 'verification' : inspectingVolume.displayStatus),
+              provider: inspectingVolume.topProvider,
+            }}
+          />
         </div>
 
         <!-- Discovered Candidates & Acquisition Intelligence -->
@@ -1079,6 +1150,189 @@
     border-radius: 999px;
     text-transform: uppercase;
     letter-spacing: 0.05em;
+  }
+
+  /* 12 Explicit M13 Collection States */
+  .state-owned,
+  .card-badge.state-owned {
+    background: #dcfce7;
+    color: #166534;
+    border: 1.5px solid #166534;
+  }
+
+  .state-missing,
+  .card-badge.state-missing {
+    background: #fee2e2;
+    color: #991b1b;
+    border: 1.5px solid #991b1b;
+  }
+
+  .state-available,
+  .card-badge.state-available {
+    background: #e0f2fe;
+    color: #0369a1;
+    border: 1.5px solid #0369a1;
+  }
+
+  .state-pending-review,
+  .card-badge.state-pending-review {
+    background: #f3e8ff;
+    color: #6b21a8;
+    border: 1.5px solid #6b21a8;
+  }
+
+  .state-queued,
+  .card-badge.state-queued {
+    background: #fef3c7;
+    color: #92400e;
+    border: 1.5px solid #92400e;
+  }
+
+  .state-downloading,
+  .card-badge.state-downloading {
+    background: #fef08a;
+    color: #854d0e;
+    border: 1.5px solid #854d0e;
+  }
+
+  .state-validating,
+  .card-badge.state-validating {
+    background: #e0e7ff;
+    color: #3730a3;
+    border: 1.5px solid #3730a3;
+  }
+
+  .state-staged,
+  .card-badge.state-staged {
+    background: #ede9fe;
+    color: #5b21b6;
+    border: 1.5px solid #5b21b6;
+  }
+
+  .state-publishing,
+  .card-badge.state-publishing {
+    background: #ccfbf1;
+    color: #115e59;
+    border: 1.5px solid #115e59;
+  }
+
+  .state-awaiting-verification,
+  .card-badge.state-awaiting-verification {
+    background: #fae8ff;
+    color: #86198f;
+    border: 1.5px solid #86198f;
+  }
+
+  .state-failed,
+  .card-badge.state-failed {
+    background: #fecaca;
+    color: #991b1b;
+    border: 1.5px solid #991b1b;
+  }
+
+  .state-unknown,
+  .card-badge.state-unknown {
+    background: #f1f5f9;
+    color: #475569;
+    border: 1.5px solid #475569;
+  }
+
+  .next-missing-banner {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 12px 16px;
+    margin-bottom: 1rem;
+    border: 2px solid var(--ink);
+    background: color-mix(in srgb, var(--spot) 16%, var(--surface));
+    box-shadow: var(--sh-3);
+  }
+
+  .nmb-content {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  .nmb-badge {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 10px;
+    font-weight: 900;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--ink);
+    background: var(--spot);
+    padding: 2px 6px;
+    border: 1.5px solid var(--ink);
+    width: fit-content;
+  }
+
+  .nmb-title {
+    font-size: 16px;
+    font-weight: 900;
+    color: var(--ink);
+  }
+
+  .nmb-desc {
+    font-size: 12px;
+    color: var(--muted);
+  }
+
+  .nmb-actions {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .is-next-missing {
+    outline: 3px solid var(--spot) !important;
+    border-color: var(--ink) !important;
+  }
+
+  .next-in-line-pill {
+    font-size: 9px;
+    font-weight: 900;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    background: var(--spot);
+    color: var(--ink);
+    padding: 1px 5px;
+    border: 1px solid var(--ink);
+    border-radius: 999px;
+    margin-left: 4px;
+  }
+
+  .card-vol-identity {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex: 1;
+    margin-left: 0.35rem;
+  }
+
+  .table-vol-id {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .card-thumb-wrap {
+    margin-bottom: 6px;
+    border: 1.5px solid var(--ink);
+    border-radius: 2px;
+    overflow: hidden;
+    max-height: 110px;
+  }
+
+  .card-thumb {
+    width: 100%;
+    height: 100px;
+    object-fit: cover;
+    display: block;
   }
 
   .badge-owned {
