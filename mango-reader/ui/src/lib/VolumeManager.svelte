@@ -172,11 +172,11 @@
       } else if (res.simulatedCount > 0) {
         toast.info(res.message);
       } else {
-        toast.warn(res.message);
+        toast.info(res.message);
       }
       showPlanModal = false;
       clearSelection();
-      await load();
+      await refresh();
     } catch (e: any) {
       planError = e?.message || 'Failed to execute batch acquisition';
     } finally {
@@ -277,56 +277,41 @@
   {/if}
 
   {#if summary}
-    <!-- Summary Stats Bar -->
-    <div class="vm-stats-bar">
-      <div class="stat-item">
-        <span class="stat-value">{summary.totalOfficialVolumes}</span>
-        <span class="stat-label">Official Vols</span>
+    <!-- Refined Summary Stats Bar (M13.5) -->
+    <div class="vm-stats-summary" data-testid="vm-stats-summary">
+      <div class="stats-summary-left">
+        <span class="stat-pill-item highlight-owned">
+          <strong>{summary.ownedCount}</strong> of {summary.totalOfficialVolumes} Owned in Komga
+        </span>
+        <span class="stat-pill-item highlight-missing">
+          <strong>{summary.missingReleasedCount}</strong> Missing
+        </span>
+        {#if summary.candidateAvailableCount > 0}
+          <span class="stat-pill-item highlight-candidates">
+            <strong>{summary.candidateAvailableCount}</strong> Available Candidates
+          </span>
+        {/if}
+        {#if summary.inProgressCount > 0}
+          <span class="stat-pill-item highlight-active">
+            <strong>{summary.inProgressCount}</strong> Acquiring
+          </span>
+        {/if}
+        {#if summary.unreleasedCount > 0}
+          <span class="stat-pill-item highlight-muted">
+            <strong>{summary.unreleasedCount}</strong> Unreleased
+          </span>
+        {/if}
       </div>
-      <div class="stat-divider"></div>
-      <div class="stat-item spot">
-        <span class="stat-value">{summary.ownedCount}</span>
-        <span class="stat-label">Owned in Komga</span>
-      </div>
-      {#if summary.publishedCount > 0}
-        <div class="stat-divider"></div>
-        <div class="stat-item info">
-          <span class="stat-value">{summary.publishedCount}</span>
-          <span class="stat-label">Published</span>
-        </div>
-      {/if}
-      {#if summary.inProgressCount > 0}
-        <div class="stat-divider"></div>
-        <div class="stat-item active">
-          <span class="stat-value">{summary.inProgressCount}</span>
-          <span class="stat-label">Acquiring</span>
-        </div>
-      {/if}
-      <div class="stat-divider"></div>
-      <div class="stat-item candidate">
-        <span class="stat-value">{summary.candidateAvailableCount}</span>
-        <span class="stat-label">Candidates</span>
-      </div>
-      <div class="stat-divider"></div>
-      <div class="stat-item missing">
-        <span class="stat-value">{summary.missingReleasedCount}</span>
-        <span class="stat-label">Missing</span>
-      </div>
-      {#if summary.unreleasedCount > 0}
-        <div class="stat-divider"></div>
-        <div class="stat-item muted">
-          <span class="stat-value">{summary.unreleasedCount}</span>
-          <span class="stat-label">Unreleased</span>
-        </div>
-      {/if}
     </div>
 
-    <!-- Next Missing Volume Sequence Banner (M13.1) -->
+    <!-- Next Missing Volume Sequence Banner (M13.1 / M13.5) -->
     {#if missingSeq && !missingSeq.isComplete && missingSeq.nextMissingVolume != null}
       <div class="next-missing-banner" data-testid="next-missing-banner">
         <div class="nmb-content">
-          <span class="nmb-badge"><Icon name="arrow" size={13} /> NEXT MISSING IN SEQUENCE</span>
-          <strong class="nmb-title">Volume {missingSeq.nextMissingVolume}</strong>
+          <div class="nmb-header-row">
+            <span class="nmb-badge"><Icon name="arrow" size={13} /> NEXT MISSING IN SEQUENCE</span>
+            <strong class="nmb-title">Volume {missingSeq.nextMissingVolume}</strong>
+          </div>
           <span class="nmb-desc">{missingSeq.explanation}</span>
         </div>
         <div class="nmb-actions">
@@ -455,7 +440,7 @@
                   <img src={vol.coverUrl} alt={vol.label} class="card-thumb" loading="lazy" />
                 </div>
               {/if}
-              <p class="card-status-label">{vol.statusLabel}</p>
+              <p class="card-status-label" title={vol.statusLabel}>{vol.statusLabel}</p>
 
               {#if vol.isOwned}
                 <div class="card-storage-box">
@@ -471,6 +456,7 @@
                   <span class="cand-provider-tag {vol.topProvider || ''}">{vol.topProvider?.toUpperCase() || 'RELEASE'}</span>
                   <span class="cand-score">{Math.round(vol.topCandidateScore || 0)}% match</span>
                 </div>
+                <p class="cand-release-title" title={vol.topCandidateTitle}>{vol.topCandidateTitle}</p>
               {:else if vol.releaseDate}
                 <span class="card-release-date">Release: {vol.releaseDate}</span>
               {/if}
@@ -479,12 +465,12 @@
             <div class="card-actions" onclick={(e) => e.stopPropagation()}>
               {#if !vol.isOwned && vol.candidateCount > 0}
                 <button
-                  class="btn sm subtle cand-btn"
+                  class="btn sm spot cand-btn"
                   onclick={() => onInspectCandidate?.(vol.volumeNumber)}
                   title="Inspect and compare discovered candidates"
                 >
-                  <Icon name="search" size={14} />
-                  {vol.candidateCount} cand.
+                  <Icon name="search" size={13} />
+                  {vol.candidateCount} {vol.candidateCount === 1 ? 'Candidate' : 'Candidates'}
                 </button>
               {:else if !vol.isOwned}
                 <button
@@ -492,12 +478,11 @@
                   onclick={() => onInspectCandidate?.(vol.volumeNumber)}
                   title="Search for candidates"
                 >
-                  <Icon name="search" size={14} />
-                  Find
+                  <Icon name="search" size={13} /> Find
                 </button>
               {:else}
                 <span class="owned-verified-check" title="Verified in Komga canonical storage">
-                  <Icon name="check" size={14} /> Owned
+                  <Icon name="check" size={13} /> In Library
                 </span>
               {/if}
               <button
@@ -1033,45 +1018,6 @@
     color: #92400e;
   }
 
-  .vm-stats-bar {
-    display: flex;
-    align-items: center;
-    gap: 1.25rem;
-    background: var(--surface);
-    border: 2px solid var(--ink);
-    padding: 0.75rem 1.25rem;
-    margin-bottom: 1.25rem;
-    overflow-x: auto;
-  }
-
-  .stat-item {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    min-width: 4.5rem;
-  }
-
-  .stat-value {
-    font-size: 1.25rem;
-    font-weight: 900;
-    color: var(--ink);
-  }
-
-  .stat-label {
-    font-size: 0.75rem;
-    text-transform: uppercase;
-    color: var(--muted);
-    letter-spacing: 0.05em;
-    font-weight: 700;
-  }
-
-  .stat-divider {
-    width: 2px;
-    height: 1.75rem;
-    background: var(--ink);
-    opacity: 0.2;
-  }
-
   .vm-controls-bar {
     display: flex;
     justify-content: space-between;
@@ -1235,6 +1181,82 @@
     background: #f1f5f9;
     color: #475569;
     border: 1.5px solid #475569;
+  }
+
+  .vm-stats-summary {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    padding: 0.75rem 1rem;
+    margin-bottom: 0.85rem;
+    border: 2px solid var(--ink);
+    background: var(--surface);
+    box-shadow: var(--sh-2);
+  }
+
+  .stats-summary-left {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.6rem;
+  }
+
+  .stat-pill-item {
+    font-size: 0.82rem;
+    font-weight: 500;
+    color: var(--ink);
+    padding: 2px 8px;
+    border-radius: 4px;
+    background: var(--bg-soft, #f4f4f0);
+    border: 1px solid var(--line);
+  }
+
+  .stat-pill-item.highlight-owned {
+    background: #dcfce7;
+    border-color: #166534;
+    color: #166534;
+  }
+
+  .stat-pill-item.highlight-missing {
+    background: #fee2e2;
+    border-color: #991b1b;
+    color: #991b1b;
+  }
+
+  .stat-pill-item.highlight-candidates {
+    background: #e0f2fe;
+    border-color: #0369a1;
+    color: #0369a1;
+  }
+
+  .stat-pill-item.highlight-active {
+    background: #fef08a;
+    border-color: #854d0e;
+    color: #854d0e;
+  }
+
+  .stat-pill-item.highlight-muted {
+    background: #f1f5f9;
+    border-color: #64748b;
+    color: #64748b;
+  }
+
+  .nmb-header-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+
+  .cand-release-title {
+    font-size: 0.72rem;
+    color: var(--muted);
+    margin: 2px 0 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 100%;
   }
 
   .next-missing-banner {

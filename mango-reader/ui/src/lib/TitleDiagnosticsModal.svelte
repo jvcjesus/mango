@@ -533,7 +533,7 @@
                   class:banner-info={!timeline.gaps.hasInteriorGaps && timeline.gaps.missingCount > 0}
                 >
                   <div class="gap-banner-content">
-                    <Icon name={timeline.gaps.hasInteriorGaps ? 'alert-triangle' : timeline.gaps.missingCount === 0 ? 'check' : 'info'} size={18} />
+                    <Icon name={timeline.gaps.hasInteriorGaps ? 'alert' : timeline.gaps.missingCount === 0 ? 'check' : 'info'} size={18} />
                     <div class="gap-banner-text">
                       <strong>{timeline.gaps.summaryText}</strong>
                       <span>
@@ -610,8 +610,8 @@
                                 class="btn mini spot vol-plan-btn"
                                 onclick={() => {
                                   backlogScope = 'EXPLICIT_VOLUMES';
-                                  backlogExplicitVolumesInput = String(v.volumeNumber);
-                                  handleGenerateBacklogPlan();
+                                  backlogExplicitInput = String(v.volumeNumber);
+                                  handlePlanBacklog();
                                 }}
                                 title="Plan backlog acquisition for Volume {v.volumeNumber}"
                               >
@@ -632,7 +632,7 @@
                 <!-- Reading-Source Separation Card -->
                 <div class="reading-source-separation-box">
                   <div class="subcard-header">
-                    <Icon name="folder" size={15} />
+                    <Icon name="book" size={15} />
                     <h4>Reading-Source & Physical Ownership Separation (Section 10.3)</h4>
                   </div>
                   <div class="separation-grid">

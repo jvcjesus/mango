@@ -26,6 +26,7 @@
   import { ago, formatBytes, formatLastChecked, formatNextCheck } from '../lib/util';
   import {
     groupReviewQueueBySeries,
+    calculateWatcherGroupSummary,
     type SeriesGroupedReviewQueue,
   } from '../lib/volumeStatus';
   import Downloads from './Downloads.svelte';
@@ -75,9 +76,36 @@
     }
   }
 
+  const ownedVolumesMap = $derived.by<Record<string, number[]>>(() => {
+    const map: Record<string, number[]> = {};
+    if (!watchersData?.watchers) return map;
+    for (const w of watchersData.watchers) {
+      if (w.isOwned || w.state === 'OWNERSHIP_DETECTED') {
+        const keys = [w.seriesId, w.seriesTitle, w.mangaId ? `manga:${w.mangaId}` : ''].filter(Boolean) as string[];
+        for (const k of keys) {
+          if (!map[k]) map[k] = [];
+          if (!map[k].includes(w.volumeNumber)) map[k].push(w.volumeNumber);
+        }
+      }
+    }
+    return map;
+  });
+
+  const totalsMap = $derived.by<Record<string, number | null>>(() => {
+    const map: Record<string, number | null> = {};
+    if (!watchersData?.watchers) return map;
+    for (const w of watchersData.watchers) {
+      const keys = [w.seriesId, w.seriesTitle, w.mangaId ? `manga:${w.mangaId}` : ''].filter(Boolean) as string[];
+      for (const k of keys) {
+        map[k] = (map[k] ?? 0) + 1;
+      }
+    }
+    return map;
+  });
+
   const groupedSeriesInbox = $derived.by<SeriesGroupedReviewQueue[]>(() => {
     if (!reviewItems.length) return [];
-    return groupReviewQueueBySeries(reviewItems);
+    return groupReviewQueueBySeries(reviewItems, ownedVolumesMap, totalsMap);
   });
 
   const totalPendingProposals = $derived.by(() => {
@@ -228,8 +256,18 @@
         const matchCand = (w.topCandidateTitle ?? '').toLowerCase().includes(q);
         if (!matchTitle && !matchCand) return false;
       }
-      if (watchersFilter !== 'ALL' && w.state !== watchersFilter) {
-        return false;
+      if (watchersFilter !== 'ALL') {
+        if (watchersFilter === 'OWNED') {
+          if (!w.isOwned && w.state !== 'OWNERSHIP_DETECTED') return false;
+        } else if (watchersFilter === 'ELIGIBLE_CANDIDATE_FOUND') {
+          if (w.isOwned || (w.state !== 'ELIGIBLE_CANDIDATE_FOUND' && w.state !== 'NOTIFIED' && (!w.candidateCount || w.candidateCount === 0) && !w.topCandidateId)) return false;
+        } else if (watchersFilter === 'RELEASED_AWAITING_PROVIDER') {
+          if (w.isOwned || (w.state !== 'RELEASED_AWAITING_PROVIDER' && !w.isReleased)) return false;
+        } else if (watchersFilter === 'UPCOMING') {
+          if (w.isOwned || (w.state !== 'UPCOMING' && w.isReleased)) return false;
+        } else if (w.state !== watchersFilter) {
+          return false;
+        }
       }
       if (watchersProviderFilter !== 'ALL') {
         const matchLast = w.lastProviderChecked?.toLowerCase() === watchersProviderFilter.toLowerCase();
@@ -266,15 +304,16 @@
       if (!map.has(key)) map.set(key, []);
       map.get(key)!.push(w);
     }
-    return Array.from(map.entries()).map(([title, watchers]) => ({
-      title,
-      mangaId: watchers[0].mangaId,
-      watchers,
-      totalCount: watchers.length,
-      candidateFoundCount: watchers.filter((w) => w.state === 'ELIGIBLE_CANDIDATE_FOUND').length,
-      awaitingCount: watchers.filter((w) => w.state === 'RELEASED_AWAITING_PROVIDER').length,
-      ownedCount: watchers.filter((w) => w.state === 'OWNED').length,
-    }));
+    return Array.from(map.entries()).map(([title, watchers]) => {
+      const summary = calculateWatcherGroupSummary(watchers);
+      return {
+        title,
+        mangaId: watchers[0].mangaId,
+        seriesId: watchers[0].seriesId,
+        watchers,
+        ...summary,
+      };
+    });
   });
 
   const paginatedWatchers = $derived.by(() => {
@@ -445,7 +484,7 @@
           <!-- SERIES-GROUPED INBOX LIST (M13.2) -->
           <div class="series-groups-list">
             {#each groupedSeriesInbox as group (group.seriesId)}
-              {@const isExpanded = expandedSeriesGroups[group.seriesId]}
+              {@const isExpanded = expandedSeriesGroups[group.seriesId] ?? (group.primaryProposals.length === 0)}
               <div class="series-group-card">
                 <!-- Series Group Header -->
                 <div class="group-header">
@@ -664,6 +703,59 @@
                       {/if}
                     </div>
                   {/if}
+
+                  <!-- Resolved / Filtered Proposals (Approved, Rejected, Skipped, etc.) -->
+                  {#if group.otherProposals.length > 0}
+                    <div class="other-proposals-section">
+                      <div class="section-label-row">
+                        <span class="section-label other-label">
+                          <Icon name="bookmark" size={13} /> {reviewStatusFilter === 'all' ? 'Resolved / Historical' : reviewStatusFilter.toUpperCase()} Proposals
+                        </span>
+                      </div>
+
+                      <div class="proposals-list other-list">
+                        {#each group.otherProposals as prop (prop.id)}
+                          <div class="proposal-card other-card status-{prop.status}">
+                            <div class="prop-info-col">
+                              <div class="prop-top-line">
+                                <strong class="prop-vol">Volume {prop.volumeNumber}</strong>
+                                <span class="provider-pill {prop.provider}">{prop.provider.toUpperCase()}</span>
+                                <span class="tag status-pill status-{prop.status}">{prop.status.toUpperCase()}</span>
+                                {#if prop.qualityScore}
+                                  <span class="score-pill">{Math.round(prop.qualityScore)}% Match</span>
+                                {/if}
+                                {#if prop.fileSizeBytes}
+                                  <span class="size-pill">{formatBytes(prop.fileSizeBytes)}</span>
+                                {/if}
+                              </div>
+
+                              <p class="prop-title">{prop.title || prop.rawTitle}</p>
+
+                              {#if prop.statusReason}
+                                <p class="prop-status-reason">
+                                  <Icon name="info" size={13} /> {prop.statusReason}
+                                </p>
+                              {/if}
+                            </div>
+
+                            <div class="prop-actions-col">
+                              <button
+                                class="btn sm subtle"
+                                onclick={() => {
+                                  inspectingVolumeTarget = {
+                                    mangaId: prop.mangaId || 0,
+                                    volume: prop.volumeNumber,
+                                  };
+                                }}
+                              >
+                                <Icon name="search" size={13} /> Inspect
+                              </button>
+                            </div>
+                          </div>
+                        {/each}
+                      </div>
+                    </div>
+                  {/if}
                 </div>
               </div>
             {/each}
@@ -699,7 +791,7 @@
             <span class="stat-lbl">Awaiting Upload</span>
           </button>
           <button type="button" class="stat-card" class:selected={watchersFilter === 'ELIGIBLE_CANDIDATE_FOUND'} onclick={() => { watchersFilter = 'ELIGIBLE_CANDIDATE_FOUND'; watchersPage = 1; }}>
-            <span class="stat-val" style="color: var(--spot, #ff7a00);">{watchersData.summary.candidateFoundCount}</span>
+            <span class="stat-val" style="color: var(--spot, #ff7a00);">{watchersData.summary.candidateFoundCount + (watchersData.summary.notifiedCount || 0)}</span>
             <span class="stat-lbl">Candidates Found</span>
           </button>
           <button type="button" class="stat-card" class:selected={watchersFilter === 'OWNED'} onclick={() => { watchersFilter = 'OWNED'; watchersPage = 1; }}>
@@ -1231,6 +1323,40 @@
     gap: 6px;
     font-weight: 700;
     cursor: pointer;
+  }
+
+  .other-proposals-section {
+    display: flex;
+    flex-direction: column;
+    gap: 0.65rem;
+    padding-top: 0.5rem;
+    border-top: 1px solid var(--line);
+  }
+
+  .other-card {
+    opacity: 0.9;
+    border-left: 4px solid var(--muted);
+  }
+
+  .other-card.status-approved {
+    border-left-color: var(--status-ok, #16a34a);
+  }
+
+  .other-card.status-rejected {
+    border-left-color: var(--status-bad, #dc2626);
+  }
+
+  .other-card.status-skipped {
+    border-left-color: var(--status-warn, #d97706);
+  }
+
+  .prop-status-reason {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 0.78rem;
+    color: var(--muted);
+    margin: 0;
   }
 
   .empty-inbox-panel {

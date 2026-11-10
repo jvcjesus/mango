@@ -461,6 +461,24 @@ pub fn gather_local_owned_volumes(conn: &Connection, manga_id: Option<i64>) -> R
                 }
             }
         }
+
+        // Publication receipts for this manga
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT volume_number, canonical_path FROM publication_receipts WHERE manga_id = ?1 AND (verified_ownership = 1 OR canonical_path IS NOT NULL)",
+        ) {
+            if let Ok(rows) = stmt.query_map([check_id], |r| {
+                Ok((r.get::<_, Option<f64>>(0)?, r.get::<_, Option<String>>(1)?))
+            }) {
+                for (vol_num, can_path) in rows.flatten() {
+                    let vol_opt = vol_num.or_else(|| can_path.as_deref().and_then(crate::release::parse_volume));
+                    if let Some(v) = vol_opt {
+                        if !owned.iter().any(|&ov: &f64| (ov - v).abs() < 0.001) {
+                            owned.push(v);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     owned.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));

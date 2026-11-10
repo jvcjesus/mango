@@ -1041,8 +1041,79 @@ export interface SeriesGroupedReviewQueue {
   outOfOrderProposals: ReviewQueueItem[];
   otherProposals: ReviewQueueItem[];
   pendingCount: number;
+  otherCount: number;
   outOfOrderCount: number;
   warnings: string[];
+}
+
+/**
+ * Safely parses earlierMissingGaps whether it is a number array, JSON array string, or null.
+ */
+export function parseGaps(gaps: unknown): number[] {
+  if (Array.isArray(gaps)) {
+    return gaps.map(Number).filter((n) => !isNaN(n));
+  }
+  if (typeof gaps === 'string') {
+    let current: unknown = gaps;
+    for (let depth = 0; depth < 3 && typeof current === 'string'; depth++) {
+      try {
+        current = JSON.parse(current);
+      } catch {
+        break;
+      }
+    }
+    if (Array.isArray(current)) {
+      return current.map(Number).filter((n) => !isNaN(n));
+    }
+    const parts = gaps
+      .replace(/[[\]"']/g, '')
+      .split(/[,\s]+/)
+      .map(Number)
+      .filter((n) => !isNaN(n));
+    if (parts.length > 0) return parts;
+  }
+  return [];
+}
+
+/**
+ * Helper to calculate accurate watcher group metrics respecting Komga ownership authority.
+ */
+export function calculateWatcherGroupSummary(watchers: import('./api').TitleAvailabilityWatcherDto[]): {
+  totalCount: number;
+  ownedCount: number;
+  candidateFoundCount: number;
+  awaitingCount: number;
+  upcomingCount: number;
+} {
+  let ownedCount = 0;
+  let candidateFoundCount = 0;
+  let awaitingCount = 0;
+  let upcomingCount = 0;
+
+  for (const w of watchers) {
+    if (w.isOwned === true || w.state === 'OWNERSHIP_DETECTED' || w.state === 'ACQUIRED') {
+      ownedCount++;
+    } else if (
+      w.state === 'ELIGIBLE_CANDIDATE_FOUND' ||
+      w.state === 'NOTIFIED' ||
+      (w.candidateCount != null && w.candidateCount > 0) ||
+      Boolean(w.topCandidateId)
+    ) {
+      candidateFoundCount++;
+    } else if (w.state === 'RELEASED_AWAITING_PROVIDER' || w.isReleased) {
+      awaitingCount++;
+    } else {
+      upcomingCount++;
+    }
+  }
+
+  return {
+    totalCount: watchers.length,
+    ownedCount,
+    candidateFoundCount,
+    awaitingCount,
+    upcomingCount,
+  };
 }
 
 /**
@@ -1086,12 +1157,15 @@ export function groupReviewQueueBySeries(
       return a.volumeNumber - b.volumeNumber;
     });
 
+    otherProposals.sort((a, b) => a.volumeNumber - b.volumeNumber);
+
     const primaryProposals: ReviewQueueItem[] = [];
     const outOfOrderProposals: ReviewQueueItem[] = [];
     const warnings: string[] = [];
 
     for (const item of pendingItems) {
-      const hasGaps = item.earlierMissingGaps && item.earlierMissingGaps.length > 0;
+      const parsedGaps = parseGaps(item.earlierMissingGaps);
+      const hasGaps = parsedGaps.length > 0;
       const isPriority1 = (item.acquisitionPriority ?? 1) === 1;
       const matchesNextMissing = missingSeq.nextMissingVolume != null && item.volumeNumber === missingSeq.nextMissingVolume;
 
@@ -1102,7 +1176,7 @@ export function groupReviewQueueBySeries(
       }
 
       if (hasGaps && !warnings.some((w) => w.includes(`Vol ${item.volumeNumber}`))) {
-        warnings.push(`Volume ${item.volumeNumber} is out-of-order: earlier missing volumes (${item.earlierMissingGaps!.join(', ')})`);
+        warnings.push(`Volume ${item.volumeNumber} is out-of-order: earlier missing volumes (${parsedGaps.join(', ')})`);
       }
     }
 
@@ -1117,12 +1191,13 @@ export function groupReviewQueueBySeries(
       outOfOrderProposals,
       otherProposals,
       pendingCount: pendingItems.length,
+      otherCount: otherProposals.length,
       outOfOrderCount: outOfOrderProposals.length,
       warnings,
     });
   }
 
-  // Sort groups: groups with pending actionable items first, then alphabetically
+  // Sort groups: groups with pending actionable items first, then groups with any items, then alphabetically
   result.sort((a, b) => {
     if (a.pendingCount > 0 && b.pendingCount === 0) return -1;
     if (b.pendingCount > 0 && a.pendingCount === 0) return 1;

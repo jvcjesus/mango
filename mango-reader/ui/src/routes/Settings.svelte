@@ -1542,7 +1542,7 @@
     const ok = await confirm({
       title: `Delete profile "${prof.name}"?`,
       message: 'Any series assigned to this profile will revert to the default profile.',
-      confirm: 'Delete',
+      confirmText: 'Delete',
       danger: true,
     });
     if (!ok) return;
@@ -3143,10 +3143,10 @@
                       </div>
                       <div class="profile-actions">
                         <button class="btn pill icon-text" onclick={() => startEditProfile(prof)}>
-                          <Icon name="pencil" size={14} /> Edit
+                          <Icon name="sliders" size={14} /> Edit
                         </button>
                         <button class="btn pill icon-text" onclick={() => handleDuplicateProfile(prof.id)}>
-                          <Icon name="copy" size={14} /> Duplicate
+                          <Icon name="plus" size={14} /> Duplicate
                         </button>
                         {#if !prof.isDefault}
                           <button class="btn pill" onclick={() => handleSetDefaultProfile(prof)} title="Make Default">
@@ -3916,7 +3916,7 @@
                           {#if issue.mangaId}
                             <a href="#/title/{issue.mangaId}" class="issue-title-link">
                               {issue.seriesTitle ? `${issue.seriesTitle} (ID #${issue.mangaId})` : `Manga #${issue.mangaId}`}
-                              <Icon name="chevron-right" size={14} />
+                              <Icon name="forward" size={14} />
                             </a>
                           {:else if issue.seriesTitle}
                             <span class="issue-title">{issue.seriesTitle}</span>

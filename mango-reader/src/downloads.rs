@@ -731,10 +731,28 @@ impl Downloads {
             for (ch_id, pub_path) in published_items {
                 let path = PathBuf::from(&pub_path);
                 if path.is_file() && crate::pipeline::publisher::verify_cbz_integrity(&path).is_ok() {
-                    conn.execute(
-                        "UPDATE downloads SET state = CASE WHEN EXISTS(SELECT 1 FROM metadata_handoffs h WHERE h.chapter_id=downloads.chapter_id) THEN CASE WHEN state='metadata_wait' THEN 'metadata_wait' ELSE state END ELSE 'verifying' END WHERE chapter_id = ?1",
-                        [ch_id],
-                    )?;
+                    let is_already_verified = conn
+                        .query_row(
+                            "SELECT 1 FROM publication_receipts WHERE chapter_id = ?1 AND verified_ownership = 1",
+                            [ch_id],
+                            |_| Ok(true),
+                        )
+                        .optional()?
+                        .unwrap_or(false);
+
+                    if is_already_verified {
+                        tracing::info!("Startup recovery: chapter {} already has verified published canonical media, completing publication lifecycle", ch_id);
+                        let _ = crate::acquisition::service::complete_queued_publication(conn, ch_id);
+                        let _ = conn.execute(
+                            "UPDATE metadata_handoffs SET state = 'succeeded', message = 'Acquisition complete — canonical archive verified', updated_at = strftime('%s','now') WHERE chapter_id = ?1",
+                            [ch_id],
+                        );
+                    } else {
+                        conn.execute(
+                            "UPDATE downloads SET state = CASE WHEN EXISTS(SELECT 1 FROM metadata_handoffs h WHERE h.chapter_id=downloads.chapter_id) THEN CASE WHEN state='metadata_wait' THEN 'metadata_wait' ELSE state END ELSE 'verifying' END WHERE chapter_id = ?1",
+                            [ch_id],
+                        )?;
+                    }
                 } else {
                     let alt_path: Option<String> = conn
                         .query_row(
@@ -753,10 +771,26 @@ impl Downloads {
                         .filter(|p| p.is_file() && crate::pipeline::publisher::verify_cbz_integrity(p).is_ok());
                     if let Some(rec) = recovered {
                         let rec_str = rec.to_string_lossy().to_string();
-                        conn.execute(
-                            "UPDATE downloads SET published_path = ?2, state = 'verifying', error = NULL WHERE chapter_id = ?1",
-                            rusqlite::params![ch_id, rec_str],
-                        )?;
+                        let is_verified_or_owned = conn
+                            .query_row(
+                                "SELECT 1 FROM publication_receipts WHERE chapter_id = ?1 AND verified_ownership = 1",
+                                [ch_id],
+                                |_| Ok(true),
+                            )
+                            .optional()?
+                            .unwrap_or(false);
+                        if is_verified_or_owned {
+                            let _ = crate::acquisition::service::complete_queued_publication(conn, ch_id);
+                            let _ = conn.execute(
+                                "UPDATE metadata_handoffs SET state = 'succeeded', message = 'Acquisition complete — canonical archive verified', updated_at = strftime('%s','now') WHERE chapter_id = ?1",
+                                [ch_id],
+                            );
+                        } else {
+                            conn.execute(
+                                "UPDATE downloads SET published_path = ?2, state = 'verifying', error = NULL WHERE chapter_id = ?1",
+                                rusqlite::params![ch_id, rec_str],
+                            )?;
+                        }
                     } else {
                         conn.execute(
                             "UPDATE downloads SET state = 'failed', error = 'Published canonical file verification failed on startup' WHERE chapter_id = ?1",
@@ -3323,6 +3357,83 @@ mod tests {
             "Canonical library artifact is never deleted on cancellation"
         );
         assert!(crate::pipeline::publisher::verify_cbz_integrity(&published_cbz).is_ok());
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    async fn test_startup_recovery_completes_already_verified_published_downloads() {
+        let pid = std::process::id();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let temp_dir = std::env::temp_dir().join(format!("mango-test-recov-comp-{pid}-{nanos}"));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let db = Db::open(&temp_dir.join("test.db")).unwrap();
+        let lib_dir = temp_dir.join("manga");
+        fs::create_dir_all(&lib_dir).unwrap();
+        let published_cbz = lib_dir.join("Haikyu!! v06.cbz");
+        make_test_cbz(&published_cbz, "Haikyu!!");
+
+        let pub_str = published_cbz.to_string_lossy().to_string();
+
+        db.call(move |conn| {
+            conn.execute("INSERT INTO manga (id, source_id, url, title, in_library) VALUES (1092, 1, '/m', 'Haikyu!!', 1)", [])?;
+            conn.execute(
+                "INSERT INTO chapters (id, manga_id, url, name, chapter_number, source_order, fetched_at, read, download_path)
+                 VALUES (15885, 1092, '/c15885', 'Volume 06', 6.0, 6, 0, 0, ?1)",
+                rusqlite::params![pub_str],
+            )?;
+            conn.execute(
+                "INSERT INTO downloads (chapter_id, state, position, added_at, published_path, target_library_id, error)
+                 VALUES (15885, 'verifying', 1, 1000, ?1, 'lib-en', 'Published — waiting for exact Komga book')",
+                rusqlite::params![pub_str],
+            )?;
+            conn.execute(
+                "INSERT INTO publication_receipts (id, chapter_id, manga_id, series_title, volume_number, canonical_path, file_size_bytes, file_sha256, published_at, verified_ownership, verification_status, created_at, updated_at)
+                 VALUES ('rcpt-15885', 15885, 1092, 'Haikyu!!', 6.0, ?1, 1000, 'hash', 1000, 1, 'verified', 1000, 1000)",
+                rusqlite::params![pub_str],
+            )?;
+            conn.execute(
+                "INSERT INTO metadata_handoffs (chapter_id, canonical_path, state, message, updated_at)
+                 VALUES (15885, ?1, 'waiting_komga', 'Resolving exact Komga book', 1000)",
+                rusqlite::params![pub_str],
+            )?;
+            conn.execute(
+                "INSERT INTO acquisition_history (chapter_id, manga_id, series, release_name, canonical_path, outcome, completed_at)
+                 VALUES (15885, 1092, 'Haikyu!!', 'Volume 06', ?1, 'published', 1000)",
+                rusqlite::params![pub_str],
+            )?;
+            Ok(())
+        }).await.unwrap();
+
+        Downloads::run_startup_recovery(&db).await.unwrap();
+
+        let (dl_exists, handoff_state, hist_outcome): (bool, Option<String>, Option<String>) = db.call(|conn| {
+            let dl_exists = conn.query_row(
+                "SELECT 1 FROM downloads WHERE chapter_id = 15885",
+                [],
+                |_| Ok(true),
+            ).optional()?.unwrap_or(false);
+            let handoff_state = conn.query_row(
+                "SELECT state FROM metadata_handoffs WHERE chapter_id = 15885",
+                [],
+                |r| r.get(0),
+            ).optional()?;
+            let hist_outcome = conn.query_row(
+                "SELECT outcome FROM acquisition_history WHERE chapter_id = 15885",
+                [],
+                |r| r.get(0),
+            ).optional()?;
+            Ok((dl_exists, handoff_state, hist_outcome))
+        }).await.unwrap();
+
+        assert!(!dl_exists, "Stale download in verifying state must be deleted upon recovery");
+        assert_eq!(handoff_state.as_deref(), Some("succeeded"));
+        assert_eq!(hist_outcome.as_deref(), Some("completed"));
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

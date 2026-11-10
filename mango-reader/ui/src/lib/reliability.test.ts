@@ -1970,7 +1970,7 @@ describe('first-class volume acquisition & release semantics', () => {
       };
 
       // When token input is '********' (unchanged placeholder), patch must omit token to preserve backend state
-      const tokenInputUnchanged = '********';
+      const tokenInputUnchanged: string = '********';
       const patch1: import('./api').AcquisitionConfigPatch = {
         torboxEnabled: originalConfig.torboxEnabled,
         torboxUrl: originalConfig.torboxUrl || undefined,
@@ -1979,14 +1979,14 @@ describe('first-class volume acquisition & release semantics', () => {
       expect(patch1.torboxToken).toBeUndefined();
 
       // When token input is 'CLEAR', patch sends empty string to forget token
-      const tokenInputClear = 'CLEAR';
+      const tokenInputClear: string = 'CLEAR';
       const patch2: import('./api').AcquisitionConfigPatch = {
         torboxToken: tokenInputClear === 'CLEAR' ? '' : (tokenInputClear && tokenInputClear !== '********' ? tokenInputClear.trim() : undefined),
       };
       expect(patch2.torboxToken).toBe('');
 
       // When user enters a new token, patch sends trimmed token
-      const tokenInputNew = '  secret_new_token_123  ';
+      const tokenInputNew: string = '  secret_new_token_123  ';
       const patch3: import('./api').AcquisitionConfigPatch = {
         torboxToken: tokenInputNew === 'CLEAR' ? '' : (tokenInputNew && tokenInputNew !== '********' ? tokenInputNew.trim() : undefined),
       };
@@ -1995,33 +1995,39 @@ describe('first-class volume acquisition & release semantics', () => {
       // 2. Candidate ranking & status badges
       const candidate: import('./api').AcquisitionCandidate = {
         release: {
-          id: 'nyaa-12345',
+          source: 'nyaa',
+          sourceItemId: '12345',
           title: '[Group] Berserk - Vol. 01 [Digital] [1080p]',
-          url: 'https://nyaa.si/view/12345',
-          magnet: 'magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567',
+          rawTitle: '[Group] Berserk - Vol. 01 [Digital] [1080p]',
+          sourceUrl: 'https://nyaa.si/view/12345',
+          magnetUrl: 'magnet:?xt=urn:btih:0123456789abcdef0123456789abcdef01234567',
           infoHash: '0123456789abcdef0123456789abcdef01234567',
           sizeBytes: 157286400,
+          sizeFormatted: '150 MiB',
           seeders: 42,
           leechers: 3,
           publishedAt: 1700000000,
           uploader: 'Group',
-          unit: {
-            kind: 'volume',
-            number: 1,
-            unitType: 'single',
+          releaseUnit: {
+            type: 'volume',
+            value: 1,
           },
-          trusted: true,
-          remake: false,
+          isTrusted: true,
+          isRemake: false,
         },
-        exactMatch: true,
-        alreadyOwned: false,
-        currentlyAcquiring: false,
+        score: 100,
+        matchType: 'exact',
+        ownershipStatus: 'missing',
+        unitsIncluded: [1],
+        unitsOwned: [],
+        unitsMissing: [1],
+        coverageSummary: 'Volume 1',
       };
 
-      expect(candidate.exactMatch).toBe(true);
-      expect(candidate.release.trusted).toBe(true);
-      expect(candidate.release.unit.kind).toBe('volume');
-      expect(candidate.release.unit.number).toBe(1);
+      expect(candidate.matchType).toBe('exact');
+      expect(candidate.release.isTrusted).toBe(true);
+      expect(candidate.release.releaseUnit.type).toBe('volume');
+      expect((candidate.release.releaseUnit as any).value).toBe(1);
       expect(candidate.release.seeders).toBe(42);
 
       // 3. TorBox external download job lifecycle representation
@@ -2036,7 +2042,6 @@ describe('first-class volume acquisition & release semantics', () => {
         sourceType: 'nyaa',
         backendType: 'torbox',
         externalJobId: 'tb-999',
-        torrentHash: '0123456789abcdef0123456789abcdef01234567',
         rawTitle: '[Group] Berserk - Vol. 01 [Digital] [1080p]',
         uploader: 'Group',
         releaseSize: 157286400,
@@ -2045,6 +2050,7 @@ describe('first-class volume acquisition & release semantics', () => {
         total: 100,
         attempts: 1,
         retryAt: null,
+        error: null,
         canRetryKomga: false,
       };
 
@@ -2069,36 +2075,36 @@ describe('first-class volume acquisition & release semantics', () => {
 
       const collectionCandidate: import('./api').AcquisitionCandidate = {
         release: {
-          id: 'nyaa-54321',
+          source: 'nyaa',
+          sourceItemId: '54321',
           title: '[Stick] Blue Lock v01-39 [Digital]',
-          url: 'https://nyaa.si/view/54321',
-          magnet: 'magnet:?xt=urn:btih:fedcba9876543210fedcba9876543210fedcba98',
+          rawTitle: '[Stick] Blue Lock v01-39 [Digital]',
+          sourceUrl: 'https://nyaa.si/view/54321',
+          magnetUrl: 'magnet:?xt=urn:btih:fedcba9876543210fedcba9876543210fedcba98',
           infoHash: 'fedcba9876543210fedcba9876543210fedcba98',
           sizeBytes: 4200000000,
+          sizeFormatted: '4.2 GB',
           seeders: 55,
           leechers: 8,
           publishedAt: 1710000000,
           uploader: 'Stick',
-          unit: {
-            kind: 'range',
-            start: 1,
-            end: 39,
-            unitType: 'range',
+          releaseUnit: {
+            type: 'collection',
+            value: { start: 1, end: 39 },
           },
-          trusted: true,
-          remake: false,
+          isTrusted: true,
+          isRemake: false,
           isVariant: false,
           isMixed: false,
         },
-        exactMatch: true,
-        alreadyOwned: false,
-        currentlyAcquiring: false,
-        smartScore,
+        score: 88.5,
+        matchType: 'range',
+        ownershipStatus: 'partial',
         unitsIncluded: [1, 2, 3],
         unitsMissing: [2, 3],
         unitsOwned: [1],
-        ownershipStatus: 'partial',
         coverageSummary: '2 of 3 volumes missing',
+        smartScore,
       };
 
       expect(collectionCandidate.smartScore?.summaryTag).toBe('BEST MATCH');
@@ -2107,7 +2113,7 @@ describe('first-class volume acquisition & release semantics', () => {
 
       // 5. Collection Inspection model and child unit download representation
       const inspection: import('./api').CollectionInspection = {
-        releaseTitle: '[Stick] Blue Lock v01-03 [Digital]',
+        release: collectionCandidate.release,
         totalUnits: 3,
         missingCount: 2,
         ownedCount: 1,
@@ -2144,6 +2150,7 @@ describe('first-class volume acquisition & release semantics', () => {
         total: 100,
         attempts: 0,
         retryAt: null,
+        error: null,
         canRetryKomga: false,
       };
 
@@ -2292,18 +2299,24 @@ describe('first-class volume acquisition & release semantics', () => {
         profileSnapshot: {
           id: 'default',
           name: 'Default Manga',
+          isDefault: true,
           language: 'en',
-          destinationLibrary: 'manga',
+          preferredReleaseType: 'volume',
+          sourceSelection: 'smart',
+          preferredSources: ['nyaa', 'mangadot'],
           preferredUploaders: ['Stick'],
-          ignoredUploaders: [],
-          qualityPreference: 'digital_preferred',
           minSeeders: 1,
-          allowCollections: true,
-          requireExactMatch: true,
-          maxUnnecessaryDuplicateCoverage: 50,
+          preferDigital: true,
+          trustedOnly: false,
+          collectionPolicy: 'smart',
+          maxUnnecessaryDuplicateCoverage: 3,
           maxAcquisitionSizeBytes: null,
           maxPlanSizeBytes: null,
-          isDefault: true,
+          qualityPreference: 'best',
+          allowMixedCollections: false,
+          allowZeroSeeders: 'no',
+          allowUnsupportedEditions: false,
+          autoAcquire: false,
           createdAt: 0,
           updatedAt: 0,
         },
@@ -2350,6 +2363,7 @@ describe('first-class volume acquisition & release semantics', () => {
             executionId: 'exec_001',
             itemIndex: 0,
             frozenCandidate: {
+              seriesIdentity: 'Blue Lock',
               provider: 'nyaa',
               providerReleaseId: 'nyaa_39',
               title: 'Blue Lock v39 (Digital) [Stick]',
@@ -2358,27 +2372,23 @@ describe('first-class volume acquisition & release semantics', () => {
               size: 312000000,
               language: 'en',
               publishedAt: 1700000000,
-              releaseUnit: { type: 'volume', number: 39 },
+              releaseUnit: { type: 'volume', value: 39 },
               releaseNumber: 39,
               releaseRange: null,
               edition: 'Digital',
+              availability: 'available',
               qualitySignals: {
                 isDigital: true,
-                isRaw: false,
-                isRemake: false,
                 isTrusted: true,
+                isPreferredUploader: true,
+                editionRecognized: true,
                 editionPenalty: 0,
-                hasCbzExtension: true,
-                hasValidMangaZip: false,
-                rejectedNonZipFormat: false,
               },
-              health: { seeders: 12, leechers: 2, lastCheckedAt: 1700000000 },
+              health: { seeders: 12, leechers: 2, sourceHealthy: true },
               score: 95,
               confidence: 'high',
-              unitsIncluded: [39],
-              unitsOwned: [],
-              unitsMissing: [39],
-              duplicateUnits: [],
+              ownedUnits: [],
+              missingUnits: [39],
               providerMetadata: { unitMappingProvenance: 'ParsedVolumeFromTitle' },
             },
             expectedUnits: [39],
@@ -2475,6 +2485,7 @@ describe('first-class volume acquisition & release semantics', () => {
 
     it('detects and displays inferred MangaDot volume mappings with explicit review warning', () => {
       const inferredCandidate: import('./api').NormalizedAcquisitionCandidate = {
+        seriesIdentity: 'Blue Lock',
         provider: 'mangadot',
         providerReleaseId: 'md_39',
         title: 'Blue Lock Chapter 289-298',
@@ -2483,27 +2494,23 @@ describe('first-class volume acquisition & release semantics', () => {
         size: 80000000,
         language: 'en',
         publishedAt: null,
-        releaseUnit: { type: 'volume', number: 39 },
+        releaseUnit: { type: 'volume', value: 39 },
         releaseNumber: 39,
         releaseRange: null,
         edition: null,
+        availability: 'available',
         qualitySignals: {
           isDigital: true,
-          isRaw: false,
-          isRemake: false,
           isTrusted: false,
+          isPreferredUploader: false,
+          editionRecognized: false,
           editionPenalty: 0,
-          hasCbzExtension: false,
-          hasValidMangaZip: true,
-          rejectedNonZipFormat: false,
         },
-        health: { seeders: null, leechers: null, lastCheckedAt: null },
+        health: { seeders: null, leechers: null, sourceHealthy: true },
         score: 70,
         confidence: 'review_recommended',
-        unitsIncluded: [39],
-        unitsOwned: [],
-        unitsMissing: [39],
-        duplicateUnits: [],
+        ownedUnits: [],
+        missingUnits: [39],
         providerMetadata: {
           unitMappingProvenance: 'ChapterToVolumeInference',
           volumeSupportMode: 'inferred',

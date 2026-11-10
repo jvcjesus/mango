@@ -4,6 +4,8 @@ import {
   calculateNextMissingVolume,
   groupReviewQueueBySeries,
   deriveLifecycleTimeline,
+  parseGaps,
+  calculateWatcherGroupSummary,
 } from './volumeStatus';
 import type { VolumeManagerEntry, ReviewQueueItem } from './api';
 
@@ -298,6 +300,192 @@ describe('Mango M13 — Unified Series Workspace, Acquisition Inbox & Lifecycle 
       expect(groups.size).toBe(2);
       expect(groups.get('Haikyu!!')).toHaveLength(2);
       expect(groups.get('Chainsaw Man')).toHaveLength(1);
+    });
+
+    it('calculates watcher group summary with mixed ownership, notified, and candidate states', () => {
+      // Models Haikyu!! real API payload: 6 OWNERSHIP_DETECTED (owned), 39 NOTIFIED with candidates
+      const mockWatchers: import('./api').TitleAvailabilityWatcherDto[] = [
+        // 6 owned volumes
+        ...[1, 2, 3, 4, 5, 6].map((vol) => ({
+          id: vol,
+          seriesId: 'manga:1092',
+          mangaId: 1092,
+          seriesTitle: 'Haikyu!!',
+          volumeNumber: vol,
+          isOwned: true,
+          isReleased: true,
+          monitoringEnabled: true,
+          state: 'OWNERSHIP_DETECTED',
+          candidateCount: 0,
+        } as import('./api').TitleAvailabilityWatcherDto)),
+        // 35 notified with candidates
+        ...Array.from({ length: 35 }, (_, i) => i + 7).map((vol) => ({
+          id: vol,
+          seriesId: 'manga:1092',
+          mangaId: 1092,
+          seriesTitle: 'Haikyu!!',
+          volumeNumber: vol,
+          isOwned: false,
+          isReleased: true,
+          monitoringEnabled: true,
+          state: 'NOTIFIED',
+          candidateCount: 8,
+          topCandidateTitle: `Haikyu!! v${vol}`,
+        } as import('./api').TitleAvailabilityWatcherDto)),
+        // 2 eligible candidates found (un-notified yet)
+        {
+          id: 42,
+          seriesId: 'manga:1092',
+          mangaId: 1092,
+          seriesTitle: 'Haikyu!!',
+          volumeNumber: 42,
+          isOwned: false,
+          isReleased: true,
+          monitoringEnabled: true,
+          state: 'ELIGIBLE_CANDIDATE_FOUND',
+          candidateCount: 2,
+        } as import('./api').TitleAvailabilityWatcherDto,
+        // 1 awaiting upload
+        {
+          id: 43,
+          seriesId: 'manga:1092',
+          mangaId: 1092,
+          seriesTitle: 'Haikyu!!',
+          volumeNumber: 43,
+          isOwned: false,
+          isReleased: true,
+          monitoringEnabled: true,
+          state: 'RELEASED_AWAITING_PROVIDER',
+          candidateCount: 0,
+        } as import('./api').TitleAvailabilityWatcherDto,
+        // 1 upcoming
+        {
+          id: 44,
+          seriesId: 'manga:1092',
+          mangaId: 1092,
+          seriesTitle: 'Haikyu!!',
+          volumeNumber: 44,
+          isOwned: false,
+          isReleased: false,
+          monitoringEnabled: true,
+          state: 'UPCOMING',
+          candidateCount: 0,
+        } as import('./api').TitleAvailabilityWatcherDto,
+        {
+          id: 45,
+          seriesId: 'manga:1092',
+          mangaId: 1092,
+          seriesTitle: 'Haikyu!!',
+          volumeNumber: 45,
+          isOwned: false,
+          isReleased: false,
+          monitoringEnabled: true,
+          state: 'UPCOMING',
+          candidateCount: 0,
+        } as import('./api').TitleAvailabilityWatcherDto,
+      ];
+
+      const summary = calculateWatcherGroupSummary(mockWatchers);
+      expect(summary.totalCount).toBe(45);
+      expect(summary.ownedCount).toBe(6);
+      expect(summary.candidateFoundCount).toBe(36); // 35 notified + 1 eligible (id: 42)
+      expect(summary.awaitingCount).toBe(1);
+      expect(summary.upcomingCount).toBe(2);
+    });
+  });
+
+  describe('M13.5 Acquisition Inbox Robustness & Gap Parsing', () => {
+    it('safely parses earlierMissingGaps from strings, arrays, or null', () => {
+      expect(parseGaps([1, 2, 3])).toEqual([1, 2, 3]);
+      expect(parseGaps('[1.0, 2.0]')).toEqual([1, 2]);
+      expect(parseGaps('"[1.0]"')).toEqual([1]);
+      expect(parseGaps(null)).toEqual([]);
+      expect(parseGaps(undefined)).toEqual([]);
+      expect(parseGaps('invalid')).toEqual([]);
+    });
+
+    it('processes review queue proposals with string earlierMissingGaps without throwing TypeError', () => {
+      const itemWithStringGaps: ReviewQueueItem = {
+        id: 19,
+        mangaId: 704,
+        seriesId: 'manga:704',
+        seriesTitle: 'The Promised Neverland',
+        volumeNumber: 2,
+        recommendedCandidateId: 'c19',
+        provider: 'madokami',
+        title: 'The Promised Neverland v02',
+        rawTitle: 'The Promised Neverland v02.cbz',
+        qualityScore: 90,
+        confidence: 'high',
+        status: 'pending',
+        acquisitionPriority: 2,
+        // In the real Rust API response, earlier_missing_gaps is a JSON string "[1.0]"
+        earlierMissingGaps: '[1.0]' as unknown as number[],
+        orderingExplanation: 'Earlier missing volumes detected',
+        isSafeToApprove: false,
+        createdAt: 100,
+        updatedAt: 100,
+      };
+
+      const itemVol1: ReviewQueueItem = {
+        id: 8,
+        mangaId: 704,
+        seriesId: 'manga:704',
+        seriesTitle: 'The Promised Neverland',
+        volumeNumber: 1,
+        recommendedCandidateId: 'c8',
+        provider: 'madokami',
+        title: 'The Promised Neverland v01',
+        rawTitle: 'The Promised Neverland v01.cbz',
+        qualityScore: 90,
+        confidence: 'high',
+        status: 'pending',
+        acquisitionPriority: 1,
+        earlierMissingGaps: null as unknown as number[],
+        orderingExplanation: 'Lowest missing volume',
+        isSafeToApprove: true,
+        createdAt: 100,
+        updatedAt: 100,
+      };
+
+      // Must not throw "TypeError: earlierMissingGaps.join is not a function"
+      expect(() => {
+        const groups = groupReviewQueueBySeries([itemVol1, itemWithStringGaps]);
+        expect(groups).toHaveLength(1);
+        expect(groups[0].primaryProposals).toHaveLength(1);
+        expect(groups[0].primaryProposals[0].volumeNumber).toBe(1);
+        expect(groups[0].outOfOrderProposals).toHaveLength(1);
+        expect(groups[0].outOfOrderProposals[0].volumeNumber).toBe(2);
+        expect(groups[0].warnings[0]).toContain('earlier missing volumes (1)');
+      }).not.toThrow();
+    });
+
+    it('correctly populates otherProposals for approved and rejected items', () => {
+      const approvedItem: ReviewQueueItem = {
+        id: 12,
+        mangaId: 1092,
+        seriesId: 'manga:1092',
+        seriesTitle: 'Haikyu!!',
+        volumeNumber: 6,
+        recommendedCandidateId: 'c12',
+        provider: 'madokami',
+        title: 'Haikyu!! v06',
+        rawTitle: 'Haikyu!! v06.cbz',
+        qualityScore: 90,
+        confidence: 'high',
+        status: 'approved',
+        acquisitionPriority: 1,
+        isSafeToApprove: true,
+        createdAt: 100,
+        updatedAt: 100,
+      };
+
+      const groups = groupReviewQueueBySeries([approvedItem]);
+      expect(groups).toHaveLength(1);
+      expect(groups[0].pendingCount).toBe(0);
+      expect(groups[0].otherCount).toBe(1);
+      expect(groups[0].otherProposals).toHaveLength(1);
+      expect(groups[0].otherProposals[0].status).toBe('approved');
     });
   });
 });
