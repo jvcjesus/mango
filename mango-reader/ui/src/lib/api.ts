@@ -3148,6 +3148,15 @@ export interface MonitoringSettings {
   autoPublishManual: boolean;
 }
 
+export interface UpdateMonitoringSettingsRequest {
+  automationMode?: AutomationMode;
+  intervalHours?: number;
+  trackedStatuses?: string[];
+  autoAcquireEnabled?: boolean;
+  operatingMode?: string;
+  autoPublishManual?: boolean;
+}
+
 export interface ReviewQueueItem {
   id: number;
   mangaId: number | null;
@@ -3200,7 +3209,7 @@ export interface BatchApproveReviewQueueResponse {
 export const getMonitoringSettings = () =>
   get<MonitoringSettings>('/monitoring/settings');
 
-export const updateMonitoringSettings = (settings: Partial<MonitoringSettings>) =>
+export const updateMonitoringSettings = (settings: UpdateMonitoringSettingsRequest) =>
   send<MonitoringSettings>('POST', '/monitoring/settings', settings);
 
 export const triggerMonitoringRefresh = () =>

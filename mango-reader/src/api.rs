@@ -5232,7 +5232,7 @@ async fn get_naming_backups(
     Ok(Json(backups))
 }
 
-async fn get_monitoring_settings(
+pub(crate) async fn get_monitoring_settings(
     Me(app): Me,
 ) -> Result<Json<crate::acquisition::monitoring::MonitoringSettings>> {
     app.me.admin()?;
@@ -5240,13 +5240,17 @@ async fn get_monitoring_settings(
     Ok(Json(settings))
 }
 
-async fn post_monitoring_settings(
+pub(crate) async fn post_monitoring_settings(
     Me(app): Me,
-    Json(settings): Json<crate::acquisition::monitoring::MonitoringSettings>,
+    Json(settings): Json<crate::acquisition::monitoring::UpdateMonitoringSettingsRequest>,
 ) -> Result<Json<crate::acquisition::monitoring::MonitoringSettings>> {
     app.me.admin()?;
-    app.db.call(move |conn| crate::acquisition::monitoring::update_monitoring_settings(conn, &settings)).await?;
-    let updated = app.db.call(|conn| crate::acquisition::monitoring::get_monitoring_settings(conn)).await?;
+    let updated = app
+        .db
+        .call(move |conn| {
+            crate::acquisition::monitoring::update_monitoring_settings(conn, &settings)
+        })
+        .await?;
     Ok(Json(updated))
 }
 

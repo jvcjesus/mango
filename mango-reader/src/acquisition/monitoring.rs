@@ -16,8 +16,9 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::acquisition::auto_acquire::{
-    is_global_auto_acquire_enabled, is_simulation_mode, SETTING_AUTO_ACQUIRE_ENABLED,
-    SETTING_OPERATING_MODE, SETTING_AUTO_PUBLISH_MANUAL,
+    is_global_auto_acquire_enabled, is_simulation_mode, set_auto_publish_manual_enabled,
+    set_global_auto_acquire, set_operating_mode, SETTING_AUTO_PUBLISH_MANUAL,
+    SETTING_OPERATING_MODE,
 };
 use crate::acquisition::approval::ApproveCandidateRequest;
 use crate::acquisition::providers::ReleaseCandidate;
@@ -54,12 +55,17 @@ impl AutomationMode {
         }
     }
 
-    pub fn from_str(s: &str) -> Self {
+    pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_lowercase().as_str() {
-            "review_before_acquisition" | "review" | "mode_b" => Self::ReviewBeforeAcquisition,
-            "automatic_acquisition" | "auto" | "mode_c" => Self::AutomaticAcquisition,
-            _ => Self::MonitorOnly,
+            "monitor_only" | "monitor" | "mode_a" => Some(Self::MonitorOnly),
+            "review_before_acquisition" | "review" | "mode_b" => Some(Self::ReviewBeforeAcquisition),
+            "automatic_acquisition" | "auto" | "mode_c" => Some(Self::AutomaticAcquisition),
+            _ => None,
         }
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        Self::parse(s).unwrap_or(Self::MonitorOnly)
     }
 }
 
@@ -80,6 +86,52 @@ pub struct MonitoringSettings {
     pub auto_acquire_enabled: bool,
     pub operating_mode: String,
     pub auto_publish_manual: bool,
+}
+
+/// Partial update payload for monitoring and automation settings.
+/// Every field is optional to allow selective mutation without overwriting
+/// unrelated safety flags.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateMonitoringSettingsRequest {
+    #[serde(default, alias = "automation_mode")]
+    pub automation_mode: Option<String>,
+    #[serde(default, alias = "interval_hours")]
+    pub interval_hours: Option<i64>,
+    #[serde(default, alias = "tracked_statuses")]
+    pub tracked_statuses: Option<Vec<String>>,
+    #[serde(default, alias = "auto_acquire_enabled")]
+    pub auto_acquire_enabled: Option<bool>,
+    #[serde(default, alias = "operating_mode")]
+    pub operating_mode: Option<String>,
+    #[serde(default, alias = "auto_publish_manual")]
+    pub auto_publish_manual: Option<bool>,
+}
+
+impl From<MonitoringSettings> for UpdateMonitoringSettingsRequest {
+    fn from(s: MonitoringSettings) -> Self {
+        Self {
+            automation_mode: Some(s.automation_mode.as_str().to_string()),
+            interval_hours: Some(s.interval_hours),
+            tracked_statuses: Some(s.tracked_statuses),
+            auto_acquire_enabled: Some(s.auto_acquire_enabled),
+            operating_mode: Some(s.operating_mode),
+            auto_publish_manual: Some(s.auto_publish_manual),
+        }
+    }
+}
+
+impl From<&MonitoringSettings> for UpdateMonitoringSettingsRequest {
+    fn from(s: &MonitoringSettings) -> Self {
+        Self {
+            automation_mode: Some(s.automation_mode.as_str().to_string()),
+            interval_hours: Some(s.interval_hours),
+            tracked_statuses: Some(s.tracked_statuses.clone()),
+            auto_acquire_enabled: Some(s.auto_acquire_enabled),
+            operating_mode: Some(s.operating_mode.clone()),
+            auto_publish_manual: Some(s.auto_publish_manual),
+        }
+    }
 }
 
 /// Proposed acquisition in the Review Queue (Mode B)
@@ -179,14 +231,101 @@ pub fn get_monitoring_settings(conn: &Connection) -> Result<MonitoringSettings> 
     })
 }
 
-pub fn update_monitoring_settings(conn: &Connection, settings: &MonitoringSettings) -> Result<()> {
-    set_automation_mode(conn, settings.automation_mode)?;
-    set_monitoring_interval_hours(conn, settings.interval_hours)?;
-    set_monitored_tracking_statuses(conn, &settings.tracked_statuses)?;
-    crate::settings::set(conn, SETTING_AUTO_ACQUIRE_ENABLED, &serde_json::json!(settings.auto_acquire_enabled))?;
-    crate::settings::set(conn, SETTING_OPERATING_MODE, &serde_json::json!(settings.operating_mode))?;
-    crate::settings::set(conn, SETTING_AUTO_PUBLISH_MANUAL, &serde_json::json!(settings.auto_publish_manual))?;
-    Ok(())
+/// Atomically applies a partial monitoring settings update.
+/// Only explicitly provided fields in `req` are modified; unspecified fields
+/// are strictly preserved to prevent unintended state transitions.
+/// All inputs are validated beforehand to fail closed.
+pub fn update_monitoring_settings(
+    conn: &mut Connection,
+    req: &UpdateMonitoringSettingsRequest,
+) -> Result<MonitoringSettings> {
+    // 1. Validation phase (fails closed before any mutation occurs)
+    let validated_mode = match &req.automation_mode {
+        Some(s) => {
+            let mode = AutomationMode::parse(s).ok_or_else(|| {
+                AppError::bad_request(format!(
+                    "Invalid automation mode: '{s}'. Allowed: 'monitor_only', 'review_before_acquisition', 'automatic_acquisition'"
+                ))
+            })?;
+            Some(mode)
+        }
+        None => None,
+    };
+
+    let validated_interval = match req.interval_hours {
+        Some(hours) => {
+            if !(1..=168).contains(&hours) {
+                return Err(AppError::bad_request(format!(
+                    "Monitoring interval must be between 1 and 168 hours (got {hours})"
+                )));
+            }
+            Some(hours)
+        }
+        None => None,
+    };
+
+    let validated_statuses = match &req.tracked_statuses {
+        Some(statuses) => {
+            let mut norm_list = Vec::with_capacity(statuses.len());
+            for st in statuses {
+                let trimmed = st.trim().to_lowercase();
+                match trimmed.as_str() {
+                    "reading" | "planning" | "completed" | "paused" | "dropped" => {
+                        if !norm_list.contains(&trimmed) {
+                            norm_list.push(trimmed);
+                        }
+                    }
+                    _ => {
+                        return Err(AppError::bad_request(format!(
+                            "Invalid tracking status: '{st}'. Allowed: 'reading', 'planning', 'completed', 'paused', 'dropped'"
+                        )));
+                    }
+                }
+            }
+            Some(norm_list)
+        }
+        None => None,
+    };
+
+    let validated_operating_mode = match &req.operating_mode {
+        Some(m) => {
+            let trimmed = m.trim().to_lowercase();
+            if trimmed != "simulation" && trimmed != "normal" {
+                return Err(AppError::bad_request(format!(
+                    "Invalid operating mode: '{m}'. Allowed: 'simulation', 'normal'"
+                )));
+            }
+            Some(trimmed)
+        }
+        None => None,
+    };
+
+    // 2. Atomic mutation phase (all-or-nothing transaction)
+    let tx = conn.transaction()?;
+
+    if let Some(mode) = validated_mode {
+        set_automation_mode(&tx, mode)?;
+    }
+    if let Some(interval) = validated_interval {
+        set_monitoring_interval_hours(&tx, interval)?;
+    }
+    if let Some(statuses) = validated_statuses {
+        set_monitored_tracking_statuses(&tx, &statuses)?;
+    }
+    if let Some(auto_acquire) = req.auto_acquire_enabled {
+        set_global_auto_acquire(&tx, auto_acquire)?;
+    }
+    if let Some(op_mode) = validated_operating_mode {
+        set_operating_mode(&tx, &op_mode)?;
+    }
+    if let Some(auto_publish) = req.auto_publish_manual {
+        set_auto_publish_manual_enabled(&tx, auto_publish)?;
+    }
+
+    tx.commit()?;
+
+    // 3. Return complete updated settings
+    get_monitoring_settings(conn)
 }
 
 // ============================================================================

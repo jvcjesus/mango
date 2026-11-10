@@ -8,7 +8,7 @@ mod tests {
         list_monitoring_activity, list_review_queue, log_monitoring_activity_internal,
         reject_review_queue_item, set_automation_mode, skip_review_queue_item,
         sync_followed_series_to_watchers, update_monitoring_settings, AutomationMode,
-        MonitoringSettings,
+        MonitoringSettings, UpdateMonitoringSettingsRequest,
     };
     use crate::acquisition::providers::{CandidateMatchType, ReleaseCandidate};
     use crate::db::Db;
@@ -117,7 +117,7 @@ mod tests {
             auto_publish_manual: false,
         };
 
-        db.call(move |conn| update_monitoring_settings(conn, &new_settings))
+        db.call(move |conn| update_monitoring_settings(conn, &new_settings.into()))
             .await
             .unwrap();
 
@@ -481,5 +481,265 @@ mod tests {
         assert_eq!(activity.len(), 1);
         assert_eq!(activity[0].decision_code.as_deref(), Some("WOULD_AUTO_ACQUIRE"));
         assert_eq!(activity[0].action, "simulated");
+    }
+
+    #[tokio::test]
+    async fn test_m11_partial_update_only_automation_mode() {
+        let db = setup_test_db();
+
+        let initial = db.call(|conn| get_monitoring_settings(conn)).await.unwrap();
+        assert_eq!(initial.automation_mode, AutomationMode::MonitorOnly);
+        assert_eq!(initial.interval_hours, 12);
+        assert_eq!(initial.tracked_statuses, vec!["reading", "planning"]);
+        assert!(!initial.auto_acquire_enabled);
+        assert_eq!(initial.operating_mode, "simulation");
+        assert!(!initial.auto_publish_manual);
+
+        // Update ONLY automation_mode
+        let req = UpdateMonitoringSettingsRequest {
+            automation_mode: Some("review_before_acquisition".to_string()),
+            ..Default::default()
+        };
+
+        let updated = db
+            .call(move |conn| update_monitoring_settings(conn, &req))
+            .await
+            .unwrap();
+
+        assert_eq!(updated.automation_mode, AutomationMode::ReviewBeforeAcquisition);
+        // Assert all other 5 fields preserved
+        assert_eq!(updated.interval_hours, 12);
+        assert_eq!(updated.tracked_statuses, vec!["reading", "planning"]);
+        assert!(!updated.auto_acquire_enabled);
+        assert_eq!(updated.operating_mode, "simulation");
+        assert!(!updated.auto_publish_manual);
+
+        // Verify persisted state matches
+        let persisted = db.call(|conn| get_monitoring_settings(conn)).await.unwrap();
+        assert_eq!(persisted.automation_mode, AutomationMode::ReviewBeforeAcquisition);
+        assert_eq!(persisted.interval_hours, 12);
+    }
+
+    #[tokio::test]
+    async fn test_m11_partial_update_only_tracked_statuses() {
+        let db = setup_test_db();
+
+        // Update ONLY tracked_statuses
+        let req = UpdateMonitoringSettingsRequest {
+            tracked_statuses: Some(vec!["reading".to_string(), "completed".to_string()]),
+            ..Default::default()
+        };
+
+        let updated = db
+            .call(move |conn| update_monitoring_settings(conn, &req))
+            .await
+            .unwrap();
+
+        assert_eq!(updated.tracked_statuses, vec!["reading", "completed"]);
+        assert_eq!(updated.automation_mode, AutomationMode::MonitorOnly);
+        assert_eq!(updated.interval_hours, 12);
+        assert!(!updated.auto_acquire_enabled);
+        assert_eq!(updated.operating_mode, "simulation");
+        assert!(!updated.auto_publish_manual);
+    }
+
+    #[tokio::test]
+    async fn test_m11_partial_update_only_interval_hours() {
+        let db = setup_test_db();
+
+        // Update ONLY interval_hours
+        let req = UpdateMonitoringSettingsRequest {
+            interval_hours: Some(6),
+            ..Default::default()
+        };
+
+        let updated = db
+            .call(move |conn| update_monitoring_settings(conn, &req))
+            .await
+            .unwrap();
+
+        assert_eq!(updated.interval_hours, 6);
+        assert_eq!(updated.automation_mode, AutomationMode::MonitorOnly);
+        assert_eq!(updated.tracked_statuses, vec!["reading", "planning"]);
+        assert!(!updated.auto_acquire_enabled);
+        assert_eq!(updated.operating_mode, "simulation");
+        assert!(!updated.auto_publish_manual);
+    }
+
+    #[tokio::test]
+    async fn test_m11_partial_update_preserves_custom_safety_settings() {
+        let db = setup_test_db();
+
+        // Ensure safety defaults are strictly preserved across sequential partial updates
+        let req1 = UpdateMonitoringSettingsRequest {
+            automation_mode: Some("monitor_only".to_string()),
+            ..Default::default()
+        };
+        db.call(move |conn| update_monitoring_settings(conn, &req1)).await.unwrap();
+
+        let req2 = UpdateMonitoringSettingsRequest {
+            interval_hours: Some(24),
+            ..Default::default()
+        };
+        db.call(move |conn| update_monitoring_settings(conn, &req2)).await.unwrap();
+
+        let req3 = UpdateMonitoringSettingsRequest {
+            tracked_statuses: Some(vec!["reading".to_string(), "paused".to_string()]),
+            ..Default::default()
+        };
+        let final_settings = db.call(move |conn| update_monitoring_settings(conn, &req3)).await.unwrap();
+
+        assert_eq!(final_settings.interval_hours, 24);
+        assert_eq!(final_settings.tracked_statuses, vec!["reading", "paused"]);
+        // Critical safety invariants: never activate auto-acquire or normal mode accidentally
+        assert!(!final_settings.auto_acquire_enabled, "auto_acquire must remain disabled");
+        assert_eq!(final_settings.operating_mode, "simulation", "operating_mode must remain simulation");
+        assert!(!final_settings.auto_publish_manual, "auto_publish_manual must remain disabled");
+    }
+
+    #[tokio::test]
+    async fn test_m11_partial_update_validation_rejects_malformed_input() {
+        let db = setup_test_db();
+
+        // 1. Invalid automation mode
+        let bad_mode = UpdateMonitoringSettingsRequest {
+            automation_mode: Some("invalid_mode_xyz".to_string()),
+            ..Default::default()
+        };
+        let err = db.call(move |conn| update_monitoring_settings(conn, &bad_mode)).await;
+        assert!(err.is_err(), "Invalid automation mode must fail validation");
+
+        // 2. Invalid interval (< 1 or > 168)
+        let zero_interval = UpdateMonitoringSettingsRequest {
+            interval_hours: Some(0),
+            ..Default::default()
+        };
+        let err2 = db.call(move |conn| update_monitoring_settings(conn, &zero_interval)).await;
+        assert!(err2.is_err(), "Interval 0 must fail validation");
+
+        let huge_interval = UpdateMonitoringSettingsRequest {
+            interval_hours: Some(999),
+            ..Default::default()
+        };
+        let err3 = db.call(move |conn| update_monitoring_settings(conn, &huge_interval)).await;
+        assert!(err3.is_err(), "Interval 999 must fail validation");
+
+        // 3. Invalid tracking status
+        let bad_status = UpdateMonitoringSettingsRequest {
+            tracked_statuses: Some(vec!["reading".to_string(), "bogus_status".to_string()]),
+            ..Default::default()
+        };
+        let err4 = db.call(move |conn| update_monitoring_settings(conn, &bad_status)).await;
+        assert!(err4.is_err(), "Invalid tracking status must fail validation");
+
+        // 4. Invalid operating mode
+        let bad_op_mode = UpdateMonitoringSettingsRequest {
+            operating_mode: Some("unrestricted".to_string()),
+            ..Default::default()
+        };
+        let err5 = db.call(move |conn| update_monitoring_settings(conn, &bad_op_mode)).await;
+        assert!(err5.is_err(), "Invalid operating mode must fail validation");
+
+        // Verify atomicity: database is untouched and remains at defaults
+        let settings = db.call(|conn| get_monitoring_settings(conn)).await.unwrap();
+        assert_eq!(settings.automation_mode, AutomationMode::MonitorOnly);
+        assert_eq!(settings.interval_hours, 12);
+        assert_eq!(settings.tracked_statuses, vec!["reading", "planning"]);
+    }
+
+    #[tokio::test]
+    async fn test_m11_http_endpoint_partial_updates_and_no_422() {
+        use axum::routing::post;
+        use axum::Router;
+        use tokio::net::TcpListener;
+
+        let db = setup_test_db();
+        let db_handler = db.clone();
+
+        // Construct Axum router reproducing the /api/monitoring/settings endpoint
+        let app = Router::new().route(
+            "/api/monitoring/settings",
+            post(move |axum::Json(payload): axum::Json<UpdateMonitoringSettingsRequest>| {
+                let db = db_handler.clone();
+                async move {
+                    let updated = db
+                        .call(move |conn| update_monitoring_settings(conn, &payload))
+                        .await
+                        .map_err(|e| (axum::http::StatusCode::BAD_REQUEST, e.to_string()))?;
+                    Ok::<_, (axum::http::StatusCode, String)>(axum::Json(updated))
+                }
+            }),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let client = reqwest::Client::new();
+        let base_url = format!("http://{addr}/api/monitoring/settings");
+
+        // 1. Partial update: ONLY automationMode (reproducing exact UI payload that previously produced 422)
+        let resp1 = client
+            .post(&base_url)
+            .header("Content-Type", "application/json")
+            .body(r#"{"automationMode":"review_before_acquisition"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp1.status(), reqwest::StatusCode::OK, "Partial automationMode must return 200 OK, not 422");
+        let body1: MonitoringSettings = resp1.json().await.unwrap();
+        assert_eq!(body1.automation_mode, AutomationMode::ReviewBeforeAcquisition);
+        assert_eq!(body1.interval_hours, 12);
+        assert_eq!(body1.tracked_statuses, vec!["reading", "planning"]);
+
+        // 2. Partial update: ONLY trackedStatuses
+        let resp2 = client
+            .post(&base_url)
+            .header("Content-Type", "application/json")
+            .body(r#"{"trackedStatuses":["reading","completed"]}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp2.status(), reqwest::StatusCode::OK, "Partial trackedStatuses must return 200 OK, not 422");
+        let body2: MonitoringSettings = resp2.json().await.unwrap();
+        assert_eq!(body2.tracked_statuses, vec!["reading", "completed"]);
+        assert_eq!(body2.automation_mode, AutomationMode::ReviewBeforeAcquisition);
+
+        // 3. Partial update: ONLY intervalHours
+        let resp3 = client
+            .post(&base_url)
+            .header("Content-Type", "application/json")
+            .body(r#"{"intervalHours":6}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp3.status(), reqwest::StatusCode::OK, "Partial intervalHours must return 200 OK, not 422");
+        let body3: MonitoringSettings = resp3.json().await.unwrap();
+        assert_eq!(body3.interval_hours, 6);
+        assert_eq!(body3.automation_mode, AutomationMode::ReviewBeforeAcquisition);
+
+        // 4. Snake_case alias support
+        let resp4 = client
+            .post(&base_url)
+            .header("Content-Type", "application/json")
+            .body(r#"{"automation_mode":"monitor_only"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp4.status(), reqwest::StatusCode::OK);
+        let body4: MonitoringSettings = resp4.json().await.unwrap();
+        assert_eq!(body4.automation_mode, AutomationMode::MonitorOnly);
+
+        // 5. Malformed payload returns 400 Bad Request, NOT 422 or 500
+        let resp5 = client
+            .post(&base_url)
+            .header("Content-Type", "application/json")
+            .body(r#"{"intervalHours":0}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp5.status(), reqwest::StatusCode::BAD_REQUEST);
     }
 }
