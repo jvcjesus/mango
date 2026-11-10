@@ -1026,6 +1026,13 @@
     operatingMode: 'simulation',
     autoPublishManual: false,
   });
+  let savingTrackedStatuses = $state(false);
+
+  const monitoredSummaryText = $derived(
+    !monitoringSettings.trackedStatuses || monitoringSettings.trackedStatuses.length === 0
+      ? 'None selected'
+      : monitoringSettings.trackedStatuses.map((s) => s.charAt(0).toUpperCase() + s.slice(1)).join(', ')
+  );
 
   async function loadMonitoringSettings() {
     try {
@@ -1054,18 +1061,28 @@
   }
 
   async function toggleTrackedStatus(status: string) {
-    const current = new Set(monitoringSettings.trackedStatuses);
+    if (savingTrackedStatuses) return;
+    const previous = [...(monitoringSettings.trackedStatuses || [])];
+    const current = new Set(monitoringSettings.trackedStatuses || []);
     if (current.has(status)) {
       current.delete(status);
     } else {
       current.add(status);
     }
     const updated = Array.from(current);
+    // Optimistic update for immediate visual feedback
+    monitoringSettings.trackedStatuses = updated;
+    savingTrackedStatuses = true;
     try {
-      monitoringSettings = await updateMonitoringSettings({ trackedStatuses: updated });
+      const res = await updateMonitoringSettings({ trackedStatuses: updated });
+      monitoringSettings = res;
       toast.success('Tracked list filters updated');
     } catch (e) {
+      // Roll back to previously confirmed selection on error
+      monitoringSettings.trackedStatuses = previous;
       toast.error(`Failed to update tracked list filters: ${message(e)}`);
+    } finally {
+      savingTrackedStatuses = false;
     }
   }
 
@@ -2854,18 +2871,33 @@
                   Select which personal tracking lists are monitored for missing volumes and release discovery.
                 </span>
               </div>
-              <div class="how">
-                <div class="pill-group" role="group" aria-label="Monitored lists">
+              <div class="how" style="flex-direction: column; align-items: flex-start; gap: 8px;">
+                <div class="pill-group tracked-statuses-group" role="group" aria-label="Monitored tracking lists">
                   {#each ['reading', 'planning', 'completed', 'paused', 'dropped'] as status}
+                    {@const isSelected = monitoringSettings.trackedStatuses?.includes(status) ?? false}
                     <button
                       type="button"
-                      class="pill mini"
-                      class:active={monitoringSettings.trackedStatuses.includes(status)}
+                      class="tracked-status-btn"
+                      class:selected={isSelected}
+                      aria-pressed={isSelected}
+                      disabled={savingTrackedStatuses}
                       onclick={() => toggleTrackedStatus(status)}
                     >
-                      {status.charAt(0).toUpperCase() + status.slice(1)}
+                      {#if isSelected}
+                        <Icon name="check" size={13} stroke={2.5} />
+                      {/if}
+                      <span>{status.charAt(0).toUpperCase() + status.slice(1)}</span>
                     </button>
                   {/each}
+                </div>
+                <div class="tracked-summary">
+                  <span>Monitoring: <strong>{monitoredSummaryText}</strong></span>
+                  {#if savingTrackedStatuses}
+                    <span class="saving-indicator">
+                      <span class="spin"><Icon name="spinner" size={13} stroke={2.5} /></span>
+                      Saving…
+                    </span>
+                  {/if}
                 </div>
               </div>
             </div>
@@ -6689,5 +6721,74 @@
     display: flex;
     align-items: center;
     gap: 0.5rem;
+  }
+
+  /* ---------- Monitored Tracking Lists (M11) ---------- */
+  .tracked-statuses-group {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: center;
+  }
+
+  .tracked-status-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    min-height: 32px;
+    padding: 4px 14px;
+    border-radius: 9999px;
+    border: 2px solid var(--shade, rgba(0, 0, 0, 0.2));
+    background: var(--surface, var(--paper));
+    color: var(--dim, inherit);
+    font-size: 13px;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.15s ease;
+    user-select: none;
+  }
+
+  .tracked-status-btn:hover:not(:disabled) {
+    border-color: var(--ink);
+    color: var(--ink);
+  }
+
+  .tracked-status-btn.selected,
+  .tracked-status-btn[aria-pressed='true'] {
+    border-color: var(--ink);
+    background: var(--ink);
+    color: var(--paper);
+    font-weight: 700;
+  }
+
+  .tracked-status-btn:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+
+  .tracked-status-btn:focus-visible {
+    outline: 2px solid var(--ink);
+    outline-offset: 2px;
+  }
+
+  .tracked-summary {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+    font-size: 13px;
+    color: var(--dim, #666);
+  }
+
+  .tracked-summary strong {
+    color: var(--ink);
+  }
+
+  .tracked-summary .saving-indicator {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    color: var(--dim, #666);
+    font-style: italic;
   }
 </style>
