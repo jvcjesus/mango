@@ -155,7 +155,7 @@ fn compute_library_stats(conn: &Connection) -> Result<DashboardLibraryStats> {
     })
 }
 
-fn compute_provider_health(conn: &Connection) -> Vec<DashboardProviderHealthItem> {
+pub fn compute_provider_health(conn: &Connection) -> Vec<DashboardProviderHealthItem> {
     let komga_enabled = crate::settings::get::<bool>(conn, "pipeline.komga_enabled").unwrap_or(false);
     let komga_url = crate::settings::get::<String>(conn, "pipeline.komga_url");
     let komga_status = if komga_enabled && komga_url.is_some() {
@@ -187,35 +187,85 @@ fn compute_provider_health(conn: &Connection) -> Vec<DashboardProviderHealthItem
         ("DISABLED", "MangaBaka disabled in Settings")
     };
 
-    let torbox_configured = crate::db::state(conn, "pipeline.torbox_api_key")
+    let torbox_enabled = crate::db::state(conn, "acquisition.torbox_enabled")
         .ok()
         .flatten()
-        .filter(|k| !k.is_empty())
-        .is_some();
-    let torbox_status = if torbox_configured {
-        ("CONFIGURED", "External BitTorrent acquisition and caching backend active")
+        .map(|v| v == "true" || v == "1" || v.parse::<bool>().unwrap_or(false))
+        .unwrap_or(false);
+    let torbox_has_token = crate::db::state(conn, "acquisition.torbox_token")
+        .ok()
+        .flatten()
+        .map(|k| !k.trim().is_empty())
+        .unwrap_or(false);
+    let torbox_validated = crate::db::state(conn, "acquisition.torbox_validated")
+        .ok()
+        .flatten()
+        .map(|v| v == "valid")
+        .unwrap_or(false);
+    let torbox_status_msg = crate::db::state(conn, "acquisition.torbox_status_message")
+        .ok()
+        .flatten()
+        .filter(|m| !m.trim().is_empty());
+
+    let (torbox_status_str, torbox_details_str) = if !torbox_enabled {
+        ("DISABLED", "TorBox external BitTorrent backend disabled in Settings".to_string())
+    } else if !torbox_has_token {
+        ("UNCONFIGURED", "TorBox API token not configured".to_string())
+    } else if torbox_validated {
+        (
+            "HEALTHY",
+            torbox_status_msg.unwrap_or_else(|| "External BitTorrent acquisition and caching backend active".to_string()),
+        )
+    } else if let Some(msg) = torbox_status_msg {
+        if msg.to_lowercase().contains("error") || msg.to_lowercase().contains("invalid") || msg.to_lowercase().contains("failed") {
+            ("ATTENTION_REQUIRED", msg)
+        } else {
+            ("CONFIGURED", msg)
+        }
     } else {
-        ("UNCONFIGURED", "TorBox API token not configured")
+        ("CONFIGURED", "TorBox enabled; API connection pending verification".to_string())
+    };
+
+    let madokami_enabled = crate::db::state(conn, "acquisition.madokami_enabled")
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<bool>().ok())
+        .unwrap_or(true);
+    let (mado_status, mado_details) = if !madokami_enabled {
+        ("DISABLED", "Madokami direct acquisition disabled in Settings")
+    } else {
+        ("AVAILABLE", "Direct HTTP with byte-range resume enabled")
+    };
+
+    let nyaa_enabled = crate::db::state(conn, "acquisition.nyaa_enabled")
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<bool>().ok())
+        .unwrap_or(true);
+    let (nyaa_status, nyaa_details) = if !nyaa_enabled {
+        ("DISABLED", "Nyaa release discovery indexer disabled in Settings")
+    } else {
+        ("AVAILABLE", "Torrent discovery indexer active")
     };
 
     vec![
         DashboardProviderHealthItem {
             name: "Madokami".to_string(),
             category: "acquisition".to_string(),
-            status: "AVAILABLE".to_string(),
-            details: "Direct HTTP with byte-range resume enabled".to_string(),
+            status: mado_status.to_string(),
+            details: mado_details.to_string(),
         },
         DashboardProviderHealthItem {
             name: "Nyaa".to_string(),
             category: "acquisition".to_string(),
-            status: "AVAILABLE".to_string(),
-            details: "Torrent discovery indexer active".to_string(),
+            status: nyaa_status.to_string(),
+            details: nyaa_details.to_string(),
         },
         DashboardProviderHealthItem {
             name: "TorBox".to_string(),
             category: "acquisition".to_string(),
-            status: torbox_status.0.to_string(),
-            details: torbox_status.1.to_string(),
+            status: torbox_status_str.to_string(),
+            details: torbox_details_str,
         },
         DashboardProviderHealthItem {
             name: "Komga".to_string(),

@@ -135,6 +135,14 @@ impl From<&MonitoringSettings> for UpdateMonitoringSettingsRequest {
 }
 
 /// Proposed acquisition in the Review Queue (Mode B)
+fn default_priority() -> i64 {
+    1
+}
+
+fn default_true() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ReviewQueueItem {
@@ -158,6 +166,14 @@ pub struct ReviewQueueItem {
     pub ranking_breakdown_json: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    #[serde(default = "default_priority")]
+    pub acquisition_priority: i64,
+    #[serde(default)]
+    pub earlier_missing_gaps: Option<String>,
+    #[serde(default)]
+    pub ordering_explanation: Option<String>,
+    #[serde(default = "default_true")]
+    pub is_safe_to_approve: bool,
 }
 
 /// Audit history entry for monitoring decisions and executions
@@ -329,15 +345,98 @@ pub fn update_monitoring_settings(
 }
 
 // ============================================================================
-// Review Queue CRUD
+// Review Queue CRUD & Acquisition Ordering Engine
 // ============================================================================
+
+/// Calculates the sequential acquisition priority and gaps for a volume proposal.
+pub fn calculate_acquisition_priority(
+    conn: &Connection,
+    series_title: &str,
+    target_volume: f64,
+) -> (i64, Option<String>, Option<String>, bool) {
+    let policy = crate::settings::get::<String>(conn, "acquisition.volume_ordering_policy")
+        .unwrap_or_else(|| "sequential_priority".to_string());
+
+    let mut missing_earlier = Vec::new();
+    let mut missing_earlier_with_candidates = Vec::new();
+
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT volume_number, top_candidate_id, state FROM release_availability_watchers
+         WHERE series_title = ?1 AND is_owned = 0 AND volume_number < ?2
+         ORDER BY volume_number ASC"
+    ) {
+        if let Ok(rows) = stmt.query_map(params![series_title, target_volume], |r| {
+            Ok((
+                r.get::<_, f64>(0)?,
+                r.get::<_, Option<String>>(1)?,
+                r.get::<_, String>(2)?,
+            ))
+        }) {
+            for (vol, cand_opt, state) in rows.flatten() {
+                // If earlier volume is already acquiring, downloading, or completed, skip it
+                let is_in_progress: bool = conn.query_row(
+                    "SELECT 1 FROM downloads d
+                     JOIN chapters c ON c.id = d.chapter_id
+                     JOIN manga m ON m.id = c.manga_id
+                     WHERE m.title = ?1 AND ABS(c.chapter_number - ?2) < 0.001
+                       AND d.state IN ('queued', 'downloading', 'processing', 'validating', 'completed')
+                     LIMIT 1",
+                    params![series_title, vol],
+                    |_| Ok(true)
+                ).unwrap_or(false);
+
+                if !is_in_progress {
+                    missing_earlier.push(vol);
+                    if cand_opt.is_some() || state == "NOTIFIED" || state == "ELIGIBLE_CANDIDATE_FOUND" {
+                        missing_earlier_with_candidates.push(vol);
+                    }
+                }
+            }
+        }
+    }
+
+    if missing_earlier.is_empty() {
+        (
+            1,
+            None,
+            Some("Lowest missing volume: prioritized first in sequential acquisition order.".to_string()),
+            true,
+        )
+    } else if !missing_earlier_with_candidates.is_empty() {
+        let gaps_json = serde_json::to_string(&missing_earlier).ok();
+        let gaps_str = missing_earlier
+            .iter()
+            .map(|v| format!("Vol. {v}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let priority = 1 + missing_earlier.len() as i64;
+        let is_safe = policy == "any_available";
+        let explanation = format!(
+            "Out-of-order proposal (earlier missing {gaps_str} available with active releases); sequential priority ranks earlier volumes first."
+        );
+        (priority, gaps_json, Some(explanation), is_safe)
+    } else {
+        let gaps_json = serde_json::to_string(&missing_earlier).ok();
+        let gaps_str = missing_earlier
+            .iter()
+            .map(|v| format!("Vol. {v}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let priority = 1 + missing_earlier.len() as i64;
+        let explanation = format!(
+            "Earlier missing volumes ({gaps_str}) currently have no candidate releases; volume permitted with release gap."
+        );
+        (priority, gaps_json, Some(explanation), true)
+    }
+}
 
 pub fn list_review_queue(conn: &Connection, status: Option<&str>) -> Result<Vec<ReviewQueueItem>> {
     let mut sql = "SELECT id, manga_id, series_id, series_title, volume_number,
                           recommended_candidate_id, provider, title, raw_title, quality_score,
                           confidence, confidence_reason, file_size_bytes, publication_destination,
                           status, status_reason, alternatives_json, ranking_breakdown_json,
-                          created_at, updated_at
+                          created_at, updated_at, acquisition_priority, earlier_missing_gaps,
+                          ordering_explanation, is_safe_to_approve
                    FROM acquisition_review_queue".to_string();
 
     if let Some(st) = status {
@@ -345,7 +444,7 @@ pub fn list_review_queue(conn: &Connection, status: Option<&str>) -> Result<Vec<
             sql.push_str(&format!(" WHERE status = '{}'", st.replace('\'', "''")));
         }
     }
-    sql.push_str(" ORDER BY updated_at DESC");
+    sql.push_str(" ORDER BY acquisition_priority ASC, quality_score DESC, volume_number ASC");
 
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], map_review_queue_row)?;
@@ -362,7 +461,8 @@ pub fn get_review_queue_item(conn: &Connection, id: i64) -> Result<Option<Review
                 recommended_candidate_id, provider, title, raw_title, quality_score,
                 confidence, confidence_reason, file_size_bytes, publication_destination,
                 status, status_reason, alternatives_json, ranking_breakdown_json,
-                created_at, updated_at
+                created_at, updated_at, acquisition_priority, earlier_missing_gaps,
+                ordering_explanation, is_safe_to_approve
          FROM acquisition_review_queue WHERE id = ?1",
         [id],
         map_review_queue_row,
@@ -389,13 +489,17 @@ pub fn add_or_update_review_queue_item(
     };
     let rb_json = cand.ranking_breakdown.as_ref().and_then(|rb| serde_json::to_string(rb).ok());
 
+    let (priority, gaps_json, ordering_expl, is_safe) =
+        calculate_acquisition_priority(conn, series_title, volume_number);
+
     conn.execute(
         "INSERT INTO acquisition_review_queue (
             manga_id, series_id, series_title, volume_number, recommended_candidate_id,
             provider, title, raw_title, quality_score, confidence, confidence_reason,
             file_size_bytes, publication_destination, status, status_reason,
-            alternatives_json, ranking_breakdown_json, created_at, updated_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'pending', NULL, ?14, ?15, ?16, ?16)
+            alternatives_json, ranking_breakdown_json, created_at, updated_at,
+            acquisition_priority, earlier_missing_gaps, ordering_explanation, is_safe_to_approve
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, 'pending', NULL, ?14, ?15, ?16, ?16, ?17, ?18, ?19, ?20)
         ON CONFLICT(series_id, volume_number) DO UPDATE SET
             manga_id = excluded.manga_id,
             recommended_candidate_id = excluded.recommended_candidate_id,
@@ -409,8 +513,12 @@ pub fn add_or_update_review_queue_item(
             publication_destination = excluded.publication_destination,
             alternatives_json = excluded.alternatives_json,
             ranking_breakdown_json = excluded.ranking_breakdown_json,
-            updated_at = excluded.updated_at
-        WHERE status != 'approved'",
+            updated_at = excluded.updated_at,
+            acquisition_priority = excluded.acquisition_priority,
+            earlier_missing_gaps = excluded.earlier_missing_gaps,
+            ordering_explanation = excluded.ordering_explanation,
+            is_safe_to_approve = excluded.is_safe_to_approve
+        WHERE status NOT IN ('approved', 'rejected', 'skipped')",
         params![
             manga_id,
             series_id,
@@ -428,6 +536,10 @@ pub fn add_or_update_review_queue_item(
             alt_json,
             rb_json,
             current_time,
+            priority,
+            gaps_json,
+            ordering_expl,
+            if is_safe { 1 } else { 0 },
         ],
     )?;
 
@@ -649,8 +761,11 @@ pub async fn sync_followed_series_to_watchers(db: &Db, _http: reqwest::Client) -
             };
 
             if is_eligible {
-                let series_id = format!("manga:{manga_id}");
-                results.push((manga_id, series_id, title));
+                let canonical_id = crate::sync::reconciliation::resolve_canonical_manga_id(conn, manga_id);
+                let series_id = format!("manga:{canonical_id}");
+                if !results.iter().any(|(mid, sid, _)| *mid == canonical_id || sid == &series_id) {
+                    results.push((canonical_id, series_id, title));
+                }
             }
         }
 
@@ -727,5 +842,9 @@ fn map_review_queue_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewQueueIt
         ranking_breakdown_json: r.get(17)?,
         created_at: r.get(18)?,
         updated_at: r.get(19)?,
+        acquisition_priority: r.get(20).unwrap_or(1),
+        earlier_missing_gaps: r.get(21).ok(),
+        ordering_explanation: r.get(22).ok(),
+        is_safe_to_approve: r.get::<_, i64>(23).map(|v| v != 0).unwrap_or(true),
     })
 }

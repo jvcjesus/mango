@@ -151,6 +151,7 @@ fn setup_test_db() -> Connection {
         CREATE TABLE release_availability_watchers (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             series_id TEXT NOT NULL,
+            canonical_series_id TEXT,
             manga_id INTEGER,
             series_title TEXT NOT NULL,
             volume_number REAL NOT NULL,

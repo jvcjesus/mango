@@ -812,6 +812,7 @@
 
   let operatingModeInput = $state<'simulation' | 'normal'>('simulation');
   let autoPublishManualInput = $state(false);
+  let volumeOrderingPolicyInput = $state<'sequential_priority' | 'any_available'>('sequential_priority');
 
   async function toggleOperatingMode(target: 'simulation' | 'normal') {
     if (target === 'normal' && operatingModeInput !== 'normal') {
@@ -1006,6 +1007,7 @@
         madokamiPasswordInput = acq.hasMadokamiCredentials ? '********' : '';
         operatingModeInput = (acq.operatingMode === 'normal' ? 'normal' : 'simulation');
         autoPublishManualInput = acq.autoPublishManualAcquisitions ?? false;
+        volumeOrderingPolicyInput = (acq.volumeOrderingPolicy === 'any_available' ? 'any_available' : 'sequential_priority');
       }
 
       loadProfiles();
@@ -1622,6 +1624,7 @@
         madokamiPassword: madokamiPasswordInput === 'CLEAR' ? '' : (madokamiPasswordInput && madokamiPasswordInput !== '********' ? madokamiPasswordInput.trim() : undefined),
         operatingMode: operatingModeInput,
         autoPublishManualAcquisitions: autoPublishManualInput,
+        volumeOrderingPolicy: volumeOrderingPolicyInput,
       };
       await Promise.all([
         send('PUT', '/pipeline/config', patch),
@@ -2952,6 +2955,28 @@
 
             <div class="set">
               <div class="what">
+                <strong>Missing Volume Acquisition Order</strong>
+                <span>
+                  <strong>Lowest Missing First (Sequential):</strong> Prioritize missing volumes in sequential ascending order (e.g. Volume 5 before Volume 6 or 9). Out-of-order candidates require manual operator review.<br />
+                  <strong>Any Available:</strong> Allow acquiring any available missing volume immediately regardless of earlier gaps.
+                </span>
+              </div>
+              <div class="how">
+                <div class="seg" role="group" aria-label="Volume Acquisition Ordering Policy">
+                  <button
+                    aria-pressed={volumeOrderingPolicyInput === 'sequential_priority'}
+                    onclick={() => { volumeOrderingPolicyInput = 'sequential_priority'; }}
+                  >Sequential (Lowest First)</button>
+                  <button
+                    aria-pressed={volumeOrderingPolicyInput === 'any_available'}
+                    onclick={() => { volumeOrderingPolicyInput = 'any_available'; }}
+                  >Any Available</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="set">
+              <div class="what">
                 <strong>Automatic Safe Publication</strong>
                 <span>
                   When enabled, validated exact-volume manual acquisitions automatically publish into Komga library folders. When disabled, acquisitions remain safely staged until separate publication approval.
@@ -3698,28 +3723,36 @@
 
               <div class="integrity-metrics-grid">
                 <div class="metric-box">
-                  <span class="metric-val">{integrityReport.issues.filter(i => i.category === 'orphan_tracker_mapping').length}</span>
-                  <span class="metric-label">Orphan Tracker Mappings</span>
+                  <span class="metric-val">{integrityReport.issues.filter(i => i.category === 'identity' || i.code?.includes('MANGABAKA')).length}</span>
+                  <span class="metric-label">Identity & Conflicts</span>
                 </div>
                 <div class="metric-box">
-                  <span class="metric-val">{integrityReport.issues.filter(i => i.category === 'mangabaka_conflict').length}</span>
-                  <span class="metric-label">MangaBaka Conflicts</span>
+                  <span class="metric-val">{integrityReport.issues.filter(i => i.category === 'ownership' || i.code?.includes('KOMGA')).length}</span>
+                  <span class="metric-label">Komga Ownership</span>
                 </div>
                 <div class="metric-box">
-                  <span class="metric-val">{integrityReport.issues.filter(i => i.category === 'komga_ownership_anomaly').length}</span>
-                  <span class="metric-label">Komga Ownership Anomalies</span>
+                  <span class="metric-val">{integrityReport.issues.filter(i => i.category === 'storage' || i.code?.includes('DUPLICATE_VOLUME')).length}</span>
+                  <span class="metric-label">Volume Storage</span>
                 </div>
                 <div class="metric-box">
-                  <span class="metric-val">{integrityReport.issues.filter(i => i.category === 'duplicate_volume_record').length}</span>
-                  <span class="metric-label">Duplicate Volume Records</span>
+                  <span class="metric-val">{integrityReport.issues.filter(i => i.category === 'watchers' || i.code?.includes('WATCHER')).length}</span>
+                  <span class="metric-label">Watchers Deduplication</span>
                 </div>
                 <div class="metric-box">
-                  <span class="metric-val">{integrityReport.issues.filter(i => i.category === 'stuck_outbox_notification').length}</span>
-                  <span class="metric-label">Stuck Outbox Items</span>
+                  <span class="metric-val">{integrityReport.issues.filter(i => i.category === 'proposals' || i.code?.includes('PROPOSAL')).length}</span>
+                  <span class="metric-label">Review Proposals</span>
                 </div>
                 <div class="metric-box">
-                  <span class="metric-val">{integrityReport.issues.filter(i => i.category === 'impossible_auto_acquire_state').length}</span>
-                  <span class="metric-label">Auto-Acquire State Issues</span>
+                  <span class="metric-val">{integrityReport.issues.filter(i => i.category === 'trackers' || i.code?.includes('TRACKER')).length}</span>
+                  <span class="metric-label">Tracker Mappings</span>
+                </div>
+                <div class="metric-box">
+                  <span class="metric-val">{integrityReport.issues.filter(i => i.category === 'notifications' || i.code?.includes('OUTBOX')).length}</span>
+                  <span class="metric-label">Notification Outbox</span>
+                </div>
+                <div class="metric-box">
+                  <span class="metric-val">{integrityReport.issues.filter(i => i.category === 'policy' || i.code?.includes('AUTO_ACQUIRE')).length}</span>
+                  <span class="metric-label">Auto-Acquire Policy</span>
                 </div>
               </div>
 

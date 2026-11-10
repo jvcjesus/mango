@@ -53,6 +53,8 @@ pub mod m10_tests;
 #[cfg(test)]
 pub mod m11_tests;
 #[cfg(test)]
+pub mod m11_1_tests;
+#[cfg(test)]
 pub mod watcher_tests;
 
 use crate::error::Result;
@@ -363,6 +365,8 @@ pub struct AcquisitionConfig {
     pub madokami_url: Option<String>,
     #[serde(default)]
     pub has_madokami_credentials: bool,
+    #[serde(default = "service::default_volume_ordering_policy")]
+    pub volume_ordering_policy: String,
 }
 
 impl Default for AcquisitionConfig {
@@ -383,6 +387,7 @@ impl Default for AcquisitionConfig {
             madokami_enabled: true,
             madokami_url: Some(madokami::DEFAULT_MADOKAMI_URL.to_string()),
             has_madokami_credentials: false,
+            volume_ordering_policy: "sequential_priority".to_string(),
         }
     }
 }

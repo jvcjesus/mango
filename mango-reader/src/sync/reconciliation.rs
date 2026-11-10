@@ -300,7 +300,90 @@ pub fn find_authoritative_tracker_info(
     })
 }
 
-/// Gathers local physically owned volume numbers from downloads and chapters tables.
+/// Resolves an internal manga ID to its canonical library identity.
+/// If the manga is a source/catalog mirror pointing to a library entry, returns the library entry ID.
+/// If an unlinked entry shares exact MangaBaka ID and title with an existing library entry, returns the library entry ID.
+pub fn resolve_canonical_manga_id(conn: &Connection, manga_id: i64) -> i64 {
+    // 1. Direct library entry check
+    if let Ok(Some((in_lib, cat_id))) = conn
+        .query_row(
+            "SELECT in_library, catalog_manga_id FROM manga WHERE id = ?1",
+            [manga_id],
+            |r| Ok((r.get::<_, i64>(0)? == 1, r.get::<_, Option<i64>>(1)?)),
+        )
+        .optional()
+    {
+        if in_lib {
+            return manga_id;
+        }
+        if let Some(target) = cat_id {
+            if let Ok(Some(target_in_lib)) = conn
+                .query_row("SELECT in_library FROM manga WHERE id = ?1", [target], |r| {
+                    Ok(r.get::<_, i64>(0)? == 1)
+                })
+                .optional()
+            {
+                if target_in_lib {
+                    return target;
+                }
+            }
+        }
+    }
+
+    // 2. Check source_manga_id
+    if let Ok(Some(source_id)) = conn
+        .query_row(
+            "SELECT source_manga_id FROM manga WHERE id = ?1 AND source_manga_id IS NOT NULL",
+            [manga_id],
+            |r| r.get::<_, i64>(0),
+        )
+        .optional()
+    {
+        if let Ok(Some(in_lib)) = conn
+            .query_row("SELECT in_library FROM manga WHERE id = ?1", [manga_id], |r| {
+                Ok(r.get::<_, i64>(0)? == 1)
+            })
+            .optional()
+        {
+            if in_lib {
+                return manga_id;
+            }
+        }
+        return source_id;
+    }
+
+    // 3. Fallback: match by authoritative MangaBaka ID + exact normalized title with an in-library entry
+    if let Ok(Some((mb_id_opt, title))) = conn
+        .query_row(
+            "SELECT mangabaka_id, title FROM manga WHERE id = ?1",
+            [manga_id],
+            |r| Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, String>(1)?)),
+        )
+        .optional()
+    {
+        if let Some(mb_id) = mb_id_opt {
+            let norm_title = crate::pipeline::mangabaka::normalize_title(&title);
+            if let Ok(mut stmt) = conn.prepare(
+                "SELECT id, title FROM manga WHERE mangabaka_id = ?1 AND in_library = 1",
+            ) {
+                if let Ok(rows) = stmt.query_map([mb_id], |r| {
+                    Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+                }) {
+                    for r in rows.flatten() {
+                        let (lib_id, lib_title) = r;
+                        if crate::pipeline::mangabaka::normalize_title(&lib_title) == norm_title {
+                            return lib_id;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    manga_id
+}
+
+/// Gathers local physically owned volume numbers from downloads and chapters tables across all canonical mirror records.
 pub fn gather_local_owned_volumes(conn: &Connection, manga_id: Option<i64>) -> Result<Vec<f64>> {
     // Cross-title ownership protection: if manga_id is None, never query downloads or chapters
     // without an explicit manga identifier.
@@ -308,52 +391,72 @@ pub fn gather_local_owned_volumes(conn: &Connection, manga_id: Option<i64>) -> R
         return Ok(Vec::new());
     };
 
-    let mut owned = Vec::new();
-
-    // Canonical media published locally in downloads table
-    let sql = "SELECT d.published_path, c.name, d.raw_title
-               FROM downloads d
-               JOIN chapters c ON c.id = d.chapter_id
-               WHERE c.manga_id = ?1
-                 AND (d.published_path IS NOT NULL OR d.state = 'completed')";
-
-    if let Ok(mut stmt) = conn.prepare(sql) {
-        if let Ok(rows) = stmt.query_map([m_id], |r| {
-            Ok((
-                r.get::<_, Option<String>>(0)?,
-                r.get::<_, String>(1)?,
-                r.get::<_, Option<String>>(2)?,
-            ))
-        }) {
-            for (pub_path, c_name, raw_title) in rows.flatten() {
-                let vol_opt = pub_path
-                    .as_deref()
-                    .and_then(crate::release::parse_volume)
-                    .or_else(|| crate::release::parse_volume(&c_name))
-                    .or_else(|| raw_title.as_deref().and_then(crate::release::parse_volume));
-
-                if let Some(v) = vol_opt {
-                    if !owned.iter().any(|&ov: &f64| (ov - v).abs() < 0.001) {
-                        owned.push(v);
-                    }
+    let canonical_id = resolve_canonical_manga_id(conn, m_id);
+    let mut candidate_ids = vec![m_id];
+    if canonical_id != m_id {
+        candidate_ids.push(canonical_id);
+    }
+    // Also include any mirror manga referencing canonical_id
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT id FROM manga WHERE catalog_manga_id = ?1 OR source_manga_id = ?1"
+    ) {
+        if let Ok(rows) = stmt.query_map([canonical_id], |r| r.get::<_, i64>(0)) {
+            for id in rows.flatten() {
+                if !candidate_ids.contains(&id) {
+                    candidate_ids.push(id);
                 }
             }
         }
     }
 
-    // Existing chapter downloads
-    if let Ok(mut stmt) = conn.prepare(
-        "SELECT name, download_path FROM chapters WHERE manga_id = ?1 AND download_path IS NOT NULL",
-    ) {
-        if let Ok(rows) = stmt.query_map([m_id], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
-        }) {
-            for (name, dl_path) in rows.flatten() {
-                let vol_opt = crate::release::parse_volume(&name)
-                    .or_else(|| dl_path.as_deref().and_then(crate::release::parse_volume));
-                if let Some(v) = vol_opt {
-                    if !owned.iter().any(|&ov: &f64| (ov - v).abs() < 0.001) {
-                        owned.push(v);
+    let mut owned = Vec::new();
+
+    for check_id in candidate_ids {
+        // Canonical media published locally in downloads table
+        let sql = "SELECT d.published_path, c.name, d.raw_title
+                   FROM downloads d
+                   JOIN chapters c ON c.id = d.chapter_id
+                   WHERE c.manga_id = ?1
+                     AND (d.published_path IS NOT NULL OR d.state = 'completed')";
+
+        if let Ok(mut stmt) = conn.prepare(sql) {
+            if let Ok(rows) = stmt.query_map([check_id], |r| {
+                Ok((
+                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            }) {
+                for (pub_path, c_name, raw_title) in rows.flatten() {
+                    let vol_opt = pub_path
+                        .as_deref()
+                        .and_then(crate::release::parse_volume)
+                        .or_else(|| crate::release::parse_volume(&c_name))
+                        .or_else(|| raw_title.as_deref().and_then(crate::release::parse_volume));
+
+                    if let Some(v) = vol_opt {
+                        if !owned.iter().any(|&ov: &f64| (ov - v).abs() < 0.001) {
+                            owned.push(v);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Existing chapter downloads
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT name, download_path FROM chapters WHERE manga_id = ?1 AND download_path IS NOT NULL",
+        ) {
+            if let Ok(rows) = stmt.query_map([check_id], |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+            }) {
+                for (name, dl_path) in rows.flatten() {
+                    let vol_opt = crate::release::parse_volume(&name)
+                        .or_else(|| dl_path.as_deref().and_then(crate::release::parse_volume));
+                    if let Some(v) = vol_opt {
+                        if !owned.iter().any(|&ov: &f64| (ov - v).abs() < 0.001) {
+                            owned.push(v);
+                        }
                     }
                 }
             }
@@ -377,7 +480,13 @@ pub async fn reconcile_series(
         .map(crate::acquisition::edition::normalize_edition)
         .unwrap_or_else(|| "standard".to_string());
 
-    let series_id = if let Some(m_id) = target.manga_id {
+    let canonical_m_id = if let Some(m_id) = target.manga_id {
+        Some(db.call(move |conn| Ok(resolve_canonical_manga_id(conn, m_id))).await?)
+    } else {
+        None
+    };
+
+    let series_id = if let Some(m_id) = canonical_m_id {
         format!("manga:{m_id}")
     } else if let Some(ref k_id) = target.komga_series_id {
         format!("komga:{k_id}")
@@ -393,7 +502,7 @@ pub async fn reconcile_series(
     let current_time = now();
 
     // 1. Ownership: strictly gather canonical and Komga ownership
-    let m_id_opt = target.manga_id;
+    let m_id_opt = canonical_m_id.or(target.manga_id);
     let mut owned_volumes = db
         .call(move |conn| gather_local_owned_volumes(conn, m_id_opt))
         .await?;
@@ -1324,7 +1433,7 @@ pub fn save_reconciliation(conn: &Connection, s: &ReconciliationSummary) -> Resu
     // Synchronize durable availability watchers for missing and upcoming volumes
     let resolved_manga_id = s.manga_id.or_else(|| {
         s.series_id.strip_prefix("manga:").and_then(|id| id.parse().ok())
-    });
+    }).map(|id| resolve_canonical_manga_id(conn, id));
 
     if let Some(m_id) = resolved_manga_id {
         if let Err(e) = crate::acquisition::watcher::sync_watchers_for_series(

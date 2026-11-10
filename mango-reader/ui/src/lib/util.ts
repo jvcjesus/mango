@@ -27,9 +27,9 @@ export function formatNextCheck(seconds?: number | null): string {
   if (seconds <= now) return 'Due now';
   const diffSec = Math.round(seconds - now);
   if (diffSec < 60) return 'in <1m';
-  if (diffSec < 3600) return `in ${Math.floor(diffSec / 60)}m`;
-  if (diffSec < 86400) return `in ${Math.floor(diffSec / 3600)}h`;
-  return `in ${Math.floor(diffSec / 86400)}d`;
+  if (diffSec < 3600) return `in ${Math.round(diffSec / 60)}m`;
+  if (diffSec < 86400) return `in ${Math.round(diffSec / 3600)}h`;
+  return `in ${Math.round(diffSec / 86400)}d`;
 }
 
 /** A heading for a day: Today, Yesterday, or the date. From a time in seconds. */

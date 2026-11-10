@@ -1181,13 +1181,29 @@
                     <span class="series-title"><strong>{item.seriesTitle}</strong></span>
                     <span class="vol-num font-mono">Vol. {item.volumeNumber}</span>
                     <span class="status-pill status-{item.status}">{item.status.toUpperCase()}</span>
+                    {#if item.acquisitionPriority !== undefined}
+                      <span class="priority-pill" class:priority-one={item.acquisitionPriority === 1}>
+                        Priority #{item.acquisitionPriority}
+                      </span>
+                    {/if}
                     {#if item.confidence}
                       <span class="conf-pill conf-{item.confidence.toLowerCase()}">{item.confidence.toUpperCase()} CONFIDENCE</span>
+                    {/if}
+                    {#if item.isSafeToApprove === false}
+                      <span class="gap-alert-pill" title={item.orderingExplanation || 'Earlier missing volumes detected'}>
+                        <Icon name="alert" size={12} /> Out of Order
+                      </span>
                     {/if}
                   </div>
                   <div class="review-candidate-title font-mono font-small">
                     {item.rawTitle || item.title}
                   </div>
+                  {#if item.orderingExplanation}
+                    <div class="ordering-explanation font-small" class:out-of-order={item.isSafeToApprove === false}>
+                      <Icon name={item.isSafeToApprove ? 'check' : 'alert'} size={12} />
+                      {item.orderingExplanation}
+                    </div>
+                  {/if}
                   <div class="review-meta-row font-small muted">
                     <span class="provider-pill">{item.provider}</span>
                     <span>Quality Score: <strong>{Math.round(item.qualityScore)}/100</strong></span>
@@ -2119,6 +2135,52 @@
   .conf-pill.conf-low {
     background: var(--status-error-bg);
     color: var(--status-error);
+  }
+
+  .priority-pill {
+    font-size: 0.65rem;
+    font-weight: 700;
+    padding: 0.15rem 0.4rem;
+    border-radius: 4px;
+    background: var(--shade);
+    color: var(--ink);
+    border: 1px solid var(--line);
+  }
+
+  .priority-pill.priority-one {
+    background: #e0f2fe;
+    color: #0369a1;
+    border-color: #7dd3fc;
+  }
+
+  .gap-alert-pill {
+    font-size: 0.65rem;
+    font-weight: 700;
+    padding: 0.15rem 0.4rem;
+    border-radius: 4px;
+    background: var(--status-warn-bg);
+    color: var(--status-warn);
+    border: 1px solid var(--status-warn);
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+  }
+
+  .ordering-explanation {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+    padding: 0.2rem 0.5rem;
+    border-radius: 4px;
+    background: var(--shade);
+    color: var(--ink);
+    margin-top: 0.25rem;
+  }
+
+  .ordering-explanation.out-of-order {
+    background: var(--status-warn-bg);
+    color: var(--status-warn);
+    border: 1px solid rgba(217, 119, 6, 0.2);
   }
 
   .review-candidate-title {

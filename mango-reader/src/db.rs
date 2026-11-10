@@ -58,6 +58,7 @@ const MIGRATIONS: &[&str] = &[
     include_str!("../migrations/045_publication_verification.sql"),
     include_str!("../migrations/046_intelligent_release_discovery.sql"),
     include_str!("../migrations/047_monitoring_and_automation.sql"),
+    include_str!("../migrations/048_canonical_identity_and_watcher_deduplication.sql"),
 ];
 
 /// Now, in epoch seconds: the unit of every time the database stores.

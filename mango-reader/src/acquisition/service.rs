@@ -232,6 +232,10 @@ pub fn default_simulation_mode() -> String {
     "simulation".to_string()
 }
 
+pub fn default_volume_ordering_policy() -> String {
+    "sequential_priority".to_string()
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AcquisitionConfigPatch {
@@ -252,6 +256,7 @@ pub struct AcquisitionConfigPatch {
     pub madokami_url: Option<String>,
     pub madokami_username: Option<String>,
     pub madokami_password: Option<String>,
+    pub volume_ordering_policy: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -345,6 +350,9 @@ impl AcquisitionService {
                     .or_else(|| std::env::var("MADOKAMI_PASSWORD").ok());
                 let has_madokami_credentials = mado_user.is_some() && mado_pass.is_some();
 
+                let volume_ordering_policy = crate::settings::get::<String>(conn, "acquisition.volume_ordering_policy")
+                    .unwrap_or_else(|| "sequential_priority".to_string());
+
                 Ok((
                     AcquisitionConfig {
                         nyaa_enabled,
@@ -362,6 +370,7 @@ impl AcquisitionService {
                         madokami_enabled,
                         madokami_url,
                         has_madokami_credentials,
+                        volume_ordering_policy,
                     },
                     has_token,
                 ))
@@ -512,6 +521,12 @@ impl AcquisitionService {
                         crate::db::forget_state(conn, "acquisition.madokami_password")?;
                     } else {
                         crate::db::set_state(conn, "acquisition.madokami_password", trimmed)?;
+                    }
+                }
+                if let Some(ref pol) = patch.volume_ordering_policy {
+                    let trimmed = pol.trim().to_lowercase();
+                    if trimmed == "sequential_priority" || trimmed == "any_available" {
+                        crate::settings::set(conn, "acquisition.volume_ordering_policy", &serde_json::json!(trimmed))?;
                     }
                 }
                 Ok(())

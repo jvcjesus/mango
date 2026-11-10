@@ -221,13 +221,22 @@ pub fn sync_watchers_for_series(
         )
         .unwrap_or((true, true));
 
+    let canonical_manga_id = crate::sync::reconciliation::resolve_canonical_manga_id(conn, manga_id);
+    let canonical_series_id = format!("manga:{canonical_manga_id}");
+    let target_series_id = if series_id.starts_with("manga:") {
+        canonical_series_id.as_str()
+    } else {
+        series_id
+    };
+
     // 1. Process owned volumes: ensure any existing watcher is marked OWNERSHIP_DETECTED
     for &vol in owned_volumes {
         let _ = conn.execute(
             "UPDATE release_availability_watchers
              SET is_owned = 1, state = 'OWNERSHIP_DETECTED', next_check_at = 0, updated_at = ?1
-             WHERE series_id = ?2 AND ABS(volume_number - ?3) < 0.001 AND state != 'OWNERSHIP_DETECTED'",
-            params![current_time, series_id, vol],
+             WHERE (series_id = ?2 OR canonical_series_id = ?3 OR series_title = ?4)
+               AND ABS(volume_number - ?5) < 0.001 AND state != 'OWNERSHIP_DETECTED'",
+            params![current_time, series_id, canonical_series_id, series_title, vol],
         );
     }
 
@@ -258,12 +267,58 @@ pub fn sync_watchers_for_series(
         let interval = calculate_watcher_interval_secs(rdate.as_deref(), 0, &today_str);
         let next_check = current_time + pseudo_stagger(60, 300); // initial check staggered
 
+        // Check if a watcher already exists for this canonical volume to prevent duplicate records
+        let existing_id: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM release_availability_watchers
+                 WHERE (canonical_series_id = ?1 OR series_id = ?2 OR series_title = ?3)
+                   AND ABS(volume_number - ?4) < 0.001
+                 LIMIT 1",
+                params![canonical_series_id, target_series_id, series_title, vol],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap_or(None);
+
+        if let Some(eid) = existing_id {
+            conn.execute(
+                "UPDATE release_availability_watchers
+                 SET canonical_series_id = ?1,
+                     series_id = ?2,
+                     manga_id = ?3,
+                     series_title = ?4,
+                     mangabaka_id = COALESCE(?5, mangabaka_id),
+                     collection_id = COALESCE(?6, collection_id),
+                     release_date = COALESCE(?7, release_date),
+                     is_released = 1,
+                     monitoring_enabled = ?8,
+                     notify_on_available = ?9,
+                     updated_at = ?10
+                 WHERE id = ?11 AND state NOT IN ('OWNERSHIP_DETECTED', 'ACQUIRED', 'NOTIFIED')",
+                params![
+                    canonical_series_id,
+                    target_series_id,
+                    canonical_manga_id,
+                    series_title,
+                    mangabaka_id,
+                    collection_id,
+                    rdate,
+                    if monitoring_enabled { 1 } else { 0 },
+                    if notify_enabled { 1 } else { 0 },
+                    current_time,
+                    eid,
+                ],
+            )?;
+            continue;
+        }
+
         conn.execute(
             "INSERT INTO release_availability_watchers (
                 series_id, manga_id, series_title, volume_number, mangabaka_id, collection_id,
                 market, edition, release_date, is_released, is_owned, monitoring_enabled,
-                notify_on_available, state, next_check_at, check_interval_secs, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'en', 'standard', ?7, 1, 0, ?8, ?9, ?10, ?11, ?12, ?13, ?13)
+                notify_on_available, state, next_check_at, check_interval_secs, created_at, updated_at,
+                canonical_series_id
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'en', 'standard', ?7, 1, 0, ?8, ?9, ?10, ?11, ?12, ?13, ?13, ?14)
             ON CONFLICT(series_id, volume_number, market, edition) DO UPDATE SET
                 manga_id = excluded.manga_id,
                 series_title = excluded.series_title,
@@ -273,11 +328,12 @@ pub fn sync_watchers_for_series(
                 is_released = 1,
                 monitoring_enabled = excluded.monitoring_enabled,
                 notify_on_available = excluded.notify_on_available,
+                canonical_series_id = excluded.canonical_series_id,
                 updated_at = excluded.updated_at
             WHERE state NOT IN ('OWNERSHIP_DETECTED', 'ACQUIRED', 'NOTIFIED')",
             params![
-                series_id,
-                manga_id,
+                target_series_id,
+                canonical_manga_id,
                 series_title,
                 vol,
                 mangabaka_id,
@@ -289,6 +345,7 @@ pub fn sync_watchers_for_series(
                 next_check,
                 interval,
                 current_time,
+                canonical_series_id,
             ],
         )?;
     }
@@ -313,23 +370,69 @@ pub fn sync_watchers_for_series(
         let interval = calculate_watcher_interval_secs(rdate.as_deref(), 0, &today_str);
         let next_check = current_time + interval;
 
+        // Check if a watcher already exists for this canonical volume to prevent duplicate records
+        let existing_id: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM release_availability_watchers
+                 WHERE (canonical_series_id = ?1 OR series_id = ?2 OR series_title = ?3)
+                   AND ABS(volume_number - ?4) < 0.001
+                 LIMIT 1",
+                params![canonical_series_id, target_series_id, series_title, vol],
+                |r| r.get(0),
+            )
+            .optional()
+            .unwrap_or(None);
+
+        if let Some(eid) = existing_id {
+            conn.execute(
+                "UPDATE release_availability_watchers
+                 SET canonical_series_id = ?1,
+                     series_id = ?2,
+                     manga_id = ?3,
+                     series_title = ?4,
+                     mangabaka_id = COALESCE(?5, mangabaka_id),
+                     collection_id = COALESCE(?6, collection_id),
+                     release_date = COALESCE(?7, release_date),
+                     monitoring_enabled = ?8,
+                     notify_on_available = ?9,
+                     updated_at = ?10
+                 WHERE id = ?11 AND state NOT IN ('OWNERSHIP_DETECTED', 'ACQUIRED', 'NOTIFIED')",
+                params![
+                    canonical_series_id,
+                    target_series_id,
+                    canonical_manga_id,
+                    series_title,
+                    mangabaka_id,
+                    collection_id,
+                    rdate,
+                    if monitoring_enabled { 1 } else { 0 },
+                    if notify_enabled { 1 } else { 0 },
+                    current_time,
+                    eid,
+                ],
+            )?;
+            continue;
+        }
+
         conn.execute(
             "INSERT INTO release_availability_watchers (
                 series_id, manga_id, series_title, volume_number, mangabaka_id, collection_id,
                 market, edition, release_date, is_released, is_owned, monitoring_enabled,
-                notify_on_available, state, next_check_at, check_interval_secs, created_at, updated_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'en', 'standard', ?7, 0, 0, ?8, ?9, 'UPCOMING', ?10, ?11, ?12, ?12)
+                notify_on_available, state, next_check_at, check_interval_secs, created_at, updated_at,
+                canonical_series_id
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'en', 'standard', ?7, 0, 0, ?8, ?9, 'UPCOMING', ?10, ?11, ?12, ?12, ?13)
             ON CONFLICT(series_id, volume_number, market, edition) DO UPDATE SET
                 manga_id = excluded.manga_id,
                 series_title = excluded.series_title,
                 mangabaka_id = excluded.mangabaka_id,
                 collection_id = excluded.collection_id,
                 release_date = COALESCE(excluded.release_date, release_availability_watchers.release_date),
+                canonical_series_id = excluded.canonical_series_id,
                 updated_at = excluded.updated_at
             WHERE state NOT IN ('OWNERSHIP_DETECTED', 'ACQUIRED', 'NOTIFIED')",
             params![
-                series_id,
-                manga_id,
+                target_series_id,
+                canonical_manga_id,
                 series_title,
                 vol,
                 mangabaka_id,
@@ -340,6 +443,7 @@ pub fn sync_watchers_for_series(
                 next_check,
                 interval,
                 current_time,
+                canonical_series_id,
             ],
         )?;
     }
@@ -1093,8 +1197,13 @@ pub async fn evaluate_watcher_check(
                     && crate::acquisition::matching::detect_foreign_language(&elig.raw_title, "en")
                         .is_none();
 
+                let s_title_for_pri = s_title.clone();
+                let (_, _, _, is_safe_order) = db.call(move |conn| {
+                    Ok(crate::acquisition::monitoring::calculate_acquisition_priority(conn, &s_title_for_pri, vol))
+                }).await?;
+
                 let auto_allowed =
-                    global_auto && title_auto && is_high_confidence && is_english;
+                    global_auto && title_auto && is_high_confidence && is_english && is_safe_order;
 
                 if auto_allowed {
                     if is_sim {
@@ -1191,7 +1300,9 @@ pub async fn evaluate_watcher_check(
                         }
                     }
                 } else {
-                    let decision_code = if !global_auto {
+                    let decision_code = if !is_safe_order {
+                        "SEQUENTIAL_ORDERING_REQUIRED"
+                    } else if !global_auto {
                         "GLOBAL_AUTO_DISABLED"
                     } else if !title_auto {
                         "TITLE_AUTO_DISABLED"
@@ -1258,7 +1369,7 @@ pub async fn run_watcher_tick(
                    AND is_owned = 0
                    AND state NOT IN ('OWNERSHIP_DETECTED', 'ACQUIRED', 'MONITORING_DISABLED')
                    AND next_check_at <= ?1
-                 ORDER BY next_check_at ASC
+                 ORDER BY volume_number ASC, next_check_at ASC
                  LIMIT 10",
             )?;
             let rows = stmt.query_map([current_time], |r| r.get::<_, i64>(0))?;

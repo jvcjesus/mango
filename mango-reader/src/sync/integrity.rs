@@ -131,6 +131,14 @@ pub fn audit_library_integrity(
 
     for r in rows.flatten() {
         let (id1, title1, id2, title2, mb_id) = r;
+        if crate::sync::reconciliation::resolve_canonical_manga_id(conn, id1)
+            == crate::sync::reconciliation::resolve_canonical_manga_id(conn, id2)
+        {
+            continue;
+        }
+        if title1.trim().eq_ignore_ascii_case(title2.trim()) {
+            continue;
+        }
         issues.push(IntegrityIssue {
             id: format!("mb-conflict-{id1}-{id2}"),
             category: "identity".to_string(),
@@ -450,6 +458,107 @@ pub fn audit_library_integrity(
             storage_type: None,
             affected_paths: Vec::new(),
         });
+    }
+
+    // ---------------------------------------------------------
+    // Audit Check 7: Duplicate Availability Watchers
+    // ---------------------------------------------------------
+    let has_watchers_tbl: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='release_availability_watchers'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+
+    if has_watchers_tbl {
+        let mut dup_watchers_stmt = conn
+            .prepare(
+                "SELECT series_title, volume_number, COUNT(*) as cnt, GROUP_CONCAT(id) as ids
+                 FROM release_availability_watchers
+                 GROUP BY series_title, volume_number
+                 HAVING cnt > 1",
+            )
+            .map_err(|e| AppError::internal(format!("Prepare dup watchers error: {e}")))?;
+
+        let rows = dup_watchers_stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, f64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(|e| AppError::internal(format!("Query dup watchers error: {e}")))?;
+
+        for r in rows.flatten() {
+            let (series_title, vol_num, cnt, ids) = r;
+            issues.push(IntegrityIssue {
+                id: format!("dup-watcher-{series_title}-{vol_num}"),
+                category: "watchers".to_string(),
+                severity: IntegritySeverity::Warning,
+                code: "DUPLICATE_AVAILABILITY_WATCHERS".to_string(),
+                message: format!("Series '{series_title}' volume {vol_num} has {cnt} duplicate availability watchers"),
+                details: Some(format!("Watcher IDs: {ids}")),
+                manga_id: None,
+                series_title: Some(series_title),
+                resolution_hint: Some("Deduplicate watchers using Migration 048 or remove redundant watcher rows".to_string()),
+                storage_type: None,
+                affected_paths: Vec::new(),
+            });
+        }
+    }
+
+    // ---------------------------------------------------------
+    // Audit Check 8: Duplicate Review Proposals
+    // ---------------------------------------------------------
+    let has_review_tbl: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='acquisition_review_queue'",
+            [],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+
+    if has_review_tbl {
+        let mut dup_proposals_stmt = conn
+            .prepare(
+                "SELECT series_title, volume_number, COUNT(*) as cnt, GROUP_CONCAT(id) as ids
+                 FROM acquisition_review_queue
+                 WHERE status = 'pending'
+                 GROUP BY series_title, volume_number
+                 HAVING cnt > 1",
+            )
+            .map_err(|e| AppError::internal(format!("Prepare dup proposals error: {e}")))?;
+
+        let rows = dup_proposals_stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, f64>(1)?,
+                    r.get::<_, i64>(2)?,
+                    r.get::<_, String>(3)?,
+                ))
+            })
+            .map_err(|e| AppError::internal(format!("Query dup proposals error: {e}")))?;
+
+        for r in rows.flatten() {
+            let (series_title, vol_num, cnt, ids) = r;
+            issues.push(IntegrityIssue {
+                id: format!("dup-proposal-{series_title}-{vol_num}"),
+                category: "proposals".to_string(),
+                severity: IntegritySeverity::Warning,
+                code: "DUPLICATE_REVIEW_PROPOSALS".to_string(),
+                message: format!("Series '{series_title}' volume {vol_num} has {cnt} active pending review proposals"),
+                details: Some(format!("Proposal IDs: {ids}")),
+                manga_id: None,
+                series_title: Some(series_title),
+                resolution_hint: Some("Keep highest ranked proposal and reject or dismiss duplicate proposals".to_string()),
+                storage_type: None,
+                affected_paths: Vec::new(),
+            });
+        }
     }
 
     // ---------------------------------------------------------

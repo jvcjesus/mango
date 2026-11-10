@@ -904,6 +904,7 @@ export interface AcquisitionConfig {
   madokamiEnabled?: boolean;
   madokamiUrl?: string | null;
   hasMadokamiCredentials?: boolean;
+  volumeOrderingPolicy?: 'sequential_priority' | 'any_available' | string;
 }
 
 export interface AcquisitionConfigPatch {
@@ -921,6 +922,7 @@ export interface AcquisitionConfigPatch {
   madokamiUrl?: string;
   madokamiUsername?: string;
   madokamiPassword?: string;
+  volumeOrderingPolicy?: 'sequential_priority' | 'any_available' | string;
 }
 
 export interface AcquisitionHistoryRecord {
@@ -3174,6 +3176,10 @@ export interface ReviewQueueItem {
   publicationDestination?: string | null;
   status: 'pending' | 'approved' | 'rejected' | 'skipped' | 'simulated';
   statusReason?: string | null;
+  acquisitionPriority?: number;
+  earlierMissingGaps?: number[];
+  orderingExplanation?: string | null;
+  isSafeToApprove?: boolean;
   alternativesJson?: string | null;
   rankingBreakdownJson?: string | null;
   createdAt: number;
