@@ -19,7 +19,8 @@ fn setup_test_db() -> Connection {
             auto_acquire INTEGER NOT NULL DEFAULT 0,
             auto_acquire_activated_at INTEGER,
             release_monitoring_enabled INTEGER NOT NULL DEFAULT 1,
-            release_notify_enabled INTEGER NOT NULL DEFAULT 1
+            release_notify_enabled INTEGER NOT NULL DEFAULT 1,
+            automation_override TEXT NOT NULL DEFAULT 'inherit'
         );
 
         CREATE TABLE series_reconciliations (
@@ -375,7 +376,7 @@ fn test_title_monitoring_settings_toggles() {
     assert!(settings.release_notify_enabled);
     assert!(!settings.auto_acquire_enabled); // Independent setting!
 
-    let updated = set_title_monitoring_settings(&conn, 301, false, false).unwrap();
+    let updated = set_title_monitoring_settings(&conn, 301, false, false, None).unwrap();
     assert!(!updated.release_monitoring_enabled);
     assert!(!updated.release_notify_enabled);
     assert!(!updated.auto_acquire_enabled);

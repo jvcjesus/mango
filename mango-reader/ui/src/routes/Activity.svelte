@@ -12,11 +12,13 @@
     batchApproveReviewQueue,
     getMonitoringActivity,
     triggerMonitoringRefresh,
+    getAutomationOverview,
     message,
     type WatchersDashboardResponseDto,
     type TitleAvailabilityWatcherDto,
     type ReviewQueueItem,
     type MonitoringActivityEntry,
+    type AutomationOverviewMetrics,
   } from '../lib/api';
   import CandidateInspectorModal from '../lib/CandidateInspectorModal.svelte';
   import LifecycleTimeline from '../lib/LifecycleTimeline.svelte';
@@ -47,6 +49,15 @@
   function setTab(tab: ActivityTab) {
     activeTab = tab;
     go(`/activity?tab=${tab}`);
+  }
+
+  // Automation Overview metrics (M14)
+  let automationOverview = $state<AutomationOverviewMetrics | null>(null);
+
+  async function loadOverview() {
+    try {
+      automationOverview = await getAutomationOverview();
+    } catch (_) {}
   }
 
   // ---------------------------------------------------------------------------
@@ -344,6 +355,7 @@
   }
 
   onMount(() => {
+    loadOverview();
     loadReviewQueue();
     loadWatchers();
     loadActivityHistory();
@@ -378,6 +390,57 @@
         {/if}
       </div>
     </div>
+
+    <!-- Automation Overview Grid (M14) -->
+    {#if automationOverview}
+      <div class="automation-overview-grid" data-testid="automation-overview">
+        <div class="ov-card" class:active={automationOverview.autoAcquireEnabled}>
+          <div class="ov-label">AUTOMATION ENGINE</div>
+          <div class="ov-val">
+            <span class="ov-mode-badge">{automationOverview.automationMode.replace(/_/g, ' ').toUpperCase()}</span>
+          </div>
+          <div class="ov-sub">
+            {automationOverview.operatingMode === 'simulation' ? 'Simulation (Dry-Run)' : 'Normal (Live)'}
+            {#if automationOverview.autoAcquireEnabled} · Master Active{:else} · Master OFF{/if}
+          </div>
+        </div>
+
+        <div class="ov-card">
+          <div class="ov-label">ACTIVE / DOWNLOADING</div>
+          <div class="ov-val">{automationOverview.activeAcquisitionsCount}</div>
+          <div class="ov-sub">In-flight acquisitions</div>
+        </div>
+
+        <div class="ov-card" class:highlight={automationOverview.pendingReviewsCount > 0}>
+          <div class="ov-label">PENDING REVIEWS</div>
+          <div class="ov-val">{automationOverview.pendingReviewsCount}</div>
+          <div class="ov-sub">Proposals awaiting review</div>
+        </div>
+
+        <div class="ov-card">
+          <div class="ov-label">VERIFYING IN KOMGA</div>
+          <div class="ov-val">{automationOverview.awaitingVerificationCount}</div>
+          <div class="ov-sub">Published · index pending</div>
+        </div>
+
+        <div class="ov-card" class:warn={automationOverview.blockedAcquisitionsCount > 0}>
+          <div class="ov-label">BLOCKED / FAILED</div>
+          <div class="ov-val">{automationOverview.blockedAcquisitionsCount}</div>
+          <div class="ov-sub">Requires manual attention</div>
+        </div>
+
+        <div class="ov-card ov-card-providers">
+          <div class="ov-label">PROVIDER HEALTH</div>
+          <div class="ov-providers">
+            {#each automationOverview.providerHealth as p}
+              <span class="ov-prov-chip" class:healthy={p.status === 'healthy'} class:unconf={p.status === 'unconfigured'} class:dis={p.status === 'disabled'} title={p.details}>
+                {p.provider}: {p.status}
+              </span>
+            {/each}
+          </div>
+        </div>
+      </div>
+    {/if}
 
     <!-- Primary Subnavigation Tabs (M13.2) -->
     <div class="activity-tabs" role="tablist" aria-label="Activity Subnavigation">
@@ -1500,5 +1563,98 @@
 
   .danger-text {
     color: var(--status-error, #c62828);
+  }
+
+  /* Automation Overview Grid (M14) */
+  .automation-overview-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+    gap: 0.75rem;
+    margin-bottom: 1.25rem;
+  }
+
+  .ov-card {
+    background: var(--surface);
+    border: 2px solid var(--ink);
+    padding: 0.65rem 0.85rem;
+    box-shadow: var(--sh-2);
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+  }
+
+  .ov-card.highlight {
+    border-color: var(--accent);
+  }
+
+  .ov-card.warn {
+    border-color: var(--status-warn, #d97706);
+  }
+
+  .ov-card.active {
+    border-color: #16a34a;
+  }
+
+  .ov-label {
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    color: var(--muted);
+  }
+
+  .ov-val {
+    font-size: 1.15rem;
+    font-weight: 800;
+    color: var(--ink);
+    line-height: 1.2;
+  }
+
+  .ov-sub {
+    font-size: 0.72rem;
+    color: var(--muted);
+  }
+
+  .ov-mode-badge {
+    font-size: 0.78rem;
+    font-weight: 700;
+    padding: 2px 6px;
+    background: var(--surface-2);
+    border-radius: var(--radius-sm);
+  }
+
+  .ov-card-providers {
+    grid-column: span 1;
+  }
+
+  .ov-providers {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-top: 2px;
+  }
+
+  .ov-prov-chip {
+    font-size: 0.7rem;
+    font-weight: 600;
+    padding: 1px 6px;
+    border-radius: var(--radius-pill);
+    background: var(--surface-2);
+    border: 1px solid var(--border);
+  }
+
+  .ov-prov-chip.healthy {
+    background: rgba(34, 197, 94, 0.15);
+    color: #15803d;
+    border-color: rgba(34, 197, 94, 0.4);
+  }
+
+  .ov-prov-chip.unconf {
+    background: rgba(245, 158, 11, 0.15);
+    color: #b45309;
+    border-color: rgba(245, 158, 11, 0.4);
+  }
+
+  .ov-prov-chip.dis {
+    opacity: 0.6;
   }
 </style>

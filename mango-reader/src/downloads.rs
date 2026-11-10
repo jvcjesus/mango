@@ -721,6 +721,7 @@ impl Downloads {
     pub async fn run_startup_recovery(db: &Db) -> Result<()> {
         db.call(|conn| {
             conn.execute("UPDATE import_candidates SET state=CASE WHEN cancel_requested=1 THEN 'ignored' ELSE 'queued' END WHERE state='processing'",[])?;
+            let _ = crate::acquisition::orchestrator::reclaim_stale_leases(conn);
             // 1. Verify any downloads marked with published_path
             let mut stmt = conn.prepare("SELECT chapter_id, published_path FROM downloads WHERE published_path IS NOT NULL")?;
             let published_items = stmt
@@ -1028,6 +1029,27 @@ impl Downloads {
                                         "Acquisition complete — verified in Komga",
                                         Some(pub_path.clone()),
                                     );
+                                    if let Some(acq) = &self.acquisition {
+                                        let acq_c = acq.clone();
+                                        let db_c = self.db.clone();
+                                        let http_c = self
+                                            .pipeline
+                                            .as_ref()
+                                            .map(|p| p.http.clone())
+                                            .unwrap_or_else(reqwest::Client::new);
+                                        tokio::spawn(async move {
+                                            if let Err(e) = crate::acquisition::orchestrator::advance_continuous_backlog(
+                                                &db_c,
+                                                http_c,
+                                                Some(&acq_c),
+                                                chapter_id,
+                                            )
+                                            .await
+                                            {
+                                                tracing::warn!("Continuous backlog advancement error for chapter {chapter_id}: {e}");
+                                            }
+                                        });
+                                    }
                                 } else {
                                     let _ = self
                                         .db
@@ -1065,6 +1087,24 @@ impl Downloads {
                                     Ok(())
                                 })
                                 .await;
+                            if let Some(acq) = &self.acquisition {
+                                let acq_c = acq.clone();
+                                let db_c = self.db.clone();
+                                let http_c = self
+                                    .pipeline
+                                    .as_ref()
+                                    .map(|p| p.http.clone())
+                                    .unwrap_or_else(reqwest::Client::new);
+                                tokio::spawn(async move {
+                                    let _ = crate::acquisition::orchestrator::advance_continuous_backlog(
+                                        &db_c,
+                                        http_c,
+                                        Some(&acq_c),
+                                        chapter_id,
+                                    )
+                                    .await;
+                                });
+                            }
                         }
                     }
                     *self.live_stage.lock().unwrap_or_else(|e| e.into_inner()) = None;
@@ -1564,6 +1604,16 @@ impl Downloads {
 
     /// Handles external remote torrent acquisition via TorBox.
     async fn handle_torbox_job(&self, job: &Job) -> Result<Option<(String, i64)>> {
+        if self.keep_free > 0
+            && free_space(&self.data_dir).is_some_and(|free| free < self.keep_free)
+        {
+            let why = format!(
+                "Less than {} MB is free on the disk. Delete some downloads or free storage to make room.",
+                self.keep_free >> 20
+            );
+            return Err(AppError::new(507, "disk_full", why));
+        }
+
         // 1. If already retrieved, verify staging CBZ
         if let Some(ref rel) = job.retrieved_path {
             let path = self.dir.join(rel);
@@ -1942,6 +1992,16 @@ impl Downloads {
 
     /// Handles direct HTTP retrieval of a Madokami candidate archive.
     async fn handle_madokami_job(&self, job: &Job) -> Result<Option<(String, i64)>> {
+        if self.keep_free > 0
+            && free_space(&self.data_dir).is_some_and(|free| free < self.keep_free)
+        {
+            let why = format!(
+                "Less than {} MB is free on the disk. Delete some downloads or free storage to make room.",
+                self.keep_free >> 20
+            );
+            return Err(AppError::new(507, "disk_full", why));
+        }
+
         // 1. If already retrieved, verify staging CBZ (crash recovery window B)
         if let Some(ref rel) = job.retrieved_path {
             let path = self.dir.join(rel);

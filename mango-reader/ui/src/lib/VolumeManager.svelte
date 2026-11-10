@@ -7,6 +7,7 @@
     planVolumeManagerBatch,
     acquireVolumeManagerBatch,
     getAcquisitionSettings,
+    updateTitleAvailability,
     type VolumeManagerSummary,
     type VolumeManagerEntry,
     type VolumeManagerBatchPlanResponse,
@@ -61,6 +62,25 @@
       error = e?.message || 'Failed to load official volume manager';
     } finally {
       loading = false;
+    }
+  }
+
+  let updatingAutomation = $state(false);
+
+  async function handleAutomationChange(newOverride: string) {
+    if (updatingAutomation) return;
+    updatingAutomation = true;
+    try {
+      const res = await updateTitleAvailability(mangaId, { automationOverride: newOverride });
+      if (summary) {
+        summary.automationOverride = res.automationOverride;
+        summary.effectiveAutomationMode = res.effectiveAutomationMode;
+      }
+      toast.success(`Series automation policy updated: ${newOverride}`);
+    } catch (e: any) {
+      toast.error(e?.message || 'Failed to update automation policy');
+    } finally {
+      updatingAutomation = false;
     }
   }
 
@@ -226,6 +246,26 @@
     </div>
 
     <div class="vm-header-actions">
+      <!-- Automation Policy Selector (M14) -->
+      {#if summary}
+        <div class="automation-policy-control" title="Series Automation Policy">
+          <label for="series-automation-select" class="sr-only">Series Automation</label>
+          <select
+            id="series-automation-select"
+            class="automation-select"
+            value={summary.automationOverride || 'inherit'}
+            disabled={updatingAutomation}
+            onchange={(e) => handleAutomationChange((e.target as HTMLSelectElement).value)}
+          >
+            <option value="inherit">Policy: Inherit Global</option>
+            <option value="monitor_only">Policy: Monitor Only (Mode A)</option>
+            <option value="review_required">Policy: Require Review (Mode B)</option>
+            <option value="auto_acquire">Policy: Auto-Acquire (Mode C)</option>
+            <option value="paused">Policy: Paused</option>
+          </select>
+        </div>
+      {/if}
+
       <!-- Grid / List toggle -->
       <div class="view-toggle" role="group" aria-label="View layout">
         <button
@@ -978,6 +1018,34 @@
     display: flex;
     align-items: center;
     gap: 0.5rem;
+  }
+
+  .automation-policy-control {
+    display: inline-flex;
+    align-items: center;
+  }
+
+  .automation-select {
+    padding: 0.28rem 0.6rem;
+    font-size: 0.78rem;
+    font-weight: 600;
+    font-family: inherit;
+    border: 1.5px solid var(--ink);
+    border-radius: var(--radius-pill);
+    background: var(--surface-2);
+    color: var(--ink);
+    cursor: pointer;
+    outline: none;
+    transition: border-color var(--t-fast);
+  }
+
+  .automation-select:hover:not(:disabled) {
+    background: var(--shade);
+  }
+
+  .automation-select:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
   }
 
   .view-toggle {

@@ -23,6 +23,7 @@ pub mod matching;
 pub mod missing;
 pub mod monitoring;
 pub mod nyaa;
+pub mod orchestrator;
 pub mod physical;
 pub mod planner;
 pub mod profiles;
@@ -56,6 +57,8 @@ pub mod m11_tests;
 pub mod m11_1_tests;
 #[cfg(test)]
 pub mod watcher_tests;
+#[cfg(test)]
+pub mod e2e_simulation_tests;
 
 use crate::error::Result;
 use serde::{Deserialize, Serialize};

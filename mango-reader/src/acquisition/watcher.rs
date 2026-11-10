@@ -151,6 +151,8 @@ pub struct TitleMonitoringSettings {
     pub release_monitoring_enabled: bool,
     pub release_notify_enabled: bool,
     pub auto_acquire_enabled: bool,
+    pub automation_override: String,
+    pub effective_automation_mode: String,
 }
 
 /// Computes next polling interval with jitter based on release date proximity and failure count.
@@ -1471,19 +1473,41 @@ pub fn set_title_monitoring_settings(
     manga_id: i64,
     monitoring_enabled: bool,
     notify_enabled: bool,
+    automation_override: Option<&str>,
 ) -> Result<TitleMonitoringSettings> {
     let current_time = now();
 
-    conn.execute(
-        "UPDATE manga
-         SET release_monitoring_enabled = ?1, release_notify_enabled = ?2
-         WHERE id = ?3",
-        params![
-            if monitoring_enabled { 1 } else { 0 },
-            if notify_enabled { 1 } else { 0 },
-            manga_id
-        ],
-    )?;
+    if let Some(ov) = automation_override {
+        let norm = match ov.trim().to_lowercase().as_str() {
+            "paused" => "paused",
+            "monitor_only" | "mode_a" => "monitor_only",
+            "review_required" | "review_before_acquisition" | "mode_b" => "review_required",
+            "auto_acquire" | "automatic_acquisition" | "mode_c" => "auto_acquire",
+            _ => "inherit",
+        };
+        conn.execute(
+            "UPDATE manga
+             SET release_monitoring_enabled = ?1, release_notify_enabled = ?2, automation_override = ?3
+             WHERE id = ?4",
+            params![
+                if monitoring_enabled { 1 } else { 0 },
+                if notify_enabled { 1 } else { 0 },
+                norm,
+                manga_id
+            ],
+        )?;
+    } else {
+        conn.execute(
+            "UPDATE manga
+             SET release_monitoring_enabled = ?1, release_notify_enabled = ?2
+             WHERE id = ?3",
+            params![
+                if monitoring_enabled { 1 } else { 0 },
+                if notify_enabled { 1 } else { 0 },
+                manga_id
+            ],
+        )?;
+    }
 
     // Synchronize existing watcher rows
     conn.execute(
@@ -1506,17 +1530,28 @@ pub fn get_title_monitoring_settings(
     conn: &Connection,
     manga_id: i64,
 ) -> Result<TitleMonitoringSettings> {
+    let global_mode = crate::acquisition::monitoring::get_automation_mode(conn);
     conn.query_row(
-        "SELECT id, release_monitoring_enabled, release_notify_enabled, auto_acquire
+        "SELECT id, release_monitoring_enabled, release_notify_enabled, auto_acquire, COALESCE(automation_override, 'inherit')
          FROM manga
          WHERE id = ?1",
         [manga_id],
         |r| {
+            let auto_override: String = r.get(4)?;
+            let effective = match auto_override.as_str() {
+                "paused" => "paused".to_string(),
+                "monitor_only" => "monitor_only".to_string(),
+                "review_required" => "review_before_acquisition".to_string(),
+                "auto_acquire" => "automatic_acquisition".to_string(),
+                _ => global_mode.as_str().to_string(),
+            };
             Ok(TitleMonitoringSettings {
                 manga_id: r.get(0)?,
                 release_monitoring_enabled: r.get::<_, i64>(1)? != 0,
                 release_notify_enabled: r.get::<_, i64>(2)? != 0,
                 auto_acquire_enabled: r.get::<_, i64>(3)? != 0,
+                automation_override: auto_override,
+                effective_automation_mode: effective,
             })
         },
     )

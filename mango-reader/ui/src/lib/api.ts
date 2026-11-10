@@ -2725,8 +2725,12 @@ export const getTitleAvailability = (mangaId: number) =>
 
 export const updateTitleAvailability = (
   mangaId: number,
-  payload: { monitoringEnabled?: boolean; notifyEnabled?: boolean }
-) => send<TitleAvailabilityDto>('PATCH', `/manga/${mangaId}/availability`, payload);
+  payload: {
+    monitoringEnabled?: boolean;
+    notifyEnabled?: boolean;
+    automationOverride?: 'inherit' | 'monitor_only' | 'review_required' | 'auto_acquire' | 'paused' | string;
+  }
+) => send<TitleAvailabilityDto & TitleMonitoringSettings>('PATCH', `/manga/${mangaId}/availability`, payload);
 
 export const refreshTitleAvailability = (mangaId: number) =>
   send<{ triggered: boolean; watchersChecked: number }>(
@@ -2975,6 +2979,8 @@ export interface VolumeManagerSummary {
   unreleasedCount: number;
   isAuthoritative: boolean;
   uncertaintyReason?: string | null;
+  automationOverride?: 'inherit' | 'monitor_only' | 'review_required' | 'auto_acquire' | 'paused' | string;
+  effectiveAutomationMode?: 'monitor_only' | 'review_before_acquisition' | 'automatic_acquisition' | 'paused' | string;
   volumes: VolumeManagerEntry[];
 }
 
@@ -3238,4 +3244,38 @@ export const batchApproveReviewQueue = (ids: number[]) =>
 
 export const getMonitoringActivity = (limit = 50) =>
   get<MonitoringActivityEntry[]>(`/monitoring/activity?limit=${limit}`);
+
+export interface ProviderHealthSummary {
+  provider: string;
+  enabled: boolean;
+  configured: boolean;
+  status: 'healthy' | 'rate_limited' | 'unconfigured' | 'disabled' | string;
+  details: string;
+}
+
+export interface AutomationOverviewMetrics {
+  automationMode: string;
+  autoAcquireEnabled: boolean;
+  operatingMode: string;
+  autoPublishManual: boolean;
+  activeAcquisitionsCount: number;
+  pendingReviewsCount: number;
+  retryScheduledCount: number;
+  blockedAcquisitionsCount: number;
+  awaitingVerificationCount: number;
+  recentlyCompletedCount: number;
+  providerHealth: ProviderHealthSummary[];
+}
+
+export const getAutomationOverview = () =>
+  get<AutomationOverviewMetrics>('/monitoring/overview');
+
+export interface TitleMonitoringSettings {
+  mangaId: number;
+  releaseMonitoringEnabled: boolean;
+  releaseNotifyEnabled: boolean;
+  autoAcquireEnabled: boolean;
+  automationOverride: string;
+  effectiveAutomationMode: string;
+}
 

@@ -179,6 +179,31 @@ pub(crate) fn record_metadata_action_required(
 }
 
 pub(crate) fn complete_queued_publication(conn: &rusqlite::Connection, chapter: i64) -> Result<()> {
+    let current_time = crate::db::now();
+
+    // Query chapter details before deleting from downloads
+    let chapter_details: Option<(i64, String, String, f64)> = conn
+        .query_row(
+            "SELECT c.manga_id, m.title, c.name, c.chapter_number
+             FROM downloads d
+             JOIN chapters c ON c.id = d.chapter_id
+             JOIN manga m ON m.id = c.manga_id
+             WHERE d.chapter_id = ?1",
+            [chapter],
+            |r| {
+                let m_id: i64 = r.get(0)?;
+                let title: String = r.get(1)?;
+                let name: String = r.get(2)?;
+                let ch_num: f64 = r.get(3)?;
+                let vol = crate::release::parse_volume(&name)
+                    .or_else(|| crate::release::parse_release(&name, ch_num).volume)
+                    .unwrap_or(ch_num);
+                Ok((m_id, title, name, vol))
+            },
+        )
+        .optional()
+        .unwrap_or(None);
+
     persist_publication_provenance(conn, chapter)?;
     conn.execute("UPDATE acquisition_history SET outcome='completed', completed_at=strftime('%s','now')
         WHERE chapter_id=?1 AND canonical_path=(SELECT published_path FROM downloads WHERE chapter_id=?1)
@@ -186,6 +211,37 @@ pub(crate) fn complete_queued_publication(conn: &rusqlite::Connection, chapter: 
 
     // Record ACQUISITION_COMPLETE if not already recorded
     record_acquisition_complete(conn, chapter)?;
+
+    if let Some((manga_id, series_title, _ch_name, vol_num)) = chapter_details {
+        let series_id = format!("manga:{manga_id}");
+
+        // Update watcher to OWNERSHIP_DETECTED
+        let _ = conn.execute(
+            "UPDATE release_availability_watchers
+             SET is_owned = 1, state = 'OWNERSHIP_DETECTED', next_check_at = 0, updated_at = ?1
+             WHERE (series_id = ?2 OR series_title = ?3 OR canonical_series_id = ?2)
+               AND ABS(volume_number - ?4) < 0.001",
+            rusqlite::params![current_time, series_id, series_title, vol_num],
+        );
+
+        // Update review queue item
+        let _ = conn.execute(
+            "UPDATE acquisition_review_queue
+             SET status = 'approved', updated_at = ?1
+             WHERE (series_id = ?2 OR series_title = ?3)
+               AND ABS(volume_number - ?4) < 0.001
+               AND status = 'pending'",
+            rusqlite::params![current_time, series_id, series_title, vol_num],
+        );
+
+        // Update lifecycle state to COMPLETED
+        let _ = conn.execute(
+            "UPDATE acquisition_lifecycle
+             SET state = 'COMPLETED', completed_at = ?1, updated_at = ?1
+             WHERE (chapter_id = ?2 OR (series_id = ?3 AND ABS(volume_number - ?4) < 0.001))",
+            rusqlite::params![current_time, chapter, series_id, vol_num],
+        );
+    }
 
     conn.execute("DELETE FROM downloads WHERE chapter_id=?1", [chapter])?;
     Ok(())

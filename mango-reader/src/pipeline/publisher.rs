@@ -7,6 +7,7 @@
 //! - CONFIGURABLE ROUTING: Routes English vs Chinese editions based on metadata/settings.
 
 use crate::error::{AppError, Result};
+use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File},
     io::{BufReader, Read},
@@ -94,43 +95,140 @@ pub fn files_are_identical(a: &Path, b: &Path) -> Result<bool> {
     Ok(true)
 }
 
-/// Verifies that a ZIP/CBZ file has valid structure, readable headers, and contains plausible manga image content.
-pub fn verify_cbz_integrity(path: &Path) -> Result<()> {
+/// Structured inspection report of an archive for quality and safety verification.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ArchiveInspectionReport {
+    pub image_count: usize,
+    pub total_uncompressed_bytes: u64,
+    pub image_formats: Vec<String>,
+    pub has_comic_info: bool,
+}
+
+const DANGEROUS_PAYLOAD_EXTENSIONS: &[&str] = &[
+    "exe", "bat", "cmd", "sh", "bin", "js", "py", "dll", "so", "elf", "com", "scr", "vbs", "msi", "ps1"
+];
+
+const SUSPICIOUS_NESTED_ARCHIVE_EXTENSIONS: &[&str] = &[
+    "zip", "rar", "7z", "tar", "gz", "bz2", "xz"
+];
+
+/// Inspects a ZIP/CBZ file structure, headers, safety constraints, and image contents.
+pub fn inspect_cbz_archive(path: &Path) -> Result<ArchiveInspectionReport> {
     let file = File::open(path)?;
-    let mut archive = zip::ZipArchive::new(file).map_err(|e| AppError::bad_request(format!("Invalid CBZ archive {}: {e}", path.display())))?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| AppError::bad_request(format!("Invalid CBZ archive {}: {e}", path.display())))?;
     if archive.is_empty() {
         return Err(AppError::bad_request(format!("CBZ archive {} has 0 files", path.display())));
     }
-    // Quick header scan of all entries and check for plausible manga image content
+
     let mut image_count = 0;
+    let mut total_uncompressed_bytes: u64 = 0;
+    let mut image_formats = Vec::new();
+    let mut has_comic_info = false;
+    let mut dangerous_payload: Option<String> = None;
+    let mut nested_archive: Option<String> = None;
+
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i).map_err(|e| {
             AppError::bad_request(format!("Corrupt entry {i} in {}: {e}", path.display()))
         })?;
+
+        let name = entry.name().to_string();
+
+        // 1. Path safety and symlink traversal checks
         if entry.enclosed_name().is_none()
-            || entry.name().contains('\\')
-            || entry.name().contains(':')
+            || name.contains('\\')
+            || name.contains(':')
+            || name.contains("..")
+            || name.starts_with('/')
             || entry
                 .unix_mode()
                 .is_some_and(|mode| mode & 0o170000 == 0o120000)
         {
             return Err(AppError::bad_request("Unsafe ZIP entry path or symlink"));
         }
-        let name = entry.name();
-        let basename = name.rsplit_once('/').map(|(_, b)| b).unwrap_or(name);
-        if entry.is_file() && !name.starts_with("__MACOSX") && !basename.starts_with('.') && crate::local::is_image(name) {
-            image_count += 1;
+
+        let basename = name.rsplit_once('/').map(|(_, b)| b).unwrap_or(&name);
+
+        // Record any executable or nested payloads
+        if let Some((_, ext)) = basename.rsplit_once('.') {
+            let lower_ext = ext.to_ascii_lowercase();
+            if DANGEROUS_PAYLOAD_EXTENSIONS.contains(&lower_ext.as_str()) && dangerous_payload.is_none() {
+                dangerous_payload = Some(name.clone());
+            }
+
+            if SUSPICIOUS_NESTED_ARCHIVE_EXTENSIONS.contains(&lower_ext.as_str()) && nested_archive.is_none() {
+                nested_archive = Some(name.clone());
+            }
         }
+
+        // 4. Archive bomb protection (decompression ratio limit)
+        let uncompressed = entry.size();
+        let compressed = entry.compressed_size();
+        if compressed > 0 && uncompressed > 100 * compressed && uncompressed > 50_000_000 {
+            return Err(AppError::bad_request(format!(
+                "Abnormal compression ratio detected for entry '{}' in {}",
+                name,
+                path.display()
+            )));
+        }
+
+        total_uncompressed_bytes += uncompressed;
+
+        if entry.is_file() && !name.starts_with("__MACOSX") && !basename.starts_with('.') {
+            if basename.eq_ignore_ascii_case("ComicInfo.xml") {
+                has_comic_info = true;
+            } else if crate::local::is_image(&name) {
+                image_count += 1;
+                if let Some((_, ext)) = basename.rsplit_once('.') {
+                    let fmt = ext.to_ascii_lowercase();
+                    if !image_formats.contains(&fmt) {
+                        image_formats.push(fmt);
+                    }
+                }
+            }
+        }
+
+        // Validate checksum / CRC
         std::io::copy(&mut entry, &mut std::io::sink())
             .map_err(|_| AppError::bad_request("Corrupt CBZ entry data or checksum"))?;
     }
+
     if image_count == 0 {
         return Err(AppError::bad_request(format!(
             "Archive {} contains 0 manga images (non-manga or unsupported content)",
             path.display()
         )));
     }
-    Ok(())
+
+    if let Some(payload_name) = dangerous_payload {
+        return Err(AppError::bad_request(format!(
+            "Unsafe archive payload detected in {}: executable entry '{}'",
+            path.display(),
+            payload_name
+        )));
+    }
+
+    if let Some(archive_name) = nested_archive {
+        return Err(AppError::bad_request(format!(
+            "Suspicious nested archive detected in {}: '{}'",
+            path.display(),
+            archive_name
+        )));
+    }
+
+    Ok(ArchiveInspectionReport {
+        image_count,
+        total_uncompressed_bytes,
+        image_formats,
+        has_comic_info,
+    })
+}
+
+/// Verifies that a ZIP/CBZ file has valid structure, readable headers, safe payloads, and contains plausible manga image content.
+pub fn verify_cbz_integrity(path: &Path) -> Result<()> {
+    inspect_cbz_archive(path).map(|_| ())
 }
 
 /// Atomically publishes a CBZ file to the permanent library.

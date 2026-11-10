@@ -59,6 +59,14 @@ pub struct VolumeManagerEntry {
     pub komga_book_name: Option<String>,
 }
 
+fn default_inherit() -> String {
+    "inherit".to_string()
+}
+
+fn default_monitor_only() -> String {
+    "monitor_only".to_string()
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VolumeManagerSummary {
@@ -80,6 +88,10 @@ pub struct VolumeManagerSummary {
     pub unreleased_count: usize,
     pub is_authoritative: bool,
     pub uncertainty_reason: Option<String>,
+    #[serde(default = "default_inherit")]
+    pub automation_override: String,
+    #[serde(default = "default_monitor_only")]
+    pub effective_automation_mode: String,
     pub volumes: Vec<VolumeManagerEntry>,
 }
 
@@ -764,6 +776,24 @@ pub fn get_volume_manager_summary_with_ownership(
         volumes.len()
     };
 
+    let (auto_override, global_mode) = (
+        conn.query_row(
+            "SELECT COALESCE(automation_override, 'inherit') FROM manga WHERE id = ?1",
+            [manga_id],
+            |r| r.get(0),
+        )
+        .unwrap_or_else(|_| "inherit".to_string()),
+        crate::acquisition::monitoring::get_automation_mode(conn),
+    );
+
+    let effective_automation_mode = match auto_override.as_str() {
+        "paused" => "paused".to_string(),
+        "monitor_only" => "monitor_only".to_string(),
+        "review_required" => "review_before_acquisition".to_string(),
+        "auto_acquire" => "automatic_acquisition".to_string(),
+        _ => global_mode.as_str().to_string(),
+    };
+
     Ok(VolumeManagerSummary {
         manga_id,
         series_id,
@@ -782,6 +812,8 @@ pub fn get_volume_manager_summary_with_ownership(
         unreleased_count,
         is_authoritative,
         uncertainty_reason,
+        automation_override: auto_override,
+        effective_automation_mode,
         volumes,
     })
 }

@@ -282,6 +282,10 @@ pub fn router(state: Spaces) -> Router {
             get(get_monitoring_settings).post(post_monitoring_settings),
         )
         .route(
+            "/monitoring/overview",
+            get(get_monitoring_overview),
+        )
+        .route(
             "/monitoring/refresh",
             post(post_monitoring_refresh),
         )
@@ -4463,6 +4467,7 @@ async fn get_title_availability(
 struct PatchTitleAvailabilityRequest {
     monitoring_enabled: Option<bool>,
     notify_enabled: Option<bool>,
+    automation_override: Option<String>,
 }
 
 async fn patch_title_availability(
@@ -4477,7 +4482,14 @@ async fn patch_title_availability(
             let current = crate::acquisition::watcher::get_title_monitoring_settings(conn, id)?;
             let new_monitoring = payload.monitoring_enabled.unwrap_or(current.release_monitoring_enabled);
             let new_notify = payload.notify_enabled.unwrap_or(current.release_notify_enabled);
-            crate::acquisition::watcher::set_title_monitoring_settings(conn, id, new_monitoring, new_notify)
+            let new_override = payload.automation_override.as_deref();
+            crate::acquisition::watcher::set_title_monitoring_settings(
+                conn,
+                id,
+                new_monitoring,
+                new_notify,
+                new_override,
+            )
         })
         .await?;
     Ok(Json(settings))
@@ -5230,6 +5242,17 @@ async fn get_naming_backups(
         crate::pipeline::naming_audit::list_naming_backups(conn)
     }).await?;
     Ok(Json(backups))
+}
+
+pub(crate) async fn get_monitoring_overview(
+    Me(app): Me,
+) -> Result<Json<crate::acquisition::orchestrator::AutomationOverviewMetrics>> {
+    app.me.admin()?;
+    let overview = app
+        .db
+        .call(|conn| crate::acquisition::orchestrator::get_automation_overview_metrics(conn))
+        .await?;
+    Ok(Json(overview))
 }
 
 pub(crate) async fn get_monitoring_settings(
