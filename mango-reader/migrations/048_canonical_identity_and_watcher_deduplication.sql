@@ -88,18 +88,18 @@ WHERE id IN (
     HAVING COUNT(*) > 1
 );
 
--- Point remaining canonical watcher rows for Haikyu!! to manga:1092
-UPDATE release_availability_watchers
-SET series_id = 'manga:1092', manga_id = 1092, canonical_series_id = 'manga:1092'
-WHERE series_title = 'Haikyu!!';
-
--- Delete redundant duplicate watcher rows
+-- Delete redundant duplicate watcher rows FIRST
 DELETE FROM release_availability_watchers
 WHERE id NOT IN (
     SELECT MIN(w.id)
     FROM release_availability_watchers w
     GROUP BY w.series_title, CAST(ROUND(w.volume_number * 1000) AS INTEGER)
 );
+
+-- Point remaining canonical watcher rows for Haikyu!! to manga:1092
+UPDATE release_availability_watchers
+SET series_id = 'manga:1092', manga_id = 1092, canonical_series_id = 'manga:1092'
+WHERE series_title = 'Haikyu!!';
 
 -- Enforce uniqueness on (canonical_series_id, volume_number, market, edition)
 CREATE UNIQUE INDEX IF NOT EXISTS idx_watchers_canonical_vol
