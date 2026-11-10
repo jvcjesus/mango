@@ -130,78 +130,83 @@
   <div class="shell" class:tabbed={tabbed && !pushed}>
     {#if !pushed}
       <header class="top">
-        {#if deep}
-          <button class="btn icon" aria-label="Back" onclick={() => back()}><Icon name="back" stroke={3} /></button>
-        {/if}
-        <a class="logo" class:alone={deep} href="#/" aria-label="Mango home">
-          <span class="dot"></span>
-          <span class="display word">MANGO</span>
-          <span class="kana" aria-hidden="true">マンゴー</span>
-        </a>
-        {#if !tabbed}
-          <nav aria-label="Primary">
-            {#each NAV as item (item.to)}
-              <a href="#{item.to}" aria-current={item.under.includes(area) ? 'page' : undefined}>
-                {item.label}
-                {#if item.to === '/updates'}{@render badge()}{/if}
-              </a>
-            {/each}
-          </nav>
-        {/if}
-        <!-- Only where whoever runs this Mango keeps accounts: the account tab of Settings, which leads to their page. -->
-        {#if session.account}
-          <a class="btn icon account" href="#/settings/account" aria-label="Your account" title="Your account" aria-current={area === 'settings' && parts[1] === 'account' ? 'page' : undefined}><Icon name="user" /></a>
-        {/if}
-        <a class="btn icon settings" href="#/settings" aria-label={news ? 'Settings: a newer Mango is out' : 'Settings'} aria-current={area === 'settings' && !(session.account && parts[1] === 'account') ? 'page' : undefined}>
-          <Icon name="sliders" />
-          {#if news}<span class="news" aria-hidden="true"></span>{/if}
-        </a>
+        <div class="top-inner">
+          {#if deep}
+            <button class="btn icon mini" aria-label="Back" onclick={() => back()}><Icon name="back" stroke={3} /></button>
+          {/if}
+          <a class="logo" class:alone={deep} href="#/" aria-label="Mango home">
+            <span class="dot"></span>
+            <span class="display word">MANGO</span>
+            <span class="kana" aria-hidden="true">マンゴー</span>
+          </a>
+          {#if !tabbed}
+            <nav aria-label="Primary">
+              {#each NAV as item (item.to)}
+                <a href="#{item.to}" aria-current={item.under.includes(area) ? 'page' : undefined}>
+                  <Icon name={item.icon} size={15} />
+                  <span>{item.label}</span>
+                  {#if item.to === '/updates'}{@render badge()}{/if}
+                </a>
+              {/each}
+            </nav>
+          {/if}
+          <!-- Only where whoever runs this Mango keeps accounts: the account tab of Settings, which leads to their page. -->
+          {#if session.account}
+            <a class="btn icon account" href="#/settings/account" aria-label="Your account" title="Your account" aria-current={area === 'settings' && parts[1] === 'account' ? 'page' : undefined}><Icon name="user" /></a>
+          {/if}
+          <a class="btn icon settings" href="#/settings" aria-label={news ? 'Settings: a newer Mango is out' : 'Settings'} aria-current={area === 'settings' && !(session.account && parts[1] === 'account') ? 'page' : undefined}>
+            <Icon name="sliders" />
+            {#if news}<span class="news" aria-hidden="true"></span>{/if}
+          </a>
+        </div>
       </header>
     {/if}
 
     {#if !pushed && area && area !== 'home'}
       <nav class="breadcrumbs-bar" aria-label="Breadcrumbs">
-        <a href="#/" class="bc-link"><Icon name="grid" size={13} /> Home</a>
-        <span class="bc-sep" aria-hidden="true">/</span>
-        {#if area === 'library'}
-          <span class="bc-current" aria-current="page">Library</span>
-        {:else if area === 'lists'}
-          <span class="bc-current" aria-current="page">Lists</span>
-        {:else if area === 'updates'}
-          <span class="bc-current" aria-current="page">Updates</span>
-        {:else if area === 'browse'}
-          <span class="bc-current" aria-current="page">Browse</span>
-        {:else if area === 'downloads'}
-          <span class="bc-current" aria-current="page">Downloads</span>
-        {:else if area === 'history'}
-          <span class="bc-current" aria-current="page">History</span>
-        {:else if area === 'settings'}
-          {#if parts[1]}
-            <a href="#/settings" class="bc-link">Settings</a>
+        <div class="breadcrumbs-inner">
+          <a href="#/" class="bc-link"><Icon name="grid" size={13} /> Home</a>
+          <span class="bc-sep" aria-hidden="true">/</span>
+          {#if area === 'library'}
+            <span class="bc-current" aria-current="page">Library</span>
+          {:else if area === 'lists'}
+            <span class="bc-current" aria-current="page">Lists</span>
+          {:else if area === 'updates'}
+            <span class="bc-current" aria-current="page">Updates</span>
+          {:else if area === 'browse'}
+            <span class="bc-current" aria-current="page">Browse</span>
+          {:else if area === 'downloads'}
+            <span class="bc-current" aria-current="page">Downloads</span>
+          {:else if area === 'history'}
+            <span class="bc-current" aria-current="page">History</span>
+          {:else if area === 'settings'}
+            {#if parts[1]}
+              <a href="#/settings" class="bc-link">Settings</a>
+              <span class="bc-sep" aria-hidden="true">/</span>
+              <span class="bc-current" aria-current="page">{parts[1].charAt(0).toUpperCase() + parts[1].slice(1)}</span>
+            {:else}
+              <span class="bc-current" aria-current="page">Settings</span>
+            {/if}
+          {:else if (area === 'title' || area === 'manga') && parts[1]}
+            <a href="#/library" class="bc-link">Library</a>
             <span class="bc-sep" aria-hidden="true">/</span>
-            <span class="bc-current" aria-current="page">{parts[1]}</span>
+            <span class="bc-current" aria-current="page">Series #{parts[1]}</span>
+          {:else if area === 'source' && parts[1]}
+            <a href="#/browse" class="bc-link">Browse</a>
+            <span class="bc-sep" aria-hidden="true">/</span>
+            <span class="bc-current" aria-current="page">Source ({parts[1]})</span>
+          {:else if area === 'extension' && parts[1]}
+            <a href="#/browse" class="bc-link">Browse</a>
+            <span class="bc-sep" aria-hidden="true">/</span>
+            <span class="bc-current" aria-current="page">Extension ({parts[1]})</span>
+          {:else if area === 'search'}
+            <a href="#/browse" class="bc-link">Browse</a>
+            <span class="bc-sep" aria-hidden="true">/</span>
+            <span class="bc-current" aria-current="page">Search</span>
           {:else}
-            <span class="bc-current" aria-current="page">Settings</span>
+            <span class="bc-current" aria-current="page">{area}</span>
           {/if}
-        {:else if (area === 'title' || area === 'manga') && parts[1]}
-          <a href="#/library" class="bc-link">Library</a>
-          <span class="bc-sep" aria-hidden="true">/</span>
-          <span class="bc-current" aria-current="page">Series #{parts[1]}</span>
-        {:else if area === 'source' && parts[1]}
-          <a href="#/browse" class="bc-link">Browse</a>
-          <span class="bc-sep" aria-hidden="true">/</span>
-          <span class="bc-current" aria-current="page">Source ({parts[1]})</span>
-        {:else if area === 'extension' && parts[1]}
-          <a href="#/browse" class="bc-link">Browse</a>
-          <span class="bc-sep" aria-hidden="true">/</span>
-          <span class="bc-current" aria-current="page">Extension ({parts[1]})</span>
-        {:else if area === 'search'}
-          <a href="#/browse" class="bc-link">Browse</a>
-          <span class="bc-sep" aria-hidden="true">/</span>
-          <span class="bc-current" aria-current="page">Search</span>
-        {:else}
-          <span class="bc-current" aria-current="page">{area}</span>
-        {/if}
+        </div>
       </nav>
     {/if}
 
@@ -291,25 +296,40 @@
   }
 
   .top {
+    border-bottom: 3px solid var(--ink);
+    background: var(--paper);
+    position: sticky;
+    top: 0;
+    z-index: 50;
+  }
+
+  .top-inner {
     display: flex;
     flex-wrap: wrap;
     align-items: center;
-    gap: 12px 28px;
-    padding: 14px var(--gutter);
-    border-bottom: 3px solid var(--ink);
+    gap: 12px 24px;
+    max-width: var(--page-max-width, 1560px);
+    margin: 0 auto;
+    padding: 10px var(--gutter);
+    width: 100%;
   }
 
   .breadcrumbs-bar {
+    border-bottom: 2px solid var(--line);
+    background: var(--shade);
+  }
+
+  .breadcrumbs-inner {
     display: flex;
     align-items: center;
     gap: 8px;
-    padding: 8px var(--gutter);
+    max-width: var(--page-max-width, 1560px);
+    margin: 0 auto;
+    padding: 7px var(--gutter);
     font-size: 12px;
     font-weight: 700;
     letter-spacing: 0.04em;
     color: var(--muted);
-    border-bottom: 2px solid var(--line);
-    background: var(--shade);
     overflow-x: auto;
     white-space: nowrap;
   }
@@ -379,18 +399,27 @@
     display: flex;
     flex: none;
     align-items: center;
-    gap: 8px;
-    min-height: 44px;
-    padding: 0 14px;
+    gap: 7px;
+    min-height: 38px;
+    padding: 0 12px;
+    border: 2px solid transparent;
     font-size: 13px;
-    font-weight: 900;
-    letter-spacing: 0.08em;
+    font-weight: 800;
+    letter-spacing: 0.06em;
     text-transform: uppercase;
+    transition: all 0.12s ease;
+  }
+
+  nav a:hover {
+    border-color: var(--ink);
+    background: var(--surface);
   }
 
   nav a[aria-current='page'] {
+    border-color: var(--ink);
     background: var(--ink);
     color: var(--paper);
+    box-shadow: var(--sh-3);
   }
 
   /* Against the far edge, whatever stands before it. */

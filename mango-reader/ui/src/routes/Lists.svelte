@@ -1012,8 +1012,9 @@
 <style>
   .lists-page {
     padding: 24px;
-    max-width: 1400px;
+    max-width: var(--page-max-width, 1560px);
     margin: 0 auto;
+    width: 100%;
   }
 
   .header {

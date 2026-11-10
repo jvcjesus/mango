@@ -116,7 +116,62 @@
     { id: 'account', label: 'Account', icon: 'user', about: 'The password, signing out, and who else may use this Mango.' },
     { id: 'about', label: 'About', icon: 'info', about: 'The tour, this version, and newer ones.' },
   ]);
-  const tab = $derived(TABS.find((entry) => entry.id === route.path.split('/')[2]) ?? TABS[0]);
+
+  // Deep-link route aliases for M12 Settings categories
+  const ROUTE_ALIASES: Record<string, { tabId: string; pipelineSection?: string }> = {
+    komga: { tabId: 'pipeline', pipelineSection: 'paths' },
+    mangabaka: { tabId: 'pipeline', pipelineSection: 'metadata' },
+    providers: { tabId: 'pipeline', pipelineSection: 'providers' },
+    automation: { tabId: 'pipeline', pipelineSection: 'automation' },
+    profiles: { tabId: 'pipeline', pipelineSection: 'automation' },
+    opentome: { tabId: 'pipeline', pipelineSection: 'metadata' },
+    maintenance: { tabId: 'pipeline', pipelineSection: 'maintenance' },
+    storage: { tabId: 'pipeline', pipelineSection: 'diagnostics' },
+    diagnostics: { tabId: 'pipeline', pipelineSection: 'diagnostics' },
+  };
+
+  let pipelineFilter = $state<string>('all');
+
+  const rawSubroute = $derived(route.path.split('/')[2] || 'appearance');
+  const resolvedTabId = $derived(ROUTE_ALIASES[rawSubroute]?.tabId ?? rawSubroute);
+  const tab = $derived(TABS.find((entry) => entry.id === resolvedTabId) ?? TABS[0]);
+
+  $effect(() => {
+    const alias = ROUTE_ALIASES[rawSubroute];
+    if (alias?.pipelineSection) {
+      pipelineFilter = alias.pipelineSection;
+    }
+  });
+
+  const currentCategory = $derived.by(() => {
+    if (['appearance', 'reader', 'account', 'about'].includes(tab.id)) return 'general';
+    if (tab.id === 'library') return 'library';
+    if (tab.id === 'downloads') return 'acquisition';
+    if (['trackers', 'notifications', 'sources'].includes(tab.id)) return 'tracking';
+    if (tab.id === 'pipeline') {
+      if (['providers', 'automation'].includes(pipelineFilter)) return 'acquisition';
+      if (['maintenance', 'diagnostics'].includes(pipelineFilter)) return 'advanced';
+      return 'library';
+    }
+    return 'general';
+  });
+
+  function selectCategory(catId: string) {
+    if (catId === 'general') {
+      location.hash = '#/settings/appearance';
+    } else if (catId === 'library') {
+      pipelineFilter = 'paths';
+      location.hash = '#/settings/pipeline';
+    } else if (catId === 'acquisition') {
+      pipelineFilter = 'providers';
+      location.hash = '#/settings/pipeline';
+    } else if (catId === 'tracking') {
+      location.hash = '#/settings/trackers';
+    } else if (catId === 'advanced') {
+      pipelineFilter = 'maintenance';
+      location.hash = '#/settings/pipeline';
+    }
+  }
 
   // On a narrow screen the groups are a strip that scrolls sideways; keep the open one in view.
   let rail = $state<HTMLElement>();
@@ -1901,7 +1956,56 @@
 
 <div class="page">
   <div class="page-head">
-    <h1 class="display">SETTINGS</h1>
+    <div class="head-left">
+      <h1 class="display">SETTINGS</h1>
+      <div class="pill-group category-switcher" role="tablist" aria-label="Settings categories">
+        <button
+          class="pill"
+          class:active={currentCategory === 'general'}
+          onclick={() => selectCategory('general')}
+          role="tab"
+          aria-selected={currentCategory === 'general'}
+        >
+          <Icon name="sliders" size={14} /> General
+        </button>
+        <button
+          class="pill"
+          class:active={currentCategory === 'library'}
+          onclick={() => selectCategory('library')}
+          role="tab"
+          aria-selected={currentCategory === 'library'}
+        >
+          <Icon name="book" size={14} /> Library & Metadata
+        </button>
+        <button
+          class="pill"
+          class:active={currentCategory === 'acquisition'}
+          onclick={() => selectCategory('acquisition')}
+          role="tab"
+          aria-selected={currentCategory === 'acquisition'}
+        >
+          <Icon name="download" size={14} /> Acquisition
+        </button>
+        <button
+          class="pill"
+          class:active={currentCategory === 'tracking'}
+          onclick={() => selectCategory('tracking')}
+          role="tab"
+          aria-selected={currentCategory === 'tracking'}
+        >
+          <Icon name="link" size={14} /> Tracking & Updates
+        </button>
+        <button
+          class="pill"
+          class:active={currentCategory === 'advanced'}
+          onclick={() => selectCategory('advanced')}
+          role="tab"
+          aria-selected={currentCategory === 'advanced'}
+        >
+          <Icon name="puzzle" size={14} /> Advanced
+        </button>
+      </div>
+    </div>
   </div>
 
   <div class="layout">
@@ -2184,6 +2288,33 @@
           <div class="set stack"><Notice error={pipelineError} /></div>
         {/if}
 
+        <div class="pipeline-section-bar">
+          <div class="pill-group" role="tablist" aria-label="Pipeline sections">
+            <button class="pill mini" class:active={pipelineFilter === 'all'} onclick={() => pipelineFilter = 'all'}>
+              All Sections
+            </button>
+            <button class="pill mini" class:active={pipelineFilter === 'paths'} onclick={() => pipelineFilter = 'paths'}>
+              Paths & Komga
+            </button>
+            <button class="pill mini" class:active={pipelineFilter === 'metadata'} onclick={() => pipelineFilter = 'metadata'}>
+              Metadata (MangaBaka/KOMF)
+            </button>
+            <button class="pill mini" class:active={pipelineFilter === 'providers'} onclick={() => pipelineFilter = 'providers'}>
+              Providers & TorBox
+            </button>
+            <button class="pill mini" class:active={pipelineFilter === 'automation'} onclick={() => pipelineFilter = 'automation'}>
+              Automation & Profiles
+            </button>
+            <button class="pill mini" class:active={pipelineFilter === 'maintenance'} onclick={() => pipelineFilter = 'maintenance'}>
+              Normalization & Maintenance
+            </button>
+            <button class="pill mini" class:active={pipelineFilter === 'diagnostics'} onclick={() => pipelineFilter = 'diagnostics'}>
+              Hygiene & Diagnostics
+            </button>
+          </div>
+        </div>
+
+        {#if pipelineFilter === 'all' || pipelineFilter === 'paths'}
         <section class="card">
           <h3>Acquisition Pipeline</h3>
             <div class="set">
@@ -2270,7 +2401,9 @@
               {/if}
             </div>
           </section>
+        {/if}
 
+        {#if pipelineFilter === 'all' || pipelineFilter === 'metadata'}
           <section class="card">
             <h3>MangaBaka Metadata Enrichment</h3>
             <div class="set">
@@ -2431,7 +2564,9 @@
               </div>
             {/if}
           </section>
+        {/if}
 
+        {#if pipelineFilter === 'all' || pipelineFilter === 'paths'}
           <section class="card">
             <h3>Komga Server Integration</h3>
             <div class="set">
@@ -2634,7 +2769,9 @@
               {/if}
             </div>
           </section>
+        {/if}
 
+        {#if pipelineFilter === 'all' || pipelineFilter === 'providers'}
           <section class="card">
             <h3>TorBox Download Backend</h3>
             <div class="set">
@@ -2782,7 +2919,9 @@
               </div>
             </div>
           </section>
+        {/if}
 
+        {#if pipelineFilter === 'all' || pipelineFilter === 'automation'}
           <section class="card">
             <h3>Acquisition Operating Mode & Automation</h3>
             <span class="muted">
@@ -3034,7 +3173,9 @@
               </div>
             {/if}
           </section>
+        {/if}
 
+        {#if pipelineFilter === 'all' || pipelineFilter === 'providers'}
           <section class="card">
             <h3>Acquisition Sources & Health</h3>
             <span class="muted">Operational health, discovery capabilities, and uploader reliability across configured acquisition providers.</span>
@@ -3067,7 +3208,9 @@
               {/each}
             </div>
           </section>
+        {/if}
 
+        {#if pipelineFilter === 'all' || pipelineFilter === 'paths' || pipelineFilter === 'metadata' || pipelineFilter === 'providers' || pipelineFilter === 'automation'}
           <div class="action-bar">
             <button class="btn spot" onclick={savePipeline} disabled={pipelineSaving}>
               <Icon name="check" size={18} />
@@ -3078,7 +3221,9 @@
               Refresh
             </button>
           </div>
+        {/if}
 
+        {#if pipelineFilter === 'all' || pipelineFilter === 'maintenance'}
           <!-- Library Metadata Normalization & Maintenance -->
           <section class="card">
             <div class="card-header-row">
@@ -3761,7 +3906,9 @@
               {/if}
             {/if}
           </section>
+        {/if}
 
+        {#if pipelineFilter === 'all' || pipelineFilter === 'diagnostics'}
           <!-- Staging Storage Hygiene & Cleanup Manifest (M7.1) -->
           <section class="card">
             <div class="card-header-row">
@@ -4055,6 +4202,7 @@
               </div>
             {/if}
           </section>
+        {/if}
       {:else if tab.id === 'notifications'}
         <section class="card">
           <div class="card-header-row">
@@ -5096,6 +5244,31 @@
 {/if}
 
 <style>
+  .head-left {
+    display: flex;
+    align-items: baseline;
+    gap: 20px;
+    flex-wrap: wrap;
+    margin-bottom: 8px;
+  }
+
+  .category-switcher {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex-wrap: wrap;
+  }
+
+  .pipeline-section-bar {
+    position: sticky;
+    top: 0;
+    z-index: 10;
+    background: var(--paper);
+    padding: 8px 0;
+    margin-bottom: 16px;
+    border-bottom: 2px solid var(--ink);
+  }
+
   .layout {
     display: grid;
     grid-template-columns: 220px minmax(0, 1fr);

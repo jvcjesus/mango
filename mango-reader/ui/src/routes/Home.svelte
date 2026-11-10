@@ -46,13 +46,13 @@
         <span class="dot-live"></span>
         <span>CONTROL PLANE · MANGO v1.0</span>
       </div>
-      <h1 class="hero-title">Manga Operations Dashboard</h1>
+      <h1 class="hero-title display">MANGA OPERATIONS DASHBOARD</h1>
       <p class="hero-subtitle">
         Unified acquisition, canonical library intelligence, and provider telemetry across Komga, MangaBaka, OpenTome, Madokami, and TorBox.
       </p>
     </div>
     <div class="hero-actions">
-      <button class="btn refresh-btn" onclick={() => load(true)} disabled={refreshing || loading}>
+      <button class="btn refresh-btn icon-text" onclick={() => load(true)} disabled={refreshing || loading}>
         <span class:spin={refreshing}><Icon name="refresh" size={16} /></span>
         <span>{refreshing ? 'Refreshing…' : 'Refresh Telemetry'}</span>
       </button>
@@ -66,25 +66,25 @@
       <span>QUICK ACTIONS</span>
     </div>
     <div class="actions-group">
-      <button class="action-chip" onclick={() => go('/downloads')}>
+      <button class="btn mini flat icon-text" onclick={() => go('/downloads')}>
         <Icon name="download" size={14} />
-        <span>Review Queue & Recovery</span>
+        <span>Downloads & Queue</span>
       </button>
-      <button class="action-chip" onclick={() => go('/updates')}>
+      <button class="btn mini flat icon-text" onclick={() => go('/updates')}>
         <Icon name="bell" size={14} />
-        <span>Check Release Watchers</span>
+        <span>Release Watchers</span>
       </button>
-      <button class="action-chip" onclick={() => go('/settings/pipeline')}>
+      <button class="btn mini flat icon-text" onclick={() => go('/settings/pipeline')}>
         <Icon name="search" size={14} />
-        <span>Scan Duplicates & Storage</span>
+        <span>Scan & Maintenance</span>
       </button>
-      <button class="action-chip" onclick={() => go('/lists')}>
+      <button class="btn mini flat icon-text" onclick={() => go('/lists')}>
         <Icon name="bookmark" size={14} />
-        <span>View Tracked Catalog</span>
+        <span>Tracked Catalog</span>
       </button>
-      <button class="action-chip" onclick={() => go('/library')}>
+      <button class="btn mini flat icon-text" onclick={() => go('/library')}>
         <Icon name="book" size={14} />
-        <span>Browse Canonical Library</span>
+        <span>Canonical Library</span>
       </button>
     </div>
   </nav>
@@ -111,23 +111,23 @@
           </button>
         </div>
         <div class="metrics-row">
-          <div class="metric-block">
+          <button type="button" class="metric-block metric-btn" onclick={() => go('/lists')} title="View tracked catalog">
             <span class="m-val">{summary.library.totalTrackedTitles}</span>
             <span class="m-lbl">Tracked Titles</span>
-          </div>
-          <div class="metric-block highlight-owned">
+          </button>
+          <button type="button" class="metric-block metric-btn highlight-owned" onclick={() => go('/library')} title="Browse owned volumes">
             <span class="m-val">{summary.library.totalOwnedVolumes}</span>
             <span class="m-lbl">Owned Volumes</span>
-          </div>
-          <div class="metric-block highlight-missing">
+          </button>
+          <button type="button" class="metric-block metric-btn highlight-missing" onclick={() => go('/lists')} title="Review missing volumes">
             <span class="m-val">{summary.library.missingReleasedVolumes}</span>
             <span class="m-lbl">Missing Released</span>
-          </div>
+          </button>
           {#if summary.library.titlesNeedingReview > 0}
-            <div class="metric-block highlight-review">
+            <button type="button" class="metric-block metric-btn highlight-review" onclick={() => go('/updates')} title="Inspect titles needing review">
               <span class="m-val">{summary.library.titlesNeedingReview}</span>
               <span class="m-lbl">Needs Review</span>
-            </div>
+            </button>
           {/if}
         </div>
         <div class="card-foot">
@@ -150,18 +150,24 @@
           </button>
         </div>
         <div class="metrics-row">
-          <div class="metric-block">
+          <button type="button" class="metric-block metric-btn" onclick={() => go('/downloads')} title="View active downloads">
             <span class="m-val">{summary.acquisition.activeDownloads}</span>
             <span class="m-lbl">In-Flight Downloads</span>
-          </div>
-          <div class="metric-block highlight-warn">
+          </button>
+          {#if summary.acquisition.pendingApprovals > 0}
+            <button type="button" class="metric-block metric-btn highlight-review" onclick={() => go('/updates')} title="Review proposed acquisitions">
+              <span class="m-val">{summary.acquisition.pendingApprovals}</span>
+              <span class="m-lbl">Pending Review</span>
+            </button>
+          {/if}
+          <button type="button" class="metric-block metric-btn highlight-warn" onclick={() => go('/downloads')} title="Inspect failed downloads">
             <span class="m-val">{summary.acquisition.failedJobs}</span>
             <span class="m-lbl">Failed Jobs</span>
-          </div>
-          <div class="metric-block highlight-recov">
+          </button>
+          <button type="button" class="metric-block metric-btn highlight-recov" onclick={() => go('/downloads')} title="Inspect recoverable downloads">
             <span class="m-val">{summary.acquisition.recoverableJobs}</span>
             <span class="m-lbl">Recoverable</span>
-          </div>
+          </button>
         </div>
         <div class="card-foot">
           {#if summary.acquisition.failedJobs > 0}
@@ -189,18 +195,18 @@
           </button>
         </div>
         <div class="metrics-row">
-          <div class="metric-block">
+          <button type="button" class="metric-block metric-btn" onclick={() => go('/updates')} title="View scheduled releases">
             <span class="m-val">{summary.releaseIntelligence.upcomingReleasesCount}</span>
             <span class="m-lbl">Upcoming Releases</span>
-          </div>
-          <div class="metric-block highlight-awaiting">
+          </button>
+          <button type="button" class="metric-block metric-btn highlight-awaiting" onclick={() => go('/updates')} title="View releases awaiting upload">
             <span class="m-val">{summary.releaseIntelligence.releasedAwaitingCount}</span>
             <span class="m-lbl">Awaiting Upload</span>
-          </div>
-          <div class="metric-block highlight-candidate">
+          </button>
+          <button type="button" class="metric-block metric-btn highlight-candidate" onclick={() => go('/updates')} title="View discovered candidates">
             <span class="m-val">{summary.releaseIntelligence.candidateFoundCount}</span>
             <span class="m-lbl">Candidates Found</span>
-          </div>
+          </button>
         </div>
         <div class="card-foot">
           <span class="status-indicator ok">
@@ -222,18 +228,18 @@
           </button>
         </div>
         <div class="metrics-row">
-          <div class="metric-block">
+          <button type="button" class="metric-block metric-btn" onclick={() => go('/settings/pipeline')} title="Inspect staging area">
             <span class="m-val">{formatBytes(summary.storage.stagingBytes)}</span>
             <span class="m-lbl">Staging Area</span>
-          </div>
-          <div class="metric-block highlight-reclaim">
+          </button>
+          <button type="button" class="metric-block metric-btn highlight-reclaim" onclick={() => go('/settings/pipeline')} title="Inspect reclaimable space">
             <span class="m-val">{formatBytes(summary.storage.reclaimableBytes)}</span>
             <span class="m-lbl">Reclaimable Space</span>
-          </div>
-          <div class="metric-block">
+          </button>
+          <button type="button" class="metric-block metric-btn" onclick={() => go('/settings/pipeline')} title="Inspect duplicate issues">
             <span class="m-val">{summary.storage.duplicateGroupsCount}</span>
             <span class="m-lbl">Duplicate Issues</span>
-          </div>
+          </button>
         </div>
         <div class="card-foot">
           <span class="status-indicator">
@@ -263,9 +269,11 @@
           <div class="provider-pill-card">
             <div class="prov-top">
               <span class="prov-name">{prov.name}</span>
-              <span class="badge status-pill status-{prov.status.toLowerCase()}">{prov.status}</span>
+              <span class="status-badge status-{prov.status === 'HEALTHY' || prov.status === 'AVAILABLE' ? 'ok' : prov.status === 'ATTENTION_REQUIRED' ? 'error' : prov.status === 'CONFIGURED' ? 'info' : 'neutral'}">
+                {prov.status}
+              </span>
             </div>
-            <p class="prov-details">{prov.details}</p>
+            <p class="prov-details muted font-small">{prov.details}</p>
           </div>
         {/each}
       </div>
@@ -279,7 +287,7 @@
     flex-direction: column;
     gap: 1.5rem;
     padding: 1.5rem 1rem;
-    max-width: 1280px;
+    max-width: var(--page-max-width, 1560px);
     margin: 0 auto;
     width: 100%;
   }
@@ -290,7 +298,7 @@
     justify-content: space-between;
     align-items: flex-start;
     gap: 1.5rem;
-    border-bottom: 2px solid var(--border-color, rgba(255, 255, 255, 0.08));
+    border-bottom: 2px solid var(--ink);
     padding-bottom: 1.5rem;
   }
 
@@ -309,12 +317,11 @@
     width: 8px;
     height: 8px;
     border-radius: 50%;
-    background: #22c55e;
-    box-shadow: 0 0 8px #22c55e;
+    background: var(--status-ok, #16a34a);
+    box-shadow: 0 0 6px var(--status-ok, #16a34a);
   }
 
   .hero-title {
-    font-family: 'Dela Gothic One', sans-serif;
     font-size: 1.85rem;
     margin: 0 0 0.5rem;
     letter-spacing: -0.02em;
@@ -336,21 +343,8 @@
   }
 
   .refresh-btn {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.4rem;
-    font-weight: 600;
+    font-weight: 700;
     font-size: 0.85rem;
-    padding: 0.5rem 0.85rem;
-    background: rgba(255, 255, 255, 0.05);
-    border: 1px solid var(--border-color, rgba(255, 255, 255, 0.12));
-    border-radius: 6px;
-    cursor: pointer;
-    transition: background 0.15s ease;
-  }
-
-  .refresh-btn:hover {
-    background: rgba(255, 255, 255, 0.1);
   }
 
   /* Quick Actions Bar */
@@ -358,10 +352,11 @@
     display: flex;
     align-items: center;
     gap: 1rem;
-    background: rgba(0, 0, 0, 0.25);
-    border: 1px solid var(--border-color, rgba(255, 255, 255, 0.08));
+    background: var(--shade);
+    border: 2px solid var(--ink);
     border-radius: 8px;
     padding: 0.65rem 1rem;
+    box-shadow: var(--sh-2);
     overflow-x: auto;
   }
 
@@ -370,11 +365,11 @@
     align-items: center;
     gap: 0.35rem;
     font-size: 0.75rem;
-    font-weight: 700;
-    letter-spacing: 0.06em;
-    color: var(--muted, #8b949e);
+    font-weight: 900;
+    letter-spacing: 0.08em;
+    color: var(--ink);
     white-space: nowrap;
-    border-right: 1px solid rgba(255, 255, 255, 0.1);
+    border-right: 2px solid var(--ink);
     padding-right: 0.75rem;
   }
 
@@ -385,28 +380,6 @@
     flex-wrap: nowrap;
   }
 
-  .action-chip {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.4rem;
-    background: rgba(255, 255, 255, 0.05);
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    color: #e2e8f0;
-    font-size: 0.8rem;
-    font-weight: 500;
-    padding: 0.35rem 0.65rem;
-    border-radius: 6px;
-    cursor: pointer;
-    white-space: nowrap;
-    transition: all 0.15s ease;
-  }
-
-  .action-chip:hover {
-    background: var(--spot, #ff7a00);
-    color: #111;
-    border-color: var(--spot, #ff7a00);
-  }
-
   /* Dashboard Cards Grid */
   .dashboard-grid {
     display: grid;
@@ -415,8 +388,8 @@
   }
 
   .dash-card {
-    background: var(--surface);
-    border: 2px solid var(--ink);
+    background: var(--paper);
+    border: 3px solid var(--ink);
     border-radius: 8px;
     padding: 1.25rem;
     display: flex;
@@ -436,7 +409,7 @@
     display: flex;
     justify-content: space-between;
     align-items: center;
-    border-bottom: 1px solid var(--border);
+    border-bottom: 2px solid var(--ink);
     padding-bottom: 0.65rem;
   }
 
@@ -444,14 +417,15 @@
     display: flex;
     align-items: center;
     gap: 0.45rem;
-    color: var(--spot, #ffc400);
+    color: var(--ink);
   }
 
   .card-head-title h2 {
     font-size: 1.05rem;
-    font-weight: 700;
+    font-weight: 800;
     margin: 0;
     color: var(--ink);
+    letter-spacing: -0.01em;
   }
 
   .icon-link {
@@ -467,7 +441,7 @@
 
   .icon-link:hover {
     color: var(--ink);
-    background: rgba(0, 0, 0, 0.05);
+    background: var(--shade);
   }
 
   .metrics-row {
@@ -480,6 +454,20 @@
     display: flex;
     flex-direction: column;
     gap: 0.2rem;
+    text-align: left;
+    background: transparent;
+    border: none;
+    padding: 0.25rem 0.4rem;
+    border-radius: 6px;
+    transition: background 0.12s ease;
+  }
+
+  .metric-btn {
+    cursor: pointer;
+  }
+
+  .metric-btn:hover {
+    background: var(--shade);
   }
 
   .m-val {
@@ -496,42 +484,42 @@
   }
 
   .highlight-owned .m-val {
-    color: #16a34a;
+    color: var(--status-ok, #16a34a);
   }
 
   .highlight-missing .m-val {
-    color: #dc2626;
+    color: var(--status-error, #dc2626);
   }
 
   .highlight-review .m-val {
-    color: #d97706;
+    color: var(--status-warn, #d97706);
   }
 
   .highlight-warn .m-val {
-    color: #dc2626;
+    color: var(--status-error, #dc2626);
   }
 
   .highlight-recov .m-val {
-    color: #2563eb;
+    color: var(--status-info, #2563eb);
   }
 
   .highlight-awaiting .m-val {
-    color: #d97706;
+    color: var(--status-warn, #d97706);
   }
 
   .highlight-candidate .m-val {
-    color: #0891b2;
+    color: var(--spot, #ff7a00);
   }
 
   .highlight-reclaim .m-val {
-    color: #16a34a;
+    color: var(--status-ok, #16a34a);
   }
 
   .card-foot {
     display: flex;
     justify-content: space-between;
     align-items: center;
-    border-top: 1px solid var(--border);
+    border-top: 1px solid var(--line);
     padding-top: 0.65rem;
     font-size: 0.78rem;
   }
@@ -547,21 +535,21 @@
     width: 6px;
     height: 6px;
     border-radius: 50%;
-    background: #22c55e;
+    background: var(--status-ok, #16a34a);
   }
 
   .dot-warn {
     width: 6px;
     height: 6px;
     border-radius: 50%;
-    background: #ef4444;
+    background: var(--status-error, #dc2626);
   }
 
   .dot-dim {
     width: 6px;
     height: 6px;
     border-radius: 50%;
-    background: #64748b;
+    background: var(--dim, #64748b);
   }
 
   /* Provider Telemetry Section */
@@ -569,31 +557,34 @@
     display: flex;
     flex-direction: column;
     gap: 0.75rem;
-    background: var(--surface);
-    border: 2px solid var(--ink);
+    background: var(--paper);
+    border: 3px solid var(--ink);
     border-radius: 8px;
     box-shadow: var(--sh-4);
-    padding: 1rem 1.25rem;
+    padding: 1.25rem;
   }
 
   .sec-head {
     display: flex;
     justify-content: space-between;
     align-items: center;
+    border-bottom: 2px solid var(--ink);
+    padding-bottom: 0.65rem;
   }
 
   .sec-title {
     display: flex;
     align-items: center;
     gap: 0.4rem;
-    color: var(--spot, #ffc400);
+    color: var(--ink);
   }
 
   .sec-title h3 {
     margin: 0;
     font-size: 0.95rem;
-    font-weight: 700;
+    font-weight: 800;
     color: var(--ink);
+    letter-spacing: -0.01em;
   }
 
   .provider-cards-grid {
@@ -603,8 +594,8 @@
   }
 
   .provider-pill-card {
-    background: var(--surface-alt, rgba(0, 0, 0, 0.02));
-    border: 1px solid var(--border);
+    background: var(--shade);
+    border: 1px solid var(--line);
     border-radius: 6px;
     padding: 0.6rem 0.75rem;
     display: flex;
@@ -624,31 +615,6 @@
     color: var(--ink);
   }
 
-  .status-pill {
-    font-size: 0.68rem;
-    padding: 0.1rem 0.4rem;
-    border-radius: 4px;
-    font-weight: 700;
-  }
-
-  .status-healthy,
-  .status-available {
-    background: rgba(34, 197, 94, 0.15);
-    color: #16a34a;
-    border: 1px solid rgba(34, 197, 94, 0.3);
-  }
-
-  .status-configured {
-    background: rgba(59, 130, 246, 0.15);
-    color: #2563eb;
-    border: 1px solid rgba(59, 130, 246, 0.3);
-  }
-
-  .status-disabled {
-    background: rgba(100, 116, 139, 0.15);
-    color: #64748b;
-  }
-
   .prov-details {
     margin: 0;
     font-size: 0.74rem;
@@ -663,7 +629,7 @@
     justify-content: center;
     padding: 3rem;
     gap: 0.75rem;
-    color: var(--muted, #8b949e);
+    color: var(--muted);
   }
 
   @media (max-width: 640px) {

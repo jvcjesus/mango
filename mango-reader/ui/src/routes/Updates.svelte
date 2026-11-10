@@ -18,6 +18,7 @@
     type UpdateItem,
     type Updates,
     type WatchersDashboardResponseDto,
+    type TitleAvailabilityWatcherDto,
     type ReviewQueueItem,
     type MonitoringActivityEntry,
   } from '../lib/api';
@@ -26,7 +27,7 @@
   import { keep, recall } from '../lib/keep';
   import Notice from '../lib/Notice.svelte';
   import { toast } from '../lib/toast.svelte';
-  import { ago, dayKey, dayLabel } from '../lib/util';
+  import { ago, dayKey, dayLabel, formatLastChecked, formatNextCheck } from '../lib/util';
 
   // Navigation mode
   let activeTab = $state<'chapters' | 'calendar' | 'watchers' | 'review' | 'activity'>('chapters');
@@ -270,6 +271,104 @@
     }
   }
 
+  // Watchers Table sorting, pagination, and expandable details
+  let watchersSortField = $state<'title' | 'volume' | 'state' | 'lastChecked' | 'nextCheck'>('title');
+  let watchersSortDir = $state<'asc' | 'desc'>('asc');
+  let watchersProviderFilter = $state<string>('ALL');
+  let watchersPage = $state(1);
+  let watchersPageSize = $state(25);
+  let expandedWatcherIds = $state(new Set<number>());
+
+  function toggleRowExpanded(id: number) {
+    if (expandedWatcherIds.has(id)) {
+      expandedWatcherIds.delete(id);
+    } else {
+      expandedWatcherIds.add(id);
+    }
+  }
+
+  function toggleSort(field: 'title' | 'volume' | 'state' | 'lastChecked' | 'nextCheck') {
+    if (watchersSortField === field) {
+      watchersSortDir = watchersSortDir === 'asc' ? 'desc' : 'asc';
+    } else {
+      watchersSortField = field;
+      watchersSortDir = 'asc';
+    }
+    watchersPage = 1;
+  }
+
+  const watcherDuplicates = $derived.by(() => {
+    const counts = new Map<string, number>();
+    for (const w of watchersData?.watchers ?? []) {
+      const key = `${w.seriesTitle || w.mangaId || w.seriesId}_v${w.volumeNumber}`.toLowerCase();
+      counts.set(key, (counts.get(key) ?? 0) + 1);
+    }
+    return counts;
+  });
+
+  function isWatcherDuplicate(w: TitleAvailabilityWatcherDto): boolean {
+    const key = `${w.seriesTitle || w.mangaId || w.seriesId}_v${w.volumeNumber}`.toLowerCase();
+    return (watcherDuplicates.get(key) ?? 0) > 1;
+  }
+
+  const availableProviders = $derived.by(() => {
+    const set = new Set<string>();
+    for (const w of watchersData?.watchers ?? []) {
+      if (w.lastProviderChecked) set.add(w.lastProviderChecked);
+      if (w.topCandidateProvider) set.add(w.topCandidateProvider);
+    }
+    return Array.from(set).sort();
+  });
+
+  const processedWatchers = $derived.by(() => {
+    if (!watchersData?.watchers) return [];
+    let list = watchersData.watchers.filter(w => {
+      if (watchersSearch.trim()) {
+        const q = watchersSearch.toLowerCase();
+        const matchTitle = (w.seriesTitle ?? '').toLowerCase().includes(q);
+        const matchCand = (w.topCandidateTitle ?? '').toLowerCase().includes(q);
+        if (!matchTitle && !matchCand) return false;
+      }
+      if (watchersProviderFilter !== 'ALL') {
+        const matchP = (w.lastProviderChecked?.toLowerCase() === watchersProviderFilter.toLowerCase()) ||
+                       (w.topCandidateProvider?.toLowerCase() === watchersProviderFilter.toLowerCase());
+        if (!matchP) return false;
+      }
+      if (watchersFilter === 'ALL') return true;
+      if (watchersFilter === 'OWNED') return w.isOwned;
+      if (watchersFilter === 'ERROR') {
+        return w.state === 'PROVIDER_UNAVAILABLE' || w.state === 'RATE_LIMITED' || w.state === 'REVIEW_REQUIRED';
+      }
+      return w.state === watchersFilter;
+    });
+
+    list.sort((a, b) => {
+      let cmp = 0;
+      if (watchersSortField === 'title') {
+        cmp = (a.seriesTitle || '').localeCompare(b.seriesTitle || '');
+        if (cmp === 0) cmp = a.volumeNumber - b.volumeNumber;
+      } else if (watchersSortField === 'volume') {
+        cmp = a.volumeNumber - b.volumeNumber;
+      } else if (watchersSortField === 'state') {
+        cmp = (a.state || '').localeCompare(b.state || '');
+      } else if (watchersSortField === 'lastChecked') {
+        cmp = (a.lastCheckedAt || 0) - (b.lastCheckedAt || 0);
+      } else if (watchersSortField === 'nextCheck') {
+        cmp = (a.nextCheckAt || 0) - (b.nextCheckAt || 0);
+      }
+      return watchersSortDir === 'asc' ? cmp : -cmp;
+    });
+
+    return list;
+  });
+
+  const totalWatchersCount = $derived(processedWatchers.length);
+  const totalWatchersPages = $derived(Math.max(1, Math.ceil(totalWatchersCount / watchersPageSize)));
+  const paginatedWatchers = $derived.by(() => {
+    const start = (watchersPage - 1) * watchersPageSize;
+    return processedWatchers.slice(start, start + watchersPageSize);
+  });
+
   const running = $derived(data?.status.running ?? false);
   const days = $derived.by(() => {
     const groups: { day: number; items: UpdateItem[] }[] = [];
@@ -443,7 +542,7 @@
     {#if activeTab === 'chapters'}
       <div class="tools">
         {#if data?.status.finishedAt && !running}
-          <strong>Checked {ago(data.status.finishedAt)}: {data.status.found} new{data.status.failed ? `, ${data.status.failed} failed` : ''}{data.status.waiting ? `, ${data.status.waiting} not due yet` : ''}</strong>
+          <strong class="font-small muted">Checked {ago(data.status.finishedAt)}: {data.status.found} new{data.status.failed ? `, ${data.status.failed} failed` : ''}{data.status.waiting ? `, ${data.status.waiting} not due yet` : ''}</strong>
         {/if}
         <button class="btn big spot" disabled={running || starting} onclick={run}>
           {#if running || starting}
@@ -454,25 +553,25 @@
           {running && data ? `Checking ${data.status.done} / ${data.status.total}` : starting ? 'Starting…' : 'Update now'}
         </button>
       </div>
-    {:else}
+    {:else if activeTab === 'calendar'}
       <div class="tools">
         <div class="pill-group" role="radiogroup" aria-label="Market Filter">
           <button
-            class="pill"
+            class="pill mini"
             class:active={marketFilter === 'EN'}
             onclick={() => handleMarketChange('EN')}
           >
             EN
           </button>
           <button
-            class="pill"
+            class="pill mini"
             class:active={marketFilter === 'JA'}
             onclick={() => handleMarketChange('JA')}
           >
             JA
           </button>
           <button
-            class="pill"
+            class="pill mini"
             class:active={marketFilter === 'ALL'}
             onclick={() => handleMarketChange('ALL')}
           >
@@ -486,6 +585,39 @@
             <Icon name="refresh" size={18} stroke={3} />
           {/if}
           Refresh
+        </button>
+      </div>
+    {:else if activeTab === 'watchers'}
+      <div class="tools">
+        <button class="btn big" disabled={watchersLoading} onclick={loadWatchers}>
+          {#if watchersLoading}
+            <span class="spin"><Icon name="spinner" size={18} stroke={3} /></span>
+          {:else}
+            <Icon name="refresh" size={18} stroke={3} />
+          {/if}
+          Refresh Watchers
+        </button>
+      </div>
+    {:else if activeTab === 'review'}
+      <div class="tools">
+        <button class="btn big" disabled={reviewLoading} onclick={loadReviewQueue}>
+          {#if reviewLoading}
+            <span class="spin"><Icon name="spinner" size={18} stroke={3} /></span>
+          {:else}
+            <Icon name="refresh" size={18} stroke={3} />
+          {/if}
+          Refresh Queue
+        </button>
+      </div>
+    {:else if activeTab === 'activity'}
+      <div class="tools">
+        <button class="btn big" disabled={activityLoading} onclick={loadActivityHistory}>
+          {#if activityLoading}
+            <span class="spin"><Icon name="spinner" size={18} stroke={3} /></span>
+          {:else}
+            <Icon name="refresh" size={18} stroke={3} />
+          {/if}
+          Refresh History
         </button>
       </div>
     {/if}
@@ -611,12 +743,12 @@
     {/if}
 
   {:else if activeTab === 'watchers'}
-    <!-- AVAILABILITY & WATCHERS DASHBOARD (M7.2) -->
+    <!-- AVAILABILITY & WATCHERS DASHBOARD (M7.2 / M12) -->
     <Notice loading={watchersLoading} error={watchersError} retry={loadWatchers} />
 
     {#if !watchersLoading && !watchersError}
       {#if watchersData}
-        <!-- Educational Workflow Explainer (M8.5) -->
+        <!-- Educational Workflow Explainer -->
         <div class="watchers-explainer-card">
           <div class="explainer-item">
             <span class="exp-title"><Icon name="eye" size={14} /> <strong>Watch</strong></span>
@@ -636,59 +768,71 @@
           </div>
         </div>
 
-        <!-- Metrics Grid -->
-        <div class="watchers-summary-grid">
-          <button type="button" class="metric-card" class:selected={watchersFilter === 'ALL'} onclick={() => watchersFilter = 'ALL'}>
-            <span class="metric-val">{watchersData.summary.totalWatchers}</span>
-            <span class="metric-lbl">Total Watchers</span>
+        <!-- Metrics Grid (Stat Cards) -->
+        <div class="stat-grid watchers-stat-grid">
+          <button type="button" class="stat-card" class:selected={watchersFilter === 'ALL'} onclick={() => { watchersFilter = 'ALL'; watchersPage = 1; }}>
+            <span class="stat-val">{watchersData.summary.totalWatchers}</span>
+            <span class="stat-lbl">Total Watchers</span>
           </button>
-          <button type="button" class="metric-card metric-upcoming" class:selected={watchersFilter === 'UPCOMING'} onclick={() => watchersFilter = 'UPCOMING'}>
-            <span class="metric-val">{watchersData.summary.upcomingCount}</span>
-            <span class="metric-lbl">Upcoming</span>
+          <button type="button" class="stat-card" class:selected={watchersFilter === 'UPCOMING'} onclick={() => { watchersFilter = 'UPCOMING'; watchersPage = 1; }}>
+            <span class="stat-val" style="color: var(--status-info, #2563eb);">{watchersData.summary.upcomingCount}</span>
+            <span class="stat-lbl">Upcoming</span>
           </button>
-          <button type="button" class="metric-card metric-awaiting" class:selected={watchersFilter === 'RELEASED_AWAITING_PROVIDER'} onclick={() => watchersFilter = 'RELEASED_AWAITING_PROVIDER'}>
-            <span class="metric-val">{watchersData.summary.releasedAwaitingCount}</span>
-            <span class="metric-lbl">Awaiting Upload</span>
+          <button type="button" class="stat-card" class:selected={watchersFilter === 'RELEASED_AWAITING_PROVIDER'} onclick={() => { watchersFilter = 'RELEASED_AWAITING_PROVIDER'; watchersPage = 1; }}>
+            <span class="stat-val" style="color: var(--status-warn, #d97706);">{watchersData.summary.releasedAwaitingCount}</span>
+            <span class="stat-lbl">Awaiting Upload</span>
           </button>
-          <button type="button" class="metric-card metric-candidate" class:selected={watchersFilter === 'ELIGIBLE_CANDIDATE_FOUND'} onclick={() => watchersFilter = 'ELIGIBLE_CANDIDATE_FOUND'}>
-            <span class="metric-val">{watchersData.summary.candidateFoundCount}</span>
-            <span class="metric-lbl">Candidates Found</span>
+          <button type="button" class="stat-card" class:selected={watchersFilter === 'ELIGIBLE_CANDIDATE_FOUND'} onclick={() => { watchersFilter = 'ELIGIBLE_CANDIDATE_FOUND'; watchersPage = 1; }}>
+            <span class="stat-val" style="color: var(--spot, #ff7a00);">{watchersData.summary.candidateFoundCount}</span>
+            <span class="stat-lbl">Candidates Found</span>
           </button>
-          <button type="button" class="metric-card metric-notified" class:selected={watchersFilter === 'NOTIFIED'} onclick={() => watchersFilter = 'NOTIFIED'}>
-            <span class="metric-val">{watchersData.summary.notifiedCount}</span>
-            <span class="metric-lbl">Notified</span>
+          <button type="button" class="stat-card" class:selected={watchersFilter === 'NOTIFIED'} onclick={() => { watchersFilter = 'NOTIFIED'; watchersPage = 1; }}>
+            <span class="stat-val" style="color: #9333ea;">{watchersData.summary.notifiedCount}</span>
+            <span class="stat-lbl">Notified</span>
           </button>
-          <button type="button" class="metric-card metric-owned" class:selected={watchersFilter === 'OWNED'} onclick={() => watchersFilter = 'OWNED'}>
-            <span class="metric-val">{watchersData.summary.ownedCount}</span>
-            <span class="metric-lbl">Owned / Complete</span>
+          <button type="button" class="stat-card" class:selected={watchersFilter === 'OWNED'} onclick={() => { watchersFilter = 'OWNED'; watchersPage = 1; }}>
+            <span class="stat-val" style="color: var(--status-ok, #16a34a);">{watchersData.summary.ownedCount}</span>
+            <span class="stat-lbl">Owned / Complete</span>
           </button>
-          <button type="button" class="metric-card metric-error" class:selected={watchersFilter === 'ERROR'} onclick={() => watchersFilter = 'ERROR'}>
-            <span class="metric-val">{watchersData.summary.errorCount}</span>
-            <span class="metric-lbl">Issues / Errors</span>
+          <button type="button" class="stat-card" class:selected={watchersFilter === 'ERROR'} onclick={() => { watchersFilter = 'ERROR'; watchersPage = 1; }}>
+            <span class="stat-val" style="color: var(--status-error, #dc2626);">{watchersData.summary.errorCount}</span>
+            <span class="stat-lbl">Issues / Errors</span>
           </button>
         </div>
 
         <!-- Filter & Search Toolbar -->
-        <div class="watchers-toolbar">
-          <div class="filter-pills">
-            {#each [
-              ['ALL', 'All'],
-              ['UPCOMING', 'Upcoming'],
-              ['RELEASED_AWAITING_PROVIDER', 'Awaiting Upload'],
-              ['ELIGIBLE_CANDIDATE_FOUND', 'Candidates Found'],
-              ['NOTIFIED', 'Notified'],
-              ['OWNED', 'Owned'],
-              ['ERROR', 'Issues']
-            ] as [fKey, fLabel]}
-              <button
-                class="pill mini"
-                class:active={watchersFilter === fKey}
-                onclick={() => watchersFilter = fKey}
-              >
-                {fLabel}
-              </button>
-            {/each}
+        <div class="table-toolbar">
+          <div class="toolbar-left">
+            <input
+              type="search"
+              class="field search-field"
+              placeholder="Search series or candidates…"
+              bind:value={watchersSearch}
+              oninput={() => watchersPage = 1}
+            />
+
+            {#if availableProviders.length > 0}
+              <label class="filter-label">
+                <span class="font-small muted">Provider:</span>
+                <select class="field select-compact" bind:value={watchersProviderFilter} onchange={() => watchersPage = 1}>
+                  <option value="ALL">All Providers</option>
+                  {#each availableProviders as prov}
+                    <option value={prov}>{prov}</option>
+                  {/each}
+                </select>
+              </label>
+            {/if}
+
+            <label class="filter-label">
+              <span class="font-small muted">Rows:</span>
+              <select class="field select-compact" bind:value={watchersPageSize} onchange={() => watchersPage = 1}>
+                <option value={25}>25</option>
+                <option value={50}>50</option>
+                <option value={100}>100</option>
+              </select>
+            </label>
           </div>
+
           <div class="bulk-actions-group">
             <button
               class="btn mini"
@@ -711,133 +855,236 @@
                 <Icon name="play" size={12} /> Resume ({selectedWatcherIds.size})
               </button>
               <button class="btn mini text" onclick={() => selectedWatcherIds.clear()}>
-                Clear
+                Clear ({selectedWatcherIds.size})
               </button>
             {/if}
           </div>
-          <div class="search-box">
-            <input
-              type="search"
-              class="field search-field"
-              placeholder="Search title…"
-              bind:value={watchersSearch}
-            />
-          </div>
         </div>
 
-        <!-- Filtered Watchers List -->
-        {@const filteredWatchers = watchersData.watchers.filter(w => {
-          if (watchersSearch.trim()) {
-            const q = watchersSearch.toLowerCase();
-            if (!w.seriesTitle?.toLowerCase().includes(q)) return false;
-          }
-          if (watchersFilter === 'ALL') return true;
-          if (watchersFilter === 'OWNED') return w.isOwned;
-          if (watchersFilter === 'ERROR') {
-            return w.state === 'PROVIDER_UNAVAILABLE' || w.state === 'RATE_LIMITED' || w.state === 'REVIEW_REQUIRED';
-          }
-          return w.state === watchersFilter;
-        })}
-
-        {#if filteredWatchers.length === 0}
+        {#if processedWatchers.length === 0}
           <div class="panel empty-watchers-panel">
-            <p class="muted">No availability watchers match current filter.</p>
+            <p class="muted">No availability watchers match the current filter or search criteria.</p>
           </div>
         {:else}
-          <div class="watchers-list">
-            {#each filteredWatchers as watcher (watcher.id)}
-              <div class="watcher-card" class:card-highlight={watcher.seriesTitle === 'Kagurabachi' && watcher.volumeNumber === 9}>
-                <div class="watcher-main-row">
-                  <label class="watcher-checkbox-label" title="Select Volume {watcher.volumeNumber}">
+          <div class="data-table-wrap">
+            <table class="data-table font-small">
+              <thead>
+                <tr>
+                  <th class="th-checkbox">
                     <input
                       type="checkbox"
-                      checked={selectedWatcherIds.has(watcher.id)}
-                      onchange={(e) => toggleWatcherSelect(watcher.id, (e.target as HTMLInputElement).checked)}
+                      checked={paginatedWatchers.length > 0 && paginatedWatchers.every(w => selectedWatcherIds.has(w.id))}
+                      onchange={(e) => {
+                        const checked = (e.currentTarget as HTMLInputElement).checked;
+                        for (const w of paginatedWatchers) {
+                          toggleWatcherSelect(w.id, checked);
+                        }
+                      }}
+                      aria-label="Select all watchers on current page"
                     />
-                  </label>
-                  <div class="watcher-title-col">
-                    <div class="watcher-series-head">
-                      {#if watcher.mangaId}
-                        <a href="#/title/{watcher.mangaId}" class="watcher-series-link">
-                          <strong>{watcher.seriesTitle || `Manga #${watcher.mangaId}`}</strong>
-                        </a>
-                      {:else}
-                        <strong>{watcher.seriesTitle}</strong>
-                      {/if}
-                      <span class="vol-tag">Vol {watcher.volumeNumber}</span>
-                      <span class="pill-badge edition-pill">{watcher.edition}</span>
+                  </th>
+                  <th class="sortable" onclick={() => toggleSort('title')}>
+                    Series Title {watchersSortField === 'title' ? (watchersSortDir === 'asc' ? '▲' : '▼') : ''}
+                  </th>
+                  <th class="sortable th-vol" onclick={() => toggleSort('volume')}>
+                    Vol {watchersSortField === 'volume' ? (watchersSortDir === 'asc' ? '▲' : '▼') : ''}
+                  </th>
+                  <th class="sortable th-status" onclick={() => toggleSort('state')}>
+                    Status {watchersSortField === 'state' ? (watchersSortDir === 'asc' ? '▲' : '▼') : ''}
+                  </th>
+                  <th>Best Candidate</th>
+                  <th class="sortable th-time" onclick={() => toggleSort('lastChecked')}>
+                    Last Checked {watchersSortField === 'lastChecked' ? (watchersSortDir === 'asc' ? '▲' : '▼') : ''}
+                  </th>
+                  <th class="sortable th-time" onclick={() => toggleSort('nextCheck')}>
+                    Next Check {watchersSortField === 'nextCheck' ? (watchersSortDir === 'asc' ? '▲' : '▼') : ''}
+                  </th>
+                  <th class="th-actions">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                {#each paginatedWatchers as watcher (watcher.id)}
+                  {@const isExpanded = expandedWatcherIds.has(watcher.id)}
+                  {@const isDup = isWatcherDuplicate(watcher)}
+                  <tr class="watcher-row" class:row-selected={selectedWatcherIds.has(watcher.id)} class:row-expanded={isExpanded}>
+                    <td class="td-checkbox">
+                      <input
+                        type="checkbox"
+                        checked={selectedWatcherIds.has(watcher.id)}
+                        onchange={(e) => toggleWatcherSelect(watcher.id, (e.target as HTMLInputElement).checked)}
+                        aria-label="Select Volume {watcher.volumeNumber}"
+                      />
+                    </td>
+                    <td class="td-title">
+                      <div class="series-name-wrap">
+                        {#if watcher.mangaId}
+                          <a href="#/title/{watcher.mangaId}" class="series-link">
+                            <strong>{watcher.seriesTitle || `Manga #${watcher.mangaId}`}</strong>
+                          </a>
+                        {:else}
+                          <strong>{watcher.seriesTitle}</strong>
+                        {/if}
+                        {#if watcher.edition && watcher.edition !== 'standard'}
+                          <span class="edition-pill">{watcher.edition}</span>
+                        {/if}
+                        {#if isDup}
+                          <span class="status-badge status-warn" title="Multiple watcher records exist for this title and volume">
+                            <Icon name="alert" size={11} stroke={2.5} /> Duplicate
+                          </span>
+                        {/if}
+                      </div>
+                    </td>
+                    <td class="td-vol font-mono">
+                      <span class="vol-num-tag">Vol. {watcher.volumeNumber}</span>
+                    </td>
+                    <td class="td-status">
                       {#if watcher.isOwned}
-                        <span class="pill-badge active">Owned</span>
+                        <span class="status-badge status-owned">Owned</span>
+                      {:else if watcher.state === 'ELIGIBLE_CANDIDATE_FOUND' || watcher.state === 'CANDIDATE_FOUND'}
+                        <span class="status-badge status-candidate">Candidate</span>
+                      {:else if watcher.state === 'RELEASED_AWAITING_PROVIDER'}
+                        <span class="status-badge status-awaiting">Awaiting</span>
+                      {:else if watcher.state === 'UPCOMING'}
+                        <span class="status-badge status-upcoming">Upcoming</span>
+                      {:else if watcher.state === 'NOTIFIED'}
+                        <span class="status-badge status-info">Notified</span>
+                      {:else if watcher.state === 'FAILED_PERMANENT' || watcher.state === 'PROVIDER_UNAVAILABLE' || watcher.state === 'RATE_LIMITED' || watcher.state === 'REVIEW_REQUIRED'}
+                        <span class="status-badge status-error">{watcher.state}</span>
                       {:else}
-                        <span class="pill-badge state-badge state-{watcher.state.toLowerCase()}">
-                          {watcher.state}
-                        </span>
+                        <span class="status-badge status-neutral">{watcher.state}</span>
                       {/if}
-                    </div>
-
-                    <div class="watcher-meta-row font-small muted">
-                      {#if watcher.releaseDate}
-                        <span>Released: <strong>{watcher.releaseDate}</strong></span>
-                      {/if}
-                      {#if watcher.lastCheckedAt}
-                        <span>Checked: {ago(watcher.lastCheckedAt * 1000)}</span>
-                      {/if}
-                      <span>Next Check: {ago(watcher.nextCheckAt * 1000)}</span>
-                      {#if watcher.lastProviderChecked}
-                        <span>Provider: <code>{watcher.lastProviderChecked}</code></span>
-                      {/if}
-                    </div>
-                  </div>
-
-                  <div class="watcher-actions-col">
-                    <button
-                      class="btn mini"
-                      disabled={refreshingWatchers[watcher.id]}
-                      onclick={() => handleRefreshWatcher(watcher.id)}
-                      title="Run on-demand check for Volume {watcher.volumeNumber}"
-                    >
-                      {#if refreshingWatchers[watcher.id]}
-                        <span class="spin"><Icon name="spinner" size={13} stroke={3} /></span> Checking…
+                    </td>
+                    <td class="td-cand">
+                      {#if watcher.topCandidateTitle}
+                        <div class="cand-cell">
+                          {#if watcher.topCandidateProvider}
+                            <span class="provider-pill">{watcher.topCandidateProvider}</span>
+                          {/if}
+                          <span class="cand-text font-mono" title={watcher.topCandidateTitle}>{watcher.topCandidateTitle}</span>
+                        </div>
+                      {:else if watcher.candidateCount && watcher.candidateCount > 0}
+                        <span class="muted font-small">{watcher.candidateCount} candidates</span>
                       {:else}
-                        <Icon name="search" size={13} /> Check Now
+                        <span class="muted font-small">—</span>
                       {/if}
-                    </button>
+                    </td>
+                    <td class="td-time font-small muted">
+                      {formatLastChecked(watcher.lastCheckedAt)}
+                    </td>
+                    <td class="td-time font-small">
+                      <span class:text-warn={formatNextCheck(watcher.nextCheckAt) === 'Due now'}>
+                        {formatNextCheck(watcher.nextCheckAt)}
+                      </span>
+                    </td>
+                    <td class="td-actions">
+                      <div class="action-btn-row">
+                        <button
+                          class="btn mini icon-text"
+                          disabled={refreshingWatchers[watcher.id]}
+                          onclick={() => handleRefreshWatcher(watcher.id)}
+                          title="Run on-demand check for Volume {watcher.volumeNumber}"
+                        >
+                          {#if refreshingWatchers[watcher.id]}
+                            <span class="spin"><Icon name="spinner" size={12} stroke={3} /></span>
+                          {:else}
+                            <Icon name="search" size={12} />
+                          {/if}
+                          <span>Check</span>
+                        </button>
+                        {#if watcher.mangaId}
+                          <button
+                            class="btn mini flat icon"
+                            onclick={() => {
+                              inspectingVolumeTarget = { mangaId: watcher.mangaId!, volume: watcher.volumeNumber };
+                            }}
+                            title="Inspect candidate transports"
+                          >
+                            <Icon name="eye" size={12} />
+                          </button>
+                        {/if}
+                        <button
+                          class="btn mini flat icon"
+                          onclick={() => toggleRowExpanded(watcher.id)}
+                          title={isExpanded ? 'Collapse details' : 'Expand details'}
+                        >
+                          <Icon name={isExpanded ? 'up' : 'down'} size={12} />
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
 
-                    {#if watcher.mangaId}
-                      <button
-                        class="btn mini flat"
-                        onclick={() => {
-                          inspectingVolumeTarget = { mangaId: watcher.mangaId!, volume: watcher.volumeNumber };
-                        }}
-                        title="Inspect candidate transports"
-                      >
-                        <Icon name="eye" size={13} /> Inspect
-                      </button>
-                    {/if}
-                  </div>
-                </div>
+                  {#if isExpanded}
+                    <tr class="drawer-row">
+                      <td colspan="8">
+                        <div class="drawer-content">
+                          <div class="drawer-grid">
+                            <div class="drawer-field">
+                              <span class="drawer-label">Release Date</span>
+                              <span class="drawer-value font-mono">{watcher.releaseDate || 'Unknown'}</span>
+                            </div>
+                            <div class="drawer-field">
+                              <span class="drawer-label">Last Provider</span>
+                              <span class="drawer-value">{watcher.lastProviderChecked || 'None recorded'}</span>
+                            </div>
+                            <div class="drawer-field">
+                              <span class="drawer-label">Consecutive Failures</span>
+                              <span class="drawer-value">{watcher.consecutiveFailures}</span>
+                            </div>
+                            <div class="drawer-field">
+                              <span class="drawer-label">Check Interval</span>
+                              <span class="drawer-value font-mono">{Math.round(watcher.checkIntervalSecs / 60)} min</span>
+                            </div>
+                          </div>
 
-                <!-- Top Candidate Preview if available -->
-                {#if watcher.topCandidateTitle || (watcher.candidateCount && watcher.candidateCount > 0)}
-                  <div class="candidate-preview-bar font-small">
-                    <span class="cand-badge">
-                      <Icon name="download" size={12} />
-                      {watcher.candidateCount || 1} Candidate{(watcher.candidateCount || 1) > 1 ? 's' : ''}
-                    </span>
-                    {#if watcher.topCandidateProvider}
-                      <span class="provider-pill">{watcher.topCandidateProvider}</span>
-                    {/if}
-                    <span class="cand-title font-mono">{watcher.topCandidateTitle || 'Candidate Available'}</span>
-                  </div>
-                {/if}
+                          {#if watcher.topCandidateTitle}
+                            <div class="drawer-cand-box">
+                              <strong>Top Candidate:</strong>
+                              <span class="font-mono">{watcher.topCandidateTitle}</span>
+                              {#if watcher.topCandidateFingerprint}
+                                <span class="muted font-small font-mono">Fingerprint: {watcher.topCandidateFingerprint}</span>
+                              {/if}
+                            </div>
+                          {/if}
 
-                {#if watcher.lastError}
-                  <div class="watcher-error-note font-small">
-                    <Icon name="close" size={12} /> {watcher.lastError}
-                  </div>
-                {/if}
-              </div>
-            {/each}
+                          {#if watcher.lastError}
+                            <div class="drawer-error-box">
+                              <Icon name="alert" size={14} />
+                              <span>{watcher.lastError}</span>
+                            </div>
+                          {/if}
+                        </div>
+                      </td>
+                    </tr>
+                  {/if}
+                {/each}
+              </tbody>
+            </table>
+          </div>
+
+          <!-- Pagination Bar -->
+          <div class="pagination-bar">
+            <span class="pagination-info muted">
+              Showing {Math.min((watchersPage - 1) * watchersPageSize + 1, totalWatchersCount)}–{Math.min(watchersPage * watchersPageSize, totalWatchersCount)} of {totalWatchersCount} watchers
+            </span>
+            <div class="pagination-actions">
+              <button
+                class="btn mini flat page-btn"
+                disabled={watchersPage <= 1}
+                onclick={() => watchersPage = Math.max(1, watchersPage - 1)}
+              >
+                Prev
+              </button>
+              <span class="pagination-pages font-small">
+                Page {watchersPage} of {totalWatchersPages}
+              </span>
+              <button
+                class="btn mini flat page-btn"
+                disabled={watchersPage >= totalWatchersPages}
+                onclick={() => watchersPage = Math.min(totalWatchersPages, watchersPage + 1)}
+              >
+                Next
+              </button>
+            </div>
           </div>
         {/if}
       {/if}
@@ -1471,210 +1718,16 @@
     font-size: 12px;
   }
 
-  /* Availability Watchers Dashboard Styles (M7.2) */
-  .watchers-summary-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
-    gap: 0.65rem;
-    margin: 1rem 0;
-  }
-
-  .watchers-summary-grid .metric-card {
-    background: var(--shade);
-    border: 1px solid var(--border-color, rgba(255, 255, 255, 0.08));
-    border-radius: 6px;
-    padding: 0.75rem;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 0.25rem;
-    text-align: center;
-    cursor: pointer;
-    transition: border-color 0.15s ease, background 0.15s ease;
-  }
-
-  .watchers-summary-grid .metric-card:hover {
-    border-color: var(--spot, #ff7a00);
-  }
-
-  .watchers-summary-grid .metric-card.selected {
-    border-color: var(--spot, #ff7a00);
-    background: rgba(255, 122, 0, 0.08);
-  }
-
-  .metric-val {
-    font-size: 1.4rem;
-    font-weight: 700;
-  }
-
-  .metric-lbl {
-    font-size: 0.72rem;
-    color: var(--muted, #888);
-  }
-
-  .metric-upcoming .metric-val { color: #3b82f6; }
-  .metric-awaiting .metric-val { color: #eab308; }
-  .metric-candidate .metric-val { color: var(--spot, #ff7a00); }
-  .metric-notified .metric-val { color: #a855f7; }
-  .metric-owned .metric-val { color: #22c55e; }
-  .metric-error .metric-val { color: #ef4444; }
-
-  .watchers-toolbar {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    flex-wrap: wrap;
-    gap: 0.75rem;
-    margin-bottom: 1rem;
-  }
-
-  .filter-pills {
-    display: flex;
-    gap: 0.4rem;
-    flex-wrap: wrap;
-  }
-
-  .search-field {
-    min-width: 220px;
-    padding: 0.4rem 0.75rem;
-    font-size: 13px;
-  }
-
-  .watchers-list {
-    display: flex;
-    flex-direction: column;
-    gap: 0.75rem;
-  }
-
-  .watcher-card {
-    background: var(--shade);
-    border: 1px solid var(--border-color, rgba(255, 255, 255, 0.08));
-    border-radius: 8px;
-    padding: 1rem;
-    display: flex;
-    flex-direction: column;
-    gap: 0.6rem;
-  }
-
-  .watcher-card.card-highlight {
-    border-color: var(--spot, #ff7a00);
-    box-shadow: 0 0 12px rgba(255, 122, 0, 0.15);
-  }
-
-  .watcher-main-row {
-    display: flex;
-    justify-content: space-between;
-    align-items: flex-start;
-    gap: 1rem;
-    flex-wrap: wrap;
-  }
-
-  .watcher-title-col {
-    display: flex;
-    flex-direction: column;
-    gap: 0.35rem;
-  }
-
-  .watcher-series-head {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    flex-wrap: wrap;
-  }
-
-  .watcher-series-link {
-    color: var(--ink);
-    text-decoration: none;
-    font-size: 15px;
-  }
-
-  .watcher-series-link:hover {
-    text-decoration: underline;
-  }
-
-  .vol-tag {
-    font-weight: 700;
-    font-size: 13px;
-    color: var(--spot, #ff7a00);
-  }
-
-  .edition-pill {
-    font-size: 11px;
-    padding: 2px 6px;
-    border-radius: 4px;
-    background: rgba(255, 255, 255, 0.06);
-  }
-
-  .state-badge {
-    font-size: 11px;
-    font-weight: 600;
-    padding: 2px 8px;
-    border-radius: 4px;
-    background: rgba(255, 255, 255, 0.08);
-  }
-
-  .watcher-meta-row {
-    display: flex;
-    gap: 1rem;
-    flex-wrap: wrap;
-  }
-
-  .watcher-actions-col {
-    display: flex;
-    gap: 0.5rem;
-    align-items: center;
-  }
-
-  .candidate-preview-bar {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    background: rgba(255, 122, 0, 0.08);
-    border: 1px solid rgba(255, 122, 0, 0.2);
-    border-radius: 6px;
-    padding: 0.4rem 0.75rem;
-  }
-
-  .cand-badge {
-    display: flex;
-    align-items: center;
-    gap: 0.25rem;
-    font-weight: 700;
-    color: var(--spot, #ff7a00);
-  }
-
-  .provider-pill {
-    background: var(--spot, #ff7a00);
-    color: #111;
-    font-size: 10px;
-    font-weight: 700;
-    padding: 1px 5px;
-    border-radius: 3px;
-    text-transform: uppercase;
-  }
-
-  .cand-title {
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-  }
-
-  .watcher-error-note {
-    color: #ef4444;
-    display: flex;
-    align-items: center;
-    gap: 0.35rem;
-  }
-
+  /* Availability Watchers Dashboard & Operational Table Styles (M12) */
   .watchers-explainer-card {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
     gap: 0.75rem;
-    background: rgba(0, 0, 0, 0.25);
-    border: 1px solid var(--border-color, rgba(255, 255, 255, 0.08));
+    background: var(--shade);
+    border: 1px solid var(--line);
     border-radius: 8px;
     padding: 0.85rem 1rem;
-    margin-bottom: 0.5rem;
+    margin-bottom: 0.75rem;
   }
 
   .explainer-item {
@@ -1688,14 +1741,52 @@
     align-items: center;
     gap: 0.35rem;
     font-size: 0.82rem;
-    color: var(--accent, #6366f1);
+    color: var(--ink);
   }
 
   .explainer-item p {
     margin: 0;
     font-size: 0.76rem;
-    color: var(--muted, #8b949e);
+    color: var(--muted);
     line-height: 1.35;
+  }
+
+  .watchers-stat-grid {
+    grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+    margin-bottom: 1rem;
+  }
+
+  .table-toolbar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+    margin-bottom: 0.75rem;
+  }
+
+  .toolbar-left {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    flex-wrap: wrap;
+  }
+
+  .search-field {
+    min-width: 220px;
+    padding: 0.4rem 0.75rem;
+    font-size: 13px;
+  }
+
+  .filter-label {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+  }
+
+  .select-compact {
+    padding: 0.35rem 0.6rem;
+    font-size: 12px;
   }
 
   .bulk-actions-group {
@@ -1705,20 +1796,189 @@
     flex-wrap: wrap;
   }
 
-  .watcher-checkbox-label {
-    display: flex;
-    align-items: center;
-    cursor: pointer;
-    padding-right: 0.25rem;
+  .th-checkbox, .td-checkbox {
+    width: 36px;
+    text-align: center;
   }
 
-  .watcher-checkbox-label input {
+  .td-checkbox input, .th-checkbox input {
     cursor: pointer;
     width: 15px;
     height: 15px;
-    accent-color: var(--accent, #6366f1);
+    accent-color: var(--ink);
   }
 
+  .sortable {
+    cursor: pointer;
+    user-select: none;
+  }
+
+  .sortable:hover {
+    color: var(--ink);
+    background: var(--shade-2);
+  }
+
+  .th-vol, .td-vol {
+    width: 70px;
+    text-align: center;
+  }
+
+  .th-status, .td-status {
+    width: 100px;
+  }
+
+  .th-time, .td-time {
+    width: 110px;
+  }
+
+  .th-actions, .td-actions {
+    width: 140px;
+    text-align: right;
+  }
+
+  .series-name-wrap {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    flex-wrap: wrap;
+  }
+
+  .series-link {
+    color: var(--ink);
+    text-decoration: none;
+    font-size: 14px;
+  }
+
+  .series-link:hover {
+    text-decoration: underline;
+  }
+
+  .vol-num-tag {
+    font-weight: 700;
+    color: var(--ink);
+  }
+
+  .edition-pill {
+    font-size: 11px;
+    padding: 1px 6px;
+    border-radius: 4px;
+    background: var(--shade);
+    color: var(--dim);
+  }
+
+  .cand-cell {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    max-width: 320px;
+  }
+
+  .provider-pill {
+    background: var(--spot, #ff7a00);
+    color: var(--ink);
+    font-size: 10px;
+    font-weight: 700;
+    padding: 1px 5px;
+    border-radius: 3px;
+    text-transform: uppercase;
+    flex-shrink: 0;
+  }
+
+  .cand-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: 12px;
+  }
+
+  .action-btn-row {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 0.35rem;
+  }
+
+  .watcher-row.row-selected {
+    background: color-mix(in srgb, var(--spot, #ff7a00) 10%, var(--paper));
+  }
+
+  .watcher-row.row-expanded {
+    background: var(--shade);
+  }
+
+  .drawer-row td {
+    background: var(--shade);
+    padding: 0.75rem 1rem !important;
+    border-bottom: 2px solid var(--line) !important;
+  }
+
+  .drawer-content {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+
+  .drawer-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 0.75rem;
+  }
+
+  .drawer-field {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+  }
+
+  .drawer-label {
+    font-size: 11px;
+    color: var(--muted);
+    text-transform: uppercase;
+    font-weight: 600;
+  }
+
+  .drawer-value {
+    font-size: 13px;
+    font-weight: 600;
+  }
+
+  .drawer-cand-box {
+    background: var(--paper);
+    border: 1px solid var(--line);
+    border-radius: 6px;
+    padding: 0.5rem 0.75rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+
+  .drawer-error-box {
+    background: var(--status-error-bg);
+    border: 1px solid var(--status-error);
+    color: var(--status-error);
+    border-radius: 6px;
+    padding: 0.5rem 0.75rem;
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-weight: 600;
+  }
+
+  .empty-watchers-panel {
+    padding: 32px 24px;
+    text-align: center;
+    background: var(--paper);
+    border: 2px dashed var(--line);
+    border-radius: 8px;
+    margin-top: 1rem;
+  }
+
+  .text-warn {
+    color: var(--status-warn, #d97706);
+    font-weight: 700;
+  }
+
+  /* Review Queue Styles (M10.1 / M12) */
   .review-queue-header {
     display: flex;
     justify-content: space-between;
@@ -1755,29 +2015,30 @@
   }
 
   .review-card {
-    background: var(--surface, #1e293b);
-    border: 1px solid var(--border, #334155);
+    background: var(--paper);
+    border: 2px solid var(--shade);
     border-radius: 8px;
     padding: 1rem;
-    transition: border-color 0.15s;
+    box-shadow: var(--sh-1);
+    transition: border-color 0.15s ease;
   }
 
   .review-card:hover {
-    border-color: var(--border-hover, #475569);
+    border-color: var(--dim);
   }
 
   .review-card.status-approved {
-    border-left: 3px solid #10b981;
+    border-left: 4px solid var(--status-ok, #16a34a);
   }
 
   .review-card.status-rejected {
-    border-left: 3px solid #ef4444;
-    opacity: 0.75;
+    border-left: 4px solid var(--status-error, #dc2626);
+    opacity: 0.8;
   }
 
   .review-card.status-skipped {
-    border-left: 3px solid #f59e0b;
-    opacity: 0.75;
+    border-left: 4px solid var(--status-warn, #d97706);
+    opacity: 0.8;
   }
 
   .review-main-row {
@@ -1803,6 +2064,7 @@
 
   .review-title-row .series-title {
     font-size: 1rem;
+    color: var(--ink);
   }
 
   .status-pill {
@@ -1814,27 +2076,27 @@
   }
 
   .status-pill.status-pending {
-    background: rgba(245, 158, 11, 0.2);
-    color: #f59e0b;
-    border: 1px solid rgba(245, 158, 11, 0.4);
+    background: var(--status-warn-bg);
+    color: var(--status-warn);
+    border: 1px solid var(--status-warn);
   }
 
   .status-pill.status-approved {
-    background: rgba(16, 185, 129, 0.2);
-    color: #10b981;
-    border: 1px solid rgba(16, 185, 129, 0.4);
+    background: var(--status-ok-bg);
+    color: var(--status-ok);
+    border: 1px solid var(--status-ok);
   }
 
   .status-pill.status-rejected {
-    background: rgba(239, 68, 68, 0.2);
-    color: #ef4444;
-    border: 1px solid rgba(239, 68, 68, 0.4);
+    background: var(--status-error-bg);
+    color: var(--status-error);
+    border: 1px solid var(--status-error);
   }
 
   .status-pill.status-skipped {
-    background: rgba(148, 163, 184, 0.2);
-    color: #94a3b8;
-    border: 1px solid rgba(148, 163, 184, 0.4);
+    background: var(--shade);
+    color: var(--dim);
+    border: 1px solid var(--line);
   }
 
   .conf-pill {
@@ -1845,23 +2107,23 @@
   }
 
   .conf-pill.conf-high {
-    background: rgba(16, 185, 129, 0.15);
-    color: #10b981;
+    background: var(--status-ok-bg);
+    color: var(--status-ok);
   }
 
   .conf-pill.conf-medium {
-    background: rgba(245, 158, 11, 0.15);
-    color: #f59e0b;
+    background: var(--status-warn-bg);
+    color: var(--status-warn);
   }
 
   .conf-pill.conf-low {
-    background: rgba(239, 68, 68, 0.15);
-    color: #ef4444;
+    background: var(--status-error-bg);
+    color: var(--status-error);
   }
 
   .review-candidate-title {
     word-break: break-all;
-    color: var(--fg, #f8fafc);
+    color: var(--ink);
   }
 
   .review-meta-row {
@@ -1879,10 +2141,10 @@
   }
 
   .review-reason-note {
-    background: rgba(0, 0, 0, 0.2);
+    background: var(--shade);
     padding: 0.25rem 0.5rem;
     border-radius: 4px;
-    border-left: 2px solid var(--muted, #64748b);
+    border-left: 2px solid var(--dim);
   }
 
   .review-actions-cell {
@@ -1902,11 +2164,13 @@
     width: 140px;
   }
 
+  /* Activity History Table Styles (M10.1 / M12) */
   .activity-table-wrapper {
     overflow-x: auto;
-    background: var(--surface, #1e293b);
-    border: 1px solid var(--border, #334155);
+    background: var(--paper);
+    border: 2px solid var(--shade);
     border-radius: 8px;
+    box-shadow: var(--sh-1);
   }
 
   .activity-table {
@@ -1918,13 +2182,13 @@
   .activity-table td {
     padding: 0.6rem 0.8rem;
     text-align: left;
-    border-bottom: 1px solid var(--border, #334155);
+    border-bottom: 1px solid var(--line);
   }
 
   .activity-table th {
-    background: rgba(0, 0, 0, 0.15);
-    color: var(--muted, #8b949e);
-    font-weight: 600;
+    background: var(--shade);
+    color: var(--ink);
+    font-weight: 700;
   }
 
   .action-badge {
@@ -1936,41 +2200,42 @@
   }
 
   .action-badge.action-discovered {
-    background: rgba(59, 130, 246, 0.15);
-    color: #3b82f6;
+    background: var(--status-info-bg);
+    color: var(--status-info);
   }
 
   .action-badge.action-plan_proposed {
-    background: rgba(245, 158, 11, 0.15);
-    color: #f59e0b;
+    background: var(--status-warn-bg);
+    color: var(--status-warn);
   }
 
   .action-badge.action-approved {
-    background: rgba(16, 185, 129, 0.15);
-    color: #10b981;
+    background: var(--status-ok-bg);
+    color: var(--status-ok);
   }
 
   .action-badge.action-rejected {
-    background: rgba(239, 68, 68, 0.15);
-    color: #ef4444;
+    background: var(--status-error-bg);
+    color: var(--status-error);
   }
 
   .action-badge.action-simulated {
-    background: rgba(168, 85, 247, 0.15);
-    color: #a855f7;
+    background: #f3e8ff;
+    color: #9333ea;
   }
 
   .action-badge.action-auto_acquired {
-    background: rgba(16, 185, 129, 0.25);
-    color: #10b981;
+    background: var(--status-ok-bg);
+    color: var(--status-ok);
     font-weight: 800;
   }
 
   .decision-code {
-    background: rgba(0, 0, 0, 0.25);
+    background: var(--shade);
     padding: 0.15rem 0.4rem;
     border-radius: 3px;
     font-size: 0.75rem;
+    color: var(--ink);
   }
 
   .activity-details-cell {

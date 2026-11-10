@@ -14,6 +14,24 @@ export function ago(seconds: number): string {
   return new Date(seconds * 1000).toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
 }
 
+/** Formats a timestamp in seconds for last checked display. Avoids 1969 / 56 years ago epoch bug. */
+export function formatLastChecked(seconds?: number | null): string {
+  if (!seconds || seconds <= 86400 * 365) return 'Never';
+  return ago(seconds);
+}
+
+/** Formats a future/past check timestamp in seconds. Avoids epoch 0 bugs and provides human-readable schedule. */
+export function formatNextCheck(seconds?: number | null): string {
+  if (!seconds || seconds <= 86400 * 365) return 'Pending schedule';
+  const now = Date.now() / 1000;
+  if (seconds <= now) return 'Due now';
+  const diffSec = Math.round(seconds - now);
+  if (diffSec < 60) return 'in <1m';
+  if (diffSec < 3600) return `in ${Math.floor(diffSec / 60)}m`;
+  if (diffSec < 86400) return `in ${Math.floor(diffSec / 3600)}h`;
+  return `in ${Math.floor(diffSec / 86400)}d`;
+}
+
 /** A heading for a day: Today, Yesterday, or the date. From a time in seconds. */
 export function dayLabel(seconds: number): string {
   const day = new Date(seconds * 1000);
