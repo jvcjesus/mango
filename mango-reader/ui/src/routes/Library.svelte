@@ -141,6 +141,17 @@
   <div class="page-head">
     <div class="heading">
       <h1 class="display">LIBRARY</h1>
+      <nav class="collection-nav" aria-label="Collection View">
+        <a href="#/library" class="btn pill spot" aria-current="page">
+          <Icon name="book" size={16} />
+          <span>Owned in Komga</span>
+          {#if data}<strong>{data.items.length}</strong>{/if}
+        </a>
+        <a href="#/lists" class="btn pill" title="View tracked catalog from AniList and MangaBaka">
+          <Icon name="grid" size={16} />
+          <span>Tracked Lists</span>
+        </a>
+      </nav>
       {#if data}
         <strong>{data.items.length} {data.items.length === 1 ? 'title' : 'titles'} · {data.categories.length} {data.categories.length === 1 ? 'category' : 'categories'}</strong>
       {/if}

@@ -1,16 +1,27 @@
 <script lang="ts">
   import {
+    get,
     getDashboardSummary,
+    getFollowedReconciliations,
     message,
     type DashboardSummaryDto,
+    type Library,
+    type LibraryItem,
+    type ReconciliationSummary,
+    type Resume,
   } from '../lib/api';
+  import Cover from '../lib/Cover.svelte';
   import Icon from '../lib/Icon.svelte';
   import Notice from '../lib/Notice.svelte';
+  import TitleCard from '../lib/TitleCard.svelte';
   import { toast } from '../lib/toast.svelte';
   import { formatBytes } from '../lib/util';
   import { go } from '../lib/router.svelte';
 
   let summary = $state<DashboardSummaryDto | null>(null);
+  let resume = $state<Resume | null>(null);
+  let recentItems = $state<LibraryItem[]>([]);
+  let reconciliations = $state<ReconciliationSummary[]>([]);
   let loading = $state(true);
   let error = $state<string | null>(null);
   let refreshing = $state(false);
@@ -19,10 +30,29 @@
     if (isRefresh) refreshing = true;
     else loading = true;
     error = null;
+
     try {
-      summary = await getDashboardSummary();
+      const [sumRes, libRes, recRes] = await Promise.allSettled([
+        getDashboardSummary(),
+        get<Library>('/library'),
+        getFollowedReconciliations(),
+      ]);
+
+      if (sumRes.status === 'fulfilled') {
+        summary = sumRes.value;
+      }
+      if (libRes.status === 'fulfilled') {
+        resume = libRes.value.resume;
+        recentItems = [...libRes.value.items]
+          .sort((a, b) => b.addedAt - a.addedAt)
+          .slice(0, 6);
+      }
+      if (recRes.status === 'fulfilled') {
+        reconciliations = recRes.value;
+      }
+
       if (isRefresh) {
-        toast.success('System telemetry updated');
+        toast.success('Manga dashboard updated');
       }
     } catch (e: any) {
       error = message(e);
@@ -36,6 +66,12 @@
   $effect(() => {
     load();
   });
+
+  const missingSeries = $derived.by(() => {
+    return reconciliations
+      .filter((r) => r.missingVolumesCount > 0 && r.mangaId !== null)
+      .slice(0, 8);
+  });
 </script>
 
 <div class="home-screen">
@@ -44,240 +80,256 @@
     <div class="hero-brand">
       <div class="brand-tag">
         <span class="dot-live"></span>
-        <span>CONTROL PLANE · MANGO v1.0</span>
+        <span>TANKŌBON CONTROL PLANE · MANGO</span>
       </div>
-      <h1 class="hero-title display">MANGA OPERATIONS DASHBOARD</h1>
+      <h1 class="hero-title display">MANGO</h1>
       <p class="hero-subtitle">
-        Unified acquisition, canonical library intelligence, and provider telemetry across Komga, MangaBaka, OpenTome, Madokami, and TorBox.
+        Personal manga acquisition, discovery, and canonical Komga library control plane.
       </p>
     </div>
     <div class="hero-actions">
-      <button class="btn refresh-btn icon-text" onclick={() => load(true)} disabled={refreshing || loading}>
+      <button
+        class="btn refresh-btn icon-text"
+        onclick={() => load(true)}
+        disabled={refreshing || loading}
+        aria-label="Refresh Dashboard"
+      >
         <span class:spin={refreshing}><Icon name="refresh" size={16} /></span>
-        <span>{refreshing ? 'Refreshing…' : 'Refresh Telemetry'}</span>
+        <span>{refreshing ? 'Refreshing…' : 'Refresh'}</span>
       </button>
     </div>
   </header>
 
-  <!-- Quick Actions Bar -->
-  <nav class="quick-actions-bar" aria-label="Quick Actions">
-    <div class="quick-actions-label">
-      <Icon name="sliders" size={14} />
-      <span>QUICK ACTIONS</span>
-    </div>
-    <div class="actions-group">
-      <button class="btn mini flat icon-text" onclick={() => go('/activity?tab=inbox')}>
-        <Icon name="bookmark" size={14} />
-        <span>Acquisition Inbox</span>
-      </button>
-      <button class="btn mini flat icon-text" onclick={() => go('/activity?tab=downloads')}>
-        <Icon name="download" size={14} />
-        <span>Downloads &amp; Queue</span>
-      </button>
-      <button class="btn mini flat icon-text" onclick={() => go('/activity?tab=monitoring')}>
-        <Icon name="bell" size={14} />
-        <span>Release Watchers</span>
-      </button>
-      <button class="btn mini flat icon-text" onclick={() => go('/library')}>
-        <Icon name="book" size={14} />
-        <span>Canonical Library</span>
-      </button>
-      <button class="btn mini flat icon-text" onclick={() => go('/settings/pipeline')}>
-        <Icon name="search" size={14} />
-        <span>Scan &amp; Maintenance</span>
-      </button>
-    </div>
+  <!-- Quick Navigation / Action Bar -->
+  <nav class="quick-nav-strip" aria-label="Quick Actions">
+    <a href="#/library" class="btn pill flat icon-text">
+      <Icon name="book" size={16} />
+      <span>Owned Library</span>
+    </a>
+    <a href="#/lists" class="btn pill flat icon-text">
+      <Icon name="grid" size={16} />
+      <span>Tracked Lists</span>
+    </a>
+    <a href="#/browse" class="btn pill flat icon-text">
+      <Icon name="globe" size={16} />
+      <span>Discover Manga</span>
+    </a>
+    <a href="#/activity?tab=inbox" class="btn pill flat icon-text">
+      <Icon name="bookmark" size={16} />
+      <span>Acquisition Inbox</span>
+    </a>
+    <a href="#/activity?tab=downloads" class="btn pill flat icon-text">
+      <Icon name="download" size={16} />
+      <span>Downloads &amp; Queue</span>
+    </a>
+    <a href="#/settings" class="btn pill flat icon-text">
+      <Icon name="sliders" size={16} />
+      <span>Settings</span>
+    </a>
   </nav>
 
-  {#if loading && !summary}
+  {#if loading && !summary && !resume}
     <div class="loading-state">
       <span class="spin"><Icon name="spinner" size={28} stroke={3} /></span>
-      <span>Gathering operational telemetry across systems…</span>
+      <span>Opening your manga library…</span>
     </div>
-  {:else if error && !summary}
-    <Notice error={error} retry={() => load()} />
-  {:else if summary}
-    <!-- Main Dashboard Grid -->
-    <div class="dashboard-grid">
-      <!-- 1. Library Overview -->
-      <section class="dash-card library-card">
-        <div class="card-head">
-          <div class="card-head-title">
-            <Icon name="book" size={18} />
-            <h2>Canonical Library</h2>
-          </div>
-          <button class="btn icon-link" onclick={() => go('/library')} title="Open Library">
-            <Icon name="forward" size={16} />
-          </button>
+  {:else if error && !summary && !resume}
+    <Notice {error} retry={() => load()} />
+  {:else}
+    <!-- Continue Reading Panel -->
+    {#if resume}
+      <section class="panel resume-card" aria-label="Continue reading">
+        <span class="corner-dots" aria-hidden="true"></span>
+        <div class="resume-art">
+          <Cover src={resume.cover} title={resume.title} tilt />
         </div>
-        <div class="metrics-row">
-          <button type="button" class="metric-block metric-btn" onclick={() => go('/lists')} title="View tracked catalog">
-            <span class="m-val">{summary.library.totalTrackedTitles}</span>
-            <span class="m-lbl">Tracked Titles</span>
-          </button>
-          <button type="button" class="metric-block metric-btn highlight-owned" onclick={() => go('/library')} title="Browse owned volumes">
-            <span class="m-val">{summary.library.totalOwnedVolumes}</span>
-            <span class="m-lbl">Owned Volumes</span>
-          </button>
-          <button type="button" class="metric-block metric-btn highlight-missing" onclick={() => go('/lists')} title="Review missing volumes">
-            <span class="m-val">{summary.library.missingReleasedVolumes}</span>
-            <span class="m-lbl">Missing Released</span>
-          </button>
-          {#if summary.library.titlesNeedingReview > 0}
-            <button type="button" class="metric-block metric-btn highlight-review" onclick={() => go('/updates')} title="Inspect titles needing review">
-              <span class="m-val">{summary.library.titlesNeedingReview}</span>
-              <span class="m-lbl">Needs Review</span>
-            </button>
-          {/if}
-        </div>
-        <div class="card-foot">
-          <span class="status-indicator">
-            <span class="dot-ok"></span> Komga Canonical Authority Active
-          </span>
-          <button class="btn mini flat" onclick={() => go('/library')}>Browse Library</button>
-        </div>
-      </section>
-
-      <!-- 2. Acquisition Pipeline -->
-      <section class="dash-card acquisition-card">
-        <div class="card-head">
-          <div class="card-head-title">
-            <Icon name="download" size={18} />
-            <h2>Acquisition Pipeline</h2>
-          </div>
-          <button class="btn icon-link" onclick={() => go('/activity?tab=downloads')} title="Open Downloads &amp; Queue">
-            <Icon name="forward" size={16} />
-          </button>
-        </div>
-        <div class="metrics-row">
-          <button type="button" class="metric-block metric-btn" onclick={() => go('/activity?tab=downloads')} title="View active downloads">
-            <span class="m-val">{summary.acquisition.activeDownloads}</span>
-            <span class="m-lbl">In-Flight Downloads</span>
-          </button>
-          {#if summary.acquisition.pendingApprovals > 0}
-            <button type="button" class="metric-block metric-btn highlight-review" onclick={() => go('/activity?tab=inbox')} title="Review proposed acquisitions">
-              <span class="m-val">{summary.acquisition.pendingApprovals}</span>
-              <span class="m-lbl">Pending Review</span>
-            </button>
-          {/if}
-          <button type="button" class="metric-block metric-btn highlight-warn" onclick={() => go('/activity?tab=downloads')} title="Inspect failed downloads">
-            <span class="m-val">{summary.acquisition.failedJobs}</span>
-            <span class="m-lbl">Failed Jobs</span>
-          </button>
-          <button type="button" class="metric-block metric-btn highlight-recov" onclick={() => go('/activity?tab=downloads')} title="Inspect recoverable downloads">
-            <span class="m-val">{summary.acquisition.recoverableJobs}</span>
-            <span class="m-lbl">Recoverable</span>
-          </button>
-        </div>
-        <div class="card-foot">
-          {#if summary.acquisition.failedJobs > 0}
-            <span class="status-indicator warn">
-              <span class="dot-warn"></span> {summary.acquisition.failedJobs} job(s) require attention
-            </span>
-          {:else}
-            <span class="status-indicator ok">
-              <span class="dot-ok"></span> All downloads healthy
-            </span>
-          {/if}
-          <button class="btn mini flat" onclick={() => go('/activity?tab=downloads')}>Manage Queue</button>
-        </div>
-      </section>
-
-      <!-- 3. Release Intelligence -->
-      <section class="dash-card release-card">
-        <div class="card-head">
-          <div class="card-head-title">
-            <Icon name="bell" size={18} />
-            <h2>Release Watchers</h2>
-          </div>
-          <button class="btn icon-link" onclick={() => go('/activity?tab=monitoring')} title="Open Watchers &amp; Monitoring">
-            <Icon name="forward" size={16} />
-          </button>
-        </div>
-        <div class="metrics-row">
-          <button type="button" class="metric-block metric-btn" onclick={() => go('/activity?tab=monitoring')} title="View scheduled releases">
-            <span class="m-val">{summary.releaseIntelligence.upcomingReleasesCount}</span>
-            <span class="m-lbl">Upcoming Releases</span>
-          </button>
-          <button type="button" class="metric-block metric-btn highlight-awaiting" onclick={() => go('/activity?tab=monitoring')} title="View releases awaiting upload">
-            <span class="m-val">{summary.releaseIntelligence.releasedAwaitingCount}</span>
-            <span class="m-lbl">Awaiting Upload</span>
-          </button>
-          <button type="button" class="metric-block metric-btn highlight-candidate" onclick={() => go('/activity?tab=monitoring')} title="View discovered candidates">
-            <span class="m-val">{summary.releaseIntelligence.candidateFoundCount}</span>
-            <span class="m-lbl">Candidates Found</span>
-          </button>
-        </div>
-        <div class="card-foot">
-          <span class="status-indicator ok">
-            <span class="dot-ok"></span> OpenTome Tracking Active
-          </span>
-          <button class="btn mini flat" onclick={() => go('/activity?tab=monitoring')}>View Watchers</button>
-        </div>
-      </section>
-
-      <!-- 4. Storage & Quality -->
-      <section class="dash-card storage-card">
-        <div class="card-head">
-          <div class="card-head-title">
-            <Icon name="sliders" size={18} />
-            <h2>Storage & Quality</h2>
-          </div>
-          <button class="btn icon-link" onclick={() => go('/settings/pipeline')} title="Open Storage Settings">
-            <Icon name="forward" size={16} />
-          </button>
-        </div>
-        <div class="metrics-row">
-          <button type="button" class="metric-block metric-btn" onclick={() => go('/settings/pipeline')} title="Inspect staging area">
-            <span class="m-val">{formatBytes(summary.storage.stagingBytes)}</span>
-            <span class="m-lbl">Staging Area</span>
-          </button>
-          <button type="button" class="metric-block metric-btn highlight-reclaim" onclick={() => go('/settings/pipeline')} title="Inspect reclaimable space">
-            <span class="m-val">{formatBytes(summary.storage.reclaimableBytes)}</span>
-            <span class="m-lbl">Reclaimable Space</span>
-          </button>
-          <button type="button" class="metric-block metric-btn" onclick={() => go('/settings/pipeline')} title="Inspect duplicate issues">
-            <span class="m-val">{summary.storage.duplicateGroupsCount}</span>
-            <span class="m-lbl">Duplicate Issues</span>
-          </button>
-        </div>
-        <div class="card-foot">
-          <span class="status-indicator">
-            {#if summary.storage.optimizerAvailable}
-              <span class="dot-ok"></span> RustyLibraryShrinker Active
-            {:else}
-              <span class="dot-dim"></span> Optimizer Unconfigured
-            {/if}
-          </span>
-          <button class="btn mini flat" onclick={() => go('/settings/pipeline')}>Storage Settings</button>
-        </div>
-      </section>
-    </div>
-
-    <!-- 5. Provider Telemetry Strip -->
-    <section class="provider-telemetry-section">
-      <div class="sec-head">
-        <div class="sec-title">
-          <Icon name="globe" size={16} />
-          <h3>Provider Status & Telemetry</h3>
-        </div>
-        <button class="btn mini flat" onclick={() => go('/settings')}>Configure Providers</button>
-      </div>
-
-      <div class="provider-cards-grid">
-        {#each summary.providerHealth as prov (prov.name)}
-          <div class="provider-pill-card">
-            <div class="prov-top">
-              <span class="prov-name">{prov.name}</span>
-              <span class="status-badge status-{prov.status === 'HEALTHY' || prov.status === 'AVAILABLE' ? 'ok' : prov.status === 'ATTENTION_REQUIRED' ? 'error' : prov.status === 'CONFIGURED' ? 'info' : 'neutral'}">
-                {prov.status}
+        <div class="resume-words">
+          <span class="status-badge status-candidate">CONTINUE READING</span>
+          <h2 class="display resume-title">{resume.title}</h2>
+          <p class="resume-chapter">{resume.chapterName}</p>
+          {#if resume.pageCount}
+            <div class="resume-progress">
+              <span class="meter">
+                <span style:width="{Math.round(((resume.page + 1) / resume.pageCount) * 100)}%"></span>
               </span>
+              <strong>Page {resume.page + 1} of {resume.pageCount}</strong>
             </div>
-            <p class="prov-details muted font-small">{prov.details}</p>
+          {/if}
+          <div class="resume-actions">
+            <a class="btn big spot icon-text" href="#/read/{resume.chapterId}">
+              <span>Resume Reading</span>
+              <Icon name="arrow" size={18} stroke={3} />
+            </a>
+            <a class="btn big icon-text" href="#/title/{resume.mangaId}">
+              <Icon name="book" size={16} />
+              <span>Series Workspace</span>
+            </a>
           </div>
-        {/each}
-      </div>
-    </section>
+        </div>
+      </section>
+    {/if}
+
+    <!-- Operational Telemetry Overview Strip -->
+    {#if summary}
+      <section class="telemetry-strip" aria-label="Operations Overview">
+        <button
+          type="button"
+          class="metric-chip"
+          onclick={() => go('/library')}
+          title="Browse owned library"
+        >
+          <div class="metric-icon-wrap"><Icon name="book" size={18} /></div>
+          <div class="metric-meta">
+            <span class="metric-num">{summary.library.totalOwnedVolumes}</span>
+            <span class="metric-label">Owned Volumes</span>
+          </div>
+        </button>
+
+        <button
+          type="button"
+          class="metric-chip"
+          class:alert={summary.acquisition.activeDownloads > 0}
+          onclick={() => go('/activity?tab=downloads')}
+          title="View in-flight downloads"
+        >
+          <div class="metric-icon-wrap"><Icon name="download" size={18} /></div>
+          <div class="metric-meta">
+            <span class="metric-num">{summary.acquisition.activeDownloads}</span>
+            <span class="metric-label">In-Flight Downloads</span>
+          </div>
+        </button>
+
+        <button
+          type="button"
+          class="metric-chip"
+          class:highlight={summary.acquisition.pendingApprovals > 0}
+          onclick={() => go('/activity?tab=inbox')}
+          title="Review proposed acquisitions"
+        >
+          <div class="metric-icon-wrap"><Icon name="bookmark" size={18} /></div>
+          <div class="metric-meta">
+            <span class="metric-num">{summary.acquisition.pendingApprovals}</span>
+            <span class="metric-label">Review Queue</span>
+          </div>
+        </button>
+
+        <button
+          type="button"
+          class="metric-chip"
+          class:warn={summary.library.missingReleasedVolumes > 0}
+          onclick={() => go('/lists')}
+          title="Review missing volumes"
+        >
+          <div class="metric-icon-wrap"><Icon name="bell" size={18} /></div>
+          <div class="metric-meta">
+            <span class="metric-num">{summary.library.missingReleasedVolumes}</span>
+            <span class="metric-label">Missing Released</span>
+          </div>
+        </button>
+      </section>
+    {/if}
+
+    <!-- Recommended Next Missing Volumes Section -->
+    {#if missingSeries.length > 0}
+      <section class="shelf missing-shelf" aria-label="Next missing volumes">
+        <div class="section-head">
+          <div class="sec-title-wrap">
+            <h2 class="display">NEXT MISSING VOLUMES</h2>
+            <span class="sec-subtitle">Recommended acquisitions for tracked titles</span>
+          </div>
+          <a href="#/lists" class="btn pill flat">View All Lists</a>
+        </div>
+
+        <div class="missing-cards-grid">
+          {#each missingSeries as item (item.seriesId)}
+            <div class="missing-series-card panel">
+              <div class="msc-head">
+                <span class="status-badge status-warn">
+                  {#if item.missingVolumes.length === 1}
+                    Missing Vol {item.missingVolumes[0]}
+                  {:else}
+                    {item.missingVolumesCount} Volumes Missing
+                  {/if}
+                </span>
+                <span class="msc-edition">{item.edition || 'Standard'}</span>
+              </div>
+              <h3 class="msc-title">{item.title}</h3>
+              <div class="msc-stats">
+                <span class="msc-stat">
+                  Owned: <strong>{item.ownedVolumesCount}</strong>
+                  {#if item.totalOfficialVolumes} / {item.totalOfficialVolumes}{/if}
+                </span>
+                {#if item.missingVolumes.length > 0}
+                  <span class="msc-next">
+                    Next: <strong>Vol {item.missingVolumes[0]}</strong>
+                  </span>
+                {/if}
+              </div>
+              <div class="msc-actions">
+                <a class="btn spot mini icon-text" href="#/title/{item.mangaId}">
+                  <span>Acquire</span>
+                  <Icon name="arrow" size={14} stroke={3} />
+                </a>
+              </div>
+            </div>
+          {/each}
+        </div>
+      </section>
+    {/if}
+
+    <!-- Recently Added Manga Section -->
+    {#if recentItems.length > 0}
+      <section class="shelf recent-shelf" aria-label="Recently added manga">
+        <div class="section-head">
+          <div class="sec-title-wrap">
+            <h2 class="display">RECENT IN LIBRARY</h2>
+            <span class="sec-subtitle">Titles in your local collection</span>
+          </div>
+          <a href="#/library" class="btn pill flat">Browse Library</a>
+        </div>
+
+        <div class="grid">
+          {#each recentItems as item (item.id)}
+            <TitleCard
+              id={item.id}
+              title={item.title}
+              cover={item.cover}
+              unread={item.unread}
+            />
+          {/each}
+        </div>
+      </section>
+    {/if}
+
+    <!-- Provider Telemetry & Storage Drawer -->
+    {#if summary}
+      <section class="provider-telemetry-section panel" aria-label="System status">
+        <div class="sec-head">
+          <div class="sec-title">
+            <Icon name="globe" size={16} />
+            <h3 class="display">SERVICES &amp; PROVIDERS</h3>
+          </div>
+          <span class="storage-info">
+            Staging: {formatBytes(summary.storage.stagingBytes)} ·
+            Reclaimable: {formatBytes(summary.storage.reclaimableBytes)}
+          </span>
+        </div>
+
+        <div class="provider-cards-grid">
+          {#each summary.providerHealth as prov (prov.name)}
+            <div class="provider-pill-card">
+              <div class="prov-top">
+                <span class="prov-name">{prov.name}</span>
+                <span class="status-badge status-{prov.status === 'HEALTHY' || prov.status === 'AVAILABLE' ? 'ok' : prov.status === 'ATTENTION_REQUIRED' ? 'error' : prov.status === 'CONFIGURED' ? 'info' : 'neutral'}">
+                  {prov.status}
+                </span>
+              </div>
+              <p class="prov-details muted font-small">{prov.details}</p>
+            </div>
+          {/each}
+        </div>
+      </section>
+    {/if}
   {/if}
 </div>
 
@@ -285,8 +337,8 @@
   .home-screen {
     display: flex;
     flex-direction: column;
-    gap: 1.5rem;
-    padding: 1.5rem 1rem;
+    gap: 28px;
+    padding: 28px var(--gutter) 72px;
     max-width: var(--page-max-width, 1560px);
     margin: 0 auto;
     width: 100%;
@@ -298,326 +350,375 @@
     justify-content: space-between;
     align-items: flex-start;
     gap: 1.5rem;
-    border-bottom: 2px solid var(--ink);
     padding-bottom: 1.5rem;
+    border-bottom: 3px solid var(--ink);
   }
 
   .brand-tag {
     display: inline-flex;
     align-items: center;
-    gap: 6px;
-    font-size: 0.75rem;
-    font-weight: 700;
-    letter-spacing: 0.08em;
-    color: var(--spot, #ff7a00);
-    margin-bottom: 0.35rem;
+    gap: 8px;
+    font-size: 11px;
+    font-weight: 900;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--muted);
+    margin-bottom: 6px;
   }
 
   .dot-live {
     width: 8px;
     height: 8px;
+    background: var(--spot);
+    border: 1.5px solid var(--ink);
     border-radius: 50%;
-    background: var(--status-ok, #16a34a);
-    box-shadow: 0 0 6px var(--status-ok, #16a34a);
   }
 
   .hero-title {
-    font-size: 1.85rem;
-    margin: 0 0 0.5rem;
+    font-size: clamp(38px, 8vw, 64px);
+    margin: 0;
+    line-height: 1.05;
     letter-spacing: -0.02em;
     color: var(--ink);
   }
 
   .hero-subtitle {
-    margin: 0;
-    font-size: 0.92rem;
+    margin: 8px 0 0;
+    font-size: 15px;
+    font-weight: 600;
     color: var(--muted);
-    max-width: 720px;
-    line-height: 1.5;
-  }
-
-  .hero-actions {
-    display: flex;
-    align-items: center;
-    gap: 0.75rem;
+    max-width: 640px;
+    line-height: 1.45;
   }
 
   .refresh-btn {
-    font-weight: 700;
-    font-size: 0.85rem;
+    flex-shrink: 0;
   }
 
-  /* Quick Actions Bar */
-  .quick-actions-bar {
+  /* Quick Navigation Strip */
+  .quick-nav-strip {
     display: flex;
     align-items: center;
-    gap: 1rem;
-    background: var(--shade);
-    border: 2px solid var(--ink);
-    border-radius: 8px;
-    padding: 0.65rem 1rem;
-    box-shadow: var(--sh-2);
-    overflow-x: auto;
-  }
-
-  .quick-actions-label {
-    display: flex;
-    align-items: center;
-    gap: 0.35rem;
-    font-size: 0.75rem;
-    font-weight: 900;
-    letter-spacing: 0.08em;
-    color: var(--ink);
-    white-space: nowrap;
-    border-right: 2px solid var(--ink);
-    padding-right: 0.75rem;
-  }
-
-  .actions-group {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    flex-wrap: nowrap;
-  }
-
-  /* Dashboard Cards Grid */
-  .dashboard-grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
-    gap: 1.25rem;
-  }
-
-  .dash-card {
+    gap: 10px;
+    flex-wrap: wrap;
     background: var(--paper);
-    border: 3px solid var(--ink);
-    border-radius: 8px;
-    padding: 1.25rem;
+    border: 2px solid var(--ink);
+    border-radius: 4px;
+    box-shadow: var(--sh-3);
+    padding: 8px 12px;
+  }
+
+  .quick-nav-strip .btn.pill {
+    font-size: 13px;
+    font-weight: 700;
+    padding: 6px 12px;
+  }
+
+  /* Continue Reading Card */
+  .resume-card {
+    position: relative;
     display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 28px;
+    overflow: hidden;
+    padding: 28px;
+  }
+
+  .corner-dots {
+    position: absolute;
+    top: 0;
+    right: 0;
+    width: 180px;
+    height: 180px;
+    background-image: var(--dots);
+    background-size: 9px 9px;
+    clip-path: polygon(100% 0, 0 0, 100% 100%);
+    pointer-events: none;
+  }
+
+  .resume-art {
+    position: relative;
+    flex: 0 0 clamp(110px, 20vw, 160px);
+  }
+
+  .resume-words {
+    position: relative;
+    display: flex;
+    flex: 1 1 280px;
     flex-direction: column;
-    justify-content: space-between;
-    gap: 1rem;
-    box-shadow: var(--sh-4);
+    align-items: flex-start;
+    gap: 12px;
+    min-width: 0;
+  }
+
+  .resume-title {
+    font-size: clamp(24px, 4vw, 36px);
+    margin: 0;
+    line-height: 1.15;
+    overflow-wrap: anywhere;
+  }
+
+  .resume-chapter {
+    margin: 0;
+    font-size: 16px;
+    font-weight: 700;
+    color: var(--muted);
+  }
+
+  .resume-progress {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    width: min(420px, 100%);
+  }
+
+  .resume-progress .meter {
+    flex: 1;
+    height: 16px;
+    border-width: 3px;
+  }
+
+  .resume-progress .meter span {
+    border-right: 3px solid var(--ink);
+    background: var(--spot);
+  }
+
+  .resume-progress strong {
+    font-size: 13px;
+    font-weight: 900;
+  }
+
+  .resume-actions {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-top: 4px;
+  }
+
+  /* Operations Telemetry Strip */
+  .telemetry-strip {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 14px;
+  }
+
+  .metric-chip {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 14px 18px;
+    background: var(--surface);
+    border: 2px solid var(--ink);
+    border-radius: 4px;
+    box-shadow: var(--sh-3);
+    cursor: pointer;
+    text-align: left;
     transition: transform 0.15s ease, box-shadow 0.15s ease;
   }
 
-  .dash-card:hover {
+  .metric-chip:hover {
     transform: translate(-1px, -1px);
     box-shadow: var(--sh-5);
   }
 
-  .card-head {
+  .metric-chip.alert {
+    background: color-mix(in srgb, var(--status-info-bg) 60%, var(--surface));
+  }
+
+  .metric-chip.highlight {
+    background: color-mix(in srgb, var(--spot) 20%, var(--surface));
+  }
+
+  .metric-chip.warn {
+    background: color-mix(in srgb, var(--status-warn-bg) 40%, var(--surface));
+  }
+
+  .metric-icon-wrap {
     display: flex;
-    justify-content: space-between;
     align-items: center;
-    border-bottom: 2px solid var(--ink);
-    padding-bottom: 0.65rem;
-  }
-
-  .card-head-title {
-    display: flex;
-    align-items: center;
-    gap: 0.45rem;
-    color: var(--ink);
-  }
-
-  .card-head-title h2 {
-    font-size: 1.05rem;
-    font-weight: 800;
-    margin: 0;
-    color: var(--ink);
-    letter-spacing: -0.01em;
-  }
-
-  .icon-link {
-    background: transparent;
-    border: none;
-    color: var(--muted);
-    cursor: pointer;
-    padding: 4px;
+    justify-content: center;
+    width: 38px;
+    height: 38px;
+    border: 2px solid var(--ink);
     border-radius: 4px;
-    display: flex;
-    align-items: center;
+    background: var(--paper);
+    flex-shrink: 0;
   }
 
-  .icon-link:hover {
-    color: var(--ink);
-    background: var(--shade);
-  }
-
-  .metrics-row {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(80px, 1fr));
-    gap: 0.75rem;
-  }
-
-  .metric-block {
+  .metric-meta {
     display: flex;
     flex-direction: column;
-    gap: 0.2rem;
-    text-align: left;
-    background: transparent;
-    border: none;
-    padding: 0.25rem 0.4rem;
-    border-radius: 6px;
-    transition: background 0.12s ease;
+    gap: 2px;
   }
 
-  .metric-btn {
-    cursor: pointer;
-  }
-
-  .metric-btn:hover {
-    background: var(--shade);
-  }
-
-  .m-val {
-    font-size: 1.4rem;
-    font-weight: 800;
+  .metric-num {
+    font-size: 22px;
+    font-weight: 900;
     line-height: 1.1;
     color: var(--ink);
   }
 
-  .m-lbl {
-    font-size: 0.74rem;
+  .metric-label {
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
     color: var(--muted);
-    line-height: 1.3;
   }
 
-  .highlight-owned .m-val {
-    color: var(--status-ok, #16a34a);
+  /* Next Missing Volumes Shelf */
+  .missing-shelf {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
   }
 
-  .highlight-missing .m-val {
-    color: var(--status-error, #dc2626);
+  .sec-title-wrap {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
   }
 
-  .highlight-review .m-val {
-    color: var(--status-warn, #d97706);
+  .sec-subtitle {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--muted);
   }
 
-  .highlight-warn .m-val {
-    color: var(--status-error, #dc2626);
+  .missing-cards-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+    gap: 16px;
   }
 
-  .highlight-recov .m-val {
-    color: var(--status-info, #2563eb);
+  .missing-series-card {
+    padding: 16px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    background: var(--surface);
+    border-radius: 4px;
   }
 
-  .highlight-awaiting .m-val {
-    color: var(--status-warn, #d97706);
-  }
-
-  .highlight-candidate .m-val {
-    color: var(--spot, #ff7a00);
-  }
-
-  .highlight-reclaim .m-val {
-    color: var(--status-ok, #16a34a);
-  }
-
-  .card-foot {
+  .msc-head {
     display: flex;
     justify-content: space-between;
     align-items: center;
-    border-top: 1px solid var(--line);
-    padding-top: 0.65rem;
-    font-size: 0.78rem;
+    gap: 8px;
   }
 
-  .status-indicator {
-    display: flex;
-    align-items: center;
-    gap: 0.35rem;
+  .msc-edition {
+    font-size: 11px;
+    font-weight: 700;
     color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
   }
 
-  .dot-ok {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: var(--status-ok, #16a34a);
+  .msc-title {
+    margin: 0;
+    font-size: 16px;
+    font-weight: 700;
+    line-height: 1.3;
+    color: var(--ink);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    line-clamp: 2;
+    -webkit-box-orient: vertical;
   }
 
-  .dot-warn {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: var(--status-error, #dc2626);
+  .msc-stats {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 12px;
+    color: var(--muted);
+    border-top: 1px solid var(--line);
+    padding-top: 8px;
   }
 
-  .dot-dim {
-    width: 6px;
-    height: 6px;
-    border-radius: 50%;
-    background: var(--dim, #64748b);
+  .msc-stats strong {
+    color: var(--ink);
+  }
+
+  .msc-actions {
+    margin-top: auto;
+    display: flex;
+    justify-content: flex-end;
   }
 
   /* Provider Telemetry Section */
   .provider-telemetry-section {
+    padding: 20px;
     display: flex;
     flex-direction: column;
-    gap: 0.75rem;
-    background: var(--paper);
-    border: 3px solid var(--ink);
-    border-radius: 8px;
-    box-shadow: var(--sh-4);
-    padding: 1.25rem;
+    gap: 14px;
+    border-radius: 4px;
   }
 
   .sec-head {
     display: flex;
     justify-content: space-between;
     align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
     border-bottom: 2px solid var(--ink);
-    padding-bottom: 0.65rem;
+    padding-bottom: 10px;
   }
 
   .sec-title {
     display: flex;
     align-items: center;
-    gap: 0.4rem;
-    color: var(--ink);
+    gap: 8px;
   }
 
   .sec-title h3 {
     margin: 0;
-    font-size: 0.95rem;
-    font-weight: 800;
-    color: var(--ink);
-    letter-spacing: -0.01em;
+    font-size: 16px;
+    letter-spacing: -0.02em;
+  }
+
+  .storage-info {
+    font-size: 12px;
+    font-weight: 700;
+    color: var(--muted);
   }
 
   .provider-cards-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-    gap: 0.75rem;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 12px;
   }
 
   .provider-pill-card {
-    background: var(--shade);
-    border: 1px solid var(--line);
-    border-radius: 6px;
-    padding: 0.6rem 0.75rem;
+    background: var(--paper);
+    border: 1.5px solid var(--ink);
+    border-radius: 4px;
+    padding: 10px 12px;
     display: flex;
     flex-direction: column;
-    gap: 0.25rem;
+    gap: 4px;
   }
 
   .prov-top {
     display: flex;
     justify-content: space-between;
     align-items: center;
+    gap: 8px;
   }
 
   .prov-name {
     font-weight: 700;
-    font-size: 0.85rem;
+    font-size: 13px;
     color: var(--ink);
   }
 
   .prov-details {
     margin: 0;
-    font-size: 0.74rem;
+    font-size: 11px;
     color: var(--muted);
     line-height: 1.35;
   }
@@ -627,15 +728,23 @@
     flex-direction: column;
     align-items: center;
     justify-content: center;
-    padding: 3rem;
-    gap: 0.75rem;
+    padding: 4rem;
+    gap: 12px;
     color: var(--muted);
+    font-weight: 600;
   }
 
-  @media (max-width: 640px) {
-    .home-hero {
-      flex-direction: column;
-      align-items: flex-start;
+  .spin {
+    display: inline-flex;
+    animation: spin 1s linear infinite;
+  }
+
+  @keyframes spin {
+    from {
+      transform: rotate(0deg);
+    }
+    to {
+      transform: rotate(360deg);
     }
   }
 </style>

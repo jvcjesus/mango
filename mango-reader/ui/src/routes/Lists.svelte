@@ -342,9 +342,17 @@
     <div class="title-row">
       <div class="title-wrap">
         <h1 class="display title">Lists</h1>
-        {#if data?.summary}
-          <span class="count-pill">{data.summary.total} tracked</span>
-        {/if}
+        <nav class="collection-nav" aria-label="Collection View">
+          <a href="#/library" class="btn pill" title="View physically owned manga in Komga">
+            <Icon name="book" size={16} />
+            <span>Owned in Komga</span>
+          </a>
+          <a href="#/lists" class="btn pill spot" aria-current="page">
+            <Icon name="grid" size={16} />
+            <span>Tracked Lists</span>
+            {#if data?.summary}<strong>{data.summary.total}</strong>{/if}
+          </a>
+        </nav>
       </div>
 
       <div class="actions">

@@ -442,7 +442,7 @@
       </div>
     {/if}
 
-    <!-- Primary Subnavigation Tabs (M13.2) -->
+    <!-- Primary Subnavigation Tabs (M13.2 / M15) -->
     <div class="activity-tabs" role="tablist" aria-label="Activity Subnavigation">
       <button
         class="activity-tab-btn"
@@ -452,7 +452,7 @@
         onclick={() => setTab('inbox')}
       >
         <Icon name="bookmark" size={16} />
-        <span>Acquisition Inbox</span>
+        <span>Needs Attention</span>
         {#if totalPendingProposals > 0}
           <span class="tab-badge">{totalPendingProposals}</span>
         {/if}
@@ -466,18 +466,10 @@
         onclick={() => setTab('downloads')}
       >
         <Icon name="download" size={16} />
-        <span>Downloads &amp; Queue</span>
-      </button>
-
-      <button
-        class="activity-tab-btn"
-        class:active={activeTab === 'monitoring'}
-        role="tab"
-        aria-selected={activeTab === 'monitoring'}
-        onclick={() => setTab('monitoring')}
-      >
-        <Icon name="refresh" size={16} />
-        <span>Monitoring &amp; Watchers</span>
+        <span>In Progress</span>
+        {#if automationOverview && automationOverview.activeAcquisitionsCount > 0}
+          <span class="tab-badge spot">{automationOverview.activeAcquisitionsCount}</span>
+        {/if}
       </button>
 
       <button
@@ -488,7 +480,18 @@
         onclick={() => setTab('history')}
       >
         <Icon name="book" size={16} />
-        <span>History &amp; Audit</span>
+        <span>Completed &amp; History</span>
+      </button>
+
+      <button
+        class="activity-tab-btn"
+        class:active={activeTab === 'monitoring'}
+        role="tab"
+        aria-selected={activeTab === 'monitoring'}
+        onclick={() => setTab('monitoring')}
+      >
+        <Icon name="refresh" size={16} />
+        <span>Release Watchers</span>
       </button>
     </div>
   </header>

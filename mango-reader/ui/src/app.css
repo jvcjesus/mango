@@ -438,6 +438,39 @@ select.btn {
   gap: 8px;
 }
 
+.collection-nav {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 6px;
+}
+
+.collection-nav .btn.pill {
+  font-weight: 700;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 14px;
+  font-size: 13px;
+  letter-spacing: 0.02em;
+}
+
+.collection-nav .btn.pill strong {
+  background: var(--ink);
+  color: var(--paper);
+  padding: 1px 7px;
+  border-radius: 9999px;
+  font-size: 11px;
+  font-weight: 900;
+  line-height: 1.2;
+}
+
+.collection-nav .btn.pill.spot strong {
+  background: var(--ink);
+  color: var(--spot);
+}
+
 .grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(min(var(--cover), var(--cover-most)), 1fr));

@@ -938,7 +938,7 @@
   .ownership-distinction-note :global(svg) {
     flex-shrink: 0;
     margin-top: 1px;
-    color: var(--accent, #6366f1);
+    color: var(--status-info);
   }
 
   .counter-item.has-active {
@@ -1066,13 +1066,13 @@
 
   .verified-komga-note {
     font-size: 0.8rem;
-    color: var(--accent, #3b82f6);
+    color: var(--status-info);
     font-weight: 500;
   }
 
   /* Advanced disclosure */
   .advanced-disclosure {
-    border-top: 1px solid var(--outline, #e5e7eb);
+    border-top: 1px solid var(--line);
     padding-top: 8px;
     margin-top: 2px;
   }
