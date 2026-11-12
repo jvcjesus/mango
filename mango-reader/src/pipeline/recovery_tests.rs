@@ -778,3 +778,235 @@ async fn test_watcher_notification_and_ownership_termination() {
     assert_eq!(st, "OWNERSHIP_DETECTED");
     assert_eq!(next_check, 0, "Ownership stops future scheduled monitoring");
 }
+
+#[tokio::test]
+async fn test_recovery_01_verifying_job_recovered_when_komga_already_indexed() {
+    use axum::{routing::{get, post}, Json, Router};
+    use serde_json::json;
+
+    let env = TestEnv::new("komga_verifying_recovery");
+    let canon_dir = env.library_dir.join("Haikyu!!");
+    fs::create_dir_all(&canon_dir).unwrap();
+    let canon_file = canon_dir.join("Haikyu!! v06.cbz");
+    make_synthetic_valid_cbz(&canon_file, "Haikyu!!", 6.0);
+
+    let canon_str = canon_file.to_string_lossy().to_string();
+
+    env.db.call({
+        let c_str = canon_str.clone();
+        move |conn| {
+            conn.execute("INSERT INTO manga (id, source_id, url, title, in_library) VALUES (1, 1, '/m1', 'Haikyu!!', 1)", [])?;
+            conn.execute("INSERT INTO chapters (id, manga_id, url, name, chapter_number, source_order, fetched_at, read) VALUES (601, 1, '/c601', 'Volume 6', 6.0, 1, 0, 0)", [])?;
+            conn.execute(
+                "INSERT INTO downloads (chapter_id, state, position, added_at, published_path, target_library_id) VALUES (601, 'verifying', 1, 1000, ?1, 'lib-test')",
+                [&c_str],
+            )?;
+            conn.execute(
+                "INSERT INTO publication_receipts (id, chapter_id, series_title, canonical_path, file_size_bytes, file_sha256, published_at, verified_ownership, verification_status, created_at, updated_at)
+                 VALUES ('rcpt-601', 601, 'Haikyu!!', ?1, 1024, 'dummy-sha', 1000, 0, 'published_scan_pending', 1000, 1000)",
+                [&c_str],
+            )?;
+            Ok(())
+        }
+    }).await.unwrap();
+
+    let app = Router::new()
+        .route("/api/v1/series", get(|| async {
+            Json(json!({
+                "content": [{
+                    "id": "s-haikyu",
+                    "name": "Haikyu!!",
+                    "libraryId": "lib-test",
+                    "booksCount": 1
+                }]
+            }))
+        }))
+        .route("/api/v1/series/s-haikyu/books", get(|| async {
+            Json(json!({
+                "content": [{
+                    "id": "b-haikyu-6",
+                    "seriesId": "s-haikyu",
+                    "name": "Haikyu!! v06",
+                    "number": 6.0,
+                    "metadata": {
+                        "number": "6",
+                        "title": "Haikyu!! v06"
+                    }
+                }],
+                "totalPages": 1,
+                "last": true
+            }))
+        }))
+        .route("/api/v1/libraries/lib-test/scan", post(|| async {
+            Json(json!({ "success": true }))
+        }));
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let pipeline = Arc::new(Pipeline::new(env.db.clone()));
+    let mut pipe_cfg = PipelineConfig::default();
+    pipe_cfg.enabled = true;
+    pipe_cfg.library_dir = Some(env.library_dir.to_string_lossy().to_string());
+    pipe_cfg.komga_enabled = true;
+    pipe_cfg.komga_scan_enabled = true;
+    pipe_cfg.komga_url = Some(format!("http://127.0.0.1:{port}"));
+    pipe_cfg.komga_library_id = Some("lib-test".to_string());
+    pipeline.save_config(pipe_cfg).await.unwrap();
+
+    let host = crate::host::Host::new(crate::config::HostConfig::default(), env.root.join("host_bin"), &env.root).unwrap();
+    let local = crate::local::Local::new(env.root.join("local"));
+    let images = crate::images::Images::new(env.db.clone(), host, local, &env.root, 10);
+    let mut downloads = Downloads::new(env.db.clone(), images, &env.root, 0);
+    downloads.set_pipeline(pipeline.clone());
+
+    let recovered = downloads.recover_verifying_downloads_with_komga(&pipeline).await.unwrap();
+    assert_eq!(recovered, 1, "Must recover 1 verifying job");
+
+    // Chapter 601 must be deleted from downloads (publication completed)
+    let dl_exists: bool = env.db.call(|conn| {
+        Ok(conn.query_row("SELECT count(*) FROM downloads WHERE chapter_id = 601", [], |r| r.get::<_, i64>(0))? > 0)
+    }).await.unwrap();
+    assert!(!dl_exists, "Completed download must be cleared from downloads table");
+
+    // Receipt must be promoted to verified
+    let (verified, status): (i64, String) = env.db.call(|conn| {
+        Ok(conn.query_row(
+            "SELECT verified_ownership, verification_status FROM publication_receipts WHERE chapter_id = 601",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?)
+    }).await.unwrap();
+    assert_eq!(verified, 1);
+    assert_eq!(status, "verified");
+}
+
+#[tokio::test]
+async fn test_recovery_02_verifying_job_retries_with_backoff_when_komga_unreachable() {
+    let env = TestEnv::new("komga_unreachable_recovery");
+    let canon_dir = env.library_dir.join("Berserk");
+    fs::create_dir_all(&canon_dir).unwrap();
+    let canon_file = canon_dir.join("Berserk v01.cbz");
+    make_synthetic_valid_cbz(&canon_file, "Berserk", 1.0);
+
+    let canon_str = canon_file.to_string_lossy().to_string();
+
+    env.db.call({
+        let c_str = canon_str.clone();
+        move |conn| {
+            conn.execute("INSERT INTO manga (id, source_id, url, title, in_library) VALUES (2, 1, '/m2', 'Berserk', 1)", [])?;
+            conn.execute("INSERT INTO chapters (id, manga_id, url, name, chapter_number, source_order, fetched_at, read) VALUES (602, 2, '/c602', 'Volume 1', 1.0, 1, 0, 0)", [])?;
+            conn.execute(
+                "INSERT INTO downloads (chapter_id, state, position, added_at, published_path, target_library_id) VALUES (602, 'verifying', 1, 1000, ?1, 'lib-test')",
+                [&c_str],
+            )?;
+            Ok(())
+        }
+    }).await.unwrap();
+
+    let pipeline = Arc::new(Pipeline::new(env.db.clone()));
+    let mut pipe_cfg = PipelineConfig::default();
+    pipe_cfg.enabled = true;
+    pipe_cfg.library_dir = Some(env.library_dir.to_string_lossy().to_string());
+    pipe_cfg.komga_enabled = true;
+    pipe_cfg.komga_scan_enabled = true;
+    // Port 1 is reserved and will refuse connection immediately
+    pipe_cfg.komga_url = Some("http://127.0.0.1:1".to_string());
+    pipe_cfg.komga_library_id = Some("lib-test".to_string());
+    pipeline.save_config(pipe_cfg).await.unwrap();
+
+    let host = crate::host::Host::new(crate::config::HostConfig::default(), env.root.join("host_bin"), &env.root).unwrap();
+    let local = crate::local::Local::new(env.root.join("local"));
+    let images = crate::images::Images::new(env.db.clone(), host, local, &env.root, 10);
+    let mut downloads = Downloads::new(env.db.clone(), images, &env.root, 0);
+    downloads.set_pipeline(pipeline.clone());
+
+    let recovered = downloads.recover_verifying_downloads_with_komga(&pipeline).await.unwrap();
+    assert_eq!(recovered, 0, "No jobs recovered while Komga is unreachable");
+
+    // Must still exist in verifying state with future retry_at scheduled
+    let (state, retry_at): (String, Option<i64>) = env.db.call(|conn| {
+        Ok(conn.query_row(
+            "SELECT state, retry_at FROM downloads WHERE chapter_id = 602",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )?)
+    }).await.unwrap();
+    assert_eq!(state, "verifying");
+    assert!(retry_at.is_some() && retry_at.unwrap() > 1000, "Must schedule retry backoff");
+}
+
+#[tokio::test]
+async fn test_recovery_03_torbox_recreation_updates_siblings_sharing_torrent_hash() {
+    use axum::{routing::post, Json, Router};
+    use serde_json::json;
+
+    let env = TestEnv::new("torbox_sibling_recreation");
+
+    env.db.call(|conn| {
+        conn.execute("INSERT INTO manga (id, source_id, url, title, in_library) VALUES (3, 1, '/m3', 'One Piece', 1)", [])?;
+        conn.execute("INSERT INTO chapters (id, manga_id, url, name, chapter_number, source_order, fetched_at, read) VALUES (701, 3, '/c701', 'Volume 1', 1.0, 1, 0, 0)", [])?;
+        conn.execute("INSERT INTO chapters (id, manga_id, url, name, chapter_number, source_order, fetched_at, read) VALUES (702, 3, '/c702', 'Volume 2', 2.0, 1, 0, 0)", [])?;
+
+        // Both queued with shared torrent_hash and no external_job_id yet
+        conn.execute(
+            "INSERT INTO downloads (chapter_id, state, position, added_at, source_type, backend_type, torrent_hash, raw_title)
+             VALUES (701, 'queued', 1, 1000, 'nyaa', 'torbox', 'hash-onepiece-shared', 'One Piece v01-02')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO downloads (chapter_id, state, position, added_at, source_type, backend_type, torrent_hash, raw_title)
+             VALUES (702, 'queued', 2, 1000, 'nyaa', 'torbox', 'hash-onepiece-shared', 'One Piece v01-02')",
+            [],
+        )?;
+        Ok(())
+    }).await.unwrap();
+
+    let app = Router::new().route(
+        "/torrents/createtorrent",
+        post(|| async {
+            Json(json!({
+                "success": true,
+                "data": {
+                    "torrent_id": 8888,
+                    "hash": "hash-onepiece-shared"
+                }
+            }))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+
+    let client = crate::acquisition::torbox::TorBoxClient::new(
+        reqwest::Client::new(),
+        Some(format!("http://127.0.0.1:{port}")),
+        Some("test-token".to_string()),
+    );
+
+    let host = crate::host::Host::new(crate::config::HostConfig::default(), env.root.join("host_bin"), &env.root).unwrap();
+    let local = crate::local::Local::new(env.root.join("local"));
+    let images = crate::images::Images::new(env.db.clone(), host, local, &env.root, 10);
+    let downloads = Downloads::new(env.db.clone(), images, &env.root, 0);
+
+    let job = env.db.call(|conn| crate::downloads::next_job(conn)).await.unwrap().unwrap();
+    assert_eq!(job.chapter, 701);
+
+    let new_job_id = downloads.recreate_torbox_job(&client, &job).await.unwrap();
+    assert_eq!(new_job_id, "8888");
+
+    // Both chapter 701 and sibling 702 must have external_job_id = 8888!
+    let (jid_701, jid_702): (Option<String>, Option<String>) = env.db.call(|conn| {
+        let j1: Option<String> = conn.query_row("SELECT external_job_id FROM downloads WHERE chapter_id = 701", [], |r| r.get(0)).unwrap();
+        let j2: Option<String> = conn.query_row("SELECT external_job_id FROM downloads WHERE chapter_id = 702", [], |r| r.get(0)).unwrap();
+        Ok((j1, j2))
+    }).await.unwrap();
+
+    assert_eq!(jid_701.as_deref(), Some("8888"));
+    assert_eq!(jid_702.as_deref(), Some("8888"), "Sibling sharing torrent_hash must be updated to avoid duplicate submission");
+}

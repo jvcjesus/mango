@@ -871,11 +871,229 @@ impl Downloads {
         Ok(None)
     }
 
+    /// On startup or recovery, checks Komga for any downloads currently in 'verifying' state.
+    /// If Komga already has the release indexed, completes publication immediately.
+    /// Otherwise, triggers a targeted scan and schedules backoff so worker does not spin in a tight loop.
+    pub async fn recover_verifying_downloads_with_komga(
+        &self,
+        pipeline: &crate::pipeline::Pipeline,
+    ) -> Result<usize> {
+        let (config, _, komga_key) = pipeline.load_internal_config().await.unwrap_or_default();
+        if !config.komga_enabled {
+            return Ok(0);
+        }
+
+        let jobs: Vec<Job> = self
+            .db
+            .call(|conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT d.chapter_id, d.attempts, COALESCE(s.name, 'Unknown source'), m.title, c.name, c.chapter_number, c.scanlator,
+                            m.author, m.artist, m.genre, m.description, s.lang, m.id, d.published_path, d.target_library_id, d.state,
+                            d.source_type, d.backend_type, d.external_job_id, d.external_file_id, d.torrent_hash, d.raw_title,
+                            d.uploader, d.release_size, d.retrieved_path, d.collection_id, d.collection_name, d.magnet_url, d.retrieval_identity_json
+                     FROM downloads d JOIN chapters c ON c.id = d.chapter_id JOIN manga m ON m.id = c.manga_id
+                     LEFT JOIN sources s ON s.id = m.source_id
+                     WHERE d.state = 'verifying' AND d.published_path IS NOT NULL
+                     ORDER BY d.position, d.chapter_id",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        let mut name: String = r.get(4)?;
+                        let mut number: f64 = r.get(5)?;
+                        let mut title: String = r.get(3)?;
+                        let mut release_info = crate::release::parse_release(&name, number);
+                        let identity_json: Option<String> = r.get(28)?;
+                        let mut language: Option<String> = r.get(11)?;
+                        if let Some(identity) = identity_json.as_deref().and_then(|json| {
+                            serde_json::from_str::<crate::acquisition::edition::RetrievalIdentity>(json).ok()
+                        }) {
+                            if identity.import_candidate.is_some() {
+                                title = identity.series.clone();
+                                match identity.requested_unit {
+                                    crate::acquisition::AcquisitionReleaseUnit::Volume(n) => {
+                                        number = n;
+                                        name = format!("Volume {n}");
+                                    }
+                                    crate::acquisition::AcquisitionReleaseUnit::Chapter(n) => {
+                                        number = n;
+                                        name = format!("Chapter {n}");
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            if identity.language.is_some() {
+                                language = identity.language.clone();
+                            }
+                            match identity.requested_unit {
+                                crate::acquisition::AcquisitionReleaseUnit::Volume(v) => {
+                                    release_info.release_type = crate::release::ReleaseType::Volume;
+                                    release_info.volume = Some(v);
+                                    release_info.chapter_number = None;
+                                }
+                                crate::acquisition::AcquisitionReleaseUnit::Chapter(c) => {
+                                    release_info.release_type = crate::release::ReleaseType::Chapter;
+                                    release_info.volume = None;
+                                    release_info.chapter_number = Some(c);
+                                }
+                                _ => {}
+                            }
+                        }
+                        Ok(Job {
+                            chapter: r.get(0)?,
+                            manga_id: r.get(12)?,
+                            attempts: r.get(1)?,
+                            source: r.get(2)?,
+                            title,
+                            name,
+                            number,
+                            scanlator: r.get(6)?,
+                            author: r.get(7)?,
+                            artist: r.get(8)?,
+                            genre: r.get(9)?,
+                            summary: r.get(10)?,
+                            lang: language,
+                            volume: release_info.volume,
+                            release_type: release_info.release_type,
+                            chapter_number: release_info.chapter_number,
+                            published_path: r.get(13)?,
+                            target_library_id: r.get(14)?,
+                            source_type: r.get(16)?,
+                            backend_type: r.get(17)?,
+                            external_job_id: r.get(18)?,
+                            external_file_id: r.get(19)?,
+                            torrent_hash: r.get(20)?,
+                            raw_title: r.get(21)?,
+                            uploader: r.get(22)?,
+                            release_size: r.get::<_, Option<i64>>(23)?.map(|s| s as u64),
+                            retrieved_path: r.get(24)?,
+                            collection_id: r.get(25)?,
+                            collection_name: r.get(26)?,
+                            magnet_url: r.get(27)?,
+                            retrieval_identity_json: r.get(28)?,
+                        })
+                    })?
+                    .filter_map(std::result::Result::ok)
+                    .collect::<Vec<_>>();
+                Ok(rows)
+            })
+            .await?;
+
+        if jobs.is_empty() {
+            return Ok(0);
+        }
+
+        let komga_client = crate::pipeline::komga::KomgaClient::new(
+            pipeline.http.clone(),
+            config.komga_url,
+            komga_key,
+        );
+
+        let mut recovered_count = 0;
+        for job in jobs {
+            let ch_id = job.chapter;
+            let pub_path = match &job.published_path {
+                Some(p) => p.clone(),
+                None => continue,
+            };
+            let canonical_path = PathBuf::from(&pub_path);
+            if !canonical_path.is_file() {
+                continue;
+            }
+
+            let is_vol = job.release_type == crate::release::ReleaseType::Volume;
+            let rel_num = if is_vol {
+                job.volume.unwrap_or(job.number)
+            } else {
+                job.chapter_number.unwrap_or(job.number)
+            };
+            let target_lib = job
+                .target_library_id
+                .as_deref()
+                .or(config.komga_library_id.as_deref());
+
+            match komga_client
+                .verify_release_indexed(&job.publication_title(), target_lib, is_vol, rel_num)
+                .await
+            {
+                Ok(true) => {
+                    tracing::info!(
+                        "Startup recovery: chapter {} already indexed in Komga, completing publication",
+                        ch_id
+                    );
+                    pipeline.ownership.invalidate(job.manga_id);
+                    let p_copy = pub_path.clone();
+                    let _ = self
+                        .db
+                        .call(move |conn| {
+                            let _ = crate::pipeline::receipts::update_receipt_verification(
+                                conn,
+                                &p_copy,
+                                true,
+                                None,
+                                None,
+                                "verified",
+                                Some("Verified in Komga on startup recovery"),
+                            );
+                            crate::acquisition::service::complete_queued_publication(conn, ch_id)?;
+                            let _ = conn.execute(
+                                "UPDATE metadata_handoffs SET state = 'succeeded', message = 'Acquisition complete — verified in Komga on startup', updated_at = strftime('%s','now') WHERE chapter_id = ?1",
+                                [ch_id],
+                            );
+                            Ok(())
+                        })
+                        .await;
+                    recovered_count += 1;
+                }
+                Ok(false) => {
+                    tracing::info!(
+                        "Startup recovery: chapter {} waiting for Komga scan; triggering scan with backoff",
+                        ch_id
+                    );
+                    if config.komga_scan_enabled {
+                        let _ = komga_client.trigger_scan(target_lib).await;
+                    }
+                    let _ = self
+                        .db
+                        .call(move |conn| {
+                            conn.execute(
+                                "UPDATE downloads SET retry_at = strftime('%s','now') + 10 WHERE chapter_id = ?1",
+                                [ch_id],
+                            )?;
+                            Ok(())
+                        })
+                        .await;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "Startup recovery: error contacting Komga for chapter {}: {}",
+                        ch_id,
+                        e
+                    );
+                    let _ = self
+                        .db
+                        .call(move |conn| {
+                            conn.execute(
+                                "UPDATE downloads SET retry_at = strftime('%s','now') + 30 WHERE chapter_id = ?1",
+                                [ch_id],
+                            )?;
+                            Ok(())
+                        })
+                        .await;
+                }
+            }
+        }
+
+        Ok(recovered_count)
+    }
+
     /// Works through the queue, one chapter at a time. Never returns.
     pub async fn run(self) {
         // Whatever was being fetched when Mango stopped starts over,
         // but downloads that were already published durably remain published (do NOT redownload!).
         let _ = Self::run_startup_recovery(&self.db).await;
+        if let Some(pipeline) = &self.pipeline {
+            let _ = self.recover_verifying_downloads_with_komga(pipeline).await;
+        }
 
         loop {
             let Ok(Some(job)) = self.db.call(|conn| next_job(conn)).await else {
@@ -1067,24 +1285,32 @@ impl Downloads {
                                         });
                                     }
                                 } else {
+                                    let backoff = (10 * (1 << (job.attempts as u32).min(5))).min(120);
+                                    let err_msg = if job.attempts >= 8 {
+                                        format!("Published locally · Komga scan pending (attempt {})", job.attempts + 1)
+                                    } else {
+                                        "Published — waiting for Komga".to_string()
+                                    };
                                     let _ = self
                                         .db
                                         .call(move |conn| {
                                             conn.execute(
-                                                "UPDATE downloads SET state = 'verifying', error = 'Published — waiting for Komga', attempts = attempts + 1 WHERE chapter_id = ?1",
-                                                [chapter_id],
+                                                "UPDATE downloads SET state = 'verifying', error = ?1, attempts = attempts + 1, retry_at = strftime('%s','now') + ?2 WHERE chapter_id = ?3",
+                                                rusqlite::params![&err_msg, backoff, chapter_id],
                                             )?;
                                             Ok(())
                                         })
                                         .await;
                                 }
                             } else {
+                                let backoff = (10 * (1 << (job.attempts as u32).min(5))).min(120);
+                                tracing::warn!("Komga scan trigger failed for chapter {}, will retry in {}s", chapter_id, backoff);
                                 let _ = self
                                     .db
                                     .call(move |conn| {
                                         conn.execute(
-                                            "UPDATE downloads SET state = 'failed', error = 'Published, but Komga scan trigger failed' WHERE chapter_id = ?1",
-                                            [chapter_id],
+                                            "UPDATE downloads SET state = 'verifying', error = 'Published — Komga scan trigger retry', attempts = attempts + 1, retry_at = strftime('%s','now') + ?2 WHERE chapter_id = ?1",
+                                            rusqlite::params![chapter_id, backoff],
                                         )?;
                                         Ok(())
                                     })
@@ -1440,7 +1666,7 @@ impl Downloads {
 
     /// Recreates a TorBox job from durable provenance (magnet URI, torrent hash, or execution snapshot).
     /// Updates downloads table for this chapter and all incomplete siblings sharing the old job id.
-    async fn recreate_torbox_job(
+    pub(crate) async fn recreate_torbox_job(
         &self,
         client: &crate::acquisition::torbox::TorBoxClient,
         job: &Job,
@@ -1591,7 +1817,8 @@ impl Downloads {
                              torrent_hash = COALESCE(torrent_hash, ?2),
                              magnet_url = COALESCE(magnet_url, ?3)
                          WHERE chapter_id = ?4
-                            OR (external_job_id = ?5 AND state != 'completed')",
+                            OR (external_job_id = ?5 AND state != 'completed')
+                            OR (?2 IS NOT NULL AND torrent_hash = ?2 AND state != 'completed')",
                         rusqlite::params![
                             &new_jid_db,
                             &new_hash_db,
@@ -1607,7 +1834,8 @@ impl Downloads {
                              external_file_id = NULL,
                              torrent_hash = COALESCE(torrent_hash, ?2),
                              magnet_url = COALESCE(magnet_url, ?3)
-                         WHERE chapter_id = ?4",
+                         WHERE chapter_id = ?4
+                            OR (?2 IS NOT NULL AND torrent_hash = ?2 AND state != 'completed')",
                         rusqlite::params![&new_jid_db, &new_hash_db, &magnet_db, chapter_id],
                     )?;
                 }
@@ -1642,6 +1870,41 @@ impl Downloads {
                 .is_ok()
             {
                 return Ok(Some((rel.clone(), 1)));
+            }
+        } else {
+            let rel_candidate = self.place(job);
+            let cand_path = self.dir.join(&rel_candidate);
+            if cand_path.is_file()
+                && (if crate::acquisition::physical::is_physical(job) {
+                    crate::acquisition::physical::validate_payload(&cand_path)
+                } else {
+                    crate::pipeline::publisher::verify_cbz_integrity(&cand_path)
+                })
+                .is_ok()
+            {
+                let rel_str = rel_candidate.to_string_lossy().replace('\\', "/");
+                let ch_id = job.chapter;
+                let rel_clone = rel_str.clone();
+                let _ = self
+                    .db
+                    .call(move |conn| {
+                        conn.execute(
+                            "UPDATE downloads SET retrieved_path = ?1 WHERE chapter_id = ?2",
+                            rusqlite::params![&rel_clone, ch_id],
+                        )?;
+                        conn.execute(
+                            "UPDATE chapters SET download_path = ?1 WHERE id = ?2",
+                            rusqlite::params![&rel_clone, ch_id],
+                        )?;
+                        Ok(())
+                    })
+                    .await;
+                tracing::info!(
+                    "[TorBox] Reusing previously retrieved valid staging archive for chapter {} ({})",
+                    job.chapter,
+                    rel_str
+                );
+                return Ok(Some((rel_str, 1)));
             }
         }
 
@@ -1757,14 +2020,17 @@ impl Downloads {
             crate::acquisition::BackendJobStatus::Stalled { reason } => {
                 update_stage("torbox_stalled", &format!("TorBox stalled: {reason}"));
                 let ch_id = job.chapter;
-                let err_msg = reason.clone();
-                self.db.call(move |conn| {
-                    conn.execute(
-                        "UPDATE downloads SET state = 'queued', error = ?1, retry_at = strftime('%s','now') + 15 WHERE chapter_id = ?2",
-                        rusqlite::params![&err_msg, ch_id],
-                    )?;
-                    Ok(())
-                }).await?;
+                let backoff = (15 * (1 + (job.attempts as i64).min(10))).min(300);
+                let err_msg = format!("TorBox stalled: {reason}");
+                self.db
+                    .call(move |conn| {
+                        conn.execute(
+                            "UPDATE downloads SET state = 'queued', error = ?1, attempts = attempts + 1, retry_at = strftime('%s','now') + ?2 WHERE chapter_id = ?3",
+                            rusqlite::params![&err_msg, backoff, ch_id],
+                        )?;
+                        Ok(())
+                    })
+                    .await?;
                 return Ok(None);
             }
             crate::acquisition::BackendJobStatus::Failed { error } => {
@@ -1979,11 +2245,15 @@ impl Downloads {
             })
             .await?;
 
-        // Best effort remote delete on TorBox only if no other sibling downloads remain incomplete
+        // Best effort remote delete on TorBox only if no other sibling downloads still need to retrieve files
         let ext_jid = external_job_id.clone();
         let is_last_active = self.db.call(move |conn| {
             let count: i64 = conn.query_row(
-                "SELECT count(*) FROM downloads WHERE external_job_id = ?1 AND chapter_id != ?2 AND state != 'completed'",
+                "SELECT count(*) FROM downloads
+                 WHERE external_job_id = ?1
+                   AND chapter_id != ?2
+                   AND state != 'completed'
+                   AND retrieved_path IS NULL",
                 rusqlite::params![&ext_jid, ch_id],
                 |r| r.get(0),
             ).unwrap_or(0);
@@ -1992,13 +2262,13 @@ impl Downloads {
 
         if is_last_active {
             tracing::info!(
-                "[TorBox] Cleaning up completed remote torrent job {}",
+                "[TorBox] All sibling files retrieved; cleaning up remote torrent job {}",
                 external_job_id
             );
             let _ = client.cancel(&external_job_id).await;
         } else {
             tracing::info!(
-                "[TorBox] Deferring remote cleanup for job {}: sibling item(s) not yet completed",
+                "[TorBox] Deferring remote cleanup for job {}: sibling item(s) still awaiting retrieval",
                 external_job_id
             );
         }
@@ -2494,7 +2764,7 @@ pub(crate) fn read_queue(conn: &Connection) -> Result<QueueView> {
 }
 
 /// The next chapter that is due, marked as being fetched. None while paused or when nothing is due.
-fn next_job(conn: &Connection) -> Result<Option<Job>> {
+pub(crate) fn next_job(conn: &Connection) -> Result<Option<Job>> {
     if settings::get::<bool>(conn, PAUSED).unwrap_or(false) {
         return Ok(None);
     }

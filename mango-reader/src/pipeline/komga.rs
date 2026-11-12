@@ -25,6 +25,7 @@ pub struct KomgaSeries {
     pub id: String,
     pub name: String,
     pub library_id: String,
+    #[serde(default)]
     pub books_count: i64,
 }
 
