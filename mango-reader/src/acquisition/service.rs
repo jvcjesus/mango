@@ -243,6 +243,17 @@ pub(crate) fn complete_queued_publication(conn: &rusqlite::Connection, chapter: 
         );
     }
 
+    // Ensure publication receipts for this chapter are marked verified
+    let _ = conn.execute(
+        "UPDATE publication_receipts
+         SET verified_ownership = 1,
+             verification_status = 'verified',
+             verified_at = COALESCE(verified_at, ?1),
+             updated_at = ?1
+         WHERE chapter_id = ?2",
+        rusqlite::params![current_time, chapter],
+    );
+
     conn.execute("DELETE FROM downloads WHERE chapter_id=?1", [chapter])?;
     Ok(())
 }

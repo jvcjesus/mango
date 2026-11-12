@@ -1023,9 +1023,19 @@ impl Downloads {
                                         .ownership
                                         .get_title_ownership(job.manga_id, &job.publication_title())
                                         .await;
+                                    let p_path_ver = pub_path.clone();
                                     let _ = self
                                         .db
                                         .call(move |conn| {
+                                            let _ = crate::pipeline::receipts::update_receipt_verification(
+                                                conn,
+                                                &p_path_ver,
+                                                true,
+                                                None,
+                                                None,
+                                                "verified",
+                                                Some("Verified in Komga by download worker"),
+                                            );
                                             crate::acquisition::service::complete_queued_publication(conn, chapter_id)?;
                                             Ok(())
                                         })

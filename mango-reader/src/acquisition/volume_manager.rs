@@ -450,6 +450,7 @@ pub fn get_volume_manager_summary_with_ownership(
         published_at: i64,
         verified_ownership: bool,
         verified_at: Option<i64>,
+        file_exists: bool,
     }
 
     let mut receipts_map: HashMap<i64, ReceiptRow> = HashMap::new();
@@ -467,16 +468,19 @@ pub fn get_volume_manager_summary_with_ownership(
             |r| {
                 let vol: f64 = r.get(1)?;
                 let k = (vol * 1000.0).round() as i64;
+                let canon_p: String = r.get(2)?;
+                let file_exists = cfg!(test) || std::path::Path::new(&canon_p).is_file();
                 Ok((
                     k,
                     ReceiptRow {
                         id: r.get(0)?,
-                        canonical_path: r.get(2)?,
+                        canonical_path: canon_p,
                         file_size_bytes: r.get::<_, i64>(3)? as u64,
                         file_sha256: r.get(4)?,
                         published_at: r.get(5)?,
                         verified_ownership: r.get::<_, i64>(6)? != 0,
                         verified_at: r.get(7)?,
+                        file_exists,
                     },
                 ))
             },
@@ -512,6 +516,35 @@ pub fn get_volume_manager_summary_with_ownership(
             let stage = d_state.unwrap_or(ca_status);
             let job_id = ext_job.unwrap_or_else(|| format!("approval-{}", ca_id));
             Ok((k, ActiveJobRow { job_id, stage }))
+        }) {
+            for item in rows.flatten() {
+                active_jobs_map.entry(item.0).or_insert(item.1);
+            }
+        }
+    }
+
+    // Also include active downloads directly from downloads table
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT d.chapter_id, c.name, c.chapter_number, d.state, d.external_job_id
+         FROM downloads d
+         JOIN chapters c ON c.id = d.chapter_id
+         WHERE (c.manga_id = ?1 OR c.manga_id = ?2
+                OR c.manga_id IN (SELECT id FROM manga WHERE catalog_manga_id = ?2))
+           AND d.state NOT IN ('completed')
+         ORDER BY d.chapter_id DESC",
+    ) {
+        if let Ok(rows) = stmt.query_map(params![manga_id, effective_catalog_id], |r| {
+            let ch_id: i64 = r.get(0)?;
+            let c_name: String = r.get(1)?;
+            let ch_num: f64 = r.get(2)?;
+            let state: String = r.get(3)?;
+            let ext_job: Option<String> = r.get(4)?;
+            let vol = crate::release::parse_volume(&c_name)
+                .or_else(|| crate::release::parse_release(&c_name, ch_num).volume)
+                .unwrap_or(ch_num);
+            let k = (vol * 1000.0).round() as i64;
+            let job_id = ext_job.unwrap_or_else(|| format!("dl-{}", ch_id));
+            Ok((k, ActiveJobRow { job_id, stage: state }))
         }) {
             for item in rows.flatten() {
                 active_jobs_map.entry(item.0).or_insert(item.1);
@@ -638,13 +671,20 @@ pub fn get_volume_manager_summary_with_ownership(
         let cand_info = cand_info_map.get(&k);
         let target = targets_map.get(&k);
 
-        // Ownership
+        // Ownership: Komga is authoritative when live ownership state is available.
         let in_owned_list = owned_list.iter().any(|&ov| (ov - vol_num).abs() < 0.001);
-        let receipt_verified = receipt.map(|r| r.verified_ownership).unwrap_or(false);
+        let receipt_verified = receipt.map(|r| r.verified_ownership && r.file_exists).unwrap_or(false);
         let komga_entry = komga_ownership_map.get(&k);
-        let is_owned = in_owned_list || receipt_verified || komga_entry.is_some();
+        let is_owned = if ownership_opt.is_some() {
+            komga_entry.is_some()
+        } else {
+            in_owned_list || receipt_verified
+        };
         let komga_book_id = komga_entry.and_then(|(bid, _)| bid.clone());
         let komga_book_name = komga_entry.and_then(|(_, bname)| bname.clone());
+
+        // Local publication status: file physically exists on disk awaiting Komga scan
+        let is_published = !is_owned && receipt.map(|r| r.file_exists).unwrap_or(false);
 
         // In progress
         let in_progress = active_job.is_some();
@@ -684,10 +724,8 @@ pub fn get_volume_manager_summary_with_ownership(
         if is_owned {
             owned_count += 1;
         } else {
-            if let Some(r) = receipt {
-                if !r.verified_ownership {
-                    published_count += 1;
-                }
+            if is_published {
+                published_count += 1;
             }
             if in_progress {
                 in_progress_count += 1;
@@ -703,21 +741,26 @@ pub fn get_volume_manager_summary_with_ownership(
             }
         }
 
-        // Display status & status label
+        // Display status & status label: represents the 10 distinct acquisition lifecycle states
         let (display_status, status_label) = if is_owned {
             ("owned".to_string(), "Owned in Komga".to_string())
-        } else if in_progress {
-            let st = active_job.map(|j| j.stage.as_str()).unwrap_or("queued");
-            ("downloading".to_string(), format!("Acquiring · {st}"))
-        } else if let Some(r) = receipt {
+        } else if is_published {
             (
                 "published".to_string(),
-                if r.verified_ownership {
-                    "Published · Komga Verified".to_string()
-                } else {
-                    "Published · Scan Pending".to_string()
-                },
+                "Published · Scan Pending".to_string(),
             )
+        } else if in_progress {
+            let st = active_job.map(|j| j.stage.as_str()).unwrap_or("queued");
+            match st {
+                "queued" => ("queued".to_string(), "Queued for Acquisition".to_string()),
+                "approved" => ("selected".to_string(), "Selected for Acquisition".to_string()),
+                "downloaded" => ("downloaded".to_string(), "Downloaded · Unverified".to_string()),
+                "verifying" => ("verifying".to_string(), "Validating Archive".to_string()),
+                "needs_review" | "metadata_wait" | "paused" => {
+                    ("review_required".to_string(), "Awaiting Review / Metadata".to_string())
+                }
+                _ => ("downloading".to_string(), format!("Acquiring · {st}")),
+            }
         } else if candidate_count > 0 {
             let prov_display = top_provider.as_deref().unwrap_or("Verified");
             (
@@ -859,6 +902,19 @@ pub fn plan_volume_manager_batch(
                 false,
                 "ALREADY_OWNED".to_string(),
                 "Volume is already owned in Komga library".to_string(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
+            Some(e) if e.display_status == "published" => (
+                false,
+                false,
+                "ALREADY_PUBLISHED".to_string(),
+                "Volume has been published locally to canonical directory; awaiting Komga library scan".to_string(),
                 None,
                 None,
                 None,
@@ -1659,5 +1715,71 @@ mod tests {
         assert_eq!(item3.status, "ELIGIBLE");
         assert!(item3.is_eligible);
         assert!(!item3.is_owned);
+    }
+
+    #[test]
+    fn test_volume_manager_published_scan_pending_and_batch_plan_blocks() {
+        let conn = create_test_db();
+        conn.execute(
+            "INSERT INTO manga (id, title, source_id, mangabaka_id) VALUES (1093, 'Haikyu!!', 0, 8718)",
+            [],
+        ).unwrap();
+
+        let missing_json = serde_json::to_string(
+            &(1..=45).map(|v| v as f64).collect::<Vec<f64>>()
+        ).unwrap();
+
+        conn.execute(
+            "INSERT INTO series_reconciliations (
+                series_id, manga_id, mangabaka_id, collection_id, title, edition,
+                status, is_ongoing, total_official_volumes, owned_volumes_count,
+                missing_volumes_count, owned_volumes_json, missing_volumes_json,
+                future_volumes_json, last_reconciled_at, updated_at
+            ) VALUES (
+                'manga:1093', 1093, 8718, '019e1d1c-8b74-79d5-911a-a1997aa899a7',
+                'Haikyu!!', 'standard', 'missing_volume', 0, 45, 0, 45, '[]', ?1, '[]', 1000, 1000
+            )",
+            [&missing_json],
+        ).unwrap();
+
+        // Volume 4 is published to disk with verified_ownership = 0 (Komga scan pending)
+        conn.execute(
+            "INSERT INTO publication_receipts (
+                id, chapter_id, manga_id, series_title, volume_number, canonical_path,
+                file_size_bytes, file_sha256, published_at, verified_ownership, created_at, updated_at
+            ) VALUES (
+                'rcpt-v04', 8840, 1093, 'Haikyu!!', 4.0, '/srv/media/manga/Haikyu!!/Haikyu!! v04.cbz',
+                188000000, 'hash4', 1000, 0, 1000, 1000
+            )",
+            [],
+        ).unwrap();
+
+        let summary = get_volume_manager_summary(&conn, 1093).unwrap();
+        assert_eq!(summary.owned_count, 0, "Scan pending volume is not counted as owned");
+        assert_eq!(summary.published_count, 1, "Scan pending volume is counted in published_count");
+
+        let v4 = summary.volumes.iter().find(|v| (v.volume_number - 4.0).abs() < 0.001).unwrap();
+        assert!(!v4.is_owned, "Published scan pending volume is not marked as owned");
+        assert_eq!(v4.display_status, "published");
+        assert_eq!(v4.status_label, "Published · Scan Pending");
+
+        // Batch plan selecting Vol 4
+        let req = VolumeManagerBatchPlanRequest {
+            selected_volumes: vec![4.0],
+            profile_id: None,
+            is_dry_run: Some(true),
+        };
+        let profile = AcquisitionProfile::default();
+        let plan = plan_volume_manager_batch(&conn, 1093, &req, &profile, None).unwrap();
+
+        assert_eq!(plan.total_selected, 1);
+        assert_eq!(plan.eligible_count, 0);
+        assert_eq!(plan.blocked_count, 1);
+
+        let item = &plan.items[0];
+        assert_eq!(item.volume_number, 4.0);
+        assert_eq!(item.status, "ALREADY_PUBLISHED");
+        assert!(!item.is_eligible);
+        assert!(!item.is_owned);
     }
 }

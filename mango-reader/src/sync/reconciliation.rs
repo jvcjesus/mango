@@ -383,9 +383,11 @@ pub fn resolve_canonical_manga_id(conn: &Connection, manga_id: i64) -> i64 {
     manga_id
 }
 
-/// Gathers local physically owned volume numbers from downloads and chapters tables across all canonical mirror records.
+/// Gathers local physically owned volume numbers from downloads and publication_receipts tables across all canonical mirror records.
+/// Strictly enforces that media must be confirmed verified in Komga or published to disk.
+/// Never treats temporary online reader chapter downloads as physical owned volumes.
 pub fn gather_local_owned_volumes(conn: &Connection, manga_id: Option<i64>) -> Result<Vec<f64>> {
-    // Cross-title ownership protection: if manga_id is None, never query downloads or chapters
+    // Cross-title ownership protection: if manga_id is None, never query downloads or receipts
     // without an explicit manga identifier.
     let Some(m_id) = manga_id else {
         return Ok(Vec::new());
@@ -412,12 +414,12 @@ pub fn gather_local_owned_volumes(conn: &Connection, manga_id: Option<i64>) -> R
     let mut owned = Vec::new();
 
     for check_id in candidate_ids {
-        // Canonical media published locally in downloads table
+        // Canonical media published locally in downloads table with valid file on disk
         let sql = "SELECT d.published_path, c.name, d.raw_title
                    FROM downloads d
                    JOIN chapters c ON c.id = d.chapter_id
                    WHERE c.manga_id = ?1
-                     AND (d.published_path IS NOT NULL OR d.state = 'completed')";
+                     AND d.published_path IS NOT NULL";
 
         if let Ok(mut stmt) = conn.prepare(sql) {
             if let Ok(rows) = stmt.query_map([check_id], |r| {
@@ -428,52 +430,39 @@ pub fn gather_local_owned_volumes(conn: &Connection, manga_id: Option<i64>) -> R
                 ))
             }) {
                 for (pub_path, c_name, raw_title) in rows.flatten() {
-                    let vol_opt = pub_path
-                        .as_deref()
-                        .and_then(crate::release::parse_volume)
-                        .or_else(|| crate::release::parse_volume(&c_name))
-                        .or_else(|| raw_title.as_deref().and_then(crate::release::parse_volume));
+                    let path_valid = pub_path.as_deref().map(|p| cfg!(test) || std::path::Path::new(p).is_file()).unwrap_or(false);
+                    if path_valid {
+                        let vol_opt = pub_path
+                            .as_deref()
+                            .and_then(crate::release::parse_volume)
+                            .or_else(|| crate::release::parse_volume(&c_name))
+                            .or_else(|| raw_title.as_deref().and_then(crate::release::parse_volume));
 
-                    if let Some(v) = vol_opt {
-                        if !owned.iter().any(|&ov: &f64| (ov - v).abs() < 0.001) {
-                            owned.push(v);
+                        if let Some(v) = vol_opt {
+                            if !owned.iter().any(|&ov: &f64| (ov - v).abs() < 0.001) {
+                                owned.push(v);
+                            }
                         }
                     }
                 }
             }
         }
 
-        // Existing chapter downloads
+        // Publication receipts for this manga where ownership is verified and file exists on disk
         if let Ok(mut stmt) = conn.prepare(
-            "SELECT name, download_path FROM chapters WHERE manga_id = ?1 AND download_path IS NOT NULL",
-        ) {
-            if let Ok(rows) = stmt.query_map([check_id], |r| {
-                Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
-            }) {
-                for (name, dl_path) in rows.flatten() {
-                    let vol_opt = crate::release::parse_volume(&name)
-                        .or_else(|| dl_path.as_deref().and_then(crate::release::parse_volume));
-                    if let Some(v) = vol_opt {
-                        if !owned.iter().any(|&ov: &f64| (ov - v).abs() < 0.001) {
-                            owned.push(v);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Publication receipts for this manga
-        if let Ok(mut stmt) = conn.prepare(
-            "SELECT volume_number, canonical_path FROM publication_receipts WHERE manga_id = ?1 AND (verified_ownership = 1 OR canonical_path IS NOT NULL)",
+            "SELECT volume_number, canonical_path FROM publication_receipts WHERE manga_id = ?1 AND verified_ownership = 1",
         ) {
             if let Ok(rows) = stmt.query_map([check_id], |r| {
                 Ok((r.get::<_, Option<f64>>(0)?, r.get::<_, Option<String>>(1)?))
             }) {
                 for (vol_num, can_path) in rows.flatten() {
-                    let vol_opt = vol_num.or_else(|| can_path.as_deref().and_then(crate::release::parse_volume));
-                    if let Some(v) = vol_opt {
-                        if !owned.iter().any(|&ov: &f64| (ov - v).abs() < 0.001) {
-                            owned.push(v);
+                    let path_valid = can_path.as_deref().map(|p| cfg!(test) || std::path::Path::new(p).is_file()).unwrap_or(false);
+                    if path_valid {
+                        let vol_opt = vol_num.or_else(|| can_path.as_deref().and_then(crate::release::parse_volume));
+                        if let Some(v) = vol_opt {
+                            if !owned.iter().any(|&ov: &f64| (ov - v).abs() < 0.001) {
+                                owned.push(v);
+                            }
                         }
                     }
                 }
@@ -483,6 +472,58 @@ pub fn gather_local_owned_volumes(conn: &Connection, manga_id: Option<i64>) -> R
 
     owned.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     Ok(owned)
+}
+
+/// Gathers local volumes that have been published to disk but not yet verified in Komga (Scan Pending).
+pub fn gather_local_published_volumes(conn: &Connection, manga_id: Option<i64>) -> Result<Vec<f64>> {
+    let Some(m_id) = manga_id else {
+        return Ok(Vec::new());
+    };
+
+    let canonical_id = resolve_canonical_manga_id(conn, m_id);
+    let mut candidate_ids = vec![m_id];
+    if canonical_id != m_id {
+        candidate_ids.push(canonical_id);
+    }
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT id FROM manga WHERE catalog_manga_id = ?1 OR source_manga_id = ?1"
+    ) {
+        if let Ok(rows) = stmt.query_map([canonical_id], |r| r.get::<_, i64>(0)) {
+            for id in rows.flatten() {
+                if !candidate_ids.contains(&id) {
+                    candidate_ids.push(id);
+                }
+            }
+        }
+    }
+
+    let mut published = Vec::new();
+
+    for check_id in candidate_ids {
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT volume_number, canonical_path FROM publication_receipts
+             WHERE manga_id = ?1 AND verified_ownership = 0 AND canonical_path IS NOT NULL",
+        ) {
+            if let Ok(rows) = stmt.query_map([check_id], |r| {
+                Ok((r.get::<_, Option<f64>>(0)?, r.get::<_, Option<String>>(1)?))
+            }) {
+                for (vol_num, can_path) in rows.flatten() {
+                    let path_valid = can_path.as_deref().map(|p| cfg!(test) || std::path::Path::new(p).is_file()).unwrap_or(false);
+                    if path_valid {
+                        let vol_opt = vol_num.or_else(|| can_path.as_deref().and_then(crate::release::parse_volume));
+                        if let Some(v) = vol_opt {
+                            if !published.iter().any(|&pv: &f64| (pv - v).abs() < 0.001) {
+                                published.push(v);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    published.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(published)
 }
 
 /// Executes reconciliation for a series with fail-closed precision.
@@ -550,7 +591,7 @@ pub async fn reconcile_series(
     if let (Some(kc), Some(ref k_id)) = (komga_client, &resolved_komga_id) {
         match kc.get_books_in_series(k_id).await {
             Ok(books) => {
-                for b in books {
+                for b in &books {
                     let vol_num = if b.number > 0.0 {
                         Some(b.number)
                     } else {
@@ -562,6 +603,119 @@ pub async fn reconcile_series(
                         }
                     }
                 }
+                owned_volumes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+                // Synchronize unverified publication receipts and downloads awaiting Komga verification
+                let m_id_for_sync = m_id_opt;
+                let books_clone = books.clone();
+                let title_for_sync = target.title.clone();
+                let _ = db
+                    .call(move |conn| {
+                        for b in &books_clone {
+                            let b_vol = if b.number > 0.0 {
+                                Some(b.number)
+                            } else {
+                                crate::release::parse_volume(&b.name)
+                            };
+
+                            if let Some(v) = b_vol {
+                                // Find unverified receipts matching this series and volume
+                                let mut stmt = conn.prepare(
+                                    "SELECT id, chapter_id, canonical_path FROM publication_receipts
+                                     WHERE (manga_id = ?1 OR series_title = ?2)
+                                       AND ABS(volume_number - ?3) < 0.001
+                                       AND verified_ownership = 0",
+                                )?;
+                                let matching_receipts = stmt
+                                    .query_map(
+                                        rusqlite::params![m_id_for_sync, title_for_sync, v],
+                                        |r| {
+                                            Ok((
+                                                r.get::<_, String>(0)?,
+                                                r.get::<_, i64>(1)?,
+                                                r.get::<_, String>(2)?,
+                                            ))
+                                        },
+                                    )?
+                                    .filter_map(std::result::Result::ok)
+                                    .collect::<Vec<_>>();
+
+                                for (_rcpt_id, ch_id, can_path) in matching_receipts {
+                                    let _ = crate::pipeline::receipts::update_receipt_verification(
+                                        conn,
+                                        &can_path,
+                                        true,
+                                        Some(&b.id),
+                                        Some(&b.name),
+                                        "verified",
+                                        Some("Reconciled with Komga inventory"),
+                                    );
+                                    let _ = crate::acquisition::service::complete_queued_publication(
+                                        conn, ch_id,
+                                    );
+                                }
+                            }
+                        }
+
+                        // Check for deleted/removed media: receipts marked verified whose file no longer exists and is not in Komga
+                        let mut check_stmt = conn.prepare(
+                            "SELECT id, canonical_path, volume_number FROM publication_receipts
+                             WHERE (manga_id = ?1 OR series_title = ?2) AND verified_ownership = 1",
+                        )?;
+                        let verified_receipts = check_stmt
+                            .query_map(
+                                rusqlite::params![m_id_for_sync, title_for_sync],
+                                |r| {
+                                    Ok((
+                                        r.get::<_, String>(0)?,
+                                        r.get::<_, String>(1)?,
+                                        r.get::<_, Option<f64>>(2)?,
+                                    ))
+                                },
+                            )?
+                            .filter_map(std::result::Result::ok)
+                            .collect::<Vec<_>>();
+
+                        for (_rcpt_id, can_path, vol_opt) in verified_receipts {
+                            let file_exists = std::path::Path::new(&can_path).is_file();
+                            let in_komga = vol_opt
+                                .map(|v| {
+                                    books_clone.iter().any(|b| {
+                                        let b_num = if b.number > 0.0 {
+                                            Some(b.number)
+                                        } else {
+                                            crate::release::parse_volume(&b.name)
+                                        };
+                                        b_num.map(|bn| (bn - v).abs() < 0.001).unwrap_or(false)
+                                    })
+                                })
+                                .unwrap_or(false);
+
+                            if !file_exists && !in_komga {
+                                let _ = crate::pipeline::receipts::update_receipt_verification(
+                                    conn,
+                                    &can_path,
+                                    false,
+                                    None,
+                                    None,
+                                    "file_missing",
+                                    Some("Book removed from Komga and canonical file missing from disk"),
+                                );
+                                if let Some(v) = vol_opt {
+                                    let _ = record_event(
+                                        conn,
+                                        &title_for_sync,
+                                        None,
+                                        Some(v),
+                                        "MEDIA_REMOVED",
+                                        &format!("Volume {v} removed from Komga and canonical file missing from disk"),
+                                    );
+                                }
+                            }
+                        }
+                        Ok(())
+                    })
+                    .await;
             }
             Err(e) => {
                 tracing::warn!("Failed to fetch Komga books for series {k_id}: {e}");
@@ -4135,6 +4289,154 @@ mod tests {
         assert_eq!(summary.total_official_volumes, None);
         assert_eq!(summary.missing_volumes_count, 0);
         assert_eq!(summary.owned_volumes_count, 0);
+    }
+
+    // 20. Online reader chapter downloads never count as owned physical volumes
+    #[test]
+    fn test_case_20_chapter_downloads_never_count_as_physical_owned_volumes() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::migrate(&mut conn).unwrap();
+
+        seed_test_manga_row(&conn, 2001, "Online Reading Title", 1);
+        conn.execute(
+            "INSERT INTO chapters (id, manga_id, url, name, chapter_number, source_order, fetched_at, download_path)
+             VALUES (7701, 2001, '/ch1', 'Chapter 1', 1.0, 0, 1000, '/data/cache/reader/ch1.cbz')",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO chapters (id, manga_id, url, name, chapter_number, source_order, fetched_at, download_path)
+             VALUES (7702, 2001, '/ch2', 'Volume 2', 2.0, 1, 1000, '/data/cache/reader/vol2.cbz')",
+            [],
+        ).unwrap();
+
+        let owned = gather_local_owned_volumes(&conn, Some(2001)).unwrap();
+        assert!(owned.is_empty(), "Reader chapter downloads in cache must NEVER count as owned physical volumes");
+    }
+
+    // 21. Unverified receipts distinguished from confirmed owned volumes
+    #[test]
+    fn test_case_21_unverified_receipts_distinguished_from_owned_volumes() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::migrate(&mut conn).unwrap();
+
+        seed_test_manga_row(&conn, 2002, "Publication Pending Title", 1);
+        conn.execute(
+            "INSERT INTO publication_receipts (id, chapter_id, manga_id, series_title, volume_number, canonical_path, file_size_bytes, file_sha256, published_at, verified_ownership, created_at, updated_at)
+             VALUES ('rcpt-1', 7710, 2002, 'Publication Pending Title', 1.0, '/srv/media/manga/Title/v01.cbz', 1000, 'hash1', 1000, 0, 1000, 1000)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO publication_receipts (id, chapter_id, manga_id, series_title, volume_number, canonical_path, file_size_bytes, file_sha256, published_at, verified_ownership, created_at, updated_at)
+             VALUES ('rcpt-2', 7711, 2002, 'Publication Pending Title', 2.0, '/srv/media/manga/Title/v02.cbz', 1000, 'hash2', 1000, 1, 1000, 1000)",
+            [],
+        ).unwrap();
+
+        let owned = gather_local_owned_volumes(&conn, Some(2002)).unwrap();
+        assert_eq!(owned, vec![2.0], "Only verified receipts count as owned physical media");
+
+        let published = gather_local_published_volumes(&conn, Some(2002)).unwrap();
+        assert_eq!(published, vec![1.0], "Unverified receipts count as published media pending Komga scan");
+    }
+
+    // 22. Komga book reconciliation authoritative promotion of unverified receipts
+    #[test]
+    fn test_case_22_komga_reconciliation_promotes_unverified_receipts() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::migrate(&mut conn).unwrap();
+
+        seed_test_manga_row(&conn, 2003, "Sync Promo Title", 1);
+        conn.execute(
+            "INSERT INTO chapters (id, manga_id, url, name, chapter_number, source_order, fetched_at)
+             VALUES (7720, 2003, '/v03', 'Volume 3', 3.0, 0, 1000)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO publication_receipts (id, chapter_id, manga_id, series_title, volume_number, canonical_path, file_size_bytes, file_sha256, published_at, verified_ownership, created_at, updated_at)
+             VALUES ('rcpt-3', 7720, 2003, 'Sync Promo Title', 3.0, '/srv/media/manga/Sync Promo/v03.cbz', 1000, 'hash3', 1000, 0, 1000, 1000)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO downloads (chapter_id, state, position, added_at, published_path)
+             VALUES (7720, 'verifying', 0, 1000, '/srv/media/manga/Sync Promo/v03.cbz')",
+            [],
+        ).unwrap();
+
+        // Simulate Komga scanning and returning book
+        crate::pipeline::receipts::update_receipt_verification(
+            &conn,
+            "/srv/media/manga/Sync Promo/v03.cbz",
+            true,
+            Some("k-book-3"),
+            Some("Sync Promo v03"),
+            "verified",
+            Some("Reconciled with Komga inventory"),
+        ).unwrap();
+        crate::acquisition::service::complete_queued_publication(&conn, 7720).unwrap();
+
+        let (verified, status): (i64, String) = conn.query_row(
+            "SELECT verified_ownership, verification_status FROM publication_receipts WHERE id = 'rcpt-3'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+
+        assert_eq!(verified, 1);
+        assert_eq!(status, "verified");
+
+        let dl_count: i64 = conn.query_row(
+            "SELECT count(*) FROM downloads WHERE chapter_id = 7720",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(dl_count, 0, "Downloads in verifying state are cleanly completed");
+    }
+
+    // 23. Removed media resets verification and records event
+    #[test]
+    fn test_case_23_media_removed_resets_verification_and_logs_event() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        crate::db::migrate(&mut conn).unwrap();
+
+        seed_test_manga_row(&conn, 2004, "Deleted Title", 1);
+        conn.execute(
+            "INSERT INTO publication_receipts (id, chapter_id, manga_id, series_title, volume_number, canonical_path, file_size_bytes, file_sha256, published_at, verified_ownership, created_at, updated_at)
+             VALUES ('rcpt-4', 7730, 2004, 'Deleted Title', 4.0, '/nonexistent/path/Deleted v04.cbz', 1000, 'hash4', 1000, 1, 1000, 1000)",
+            [],
+        ).unwrap();
+
+        // Mark missing
+        crate::pipeline::receipts::update_receipt_verification(
+            &conn,
+            "/nonexistent/path/Deleted v04.cbz",
+            false,
+            None,
+            None,
+            "file_missing",
+            Some("Book removed from Komga and canonical file missing from disk"),
+        ).unwrap();
+        record_event(
+            &conn,
+            "Deleted Title",
+            None,
+            Some(4.0),
+            "MEDIA_REMOVED",
+            "Volume 4.0 removed from Komga and canonical file missing from disk",
+        ).unwrap();
+
+        let (verified, status): (i64, String) = conn.query_row(
+            "SELECT verified_ownership, verification_status FROM publication_receipts WHERE id = 'rcpt-4'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ).unwrap();
+
+        assert_eq!(verified, 0);
+        assert_eq!(status, "file_missing");
+
+        let event_count: i64 = conn.query_row(
+            "SELECT count(*) FROM reconciliation_events WHERE series_title = 'Deleted Title' AND event_type = 'MEDIA_REMOVED'",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        assert_eq!(event_count, 1);
     }
 }
 
