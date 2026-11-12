@@ -132,13 +132,19 @@ impl Job {
                 serde_json::from_str::<crate::acquisition::edition::RetrievalIdentity>(json).ok()
             })
             .and_then(|identity| identity.requested_edition);
-        match edition {
-            Some(edition)
-                if edition != "standard"
+
+        let valid_edition = crate::acquisition::edition::clean_edition(edition.as_deref());
+        match valid_edition {
+            Some(ed)
+                if ed != "standard"
                     && crate::acquisition::edition::edition_from_title(&self.title).as_deref()
-                        != Some(&edition) =>
+                        != Some(&ed) =>
             {
-                format!("{} ({} Edition)", self.title, edition)
+                if ed.to_lowercase().contains("edition") {
+                    format!("{} ({})", self.title.trim(), ed)
+                } else {
+                    format!("{} ({} Edition)", self.title.trim(), ed)
+                }
             }
             _ => self.title.clone(),
         }
@@ -2562,6 +2568,24 @@ fn next_job(conn: &Connection) -> Result<Option<Job>> {
         .optional()?;
 
     if let Some((job, state)) = job_row {
+        // Validation boundary: if title fails canonical validation, do not download or publish!
+        if let Err(e) =
+            crate::pipeline::publication_metadata::validate_canonical_series_title(&job.title)
+        {
+            tracing::warn!(
+                "Job {} has contaminated series title '{}': {e}; marking needs_review",
+                job.chapter,
+                job.title
+            );
+            conn.execute(
+                "UPDATE downloads SET state = 'needs_review', error = ?2 WHERE chapter_id = ?1",
+                rusqlite::params![
+                    job.chapter,
+                    format!("Contaminated series title: {e}; reassign canonical title")
+                ],
+            )?;
+            return Ok(None);
+        }
         if state == "queued" && job.published_path.is_none() {
             conn.execute(
                 "UPDATE downloads SET state = 'downloading' WHERE chapter_id = ?1",

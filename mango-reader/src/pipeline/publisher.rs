@@ -49,6 +49,16 @@ pub fn sanitize_series_name(series: &str) -> Result<String> {
     if trimmed == ".." || trimmed == "." {
         return Err(AppError::bad_request(format!("Unsafe series name: {trimmed:?}")));
     }
+    // Reject archive extensions in series folder names
+    let lower = trimmed.to_ascii_lowercase();
+    if [".cbz", ".zip", ".rar", ".7z", ".torrent"]
+        .iter()
+        .any(|ext| lower.contains(ext))
+    {
+        return Err(AppError::bad_request(format!(
+            "Series name cannot contain archive file extensions: {trimmed}"
+        )));
+    }
     // Clean out control, path separators, and filesystem reserved characters
     let safe: String = trimmed
         .chars()
@@ -250,6 +260,9 @@ pub fn publish_cbz(
     }
 
     verify_cbz_integrity(source)?;
+
+    // Centralized pre-publication validation: reject contaminated or unsafe series metadata
+    crate::pipeline::publication_metadata::validate_publication_series_title(series)?;
 
     let safe_series = sanitize_series_name(series)?;
     let release_name = canonical_release_name(&safe_series, is_volume, number);

@@ -1328,6 +1328,13 @@ pub fn resolve_file_with_identity<'a>(
     persisted_file_id: Option<i64>,
     identity: Option<&super::edition::RetrievalIdentity>,
 ) -> std::result::Result<&'a BackendFile, TorBoxError> {
+    // Fail-closed invariant: an identity override must be explicitly approved before file resolution
+    if identity.is_some_and(|i| i.identity_override && i.override_approved_at.is_none()) {
+        return Err(TorBoxError::AmbiguousFiles(
+            "Identity override requires explicit user approval".into(),
+        ));
+    }
+
     use super::edition::{edition_from_title, normalize_edition};
     // Approval freezes source identity. Disposable backend IDs and later catalog
     // parsing cannot override an exact, unique path/size selection.

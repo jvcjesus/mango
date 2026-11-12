@@ -157,6 +157,266 @@ pub struct KomgaReconciliationOutcome {
     pub warnings: Vec<String>,
 }
 
+fn validate_no_unsafe_paths(title: &str, lower: &str, field_name: &str) -> Result<()> {
+    // Leading or trailing slashes indicate paths or directories, not titles
+    if title.starts_with('/') || title.starts_with('\\') || title.ends_with('/') || title.ends_with('\\') {
+        return Err(AppError::bad_request(format!(
+            "{field_name} cannot start or end with path separators"
+        )));
+    }
+
+    // Windows drive letters like "C:\" or "C:/"
+    if title.len() >= 3
+        && title.as_bytes()[1] == b':'
+        && (title.as_bytes()[2] == b'/' || title.as_bytes()[2] == b'\\')
+    {
+        return Err(AppError::bad_request(format!(
+            "{field_name} cannot be a filesystem path"
+        )));
+    }
+
+    // Backslashes are never used in standard manga series titles and indicate Windows paths
+    if title.contains('\\') {
+        return Err(AppError::bad_request(format!(
+            "{field_name} contains backslash path separators"
+        )));
+    }
+
+    // Directory traversal
+    if title.contains("../") || title.contains("/..") {
+        return Err(AppError::bad_request(format!(
+            "Unsafe directory traversal in {field_name}"
+        )));
+    }
+
+    // Multiple slashes: allow at most 2 consecutive slashes for titles like ".hack//SIGN", but reject path structures with multiple separated slashes
+    let slash_count = title.matches('/').count();
+    if slash_count > 2 || (slash_count == 2 && !title.contains("//")) {
+        return Err(AppError::bad_request(format!(
+            "{field_name} contains path structure with multiple slashes"
+        )));
+    }
+
+    // Directory path segments
+    let path_segments = [
+        "manga/", "downloads/", "release/", "releases/", "series/", "srv/", "home/", "tmp/", "var/",
+    ];
+    for seg in &path_segments {
+        let base_seg = &seg[..seg.len() - 1];
+        if lower.starts_with(seg) || lower.contains(&format!("/{seg}")) || lower.ends_with(&format!("/{base_seg}")) {
+            return Err(AppError::bad_request(format!(
+                "{field_name} contains directory path component: '{seg}'"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// Validates that a string is a clean, non-contaminated canonical series title.
+pub fn validate_canonical_series_title(title: &str) -> Result<()> {
+    let title = title.trim();
+
+    if title.is_empty() {
+        return Err(AppError::bad_request("Series title cannot be empty"));
+    }
+
+    if title.len() > 256 {
+        return Err(AppError::bad_request("Series title is too long (max 256 characters)"));
+    }
+
+    if title == "." || title == ".." {
+        return Err(AppError::bad_request("Unsafe directory traversal in series title"));
+    }
+
+    // Check control characters
+    if title.chars().any(char::is_control) {
+        return Err(AppError::bad_request("Series title contains control characters"));
+    }
+
+    let lower = title.to_ascii_lowercase();
+
+    // Check unsafe path separators and directory path segments
+    validate_no_unsafe_paths(title, &lower, "Series title")?;
+
+    // Archive extensions must never leak into series titles
+    let archive_extensions = [
+        ".cbz", ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz", ".torrent",
+    ];
+    for ext in &archive_extensions {
+        if lower.ends_with(ext) || lower.contains(&format!("{ext} ")) || lower.contains(&format!("{ext})")) {
+            return Err(AppError::bad_request(format!(
+                "Series title contains archive file extension: {ext}"
+            )));
+        }
+    }
+
+    // Source paths, protocol markers, and provenance prefixes must never become series titles
+    let provenance_markers = [
+        "source manga",
+        "source path",
+        "source release",
+        "source:",
+        "import-series:",
+        "import-candidate",
+        "import:",
+        "catalog:",
+        "mangadot (",
+        "madokami:",
+        "nyaa:",
+        "torbox:",
+        "http://",
+        "https://",
+        "ftp://",
+    ];
+    for marker in &provenance_markers {
+        if lower.contains(marker) {
+            return Err(AppError::bad_request(format!(
+                "Series title contains source provenance metadata ('{marker}'); select canonical title"
+            )));
+        }
+    }
+
+    // Detect URL percent-encoding (e.g. %20, %21, %28, etc.)
+    if let Some(pct_idx) = lower.find('%') {
+        if pct_idx + 2 < lower.len() {
+            let hex_slice = &lower[pct_idx + 1..pct_idx + 3];
+            if hex_slice.chars().all(|c| c.is_ascii_hexdigit()) {
+                return Err(AppError::bad_request(
+                    "Series title contains percent-encoded URL characters; select canonical title",
+                ));
+            }
+        }
+    }
+
+    // Detect decoded hex escape remnants (e.g. "21 21", "20v06", "282016", "28digital", "29 20", "29 cbz")
+    let hex_remnants = [
+        "21 21", "20v0", "20v1", "20v2", "2820", "28digital", "29 20", "29 cbz",
+    ];
+    for rem in &hex_remnants {
+        if lower.contains(rem) {
+            return Err(AppError::bad_request(
+                "Series title contains URL-decoding hex residue; select canonical title",
+            ));
+        }
+    }
+
+    // Pure volume or chapter indicators are not valid series titles
+    if lower.starts_with("volume ") && lower.len() < 14 && lower[7..].chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return Err(AppError::bad_request("Series title cannot be a bare volume number"));
+    }
+    if lower.starts_with("chapter ") && lower.len() < 15 && lower[8..].chars().all(|c| c.is_ascii_digit() || c == '.') {
+        return Err(AppError::bad_request("Series title cannot be a bare chapter number"));
+    }
+
+    Ok(())
+}
+
+/// Validates that a publication series title (which may contain an edition namespace like "Series (Deluxe)")
+/// is clean, non-contaminated, and safe for library publication.
+pub fn validate_publication_series_title(title: &str) -> Result<()> {
+    let title = title.trim();
+
+    if title.is_empty() {
+        return Err(AppError::bad_request("Publication series title cannot be empty"));
+    }
+
+    if title.len() > 300 {
+        return Err(AppError::bad_request("Publication series title is too long"));
+    }
+
+    if title == "." || title == ".." {
+        return Err(AppError::bad_request("Unsafe directory traversal in publication series title"));
+    }
+
+    if title.chars().any(char::is_control) {
+        return Err(AppError::bad_request("Publication series title contains control characters"));
+    }
+
+    let lower = title.to_ascii_lowercase();
+
+    // Check unsafe path separators and directory path segments
+    validate_no_unsafe_paths(title, &lower, "Publication series title")?;
+
+    // Archive extensions must NEVER appear in publication titles
+    let archive_extensions = [
+        ".cbz", ".zip", ".rar", ".7z", ".tar", ".gz", ".bz2", ".xz", ".torrent",
+    ];
+    for ext in &archive_extensions {
+        if lower.contains(ext) {
+            return Err(AppError::bad_request(format!(
+                "Publication series title contains archive extension: {ext}"
+            )));
+        }
+    }
+
+    // Provenance markers check
+    let provenance_markers = [
+        "source manga",
+        "source path",
+        "source release",
+        "import-series:",
+        "import-candidate",
+        "catalog:",
+        "mangadot (",
+        "madokami:",
+        "http://",
+        "https://",
+    ];
+    for marker in &provenance_markers {
+        if lower.contains(marker) {
+            return Err(AppError::bad_request(format!(
+                "Publication series title contains source provenance: '{marker}'"
+            )));
+        }
+    }
+
+    // URL hex residue check
+    let hex_remnants = [
+        "21 21", "20v0", "20v1", "20v2", "2820", "28digital", "29 20", "29 cbz",
+    ];
+    for rem in &hex_remnants {
+        if lower.contains(rem) {
+            return Err(AppError::bad_request(
+                "Publication series title contains URL-decoding hex residue",
+            ));
+        }
+    }
+
+    // If title contains parenthetical edition e.g. "Series (Deluxe)" or "Series (Deluxe Edition)",
+    // verify the edition part is valid
+    if let Some(open_paren) = title.rfind('(') {
+        if let Some(close_paren) = title.rfind(')') {
+            if close_paren > open_paren {
+                let edition_part = title[open_paren + 1..close_paren].trim();
+                let base_part = title[..open_paren].trim();
+
+                // Base series title must be valid
+                validate_canonical_series_title(base_part)?;
+
+                // Edition part must be a recognized/valid edition
+                if !crate::acquisition::edition::is_valid_edition(edition_part) {
+                    return Err(AppError::bad_request(format!(
+                        "Publication series contains invalid edition namespace: '{edition_part}'"
+                    )));
+                }
+
+                return Ok(());
+            }
+        }
+    }
+
+    // If no parenthetical edition, base title must pass canonical series validation
+    validate_canonical_series_title(title)?;
+
+    Ok(())
+}
+
+/// Convenience check for whether a title contains known contamination markers.
+pub fn is_contaminated_series_title(title: &str) -> bool {
+    validate_canonical_series_title(title).is_err()
+}
+
 /// Resolves publication metadata given a database chapter ID.
 pub async fn resolve_publication_metadata(
     db: &crate::db::Db,
@@ -372,17 +632,15 @@ async fn resolve_metadata_internal(
         config.komga_library_id.as_deref().map(|s| s.to_string())
     };
 
-    // 2. Publication series title: preserve edition namespace if requested
-    let publication_series_title = match requested_edition {
+    // 2. Publication series title: preserve edition namespace if requested and validated
+    let clean_req_edition = crate::acquisition::edition::clean_edition(requested_edition);
+    let publication_series_title = match clean_req_edition.as_deref() {
         Some(edition) if edition != "standard" => {
-            let edition_cap = {
-                let mut c = edition.chars();
-                match c.next() {
-                    None => String::new(),
-                    Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-                }
-            };
-            format!("{} ({})", series_title.trim(), edition_cap)
+            if edition.to_lowercase().contains("edition") {
+                format!("{} ({})", series_title.trim(), edition)
+            } else {
+                format!("{} ({} Edition)", series_title.trim(), edition)
+            }
         }
         _ => series_title.trim().to_string(),
     };
@@ -629,7 +887,19 @@ async fn resolve_metadata_internal(
 
     // 10. Safety Verdict
     let has_valid_number = release_number.is_some_and(|n| n >= 0.0);
+    let series_validation = validate_canonical_series_title(series_title);
+    let pub_series_validation = validate_publication_series_title(&publication_series_title);
+
+    if let Err(ref e) = series_validation {
+        warnings.push(format!("Canonical series validation error: {}", e.message));
+    }
+    if let Err(ref e) = pub_series_validation {
+        warnings.push(format!("Publication series validation error: {}", e.message));
+    }
+
+    let is_series_safe = series_validation.is_ok() && pub_series_validation.is_ok();
     let is_safe_to_publish = has_valid_number
+        && is_series_safe
         && ownership_status != PrePublicationOwnership::DestinationConflict
         && ownership_status != PrePublicationOwnership::OmnibusConflict
         && archive_status != "Corrupted"
@@ -652,7 +922,7 @@ async fn resolve_metadata_internal(
         mangabaka_volume,
         mangabaka_release_id,
         anilist_id,
-        edition: requested_edition.map(str::to_string),
+        edition: clean_req_edition,
         language: if is_chinese { "zh".into() } else { "en".into() },
         source_type: source_type.to_string(),
         backend_type: backend_type.to_string(),

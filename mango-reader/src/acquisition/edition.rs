@@ -3,9 +3,95 @@
 use super::AcquisitionReleaseUnit;
 use serde::{Deserialize, Serialize};
 
+/// Validates whether a string is a clean, acceptable edition identifier.
+pub fn is_valid_edition(value: &str) -> bool {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.len() > 50 {
+        return false;
+    }
+
+    let lower = trimmed.to_ascii_lowercase();
+
+    // Forbidden path, control, and filesystem characters
+    if trimmed.chars().any(|c| {
+        c.is_control()
+            || c == '/'
+            || c == '\\'
+            || c == '%'
+            || c == '<'
+            || c == '>'
+            || c == ':'
+            || c == '*'
+            || c == '|'
+            || c == '?'
+            || c == '\0'
+    }) {
+        return false;
+    }
+
+    // Forbidden archive and provenance markers
+    let forbidden = [
+        ".cbz",
+        ".zip",
+        ".rar",
+        ".7z",
+        ".torrent",
+        "source manga",
+        "source path",
+        "source release",
+        "source /",
+        "import-",
+        "catalog:",
+        "http:",
+        "https:",
+        "21 21",
+        "20v0",
+        "2820",
+        "29 cbz",
+    ];
+    if forbidden.iter().any(|m| lower.contains(m)) {
+        return false;
+    }
+
+    // Must consist of words with alphanumeric, spaces, hyphens, plus signs, apostrophes
+    let words = trimmed
+        .split(|c: char| !c.is_alphanumeric() && c != '-' && c != '+' && c != '\'')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>();
+    if words.is_empty() || words.len() > 5 {
+        return false;
+    }
+
+    true
+}
+
+/// Cleans and validates an optional edition string. Returns Some(clean) only if valid and non-standard.
+pub fn clean_edition(value: Option<&str>) -> Option<String> {
+    let val = value?.trim();
+    if val.is_empty() || val.eq_ignore_ascii_case("standard") {
+        return None;
+    }
+    if !is_valid_edition(val) {
+        return None;
+    }
+    let norm = normalize_edition(val);
+    if norm.is_empty() || norm == "standard" {
+        None
+    } else {
+        Some(norm)
+    }
+}
+
 pub fn normalize_edition(value: &str) -> String {
+    if !is_valid_edition(value) {
+        return String::new();
+    }
     if value.contains('+') {
-        let mut parts = value.split('+').map(normalize_edition).collect::<Vec<_>>();
+        let mut parts = value
+            .split('+')
+            .map(normalize_edition)
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>();
         parts.sort();
         parts.dedup();
         return parts.join(" + ");
@@ -138,7 +224,7 @@ impl RetrievalIdentity {
             series: series.into(),
             // An explicit edition is an acquisition intent, not a metadata-provider claim.
             requested_edition: edition
-                .map(normalize_edition)
+                .and_then(|e| clean_edition(Some(e)))
                 .or_else(|| edition_from_title(series)),
             source_release: source.into(),
             requested_unit: unit,
@@ -156,6 +242,28 @@ impl RetrievalIdentity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_source_provenance_and_archive_paths_as_editions() {
+        assert!(!is_valid_edition("source manga h ha haik haikyu 21 21 haikyu 21 21 20v06 20 282016 29 20 28digital 29 20 28danke empire 29 cbz"));
+        assert!(!is_valid_edition("/Manga/H/HA/HAIK/Haikyu!!/Haikyu!! v06.cbz"));
+        assert!(!is_valid_edition("release/book.cbz"));
+        assert!(!is_valid_edition("source /downloads/file.zip"));
+        assert_eq!(clean_edition(Some("source manga /path")), None);
+        assert_eq!(clean_edition(Some("Haikyu!! v06.cbz")), None);
+    }
+
+    #[test]
+    fn accepts_valid_editions() {
+        assert!(is_valid_edition("deluxe"));
+        assert!(is_valid_edition("omnibus"));
+        assert!(is_valid_edition("Collector's Edition"));
+        assert!(is_valid_edition("Full Color"));
+        assert!(is_valid_edition("2-in-1"));
+        assert!(is_valid_edition("deluxe + full color"));
+        assert_eq!(clean_edition(Some("Deluxe Edition")), Some("deluxe".into()));
+        assert_eq!(clean_edition(Some("standard")), None);
+    }
     #[test]
     fn requeue_preserves_selection_and_rejects_substitution() {
         let mut previous = RetrievalIdentity::new(

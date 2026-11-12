@@ -680,3 +680,183 @@ async fn test_komga_reconciliation_verifies_canonical_title_and_flags_mismatch()
     assert!(!outcome_c.is_verified);
     assert!(outcome_c.warnings.iter().any(|w| w.contains("media analysis reported an ERROR")));
 }
+
+#[tokio::test]
+async fn test_haikyu_volume_6_source_contamination_rejection() {
+    let contaminated_title = "Haikyu!! (source manga h ha haik haikyu 21 21 haikyu 21 21 20v06 20 282016 29 20 28digital 29 20 28danke empire 29 cbz Edition)";
+
+    // 1. Centralized canonical series validation rejects it
+    assert!(publication_metadata::validate_canonical_series_title(contaminated_title).is_err());
+    assert!(publication_metadata::is_contaminated_series_title(contaminated_title));
+
+    // 2. Centralized publication series validation rejects it
+    assert!(publication_metadata::validate_publication_series_title(contaminated_title).is_err());
+
+    // 3. Publisher rejects publication
+    let temp_dir = std::env::temp_dir().join(format!("mango-test-haikyu-pub-{}", std::process::id()));
+    std::fs::create_dir_all(&temp_dir).unwrap();
+    let staging_cbz = temp_dir.join("staging.cbz");
+    create_test_cbz(&staging_cbz, 10);
+
+    let pub_res = publisher::publish_cbz(
+        &staging_cbz,
+        &temp_dir,
+        contaminated_title,
+        true,
+        6.0,
+    );
+    assert!(pub_res.is_err(), "Publisher MUST reject publishing to contaminated series title");
+
+    // Verify no contaminated directory was created
+    let contaminated_dir = temp_dir.join(contaminated_title);
+    assert!(!contaminated_dir.exists(), "Publisher must never create contaminated series directory");
+
+    // 4. ComicInfo writer rejects writing contaminated series title
+    let comic_params = mangabaka::ComicInfoParams {
+        series: contaminated_title,
+        volume: Some(6.0),
+        number: None,
+        is_volume: true,
+        title: Some("Volume 06"),
+        scanlator: Some("danke-Empire"),
+        notes: None,
+    };
+    let comic_res = mangabaka::write_comic_info_to_cbz(&staging_cbz, &comic_params, None);
+    assert!(comic_res.is_err(), "ComicInfo writer MUST reject writing contaminated series title");
+
+    let _ = std::fs::remove_dir_all(temp_dir);
+}
+
+#[tokio::test]
+async fn test_url_encoded_and_source_path_contamination_rejections() {
+    let bad_titles = [
+        "/Manga/H/HA/HAIK/Haikyu%21%21/Haikyu!! v06.cbz",
+        "Haikyu!! v06 (2016) (Digital) (danke-Empire).cbz",
+        "source manga/h/ha/haik",
+        "import-series:Haikyu!!",
+        "catalog:1066",
+        "https://manga.madokami.al/Manga/H/HA/Haikyu.cbz",
+        "Haikyu!! 20v06 282016 29 cbz",
+        "Haikyu!! (source /Manga/H/HA/HAIK/Haikyu.cbz)",
+        "Volume 06",
+        "Chapter 12",
+        "../traversal/Manga",
+        "Manga/Subdir",
+        "Haikyu!!.cbz",
+        "Haikyu!!.zip",
+        "Haikyu!!\0nullbyte",
+    ];
+
+    for bad in &bad_titles {
+        assert!(
+            publication_metadata::validate_canonical_series_title(bad).is_err(),
+            "Expected '{bad}' to be rejected as canonical series title"
+        );
+        assert!(
+            publication_metadata::validate_publication_series_title(bad).is_err(),
+            "Expected '{bad}' to be rejected as publication series title"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_legitimate_series_titles_preserved() {
+    let good_titles = [
+        "Haikyu!!",
+        "JoJo's Bizarre Adventure: Steel Ball Run",
+        "KonoSuba: God's Blessing on this Wonderful World!",
+        "Blood on the Tracks",
+        "Frieren: Beyond Journey's End",
+        "進撃の巨人",
+        "チェンソーマン",
+        "SPY×FAMILY",
+        "Re:Zero - Starting Life in Another World",
+        "7SEEDS",
+        "xxxHOLiC",
+        "Fate/stay night",
+        "Alpha: A/B?",
+        "Ünïcode ✓",
+        "D.Gray-man",
+        "Neon Genesis Evangelion",
+    ];
+
+    for good in &good_titles {
+        assert!(
+            publication_metadata::validate_canonical_series_title(good).is_ok(),
+            "Expected legitimate title '{good}' to be accepted as canonical series title"
+        );
+        assert!(
+            publication_metadata::validate_publication_series_title(good).is_ok(),
+            "Expected legitimate title '{good}' to be accepted as publication series title"
+        );
+
+        // Also test valid edition combinations
+        let deluxe = format!("{good} (Deluxe Edition)");
+        assert!(
+            publication_metadata::validate_publication_series_title(&deluxe).is_ok(),
+            "Expected legitimate edition title '{deluxe}' to be accepted"
+        );
+        let omnibus = format!("{good} (Omnibus)");
+        assert!(
+            publication_metadata::validate_publication_series_title(&omnibus).is_ok(),
+            "Expected legitimate omnibus title '{omnibus}' to be accepted"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_edition_validation_and_cleaning() {
+    use crate::acquisition::edition::{clean_edition, is_valid_edition, normalize_edition};
+
+    // Valid editions
+    assert!(is_valid_edition("deluxe"));
+    assert!(is_valid_edition("omnibus"));
+    assert!(is_valid_edition("Collector's Edition"));
+    assert!(is_valid_edition("Full Color"));
+    assert!(is_valid_edition("2-in-1"));
+    assert!(is_valid_edition("deluxe + full color"));
+    assert_eq!(normalize_edition("Collector's Edition"), "collector");
+    assert_eq!(normalize_edition("Full Color Edition"), "full color");
+    assert_eq!(clean_edition(Some("Deluxe Edition")), Some("deluxe".into()));
+    assert_eq!(clean_edition(Some("standard")), None);
+    assert_eq!(clean_edition(None), None);
+
+    // Invalid editions
+    assert!(!is_valid_edition("source manga h ha haik haikyu 21 21 haikyu 21 21 20v06 20 282016 29 20 28digital 29 20 28danke empire 29 cbz"));
+    assert!(!is_valid_edition("/Manga/H/HA/HAIK/Haikyu!!/Haikyu!! v06.cbz"));
+    assert!(!is_valid_edition("release/book.cbz"));
+    assert!(!is_valid_edition("source /downloads/file.zip"));
+    assert_eq!(normalize_edition("source manga /path"), "");
+    assert_eq!(clean_edition(Some("source manga /path")), None);
+    assert_eq!(clean_edition(Some("Haikyu!! v06.cbz")), None);
+}
+
+#[tokio::test]
+async fn test_job_publication_title_never_amplifies_contaminated_edition() {
+    use crate::acquisition::{edition::RetrievalIdentity, AcquisitionReleaseUnit};
+
+    let mut identity = RetrievalIdentity::new(
+        "Haikyu!!",
+        "Haikyu!! v06 (2016) (Digital) (danke-Empire).cbz",
+        AcquisitionReleaseUnit::Volume(6.0),
+        None,
+    );
+    // Even if requested_edition in stored JSON contains contaminated string:
+    identity.requested_edition = Some("source manga h ha haik haikyu 21 21 haikyu 21 21 20v06 20 282016 29 20 28digital 29 20 28danke empire 29 cbz".into());
+
+    let job = Job {
+        chapter: 100,
+        manga_id: 1,
+        title: "Haikyu!!".into(),
+        name: "Volume 06".into(),
+        number: 6.0,
+        retrieval_identity_json: Some(serde_json::to_string(&identity).unwrap()),
+        ..Default::default()
+    };
+
+    // publication_title MUST NOT contain "(source ... Edition)"! It must safely fall back to "Haikyu!!"
+    let pub_title = job.publication_title();
+    assert_eq!(pub_title, "Haikyu!!");
+    assert!(!pub_title.contains("source"));
+    assert!(!pub_title.contains("cbz"));
+}

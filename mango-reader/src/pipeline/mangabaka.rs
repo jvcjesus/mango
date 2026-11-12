@@ -2504,6 +2504,9 @@ pub fn write_comic_info_to_cbz(
     params: &ComicInfoParams,
     enrichment: Option<&MangaBakaEnrichment>,
 ) -> Result<usize> {
+    // Validate publication series title before writing to ComicInfo.xml
+    crate::pipeline::publication_metadata::validate_publication_series_title(params.series)?;
+
     let file = File::open(cbz_path).map_err(|e| {
         AppError::bad_request(format!(
             "Cannot open CBZ archive {}: {e}",

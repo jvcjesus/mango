@@ -321,6 +321,12 @@ pub async fn capture(
 pub async fn list(db: &Db) -> Result<Vec<Candidate>> {
     db.call(|conn|{conn.execute("UPDATE downloads SET state='completed' WHERE chapter_id IN (SELECT p.chapter_id FROM import_payloads p WHERE p.state='inspected' AND NOT EXISTS(SELECT 1 FROM import_candidates c WHERE c.payload_chapter=p.chapter_id AND (c.state='needs_review' OR (c.state IN ('queued','processing') AND (EXISTS(SELECT 1 FROM downloads d WHERE d.chapter_id=c.child_chapter AND d.published_path IS NULL) OR NOT EXISTS(SELECT 1 FROM acquisition_history h WHERE h.chapter_id=c.child_chapter AND h.outcome IN ('completed','published')))))))",[])?;let mut s=conn.prepare("SELECT c.id,c.payload_chapter,c.inner_path,c.suggested_number,CASE WHEN c.state='queued' THEN COALESCE((SELECT state FROM downloads WHERE chapter_id=c.child_chapter),(SELECT outcome FROM acquisition_history WHERE chapter_id=c.child_chapter ORDER BY id DESC LIMIT 1),'queued') ELSE c.state END,c.assigned_number,c.child_chapter,COALESCE(c.assigned_series,m.title),p.provenance_json,c.assigned_kind,c.assigned_edition FROM import_candidates c JOIN import_payloads p ON p.chapter_id=c.payload_chapter JOIN chapters pc ON pc.id=p.chapter_id JOIN manga m ON m.id=pc.manga_id WHERE p.state!='cleaned' ORDER BY c.payload_chapter DESC,c.id LIMIT 500")?;let rows=s.query_map([],|r|Ok(Candidate{series:r.get(7)?,suggested_edition:serde_json::from_str::<RetrievalIdentity>(&r.get::<_,String>(8)?).ok().and_then(|i|super::edition::edition_from_title(&i.source_release)),id:r.get(0)?,payload_chapter:r.get(1)?,inner_path:r.get(2)?,suggested_number:r.get(3)?,state:r.get(4)?,assigned_number:r.get(5)?,assigned_kind:r.get(9)?,assigned_edition:r.get(10)?,child_chapter:r.get(6)?}))?.collect::<std::result::Result<Vec<_>,_>>()?;Ok(rows)}).await
 }
+
+fn validate_assigned_series_title(title: &str) -> Result<()> {
+    crate::pipeline::publication_metadata::validate_canonical_series_title(title)?;
+    Ok(())
+}
+
 pub async fn assign(db: &Db, id: i64, assignment: Assignment, base: &Path) -> Result<()> {
     if !assignment.ignore
         && (!matches!(assignment.kind.as_str(), "volume" | "chapter")
@@ -351,13 +357,16 @@ pub async fn assign(db: &Db, id: i64, assignment: Assignment, base: &Path) -> Re
  if assignment.ignore{tx.execute("UPDATE import_candidates SET state='ignored',assigned_at=?2 WHERE id=?1",rusqlite::params![id,crate::db::now()])?;settle(&tx,parent)?;tx.commit()?;return Ok(());}
  let (mut manga,mut title,json):(i64,String,String)=tx.query_row("SELECT c.manga_id,m.title,d.retrieval_identity_json FROM downloads d JOIN chapters c ON c.id=d.chapter_id JOIN manga m ON m.id=c.manga_id WHERE d.chapter_id=?1",[parent],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?)))?;
  if let Some(target)=assignment.series.as_deref().map(str::trim).filter(|s|!s.is_empty()) {
-     if target.len()>512{return Err(AppError::bad_request("Series title is too long"));}
+     validate_assigned_series_title(target)?;
      let mut stmt=tx.prepare("SELECT id FROM manga WHERE title=?1 ORDER BY id LIMIT 2")?;
      let ids=stmt.query_map([target],|r|r.get::<_,i64>(0))?.collect::<std::result::Result<Vec<_>,_>>()?;drop(stmt);
      manga=if let Some(id)=ids.first(){*id}else{tx.execute("INSERT INTO manga(source_id,url,title) VALUES (0,?1,?2)",rusqlite::params![format!("import-series:{target}"),target])?;tx.last_insert_rowid()};title=target.into();
+ } else {
+     validate_assigned_series_title(&title)?;
  }
+ let clean_assigned_edition = super::edition::clean_edition(assignment.edition.as_deref());
  let mut identity:RetrievalIdentity=serde_json::from_str(&json).map_err(|_|AppError::bad_request("Invalid payload provenance"))?;
- identity.series=title.clone();identity.inspect_payload=false;identity.import_candidate=Some(id);identity.identity_override=true;identity.override_approved_at=Some(crate::db::now());identity.requested_edition=assignment.edition.as_deref().map(super::edition::normalize_edition).filter(|e|!e.is_empty());identity.requested_unit=if assignment.kind=="chapter"{AcquisitionReleaseUnit::Chapter(assignment.number.unwrap())}else{AcquisitionReleaseUnit::Volume(assignment.number.unwrap())};
+ identity.series=title.clone();identity.inspect_payload=false;identity.import_candidate=Some(id);identity.identity_override=true;identity.override_approved_at=Some(crate::db::now());identity.requested_edition=clean_assigned_edition.clone();identity.requested_unit=if assignment.kind=="chapter"{AcquisitionReleaseUnit::Chapter(assignment.number.unwrap())}else{AcquisitionReleaseUnit::Volume(assignment.number.unwrap())};
  identity.selected_archive=None;
  let relative=Path::new(&path).strip_prefix(&base).map_err(|_|AppError::bad_request("Unsafe candidate staging path"))?.to_string_lossy().to_string();
  tx.execute("INSERT INTO chapters(manga_id,url,name,chapter_number,source_order,fetched_at) VALUES (?1,?2,?3,?4,0,?5)",rusqlite::params![manga,format!("import:{id}"),format!("{} {}",assignment.kind,assignment.number.unwrap()),assignment.number,crate::db::now()])?;let child=tx.last_insert_rowid();
@@ -372,6 +381,36 @@ pub async fn retry_inspection(db: &Db, chapter: i64) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_haikyu_source_contamination() {
+        assert!(validate_assigned_series_title(
+            "Haikyu!! (source manga h ha haik haikyu 21 21 haikyu 21 21 20v06 20 282016 29 20 28digital 29 20 28danke empire 29 cbz Edition)"
+        ).is_err());
+    }
+
+    #[test]
+    fn accepts_canonical_haikyu_title() {
+        assert!(validate_assigned_series_title("Haikyu!!").is_ok());
+    }
+
+    #[test]
+    fn accepts_legitimate_series_punctuation() {
+        assert!(validate_assigned_series_title(
+            "JoJo's Bizarre Adventure: Steel Ball Run"
+        ).is_ok());
+    }
+
+    #[test]
+    fn rejects_source_paths_and_archive_names() {
+        assert!(validate_assigned_series_title(
+            "/downloads/Haikyu!! v06.cbz"
+        ).is_err());
+        assert!(validate_assigned_series_title(
+            "Haikyu!! v06.cbz"
+        ).is_err());
+    }
+
     fn dir() -> PathBuf {
         let p = std::env::temp_dir().join(format!(
             "mango-physical-{}-{}",

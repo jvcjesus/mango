@@ -929,10 +929,6 @@ impl Pipeline {
             "source_identity"
         }
         .to_string();
-        // Edition-local units must not overwrite standard-edition canonical volumes.
-        let publication_title = job.publication_title();
-        let release_name =
-            publisher::canonical_release_name(&publication_title, is_volume, release_num);
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap_or_default()
@@ -949,6 +945,36 @@ impl Pipeline {
         } else {
             format!("Chapter {release_num}")
         };
+
+        // Edition-local units must not overwrite standard-edition canonical volumes.
+        let publication_title = job.publication_title();
+        if let Err(e) =
+            publication_metadata::validate_publication_series_title(&publication_title)
+        {
+            let err = format!("Publication series title failed safety validation: {e}");
+            tracing::warn!("PIPELINE: {err}");
+            self.record_event(PipelineEvent {
+                id: format!("{}-{}", job.chapter, now),
+                timestamp: now,
+                chapter_id: job.chapter,
+                series: job.title.clone(),
+                release_name: format!("{} v{}", job.title, release_num),
+                is_volume,
+                number: release_num,
+                outcome: "error".to_string(),
+                destination: None,
+                mangabaka_status: "skipped".to_string(),
+                optimizer_status: "skipped".to_string(),
+                komga_status: "skipped".to_string(),
+                error: Some(err.clone()),
+                mangabaka_id: None,
+                anilist_id: None,
+                requested_unit: Some(requested_unit.clone()),
+            });
+            return Err(AppError::bad_request(err));
+        }
+        let release_name =
+            publisher::canonical_release_name(&publication_title, is_volume, release_num);
 
         let (anilist_id, mangabaka_id) = self.resolve_tracker_ids(job.manga_id, &job.title).await;
         let mut resolved_mangabaka_id = mangabaka_id;
