@@ -2764,6 +2764,10 @@ export interface PublicationReceiptDto {
   verifiedAt?: number | null;
   createdAt: number;
   updatedAt: number;
+  komgaBookId?: string | null;
+  komgaTitle?: string | null;
+  verificationStatus?: string | null;
+  verificationDetails?: string | null;
 }
 
 export interface PublicationReceiptVerificationResultDto {

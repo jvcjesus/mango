@@ -1159,8 +1159,12 @@
                     {:else if r.chapterNumber != null}
                       <span class="tag">Ch. {r.chapterNumber}</span>
                     {/if}
-                    {#if r.verifiedOwnership}
-                      <span class="tag spot">Verified in Library</span>
+                    {#if r.verifiedOwnership || r.verificationStatus === 'verified'}
+                      <span class="tag spot" title={r.komgaBookId ? `Komga Book: ${r.komgaBookId}` : 'Verified in Komga'}>Confirmed in Komga</span>
+                    {:else if r.verificationStatus === 'pending'}
+                      <span class="tag warning" title="Waiting for Komga library scan">Komga Scan Pending</span>
+                    {:else if r.verificationStatus === 'failed'}
+                      <span class="tag danger" title="Verification failed">Komga Missing</span>
                     {:else}
                       <span class="tag warning">Unverified</span>
                     {/if}
@@ -1183,6 +1187,9 @@
                   </div>
                   {#if r.metadataError}
                     <div class="error-desc">Metadata error: {r.metadataError}</div>
+                  {/if}
+                  {#if r.verificationDetails && r.verificationStatus !== 'verified'}
+                    <div class="error-desc mono" style="font-size: 0.85em;">Verification: {r.verificationDetails}</div>
                   {/if}
                 </div>
                 <div class="row-actions">

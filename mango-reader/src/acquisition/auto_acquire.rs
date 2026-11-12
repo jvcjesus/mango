@@ -241,9 +241,14 @@ pub fn is_candidate_auto_eligible(
         return Err(AutoDecisionCode::ProviderUnavailable);
     }
 
-    // Gate 2: Candidate match type MUST be ExactVolume
+    // Gate 2: Candidate match type MUST be ExactVolume (or ExactChapter when profile permits)
     match cand.match_type.as_str() {
         "exact_volume" => {}
+        "exact_chapter" => {
+            if profile.preferred_release_type != "chapter" && profile.preferred_release_type != "any" {
+                return Err(AutoDecisionCode::CandidateNotExact);
+            }
+        }
         "volume_range" | "volume_range_containing_target" => {
             return Err(AutoDecisionCode::RangeRequiresManual);
         }
@@ -258,7 +263,7 @@ pub fn is_candidate_auto_eligible(
         }
     }
 
-    // Gate 3: Parser hardening: check for ambiguous multi-volume or batch tokens
+    // Gate 3: Parser hardening: check for ambiguous multi-volume, batch, or spinoff tokens
     let raw_lower = cand.raw_title.to_ascii_lowercase();
     let reject_tokens = [
         "omnibus", "2-in-1", "3-in-1", "4-in-1", "batch", "complete", "collection",
@@ -268,9 +273,16 @@ pub fn is_candidate_auto_eligible(
             return Err(AutoDecisionCode::AmbiguousTitleTokens);
         }
     }
+    for &marker in crate::acquisition::matching::SPINOFF_MARKERS {
+        if raw_lower.contains(marker) {
+            return Err(AutoDecisionCode::AmbiguousTitleTokens);
+        }
+    }
 
-    // Gate 4: Language must be English ("en")
-    // Nyaa 3_1 category is literature English; ensure no non-English indicators
+    // Gate 4: Language must match target profile (default English "en")
+    if crate::acquisition::matching::detect_foreign_language(&cand.raw_title, &profile.language).is_some() {
+        return Err(AutoDecisionCode::LanguageUnknown);
+    }
     let non_en_tokens = ["french", "français", "spanish", "español", "raw", "japanese", "german", "deutsch", "italian", "italiano"];
     for tok in non_en_tokens {
         if raw_lower.contains(tok) && !raw_lower.contains("english") {

@@ -802,21 +802,18 @@ pub fn evaluate_hard_gates(
     aliases: &[String],
     target_unit: Option<&AcquisitionReleaseUnit>,
 ) -> bool {
-    let rel_lower = release.raw_title.to_ascii_lowercase();
-    let target_norm = target_title.to_ascii_lowercase();
-
     // 1. Anime / non-manga false positive
     if is_anime_false_positive(&release.raw_title, release.category_id.as_deref()) {
         return false;
     }
 
-    // 2. Identity match: must contain target title or at least one alias
-    let title_match = rel_lower.contains(&target_norm)
-        || aliases.iter().any(|a| {
-            let a_norm = a.to_ascii_lowercase();
-            !a_norm.is_empty() && rel_lower.contains(&a_norm)
-        });
-    if !title_match {
+    // 2. Identity match: evaluate strict series identity matching (rejecting wrong series, spinoffs, and false substring matches)
+    let (series_matched, score, _) = crate::acquisition::matching::match_series_identity(
+        &release.raw_title,
+        target_title,
+        aliases,
+    );
+    if !series_matched || score < 70.0 {
         return false;
     }
 
@@ -856,19 +853,17 @@ pub fn compute_smart_score(
     all_series_missing_volumes: &[f64],
 ) -> SmartScore {
     let rel_lower = release.raw_title.to_ascii_lowercase();
-    let target_norm = target_title.to_ascii_lowercase();
-    let aliases_norm: Vec<String> = aliases.iter().map(|a| a.to_ascii_lowercase()).collect();
 
     // 1. Identity (0..25)
-    let clean_rel_lower = release.title.to_ascii_lowercase();
-    let mut identity: f64 = if clean_rel_lower.starts_with(&target_norm) {
-        18.0
-    } else if rel_lower.contains(&target_norm) {
-        15.0
-    } else if aliases_norm.iter().any(|a| !a.is_empty() && rel_lower.contains(a)) {
-        12.0
+    let (series_matched, match_score, _) = crate::acquisition::matching::match_series_identity(
+        &release.raw_title,
+        target_title,
+        aliases,
+    );
+    let mut identity: f64 = if series_matched {
+        (match_score / 100.0) * 18.0
     } else {
-        5.0
+        0.0
     };
 
     match (target_unit, &release.release_unit) {
