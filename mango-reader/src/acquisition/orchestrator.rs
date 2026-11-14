@@ -757,7 +757,7 @@ pub async fn evaluate_series_backlog(
                 let approve_req = ApproveCandidateRequest {
                     dry_run: Some(false),
                     authorization_token: None,
-                    user_id: None,
+                    user_id: Some(0), // System autonomous user
                     confirm_review: Some(true),
                     confirm_range: Some(true),
                     confirm_pack: Some(true),

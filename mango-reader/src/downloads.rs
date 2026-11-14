@@ -2204,7 +2204,7 @@ impl Downloads {
         );
         let tracker = self.tracker.clone();
         let ch_id = job.chapter;
-        client
+        let mut retrieval_res = client
             .retrieve_file_with_tracker(
                 &external_job_id,
                 selected_file.id,
@@ -2215,7 +2215,54 @@ impl Downloads {
                 &tracker.config,
                 move |_bytes, _total, _stalled| {},
             )
-            .await?;
+            .await;
+
+        if let Err(ref e) = retrieval_res {
+            if e.is_job_expired() && !recreated {
+                tracing::warn!(
+                    "[TorBox] Remote job {} expired ({}) during file retrieval. Recreating torrent from durable provenance for chapter {}",
+                    external_job_id,
+                    e,
+                    job.chapter
+                );
+                update_stage(
+                    "torbox_recreating",
+                    "TorBox job expired; resubmitting to remote swarm...",
+                );
+                external_job_id = self.recreate_torbox_job(&client, job).await?;
+                recreated = true;
+                let new_files = client.list_files(&external_job_id).await?;
+                let reselected = if identity.inspect_payload {
+                    let sel = identity.selected_archive.as_ref().ok_or_else(|| {
+                        AppError::bad_request("Choose a physical payload file before retrieval")
+                    })?;
+                    crate::acquisition::physical::resolve_payload(&new_files, sel)?
+                } else {
+                    crate::acquisition::torbox::resolve_file_with_identity(
+                        &new_files,
+                        job.raw_title.as_deref(),
+                        target_unit.as_ref(),
+                        job.release_size,
+                        None,
+                        Some(&identity),
+                    )?
+                };
+                retrieval_res = client
+                    .retrieve_file_with_tracker(
+                        &external_job_id,
+                        reselected.id,
+                        reselected.size,
+                        &part_path,
+                        ch_id,
+                        &tracker,
+                        &tracker.config,
+                        move |_bytes, _total, _stalled| {},
+                    )
+                    .await;
+            }
+        }
+        let _ = recreated;
+        retrieval_res?;
 
         // Double-check CBZ archive integrity & plausible manga images before atomic promotion
         if let Err(e) = crate::acquisition::physical::validate_payload(&part_path) {

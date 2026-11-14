@@ -59,7 +59,7 @@ impl AutomationMode {
         match s.trim().to_lowercase().as_str() {
             "monitor_only" | "monitor" | "mode_a" => Some(Self::MonitorOnly),
             "review_before_acquisition" | "review" | "mode_b" => Some(Self::ReviewBeforeAcquisition),
-            "automatic_acquisition" | "auto" | "mode_c" => Some(Self::AutomaticAcquisition),
+            "automatic_acquisition" | "automatic" | "auto" | "mode_c" => Some(Self::AutomaticAcquisition),
             _ => None,
         }
     }

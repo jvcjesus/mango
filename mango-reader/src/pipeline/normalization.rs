@@ -3360,4 +3360,64 @@ mod canonical_cover_tests {
         assert!(book_path(&remote, &local, local.join("escaped/Book.cbz").to_str()).is_err());
         fs::remove_dir_all(dir).unwrap();
     }
+
+    #[tokio::test]
+    async fn test_normalization_rejects_contaminated_series_title() {
+        let enrichment = MangaBakaEnrichment {
+            series_id: 100,
+            series_title: Some("Haikyu!! (source manga h ha haik ... cbz Edition)".into()),
+            work_title: Some("Volume 06".into()),
+            collection_id: "col-100".into(),
+            volume: 6.0,
+            release_date: Some("2016-01-01".into()),
+            summary: Some("Volleyball manga".into()),
+            pages: Some(192),
+            writers: vec!["Haruichi Furudate".into()],
+            pencillers: vec!["Haruichi Furudate".into()],
+            genres: vec!["Sports".into()],
+            tags: vec!["Volleyball".into()],
+            publisher: Some("Shueisha".into()),
+            total_volumes: Some(45),
+            web_url: Some("https://mangabaka.org/series/100".into()),
+            language: Some("en".into()),
+            work_id: Some("work-06".into()),
+            work_cover_url: None,
+        };
+
+        let res = proposed_metadata(None, &enrichment, 6.0, 192);
+        assert!(res.is_err(), "Contaminated series title must be rejected by proposed_metadata");
+        let err = res.err().unwrap();
+        assert!(err.message.contains("contaminated") || err.message.contains("Invalid") || err.message.contains("Series title"));
+    }
+
+    #[tokio::test]
+    async fn test_normalization_rollback_fails_closed_on_missing_backup() {
+        let f = Fixture::with_mapping(None, "standard", true).await;
+        f.metadata_only("standard").await;
+        let preview = f.analyze().await;
+        let result = f.execute(&preview).await;
+        assert_eq!(result.failed_count, 0);
+        assert_eq!(result.normalized_count, 1);
+
+        let rec_id = &result.items[0].id;
+        let backup_path: String = f.service.db.call({
+            let id = rec_id.clone();
+            move |conn| {
+                Ok(conn.query_row(
+                    "SELECT backup_path FROM normalization_history WHERE id = ?1",
+                    [id],
+                    |r| r.get(0),
+                )?)
+            }
+        }).await.unwrap();
+
+        // Intentionally delete backup file to test fail-closed integrity
+        let _ = fs::remove_file(Path::new(&backup_path));
+
+        let rollback_res = f.service.rollback_normalization(rec_id, None).await;
+        assert!(rollback_res.is_err(), "Rollback must fail closed when backup is missing");
+
+        // Canonical book must be untouched and valid
+        verify_cbz_integrity(&f.path).unwrap();
+    }
 }

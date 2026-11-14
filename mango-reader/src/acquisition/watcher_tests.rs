@@ -586,3 +586,125 @@ async fn test_watcher_notification_deduplication_invariant() {
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
+
+#[tokio::test]
+async fn test_unattended_watcher_cycle_submits_without_human_token() {
+    let temp_dir = std::env::temp_dir().join(format!("mango_unattended_watcher_{}_{}", std::process::id(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+    let _ = std::fs::remove_dir_all(&temp_dir);
+    let _ = std::fs::create_dir_all(&temp_dir);
+    let db = crate::db::Db::open(&temp_dir.join("test.db")).unwrap();
+    let cur_time = crate::db::now();
+
+    let temp_lib = temp_dir.clone();
+    db.call(move |conn| {
+        // Setup manga with auto_acquire enabled and automatic automation mode
+        conn.execute(
+            "INSERT INTO manga (id, source_id, url, title, update_strategy, auto_acquire, auto_acquire_activated_at, automation_mode)
+             VALUES (501, 1, 'url:501', 'Kagurabachi', 'ALWAYS_UPDATE', 1, ?1, 'automatic_acquisition')",
+            [cur_time - 86400],
+        )?;
+
+        // Enable global auto-acquire and settings
+        crate::acquisition::auto_acquire::set_global_auto_acquire(conn, true)?;
+        crate::acquisition::auto_acquire::set_auto_acquire_dry_run(conn, false)?;
+        conn.execute("INSERT OR REPLACE INTO state (key, value) VALUES ('acquisition.automation_mode', 'automatic_acquisition')", [])?;
+        conn.execute("INSERT OR REPLACE INTO state (key, value) VALUES ('acquisition.torbox_enabled', 'true')", [])?;
+        conn.execute("INSERT OR REPLACE INTO state (key, value) VALUES ('acquisition.torbox_token', 'test_token')", [])?;
+        crate::settings::set(conn, "pipeline.library_dir", &serde_json::json!(temp_lib.to_str().unwrap()))?;
+
+        // Reconciliation
+        conn.execute(
+            "INSERT INTO series_reconciliations (
+                series_id, manga_id, title, status, edition, owned_volumes_json, missing_volumes_json, future_volumes_json, total_official_volumes, last_reconciled_at, updated_at
+            ) VALUES ('manga:501', 501, 'Kagurabachi', 'missing_volume', 'standard', '[]', '[1.0]', '[]', 10, ?1, ?1)",
+            [cur_time],
+        )?;
+
+        // Release discovery target
+        conn.execute(
+            "INSERT INTO release_discovery_targets (
+                id, series_id, manga_id, series_title, volume_number, market, edition,
+                release_date, release_date_precision, date_type, status, attempts,
+                max_attempts, next_attempt_at, created_at, updated_at
+            ) VALUES (
+                501, 'manga:501', 501, 'Kagurabachi', 1.0, 'en', 'standard',
+                date('now', 'localtime'), 'day', 'official', 'candidate_available', 0, 7, 0, ?1, ?1
+            )",
+            [cur_time],
+        )?;
+
+        // Watcher due now
+        conn.execute(
+            "INSERT INTO release_availability_watchers (
+                id, series_id, manga_id, series_title, volume_number, edition,
+                is_released, is_owned, monitoring_enabled, notify_on_available,
+                state, last_attempt_at, last_checked_at, next_check_at,
+                check_interval_secs, consecutive_failures, created_at, updated_at
+            ) VALUES (
+                501, 'manga:501', 501, 'Kagurabachi', 1.0, 'standard',
+                1, 0, 1, 1,
+                'RELEASED_AWAITING_PROVIDER', 0, 0, ?1,
+                3600, 0, ?1, ?1
+            )",
+            [cur_time - 10],
+        )?;
+
+        // Cache discovery status so discover_for_volume uses the seeded candidate
+        conn.execute(
+            "INSERT INTO volume_discovery_status (
+                series_id, volume_number, last_discovered_at, status, candidate_count,
+                top_candidate_id, top_candidate_title, top_candidate_provider, top_candidate_score,
+                providers_checked, provider_errors
+            ) VALUES (
+                'manga:501', 1.0, ?1, 'candidates_found', 1,
+                'nyaa:kagura_v01', 'Kagurabachi v01', 'nyaa', 95.0,
+                '[\"nyaa\"]', '{}'
+            )",
+            [cur_time],
+        )?;
+
+        // Seed exact candidate
+        conn.execute(
+            "INSERT INTO discovered_release_candidates (
+                series_id, volume_number, candidate_id, provider, provider_item_id,
+                title, raw_title, match_type, size_bytes, is_digital, is_trusted,
+                score, score_explanation, magnet_url, seeders, confidence, language, discovered_at
+            ) VALUES (
+                'manga:501', 1.0, 'nyaa:kagura_v01', 'nyaa', 'item_501',
+                'Kagurabachi v01', 'Kagurabachi v01 (Digital).cbz', 'exact_volume',
+                150000000, 1, 1, 95.0, 'Exact match (+95)', 'magnet:?xt=urn:btih:5555555555555555555555555555555555555555', 25, 'high', 'en', ?1
+            )",
+            [cur_time],
+        )?;
+
+        Ok(())
+    }).await.unwrap();
+
+    let acq = std::sync::Arc::new(crate::acquisition::service::AcquisitionService::new(
+        db.clone(),
+        reqwest::Client::new(),
+        None,
+        None,
+    ));
+
+    // Run unattended watcher tick
+    let processed = run_watcher_tick(&db, reqwest::Client::new(), Some(&acq)).await.unwrap();
+    assert_eq!(processed, 1);
+
+    // Assert watcher was automatically acquired without manual human token
+    let watcher = db.call(|conn| Ok(get_watcher_by_id(conn, 501)?.unwrap())).await.unwrap();
+    assert_eq!(watcher.state, WatcherState::Acquired);
+
+    // Assert candidate approval was queued into database
+    let queued: bool = db.call(|conn| {
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM candidate_approvals WHERE manga_id = 501 AND volume_number = 1.0",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok(count > 0)
+    }).await.unwrap();
+    assert!(queued, "Unattended automated acquisition must submit and queue candidate approval");
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
