@@ -6,15 +6,16 @@
 use super::{AcquisitionCandidate, AcquisitionReleaseUnit};
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum UnitMappingProvenance {
+    #[default]
     ExplicitVolumeMetadata,
     ParsedVolumeFromTitle,
     ChapterToVolumeInference,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct CandidateHealth {
     pub seeders: Option<u32>,
@@ -23,7 +24,7 @@ pub struct CandidateHealth {
     pub uploader_reliability_percent: Option<f64>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct CandidateQualitySignals {
     pub is_digital: bool,
@@ -33,7 +34,7 @@ pub struct CandidateQualitySignals {
     pub edition_penalty: f64,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub struct NormalizedAcquisitionCandidate {
     pub series_identity: String,

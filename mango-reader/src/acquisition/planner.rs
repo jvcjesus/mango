@@ -126,6 +126,20 @@ pub fn score_candidate_for_profile(
         why_rec.push("✓ No duplicate volumes".to_string());
     }
 
+    // 2b. Interior reading gap resolution bonus (high priority)
+    if !owned_units.is_empty() {
+        let min_owned = owned_units.iter().map(|v| v.round() as i64).min().unwrap();
+        let max_owned = owned_units.iter().map(|v| v.round() as i64).max().unwrap();
+        let covers_interior = covers_missing.iter().any(|v| {
+            let v_i = v.round() as i64;
+            v_i > min_owned && v_i < max_owned
+        });
+        if covers_interior {
+            score += 15.0;
+            why_rec.push("✓ Resolves interior reading gap (high priority)".to_string());
+        }
+    }
+
     match profile.collection_policy.as_str() {
         "prefer_collections" => {
             if cand.release_unit.is_collection() {

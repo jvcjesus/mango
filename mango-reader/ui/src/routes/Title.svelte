@@ -961,6 +961,16 @@
       const volCandidates = vol !== null ? titleCandidates.filter((c) => (c.assignedNumber != null && Math.abs(c.assignedNumber - vol) < 0.001) || (c.suggestedNumber != null && Math.abs(c.suggestedNumber - vol) < 0.001)) : [];
       const volEvents = vol !== null ? titleEvents.filter((e) => e.is_volume && Math.abs(e.number - vol) < 0.001) : [];
 
+      const targetRel = vol !== null ? releaseDiscoveryTargets.find((t) => Math.abs(t.volumeNumber - vol) < 0.001) : null;
+      const isUpcoming = vol !== null ? (
+        (missingContent?.futureVolumes?.some((v) => Math.abs(v - vol) < 0.001) ?? false) ||
+        targetRel?.status === 'scheduled' ||
+        targetRel?.status === 'pre'
+      ) : false;
+      const isInterior = vol !== null ? (
+        missingContent?.interiorGaps?.some((v) => Math.abs(v - vol) < 0.001) ?? false
+      ) : false;
+
       const presentation = vol !== null ? resolveVolumePresentation({
         volume: vol,
         isOwnedInKomga: volOwnership?.status === 'owned',
@@ -970,7 +980,10 @@
         queuedItems: volQueued,
         importCandidates: volCandidates,
         pipelineEvents: volEvents,
-        isMissingReported: missingContent?.missingVolumes?.includes(vol) ?? false,
+        isMissingReported: missingContent?.missingVolumes?.some((v) => Math.abs(v - vol) < 0.001) ?? false,
+        isUpcoming,
+        isInteriorGap: isInterior,
+        releaseDate: targetRel?.releaseDate ?? null,
       }) : null;
 
       return {
@@ -1562,6 +1575,7 @@
               openTomeSchedule={openTomeSchedule}
               openTomeLoading={openTomeLoading}
               releaseDiscoveryTargets={releaseDiscoveryTargets}
+              missingContent={missingContent}
               autoAcquire={title.autoAcquire}
               autoAcquireActivatedAt={title.autoAcquireActivatedAt}
               onToggleAutoAcquire={handleToggleAutoAcquire}

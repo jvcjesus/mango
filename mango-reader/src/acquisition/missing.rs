@@ -17,6 +17,7 @@ pub enum UnitState {
     Missing,
     Unavailable,
     Unknown,
+    Unreleased,
 }
 
 impl std::fmt::Display for UnitState {
@@ -27,6 +28,7 @@ impl std::fmt::Display for UnitState {
             Self::Missing => write!(f, "missing"),
             Self::Unavailable => write!(f, "unavailable"),
             Self::Unknown => write!(f, "unknown"),
+            Self::Unreleased => write!(f, "unreleased"),
         }
     }
 }
@@ -51,6 +53,20 @@ pub struct MissingContentSummary {
     pub acquiring_volumes: Vec<f64>,
     pub unavailable_volumes: Vec<f64>,
     pub unknown_volumes: Vec<f64>,
+    #[serde(default)]
+    pub future_volumes: Vec<f64>,
+    #[serde(default)]
+    pub interior_gaps: Vec<f64>,
+    #[serde(default)]
+    pub leading_gaps: Vec<f64>,
+    #[serde(default)]
+    pub trailing_gaps: Vec<f64>,
+    #[serde(default)]
+    pub has_interior_gaps: bool,
+    #[serde(default)]
+    pub edition: Option<String>,
+    #[serde(default)]
+    pub collection_id: Option<String>,
     pub volume_entries: Vec<UnitStatusEntry>,
     pub total_known_chapters: usize,
     pub owned_chapters: Vec<f64>,
@@ -61,8 +77,8 @@ pub struct MissingContentSummary {
     pub explanation: String,
 }
 
-/// Computes the MissingContentSummary from explicit ownership, catalog, and acquisition inputs.
-pub fn calculate_missing_content(
+/// Computes the MissingContentSummary with gap classification, future volume awareness, and edition metadata.
+pub fn calculate_missing_content_extended(
     manga_id: i64,
     title: &str,
     owned_volumes: &[(f64, Option<String>)], // (volume_number, book_id)
@@ -70,6 +86,9 @@ pub fn calculate_missing_content(
     authoritative_total_volumes: Option<u32>,
     discovered_volumes: &[f64],
     unavailable_volumes: &[f64],
+    future_volumes: &[f64],
+    edition: Option<String>,
+    collection_id: Option<String>,
     owned_chapters: &[f64],
     acquiring_chapters: &[f64],
     authoritative_total_chapters: Option<u32>,
@@ -102,6 +121,12 @@ pub fn calculate_missing_content(
         known_vol_set.insert(v_round);
     }
 
+    // 5. Future scheduled volumes
+    for v in future_volumes {
+        let v_round = v.round() as i64;
+        known_vol_set.insert(v_round);
+    }
+
     let owned_map: HashMap<i64, Option<String>> = owned_volumes
         .iter()
         .map(|(v, b)| (v.round() as i64, b.clone()))
@@ -109,11 +134,13 @@ pub fn calculate_missing_content(
     let acquiring_set: BTreeSet<i64> = acquiring_volumes.iter().map(|v| v.round() as i64).collect();
     let unavailable_set: BTreeSet<i64> =
         unavailable_volumes.iter().map(|v| v.round() as i64).collect();
+    let future_set: BTreeSet<i64> = future_volumes.iter().map(|v| v.round() as i64).collect();
 
     let mut owned_list = Vec::new();
     let mut missing_list = Vec::new();
     let mut acquiring_list = Vec::new();
     let mut unavailable_list = Vec::new();
+    let mut future_list = Vec::new();
     let mut volume_entries = Vec::new();
 
     for &v_int in &known_vol_set {
@@ -132,6 +159,14 @@ pub fn calculate_missing_content(
                 unit: v_f64,
                 state: UnitState::Acquiring,
                 evidence: "Currently in active download queue".to_string(),
+                book_id: None,
+            });
+        } else if future_set.contains(&v_int) {
+            future_list.push(v_f64);
+            volume_entries.push(UnitStatusEntry {
+                unit: v_f64,
+                state: UnitState::Unreleased,
+                evidence: "Scheduled future release in OpenTome / MangaBaka".to_string(),
                 book_id: None,
             });
         } else if unavailable_set.contains(&v_int) {
@@ -157,6 +192,30 @@ pub fn calculate_missing_content(
             });
         }
     }
+
+    // Gap classification across released missing volumes
+    let mut interior_gaps = Vec::new();
+    let mut leading_gaps = Vec::new();
+    let mut trailing_gaps = Vec::new();
+
+    let owned_set_ints: BTreeSet<i64> = owned_list.iter().map(|v| v.round() as i64).collect();
+    if owned_set_ints.is_empty() {
+        leading_gaps = missing_list.clone();
+    } else {
+        let min_owned = *owned_set_ints.iter().next().unwrap();
+        let max_owned = *owned_set_ints.iter().next_back().unwrap();
+        for &m in &missing_list {
+            let m_i = m.round() as i64;
+            if m_i > min_owned && m_i < max_owned {
+                interior_gaps.push(m);
+            } else if m_i < min_owned {
+                leading_gaps.push(m);
+            } else if m_i > max_owned {
+                trailing_gaps.push(m);
+            }
+        }
+    }
+    let has_interior_gaps = !interior_gaps.is_empty();
 
     // Chapters calculation
     let mut known_chap_set: BTreeSet<i64> = BTreeSet::new();
@@ -193,15 +252,32 @@ pub fn calculate_missing_content(
     let is_fully_owned = !known_vol_set.is_empty() && missing_list.is_empty() && acquiring_list.is_empty();
     let has_missing = !missing_list.is_empty();
 
-    let explanation = if is_fully_owned {
-        format!("All {} known volumes are owned in Komga", known_vol_set.len())
-    } else if has_missing {
+    let explanation = if known_vol_set.is_empty() {
+        "No volume releases known or owned".to_string()
+    } else if is_fully_owned && future_list.is_empty() {
+        format!("All {} known volumes are owned in Komga", owned_list.len())
+    } else if is_fully_owned && !future_list.is_empty() {
+        format!("All {} released volumes are owned in Komga ({} upcoming scheduled)", owned_list.len(), future_list.len())
+    } else if has_interior_gaps {
         format!(
-            "{}/{} volumes owned ({} missing, {} acquiring)",
+            "{}/{} released volumes owned · Interior gap: volume(s) {:?} missing between owned volumes",
             owned_list.len(),
-            known_vol_set.len(),
+            owned_list.len() + missing_list.len(),
+            interior_gaps
+        )
+    } else if has_missing {
+        let upcoming_suffix = if future_list.is_empty() {
+            String::new()
+        } else {
+            format!(", {} upcoming", future_list.len())
+        };
+        format!(
+            "{}/{} released volumes owned ({} missing, {} acquiring{})",
+            owned_list.len(),
+            owned_list.len() + missing_list.len(),
             missing_list.len(),
-            acquiring_list.len()
+            acquiring_list.len(),
+            upcoming_suffix
         )
     } else if !acquiring_list.is_empty() {
         format!(
@@ -223,6 +299,13 @@ pub fn calculate_missing_content(
         acquiring_volumes: acquiring_list,
         unavailable_volumes: unavailable_list,
         unknown_volumes: vec![],
+        future_volumes: future_list,
+        interior_gaps,
+        leading_gaps,
+        trailing_gaps,
+        has_interior_gaps,
+        edition,
+        collection_id,
         volume_entries,
         total_known_chapters: known_chap_set.len(),
         owned_chapters: owned_chap_list,
@@ -232,6 +315,38 @@ pub fn calculate_missing_content(
         has_missing,
         explanation,
     }
+}
+
+/// Backwards-compatible wrapper calling `calculate_missing_content_extended`.
+pub fn calculate_missing_content(
+    manga_id: i64,
+    title: &str,
+    owned_volumes: &[(f64, Option<String>)], // (volume_number, book_id)
+    acquiring_volumes: &[f64],
+    authoritative_total_volumes: Option<u32>,
+    discovered_volumes: &[f64],
+    unavailable_volumes: &[f64],
+    owned_chapters: &[f64],
+    acquiring_chapters: &[f64],
+    authoritative_total_chapters: Option<u32>,
+    discovered_chapters: &[f64],
+) -> MissingContentSummary {
+    calculate_missing_content_extended(
+        manga_id,
+        title,
+        owned_volumes,
+        acquiring_volumes,
+        authoritative_total_volumes,
+        discovered_volumes,
+        unavailable_volumes,
+        &[],
+        None,
+        None,
+        owned_chapters,
+        acquiring_chapters,
+        authoritative_total_chapters,
+        discovered_chapters,
+    )
 }
 
 /// Loads missing content for a title from the database and Komga ownership.
@@ -280,23 +395,116 @@ pub fn resolve_missing_content_for_title(
         }
     }
 
-    // Query catalog entries if totals were not in ownership summary
-    if authoritative_total_vols.is_none() {
-        let sql = "SELECT total_volumes, total_chapters FROM tracker_list_entries WHERE title = ?1 OR english_title = ?1 OR romaji_title = ?1 LIMIT 1";
-        if let Ok(Some((v_tot, c_tot))) = conn
-            .query_row(sql, [title], |r| {
-                Ok((r.get::<_, Option<u32>>(0)?, r.get::<_, Option<u32>>(1)?))
-            })
-            .optional()
-        {
-            if authoritative_total_vols.is_none() {
-                authoritative_total_vols = v_tot;
+    // 2. Query series_reconciliations for collection, edition, totals, and future volumes
+    let mut recon_edition: Option<String> = None;
+    let mut recon_collection_id: Option<String> = None;
+    let mut recon_status: Option<String> = None;
+    let mut future_vols_set: BTreeSet<i64> = BTreeSet::new();
+
+    let series_id_manga = format!("manga:{manga_id}");
+    if let Ok(Some((st, col, ed, tot, ow_json, _mi_json, fu_json))) = conn
+        .query_row(
+            "SELECT status, collection_id, edition, total_official_volumes,
+                    owned_volumes_json, missing_volumes_json, future_volumes_json
+             FROM series_reconciliations
+             WHERE manga_id = ?1 OR series_id = ?2",
+            rusqlite::params![manga_id, series_id_manga],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<u32>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
+                    r.get::<_, Option<String>>(5)?,
+                    r.get::<_, Option<String>>(6)?,
+                ))
+            },
+        )
+        .optional()
+    {
+        recon_status = Some(st.clone());
+        recon_collection_id = col;
+        recon_edition = ed;
+
+        if let Some(tot_val) = tot {
+            if tot_val > 0 {
+                authoritative_total_vols = Some(tot_val);
             }
-            if authoritative_total_chaps.is_none() {
-                authoritative_total_chaps = c_tot;
+        }
+
+        // If owned_vols is empty, populate from owned_volumes_json
+        if owned_vols.is_empty() {
+            if let Some(ref json_str) = ow_json {
+                if let Ok(vols) = serde_json::from_str::<Vec<f64>>(json_str) {
+                    for v in vols {
+                        owned_vols.push((v, None));
+                    }
+                }
+            }
+        }
+
+        // Parse future_volumes_json
+        if let Some(ref json_str) = fu_json {
+            if let Ok(vols) = serde_json::from_str::<Vec<f64>>(json_str) {
+                for v in vols {
+                    future_vols_set.insert(v.round() as i64);
+                }
+            }
+        }
+
+        // Fail-closed on collection unavailable: do not fabricate unowned volumes!
+        if st == "collection_unavailable" || (recon_collection_id.is_none() && st == "review_required") {
+            authoritative_total_vols = None;
+        }
+    }
+
+    // 3. Query OpenTome release targets for future / pre-release volumes
+    let today = crate::sync::reconciliation::today_ymd();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT volume_number, release_date, status
+         FROM release_discovery_targets
+         WHERE manga_id = ?1 OR series_id = ?2",
+    ) {
+        if let Ok(rows) = stmt.query_map(rusqlite::params![manga_id, series_id_manga], |r| {
+            Ok((r.get::<_, f64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+        }) {
+            for (vol, date, stat) in rows.flatten() {
+                if stat == "pre" || date > today {
+                    future_vols_set.insert(vol.round() as i64);
+                }
             }
         }
     }
+
+    // 4. Query catalog entries if totals were not in ownership or reconciliation
+    // Only query if edition is standard or unset, preventing cross-edition omnibus skew
+    if authoritative_total_vols.is_none() && recon_status.as_deref() != Some("collection_unavailable") {
+        let is_non_standard = recon_edition
+            .as_deref()
+            .map(|e| e.to_lowercase())
+            .map(|e| e.contains("omnibus") || e.contains("deluxe") || e.contains("2-in-1") || e.contains("3-in-1") || e.contains("collector"))
+            .unwrap_or(false);
+
+        if !is_non_standard {
+            let sql = "SELECT total_volumes, total_chapters FROM tracker_list_entries WHERE title = ?1 OR english_title = ?1 OR romaji_title = ?1 LIMIT 1";
+            if let Ok(Some((v_tot, c_tot))) = conn
+                .query_row(sql, [title], |r| {
+                    Ok((r.get::<_, Option<u32>>(0)?, r.get::<_, Option<u32>>(1)?))
+                })
+                .optional()
+            {
+                if authoritative_total_vols.is_none() {
+                    authoritative_total_vols = v_tot;
+                }
+                if authoritative_total_chaps.is_none() {
+                    authoritative_total_chaps = c_tot;
+                }
+            }
+        }
+    }
+
+    let future_vols_vec: Vec<f64> = future_vols_set.into_iter().map(|v| v as f64).collect();
 
     // Query acquiring downloads from active download queue for this manga
     let mut acquiring_vols = Vec::new();
@@ -390,7 +598,7 @@ pub fn resolve_missing_content_for_title(
         }
     }
 
-    calculate_missing_content(
+    calculate_missing_content_extended(
         manga_id,
         title,
         &owned_vols,
@@ -398,6 +606,9 @@ pub fn resolve_missing_content_for_title(
         authoritative_total_vols,
         &discovered_vols,
         &[],
+        &future_vols_vec,
+        recon_edition,
+        recon_collection_id,
         &owned_chaps,
         &acquiring_chaps,
         authoritative_total_chaps,

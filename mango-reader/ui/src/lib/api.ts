@@ -1045,7 +1045,7 @@ export interface AcquisitionProfile {
 
 export interface UnitStatusEntry {
   unit: number;
-  state: 'owned' | 'acquiring' | 'missing' | 'unavailable' | 'unknown';
+  state: 'owned' | 'acquiring' | 'missing' | 'unavailable' | 'unknown' | 'unreleased';
   evidence: string;
   bookId?: string | null;
 }
@@ -1059,6 +1059,13 @@ export interface MissingContentSummary {
   acquiringVolumes: number[];
   unavailableVolumes: number[];
   unknownVolumes: number[];
+  futureVolumes?: number[];
+  interiorGaps?: number[];
+  leadingGaps?: number[];
+  trailingGaps?: number[];
+  hasInteriorGaps?: boolean;
+  edition?: string | null;
+  collectionId?: string | null;
   volumeEntries: UnitStatusEntry[];
   totalKnownChapters: number;
   ownedChapters: number[];
@@ -2488,6 +2495,7 @@ export interface SeriesGapAnalysisDto {
   totalVolumes: number;
   ownedCount: number;
   missingCount: number;
+  unreleasedCount?: number;
   interiorGapCount: number;
   leadingGapCount: number;
   trailingGapCount: number;

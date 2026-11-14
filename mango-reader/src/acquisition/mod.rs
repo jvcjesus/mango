@@ -64,7 +64,7 @@ use crate::error::Result;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum AcquisitionReleaseUnit {
     Volume(f64),
@@ -80,6 +80,7 @@ pub enum AcquisitionReleaseUnit {
         chapter_start: f64,
         chapter_end: f64,
     },
+    #[default]
     Unknown,
 }
 

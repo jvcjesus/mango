@@ -18,7 +18,8 @@ export type NormalizedStatus =
   | 'waiting_for_komga'
   | 'metadata'
   | 'complete'
-  | 'attention';
+  | 'attention'
+  | 'upcoming';
 
 export type PhysicalState =
   | 'in_library'
@@ -29,6 +30,7 @@ export type PhysicalState =
   | 'staged'
   | 'failed'
   | 'missing'
+  | 'unreleased'
   | 'unknown';
 
 export type MetadataState =
@@ -76,6 +78,9 @@ export interface VolumePresentation {
   jobId?: string | null;
   error?: string | null;
   lastUpdated?: number | null;
+  isUpcoming?: boolean;
+  isInteriorGap?: boolean;
+  releaseDate?: string | null;
 }
 
 export interface VolumeDataInputs {
@@ -88,6 +93,9 @@ export interface VolumeDataInputs {
   importCandidates?: ImportBook[];
   pipelineEvents?: PipelineEvent[];
   isMissingReported?: boolean;
+  isUpcoming?: boolean;
+  isInteriorGap?: boolean;
+  releaseDate?: string | null;
 }
 
 export interface SeriesSummary {
@@ -143,6 +151,9 @@ export function resolveVolumePresentation(input: VolumeDataInputs): VolumePresen
     importCandidates = [],
     pipelineEvents = [],
     isMissingReported = false,
+    isUpcoming = false,
+    isInteriorGap = false,
+    releaseDate = null,
   } = input;
 
   const label = `Volume ${volume}`;
@@ -456,23 +467,49 @@ export function resolveVolumePresentation(input: VolumeDataInputs): VolumePresen
     };
   }
 
-  // 4. Default: Missing
+  // 4. Default: Upcoming or Missing
+  if (isUpcoming) {
+    return {
+      volume,
+      label,
+      status: 'upcoming',
+      statusLabel: releaseDate ? `Upcoming (${releaseDate})` : 'Upcoming',
+      badgeVariant: 'neutral',
+      physicalState: 'unreleased',
+      physicalLabel: releaseDate ? `Scheduled release: ${releaseDate}` : 'Unreleased future volume',
+      metadataState: 'pending',
+      metadataLabel: 'Announced / scheduled in OpenTome / MangaBaka',
+      progressPercent: null,
+      contradictionWarning: null,
+      canRetryMetadata: false,
+      canRetryKomga: false,
+      canRetryDownload: false,
+      canReview: false,
+      canAcquire: false,
+      isUpcoming: true,
+      releaseDate: releaseDate ?? null,
+    };
+  }
+
+  const isInterior = Boolean(isInteriorGap);
   return {
     volume,
     label,
     status: 'missing',
-    statusLabel: 'Missing',
-    badgeVariant: 'neutral',
+    statusLabel: isInterior ? 'Interior Gap (Missing)' : 'Missing',
+    badgeVariant: isInterior ? 'attention' : 'neutral',
     physicalState: 'missing',
-    physicalLabel: 'Not owned in library',
+    physicalLabel: isInterior ? 'Interior gap between owned volumes' : 'Not owned in library',
     metadataState: 'pending',
     metadataLabel: 'No metadata until acquired',
     progressPercent: null,
+    contradictionWarning: null,
     canRetryMetadata: false,
     canRetryKomga: false,
     canRetryDownload: false,
     canReview: false,
     canAcquire: true,
+    isInteriorGap: isInterior,
   };
 }
 

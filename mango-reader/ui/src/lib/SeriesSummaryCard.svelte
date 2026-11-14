@@ -7,6 +7,7 @@
     ReleaseDiscoveryTarget,
     CanonicalLibraryReleasesSummary,
     TitleOwnership,
+    MissingContentSummary,
   } from './api';
   import { ago } from './util';
 
@@ -32,6 +33,7 @@
 
   let {
     summary,
+    missingContent = null,
     libraryState = null,
     reconciliation = null,
     ownership = null,
@@ -61,6 +63,7 @@
     onOpenDiagnostics,
   }: {
     summary: SeriesSummary;
+    missingContent?: MissingContentSummary | null;
     libraryState?: CanonicalLibraryReleasesSummary | null;
     reconciliation?: ReconciliationSummary | null;
     ownership?: TitleOwnership | null;
@@ -235,6 +238,9 @@
         {:else if isUpToDate}
           <span class="status-text uptodate">
             {summary.ownedCount} / {summary.totalExpectedVolumes ?? summary.ownedCount} released volumes owned · Up to date
+            {#if missingContent?.futureVolumes?.length}
+              <span class="upcoming-accent"> ({missingContent.futureVolumes.length} upcoming)</span>
+            {/if}
           </span>
         {:else}
           <span class="status-text">
@@ -242,9 +248,27 @@
             {#if summary.missingCount > 0}
               <span class="missing-accent"> · {summary.missingCount} missing</span>
             {/if}
+            {#if missingContent?.futureVolumes?.length}
+              <span class="upcoming-accent"> · {missingContent.futureVolumes.length} upcoming</span>
+            {/if}
           </span>
         {/if}
       </div>
+
+      {#if missingContent?.hasInteriorGaps}
+        <div class="interior-gap-alert-row">
+          <span class="gap-alert-badge">
+            <Icon name="alert" size={14} />
+            <span>Interior reading gap: Vol. {formatVolumeRanges(missingContent.interiorGaps ?? [])} missing between owned volumes</span>
+          </span>
+          {#if onDiscoverMissing}
+            <button class="btn tiny pill outline icon-text" onclick={onDiscoverMissing} title="Search releases for missing interior volumes">
+              <Icon name="search" size={12} />
+              Resolve Gap
+            </button>
+          {/if}
+        </div>
+      {/if}
 
       {#if activeReleaseTarget}
         <div class="release-trigger-notice" class:notice-found={activeReleaseTarget.status === 'candidate_available'}>
@@ -335,6 +359,13 @@
         <div class="counter-item has-attention">
           <span class="counter-num">{summary.attentionCount}</span>
           <span class="counter-lbl">Needs Attention</span>
+        </div>
+      {/if}
+
+      {#if (missingContent?.futureVolumes?.length ?? 0) > 0}
+        <div class="counter-item upcoming" title="Upcoming unreleased official volumes (not counted as missing)">
+          <span class="counter-num">{missingContent?.futureVolumes?.length}</span>
+          <span class="counter-lbl">Upcoming</span>
         </div>
       {/if}
     </div>
@@ -802,6 +833,32 @@
     font-weight: 700;
   }
 
+  .upcoming-accent {
+    color: #0369a1;
+    font-weight: 600;
+  }
+
+  .interior-gap-alert-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-top: 8px;
+    padding: 6px 12px;
+    background: #fffbeb;
+    border: 1px solid #fde68a;
+    border-radius: 6px;
+    font-size: 13px;
+  }
+
+  .gap-alert-badge {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    color: #92400e;
+    font-weight: 500;
+  }
+
   .release-trigger-notice {
     display: inline-flex;
     align-items: center;
@@ -957,6 +1014,15 @@
 
   .counter-item.has-attention .counter-num {
     color: #b91c1c;
+  }
+
+  .counter-item.upcoming {
+    background: #f0fdf4;
+    border-color: #86efac;
+  }
+
+  .counter-item.upcoming .counter-num {
+    color: #15803d;
   }
 
   /* Integrated OpenTome Section */

@@ -3115,6 +3115,13 @@ fn dummy_missing_summary() -> crate::acquisition::missing::MissingContentSummary
         acquiring_volumes: vec![],
         unavailable_volumes: vec![],
         unknown_volumes: vec![],
+        future_volumes: vec![],
+        interior_gaps: vec![],
+        leading_gaps: vec![],
+        trailing_gaps: vec![29.0, 30.0, 31.0],
+        has_interior_gaps: false,
+        edition: None,
+        collection_id: None,
         volume_entries: vec![],
         total_known_chapters: 0,
         owned_chapters: vec![],
@@ -3220,4 +3227,193 @@ async fn test_torbox_check_cached_torrent_and_ttl_cache() {
         TorBoxCacheStatus::Uncached
     );
     assert_eq!(call_count.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
+
+// ====================================================================
+// MILESTONE v1.2 — MISSING-CONTENT INTELLIGENCE
+// ====================================================================
+
+#[test]
+fn test_v1_2_gap_classification_interior_leading_trailing() {
+    // Owned: 3, 4, 7
+    // Known: 1..=8
+    // Missing: 1, 2, 5, 6, 8
+    let owned = vec![(3.0, Some("b3".into())), (4.0, Some("b4".into())), (7.0, Some("b7".into()))];
+    let summary = crate::acquisition::missing::calculate_missing_content_extended(
+        1001,
+        "Gap Test Title",
+        &owned,
+        &[],
+        Some(8),
+        &[],
+        &[],
+        &[],
+        None,
+        None,
+        &[],
+        &[],
+        None,
+        &[],
+    );
+
+    assert_eq!(summary.owned_volumes, vec![3.0, 4.0, 7.0]);
+    assert_eq!(summary.missing_volumes, vec![1.0, 2.0, 5.0, 6.0, 8.0]);
+    assert_eq!(summary.leading_gaps, vec![1.0, 2.0]);
+    assert_eq!(summary.interior_gaps, vec![5.0, 6.0]);
+    assert_eq!(summary.trailing_gaps, vec![8.0]);
+    assert!(summary.has_interior_gaps);
+    assert!(summary.has_missing);
+    assert!(!summary.is_fully_owned);
+    assert!(summary.explanation.contains("Interior gap"));
+    assert!(summary.explanation.contains("[5.0, 6.0]"));
+}
+
+#[test]
+fn test_v1_2_future_unreleased_not_counted_as_missing() {
+    // Owned: 1..=8
+    // Authoritative total: 10
+    // Volumes 9 and 10 are future scheduled in OpenTome / MangaBaka
+    let owned: Vec<(f64, Option<String>)> = (1..=8).map(|v| (v as f64, Some(format!("b{v}")))).collect();
+    let future = vec![9.0, 10.0];
+
+    let summary = crate::acquisition::missing::calculate_missing_content_extended(
+        1002,
+        "Ongoing Series",
+        &owned,
+        &[],
+        Some(10),
+        &[],
+        &[],
+        &future,
+        Some("standard".into()),
+        Some("col-1002".into()),
+        &[],
+        &[],
+        None,
+        &[],
+    );
+
+    assert_eq!(summary.owned_volumes.len(), 8);
+    assert!(summary.missing_volumes.is_empty());
+    assert_eq!(summary.future_volumes, vec![9.0, 10.0]);
+    assert!(summary.interior_gaps.is_empty());
+    assert!(summary.leading_gaps.is_empty());
+    assert!(summary.trailing_gaps.is_empty());
+    assert!(!summary.has_interior_gaps);
+    assert!(!summary.has_missing);
+    assert!(summary.is_fully_owned); // All released volumes are owned!
+
+    // Verify entry states
+    let v9_entry = summary.volume_entries.iter().find(|e| (e.unit - 9.0).abs() < 0.001).unwrap();
+    assert_eq!(v9_entry.state, crate::acquisition::missing::UnitState::Unreleased);
+    assert!(v9_entry.evidence.contains("Scheduled future release"));
+
+    assert!(summary.explanation.contains("All 8 released volumes are owned in Komga"));
+    assert!(summary.explanation.contains("2 upcoming scheduled"));
+}
+
+#[test]
+fn test_v1_2_omnibus_multi_edition_resolution() {
+    // 3-in-1 Deluxe omnibus edition: 14 total official volumes covering 42 chapters/volumes
+    let owned: Vec<(f64, Option<String>)> = (1..=14).map(|v| (v as f64, Some(format!("b{v}")))).collect();
+
+    let summary = crate::acquisition::missing::calculate_missing_content_extended(
+        1003,
+        "Berserk Deluxe",
+        &owned,
+        &[],
+        Some(14), // Official MangaBaka collection volume total for Deluxe Edition
+        &[],
+        &[],
+        &[],
+        Some("deluxe".into()),
+        Some("col-berserk-deluxe".into()),
+        &[],
+        &[],
+        None,
+        &[],
+    );
+
+    assert_eq!(summary.total_known_volumes, 14);
+    assert_eq!(summary.owned_volumes.len(), 14);
+    assert!(summary.missing_volumes.is_empty());
+    assert!(!summary.has_missing);
+    assert!(summary.is_fully_owned);
+    assert_eq!(summary.edition.as_deref(), Some("deluxe"));
+    assert_eq!(summary.collection_id.as_deref(), Some("col-berserk-deluxe"));
+}
+
+#[test]
+fn test_v1_2_planner_interior_gap_priority() {
+    let profile = crate::acquisition::profiles::AcquisitionProfile::default();
+
+    // User owns volume 1 and 4, missing volume 2 (interior) and volume 5 (trailing)
+    let owned_units = vec![1.0, 4.0];
+    let missing_units = vec![2.0, 5.0];
+
+    let cand_interior = crate::acquisition::candidates::NormalizedAcquisitionCandidate {
+        series_identity: "Test Series".into(),
+        title: "Test Series Vol 2".into(),
+        provider: "nyaa".into(),
+        provider_release_id: "rel-2".into(),
+        release_unit: crate::acquisition::AcquisitionReleaseUnit::Volume(2.0),
+        quality_signals: crate::acquisition::candidates::CandidateQualitySignals {
+            is_digital: true,
+            ..Default::default()
+        },
+        health: crate::acquisition::candidates::CandidateHealth {
+            seeders: Some(15),
+            leechers: Some(2),
+            source_healthy: true,
+            ..Default::default()
+        },
+        size: Some(100_000_000),
+        score: 80.0,
+        provider_metadata: serde_json::json!({ "rawTitle": "Test Series v02.cbz" }),
+        ..Default::default()
+    };
+
+    let cand_trailing = crate::acquisition::candidates::NormalizedAcquisitionCandidate {
+        series_identity: "Test Series".into(),
+        title: "Test Series Vol 5".into(),
+        provider: "nyaa".into(),
+        provider_release_id: "rel-5".into(),
+        release_unit: crate::acquisition::AcquisitionReleaseUnit::Volume(5.0),
+        quality_signals: crate::acquisition::candidates::CandidateQualitySignals {
+            is_digital: true,
+            ..Default::default()
+        },
+        health: crate::acquisition::candidates::CandidateHealth {
+            seeders: Some(15),
+            leechers: Some(2),
+            source_healthy: true,
+            ..Default::default()
+        },
+        size: Some(100_000_000),
+        score: 80.0,
+        provider_metadata: serde_json::json!({ "rawTitle": "Test Series v05.cbz" }),
+        ..Default::default()
+    };
+
+    let (score_interior, why_interior, _) = crate::acquisition::planner::score_candidate_for_profile(
+        &cand_interior,
+        &profile,
+        &missing_units,
+        &owned_units,
+        "healthy",
+    );
+
+    let (score_trailing, why_trailing, _) = crate::acquisition::planner::score_candidate_for_profile(
+        &cand_trailing,
+        &profile,
+        &missing_units,
+        &owned_units,
+        "healthy",
+    );
+
+    // Interior gap resolution receives +15 bonus
+    assert!(score_interior > score_trailing);
+    assert_eq!(score_interior - score_trailing, 15.0);
+    assert!(why_interior.iter().any(|r| r.contains("Resolves interior reading gap")));
+    assert!(!why_trailing.iter().any(|r| r.contains("Resolves interior reading gap")));
 }

@@ -570,6 +570,10 @@
                             <div class="gap-tag-pill gap-{v.gapType?.toLowerCase()}">
                               {v.gapType} GAP
                             </div>
+                          {:else if v.status === 'UNRELEASED_FUTURE'}
+                            <div class="gap-tag-pill unreleased-pill">
+                              UPCOMING
+                            </div>
                           {/if}
 
                           <div class="vol-card-meta">
@@ -604,7 +608,7 @@
                             >
                               Inspect Candidates
                             </button>
-                            {#if !v.isOwned}
+                            {#if !v.isOwned && v.status !== 'UNRELEASED_FUTURE'}
                               <button
                                 type="button"
                                 class="btn mini spot vol-plan-btn"
@@ -2268,6 +2272,12 @@
     background: var(--status-info-bg);
     color: var(--status-info);
     border: 1px solid var(--status-info);
+  }
+
+  .gap-tag-pill.unreleased-pill {
+    background: rgba(120, 113, 108, 0.12);
+    color: var(--muted);
+    border: 1px solid var(--border);
   }
 
   .vol-card-meta {

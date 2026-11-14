@@ -379,4 +379,52 @@ mod tests {
         assert_eq!(vol1.top_candidate_auto_eligible, Some(false));
         assert_eq!(vol1.top_candidate_decision_code.as_deref(), Some("PACK_REQUIRES_MANUAL"));
     }
+
+    #[test]
+    fn test_timeline_future_unreleased_volume_not_counted_as_gap() {
+        let conn = setup_test_db();
+        conn.execute(
+            "INSERT INTO manga (id, title, mangabaka_id) VALUES (9, 'Spy x Family', 500)",
+            [],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO series_reconciliations (manga_id, title, status, mangabaka_id, collection_id, total_official_volumes)
+             VALUES (9, 'Spy x Family', 'up_to_date', 500, 'col-9', 10)",
+            [],
+        ).unwrap();
+
+        // Own volumes 1..=9
+        for v in 1..=9 {
+            conn.execute(
+                "INSERT INTO chapters (manga_id, chapter_number, download_path)
+                 VALUES (9, ?1, ?2)",
+                rusqlite::params![v as f64, format!("/data/local/English/Spy x Family/v{v}.cbz")],
+            ).unwrap();
+        }
+
+        // Volume 10 is upcoming / unreleased (pre-release target in future)
+        conn.execute(
+            "INSERT INTO release_discovery_targets (id, manga_id, series_id, volume_number, release_date, status)
+             VALUES (910, 9, 'manga:9', 10.0, '2099-01-01', 'pre')",
+            [],
+        ).unwrap();
+
+        let timeline = get_series_timeline(&conn, 9).unwrap();
+        assert_eq!(timeline.volumes.len(), 10);
+        assert_eq!(timeline.gaps.owned_count, 9);
+        assert_eq!(timeline.gaps.missing_count, 0); // Future volume is NOT a missing gap!
+        assert_eq!(timeline.gaps.unreleased_count, 1);
+        assert_eq!(timeline.gaps.trailing_gap_count, 0);
+        assert_eq!(timeline.gaps.interior_gap_count, 0);
+        assert!(!timeline.gaps.has_interior_gaps);
+        assert!(timeline.gaps.gap_volume_numbers.is_empty());
+
+        let vol10 = timeline.volumes.iter().find(|v| (v.volume_number - 10.0).abs() < 0.001).unwrap();
+        assert_eq!(vol10.status, "UNRELEASED_FUTURE");
+        assert!(!vol10.is_owned);
+        assert!(!vol10.is_gap);
+        assert_eq!(vol10.gap_type, None);
+
+        assert!(timeline.gaps.summary_text.contains("Up to date: All 9 released volumes owned (1 upcoming)"));
+    }
 }

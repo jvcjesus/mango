@@ -54,6 +54,8 @@ pub struct SeriesGapAnalysisDto {
     pub total_volumes: usize,
     pub owned_count: usize,
     pub missing_count: usize,
+    #[serde(default)]
+    pub unreleased_count: usize,
     pub interior_gap_count: usize,
     pub leading_gap_count: usize,
     pub trailing_gap_count: usize,
@@ -525,11 +527,19 @@ pub fn get_series_timeline(conn: &Connection, manga_id: i64) -> Result<SeriesTim
         let canonical_path = canonical_volume_paths.get(key).cloned();
         let download_job_id = active_jobs_map.get(key).cloned();
 
-        // Gap classification
+        // Gap and status resolution
+        let is_future = if let Some((target_date, target_stat)) = opentome_targets.get(key) {
+            target_stat == "pre" || target_date > &now_date_str
+        } else if let Some(ref r_date) = release_date {
+            r_date > &now_date_str
+        } else {
+            false
+        };
+
         let mut is_gap = false;
         let mut gap_type: Option<String> = None;
 
-        if !is_owned {
+        if !is_owned && !is_future {
             if let (Some(min_o), Some(max_o)) = (min_owned_key, max_owned_key) {
                 if *key > min_o && *key < max_o {
                     is_gap = true;
@@ -548,7 +558,7 @@ pub fn get_series_timeline(conn: &Connection, manga_id: i64) -> Result<SeriesTim
                     gap_volume_numbers.push(vol_num);
                 }
             } else {
-                // If nothing is owned yet, all official unowned volumes are LEADING
+                // If nothing is owned yet, all official released unowned volumes are LEADING
                 is_gap = true;
                 gap_type = Some("LEADING".to_string());
                 leading_gap_count += 1;
@@ -565,12 +575,8 @@ pub fn get_series_timeline(conn: &Connection, manga_id: i64) -> Result<SeriesTim
             "CANDIDATE_AVAILABLE".to_string()
         } else if candidate_count > 0 {
             "CANDIDATE_UNAVAILABLE".to_string()
-        } else if let Some(ref r_date) = release_date {
-            if r_date > &now_date_str {
-                "UNRELEASED_FUTURE".to_string()
-            } else {
-                "RELEASED_MISSING".to_string()
-            }
+        } else if is_future {
+            "UNRELEASED_FUTURE".to_string()
         } else if collection_id.is_none() {
             "COLLECTION_UNAVAILABLE".to_string()
         } else if review_reason.is_some() || reconciliation_status == "review_required" {
@@ -662,7 +668,8 @@ pub fn get_series_timeline(conn: &Connection, manga_id: i64) -> Result<SeriesTim
     // 12. Gap Analysis DTO
     let total_vols_count = volumes_dto.len();
     let owned_count = owned_keys_sorted.len();
-    let missing_count = total_vols_count.saturating_sub(owned_count);
+    let unreleased_count = volumes_dto.iter().filter(|v| v.status == "UNRELEASED_FUTURE").count();
+    let missing_count = gap_volume_numbers.len();
     let has_interior_gaps = interior_gap_count > 0;
 
     let summary_text = if total_vols_count == 0 {
@@ -672,12 +679,19 @@ pub fn get_series_timeline(conn: &Connection, manga_id: i64) -> Result<SeriesTim
             "Interior volume gap detected: {} missing volume(s) between owned volumes",
             interior_gap_count
         )
+    } else if missing_count == 0 && unreleased_count > 0 {
+        format!(
+            "Up to date: All {} released volumes owned ({} upcoming)",
+            owned_count, unreleased_count
+        )
     } else if missing_count == 0 {
         format!("Complete library: All {} volumes canonically owned", owned_count)
     } else {
         format!(
-            "Contiguous library: {} of {} volumes owned ({} remaining)",
-            owned_count, total_vols_count, missing_count
+            "Contiguous library: {} of {} released volumes owned ({} remaining)",
+            owned_count,
+            owned_count + missing_count,
+            missing_count
         )
     };
 
@@ -685,6 +699,7 @@ pub fn get_series_timeline(conn: &Connection, manga_id: i64) -> Result<SeriesTim
         total_volumes: total_vols_count,
         owned_count,
         missing_count,
+        unreleased_count,
         interior_gap_count,
         leading_gap_count,
         trailing_gap_count,
