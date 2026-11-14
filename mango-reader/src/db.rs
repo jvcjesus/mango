@@ -188,6 +188,29 @@ pub(crate) fn migrate(conn: &mut Connection) -> Result<()> {
             "the database was written by a newer Mango",
         ));
     }
+
+    // Compatibility check for databases originating from upstream apixelsnet/mango releases
+    // where user_version was incremented without fork migrations 012-016.
+    let has_fork_sync: bool = conn
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='tracker_mappings'",
+            [],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+
+    if !has_fork_sync && seen >= 12 {
+        tracing::info!(
+            "Detected upstream Mango database with user_version={seen}; applying missing fork foundational migrations 012-016"
+        );
+        for sql in &MIGRATIONS[11..seen.min(16)] {
+            let tx = conn.transaction()?;
+            tx.execute_batch(sql)?;
+            tx.commit()?;
+        }
+    }
+
     for (done, sql) in MIGRATIONS.iter().enumerate().skip(seen) {
         let tx = conn.transaction()?;
         tx.execute_batch(sql)?;
@@ -252,5 +275,42 @@ mod tests {
             .unwrap();
         assert_eq!(owner, (1, "hash".into(), 1));
         assert_eq!(state(&conn, "auth.password").unwrap(), None);
+    }
+
+    #[test]
+    fn upstream_mango_upgrade_backfills_012_to_016() {
+        let mut conn = Connection::open_in_memory().unwrap();
+        // Upstream Mango had 11 migrations in early releases, but reached version 16
+        for sql in &MIGRATIONS[..11] {
+            conn.execute_batch(sql).unwrap();
+        }
+        conn.execute_batch("PRAGMA user_version = 16").unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA user_version", [], |r| r.get::<_, i64>(0)).unwrap(),
+            16
+        );
+
+        // Run migrate; must detect upstream and backfill 012-016, then advance 17-50
+        migrate(&mut conn).unwrap();
+
+        let final_ver: i64 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(final_ver as usize, MIGRATIONS.len());
+
+        // Verify fork tables and columns are present
+        let has_tracker_mappings: bool = conn
+            .query_row(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='tracker_mappings'",
+                [],
+                |_| Ok(true),
+            )
+            .unwrap();
+        assert!(has_tracker_mappings);
+
+        let has_published_path: bool = conn
+            .prepare("SELECT published_path FROM downloads")
+            .is_ok();
+        assert!(has_published_path);
     }
 }
