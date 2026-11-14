@@ -3711,3 +3711,172 @@ fn test_m6_8_3_manual_mapping_and_library_integrity() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn test_v1_1_richer_tracked_owned_reading_acquiring_semantics() {
+    let dir = std::env::temp_dir().join("mango-test-v1-1-semantics");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = Db::open(&dir.join("test.db")).expect("test db");
+    let conn = db.second().expect("conn");
+
+    // Title 1: Chainsaw Man (has active download + manga.auto_acquire = 1 + reading ahead)
+    conn.execute(
+        "INSERT INTO manga (id, title, source_id, url, auto_acquire) VALUES (101, 'Chainsaw Man', 0, 'mangabaka:101', 1)",
+        [],
+    ).unwrap();
+    conn.execute(
+        "INSERT INTO chapters (id, manga_id, url, name, chapter_number, source_order, fetched_at)
+         VALUES (501, 101, 'csm:1', 'Ch 1', 1.0, 0, 1700000000)",
+        [],
+    ).unwrap();
+    conn.execute(
+        "INSERT INTO downloads (chapter_id, position, state, added_at)
+         VALUES (501, 0, 'downloading', 1700000000)",
+        [],
+    ).unwrap();
+
+    let csm_entry = TrackerListEntry {
+        tracker: "anilist".to_string(),
+        tracker_id: "csm_al".to_string(),
+        title: "Chainsaw Man".to_string(),
+        status: "CURRENT".to_string(),
+        normalized_status: "Reading".to_string(),
+        progress_volume: Some(12.0),
+        progress_chapter: Some(97.0),
+        total_volumes: Some(18),
+        total_chapters: Some(150),
+        updated_at: 1700000000,
+        ..Default::default()
+    };
+
+    // Title 2: Dandadan (has pending Acquisition Inbox review proposal)
+    conn.execute(
+        "INSERT INTO manga (id, title, source_id, url, auto_acquire) VALUES (102, 'Dandadan', 0, 'mangabaka:102', 0)",
+        [],
+    ).unwrap();
+    conn.execute(
+        "INSERT INTO acquisition_review_queue (
+            manga_id, series_id, series_title, volume_number, recommended_candidate_id,
+            provider, title, raw_title, quality_score, status, created_at, updated_at
+         ) VALUES (
+            102, 'mb:102', 'Dandadan', 5.0, 'cand:1',
+            'nyaa', 'Dandadan v05', 'Dandadan v05 (Digital)', 95.0, 'pending', 1700000000, 1700000000
+         )",
+        [],
+    ).unwrap();
+
+    let ddd_entry = TrackerListEntry {
+        tracker: "anilist".to_string(),
+        tracker_id: "ddd_al".to_string(),
+        title: "Dandadan".to_string(),
+        status: "CURRENT".to_string(),
+        normalized_status: "Reading".to_string(),
+        progress_volume: Some(4.0),
+        progress_chapter: Some(30.0),
+        total_volumes: Some(16),
+        total_chapters: Some(120),
+        updated_at: 1700000000,
+        ..Default::default()
+    };
+
+    // Title 3: Sakamoto Days (has active release availability watcher)
+    conn.execute(
+        "INSERT INTO manga (id, title, source_id, url, auto_acquire) VALUES (103, 'Sakamoto Days', 0, 'mangabaka:103', 0)",
+        [],
+    ).unwrap();
+    conn.execute(
+        "INSERT INTO release_availability_watchers (
+            series_id, manga_id, series_title, volume_number, monitoring_enabled, state, created_at, updated_at
+         ) VALUES (
+            'mb:103', 103, 'Sakamoto Days', 11.0, 1, 'UPCOMING', 1700000000, 1700000000
+         )",
+        [],
+    ).unwrap();
+
+    let skm_entry = TrackerListEntry {
+        tracker: "anilist".to_string(),
+        tracker_id: "skm_al".to_string(),
+        title: "Sakamoto Days".to_string(),
+        status: "PLANNING".to_string(),
+        normalized_status: "Planning".to_string(),
+        progress_volume: Some(0.0),
+        progress_chapter: Some(0.0),
+        total_volumes: Some(19),
+        total_chapters: Some(160),
+        updated_at: 1700000000,
+        ..Default::default()
+    };
+
+    upsert_tracker_list_entries(&conn, &[csm_entry, ddd_entry, skm_entry]).unwrap();
+
+    // 1. Unfiltered query
+    let res = build_unified_catalog(&conn, &[], &ListsQuery::default()).unwrap();
+    assert_eq!(res.items.len(), 3);
+
+    // Verify Chainsaw Man
+    let csm = res.items.iter().find(|i| i.title == "Chainsaw Man").unwrap();
+    assert_eq!(csm.acquisition_status, "Downloading");
+    assert_eq!(csm.auto_acquire, true);
+    assert_eq!(csm.ownership_status, "Not Owned");
+    assert_eq!(csm.is_ahead_of_library, true);
+    assert_eq!(csm.progress_volume, Some(12.0));
+
+    // Verify Dandadan
+    let ddd = res.items.iter().find(|i| i.title == "Dandadan").unwrap();
+    assert_eq!(ddd.acquisition_status, "Inbox");
+    assert_eq!(ddd.inbox_count, Some(1));
+    assert_eq!(ddd.auto_acquire, false);
+
+    // Verify Sakamoto Days
+    let skm = res.items.iter().find(|i| i.title == "Sakamoto Days").unwrap();
+    assert_eq!(skm.acquisition_status, "Monitored");
+    assert_eq!(skm.auto_acquire, false);
+
+    // Verify Summary
+    assert_eq!(res.summary.total, 3);
+    assert_eq!(res.summary.reading, 2);
+    assert_eq!(res.summary.planning, 1);
+    assert_eq!(res.summary.acquiring, 1); // Chainsaw Man
+    assert_eq!(res.summary.inbox, 1);     // Dandadan
+    assert_eq!(res.summary.monitored, 1); // Sakamoto Days
+    assert_eq!(res.summary.auto_acquire, 1); // Chainsaw Man
+
+    // 2. Query filtered by acquisition = "downloading"
+    let q_dl = ListsQuery {
+        acquisition: Some("downloading".into()),
+        ..Default::default()
+    };
+    let res_dl = build_unified_catalog(&conn, &[], &q_dl).unwrap();
+    assert_eq!(res_dl.items.len(), 1);
+    assert_eq!(res_dl.items[0].title, "Chainsaw Man");
+
+    // 3. Query filtered by acquisition = "inbox"
+    let q_inbox = ListsQuery {
+        acquisition: Some("inbox".into()),
+        ..Default::default()
+    };
+    let res_inbox = build_unified_catalog(&conn, &[], &q_inbox).unwrap();
+    assert_eq!(res_inbox.items.len(), 1);
+    assert_eq!(res_inbox.items[0].title, "Dandadan");
+
+    // 4. Query filtered by acquisition = "monitored"
+    let q_mon = ListsQuery {
+        acquisition: Some("monitored".into()),
+        ..Default::default()
+    };
+    let res_mon = build_unified_catalog(&conn, &[], &q_mon).unwrap();
+    assert_eq!(res_mon.items.len(), 1);
+    assert_eq!(res_mon.items[0].title, "Sakamoto Days");
+
+    // 5. Query filtered by auto_acquire = true
+    let q_auto = ListsQuery {
+        auto_acquire: Some(true),
+        ..Default::default()
+    };
+    let res_auto = build_unified_catalog(&conn, &[], &q_auto).unwrap();
+    assert_eq!(res_auto.items.len(), 1);
+    assert_eq!(res_auto.items[0].title, "Chainsaw Man");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

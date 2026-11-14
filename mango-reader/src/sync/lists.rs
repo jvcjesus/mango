@@ -123,9 +123,18 @@ pub struct UnifiedTrackedItem {
     pub total_units: Option<i64>,
     pub komga_series_id: Option<String>,
 
-    pub acquisition_status: String, // "Idle", "Queued", "Acquiring", "Failed"
+    pub acquisition_status: String, // "Idle", "Monitored", "Inbox", "Queued", "Downloading", "Failed"
+    #[serde(default)]
+    pub inbox_count: Option<usize>,
     pub auto_acquire: bool,
     pub manga_id: Option<i64>,
+
+    #[serde(default)]
+    pub progress_volume: Option<f64>,
+    #[serde(default)]
+    pub progress_chapter: Option<f64>,
+    #[serde(default)]
+    pub is_ahead_of_library: bool,
 
     pub updated_at: i64,
 }
@@ -249,6 +258,14 @@ pub struct UnifiedCatalogSummary {
     pub owned: usize,
     pub partially_owned: usize,
     pub not_owned: usize,
+    #[serde(default)]
+    pub acquiring: usize,
+    #[serde(default)]
+    pub inbox: usize,
+    #[serde(default)]
+    pub monitored: usize,
+    #[serde(default)]
+    pub auto_acquire: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -266,6 +283,8 @@ pub struct ListsQuery {
     pub tracker: Option<String>,
     pub q: Option<String>,
     pub sort: Option<String>,
+    pub acquisition: Option<String>,
+    pub auto_acquire: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -670,6 +689,77 @@ fn resolve_ownership(
     }
 }
 
+/// Resolves the unified acquisition status for a tracked title across downloads, inbox, and watchers.
+fn resolve_acquisition_status(
+    manga_id: Option<i64>,
+    norm_title: &str,
+    aliases: &[String],
+    manga_downloads: &HashMap<i64, (bool, bool, bool)>,
+    manga_inbox: &HashMap<i64, usize>,
+    title_inbox: &HashMap<String, usize>,
+    manga_watchers: &HashMap<i64, usize>,
+    title_watchers: &HashMap<String, usize>,
+) -> (String, Option<usize>) {
+    // 1. Check active downloads if manga_id is known
+    if let Some(mid) = manga_id {
+        if let Some(&(dl, queued, failed)) = manga_downloads.get(&mid) {
+            if dl {
+                return ("Downloading".to_string(), None);
+            }
+            if queued {
+                return ("Queued".to_string(), None);
+            }
+            if failed {
+                return ("Failed".to_string(), None);
+            }
+        }
+    }
+
+    // 2. Check pending Acquisition Inbox proposals
+    let mut inbox_count = manga_id
+        .and_then(|mid| manga_inbox.get(&mid).copied())
+        .unwrap_or(0);
+    if inbox_count == 0 {
+        if let Some(&cnt) = title_inbox.get(norm_title) {
+            inbox_count = cnt;
+        } else {
+            for a in aliases {
+                let a_norm = normalize_title(a);
+                if let Some(&cnt) = title_inbox.get(&a_norm) {
+                    inbox_count = cnt;
+                    break;
+                }
+            }
+        }
+    }
+    if inbox_count > 0 {
+        return ("Inbox".to_string(), Some(inbox_count));
+    }
+
+    // 3. Check active release availability watchers
+    let mut watcher_count = manga_id
+        .and_then(|mid| manga_watchers.get(&mid).copied())
+        .unwrap_or(0);
+    if watcher_count == 0 {
+        if let Some(&cnt) = title_watchers.get(norm_title) {
+            watcher_count = cnt;
+        } else {
+            for a in aliases {
+                let a_norm = normalize_title(a);
+                if let Some(&cnt) = title_watchers.get(&a_norm) {
+                    watcher_count = cnt;
+                    break;
+                }
+            }
+        }
+    }
+    if watcher_count > 0 {
+        return ("Monitored".to_string(), None);
+    }
+
+    ("Idle".to_string(), None)
+}
+
 /// Assembles the unified catalog from cached tracker list entries, DB mappings,
 /// tracked catalog entries, and Komga series ownership.
 pub fn build_unified_catalog(
@@ -682,6 +772,87 @@ pub fn build_unified_catalog(
     let mappings = list_mappings(conn, None)?;
     let tracked_rows = list_tracked(conn).unwrap_or_default();
     let reconciliations = list_reconciliations(conn).unwrap_or_default();
+
+    // Preload manga table auto_acquire flags: manga_id -> auto_acquire
+    let mut manga_auto_acquire: HashMap<i64, bool> = HashMap::new();
+    if let Ok(mut stmt) = conn.prepare("SELECT id, auto_acquire FROM manga") {
+        if let Ok(rows) = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)? == 1))) {
+            for row in rows.flatten() {
+                manga_auto_acquire.insert(row.0, row.1);
+            }
+        }
+    }
+
+    // Preload active downloads summary: manga_id -> (has_downloading, has_queued, has_failed)
+    let mut manga_downloads: HashMap<i64, (bool, bool, bool)> = HashMap::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT c.manga_id, d.state, count(*)
+         FROM downloads d
+         JOIN chapters c ON d.chapter_id = c.id
+         GROUP BY c.manga_id, d.state",
+    ) {
+        if let Ok(rows) = stmt.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+        }) {
+            for row in rows.flatten() {
+                let entry = manga_downloads.entry(row.0).or_insert((false, false, false));
+                match row.1.as_str() {
+                    "downloading" | "processing" | "staged" => entry.0 = true,
+                    "queued" => entry.1 = true,
+                    "failed" => entry.2 = true,
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    // Preload pending acquisition proposals in inbox
+    let mut manga_inbox: HashMap<i64, usize> = HashMap::new();
+    let mut title_inbox: HashMap<String, usize> = HashMap::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT manga_id, series_title, count(*)
+         FROM acquisition_review_queue
+         WHERE status = 'pending'
+         GROUP BY manga_id, series_title",
+    ) {
+        if let Ok(rows) = stmt.query_map([], |r| {
+            Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, String>(1)?, r.get::<_, usize>(2)?))
+        }) {
+            for row in rows.flatten() {
+                if let Some(mid) = row.0 {
+                    *manga_inbox.entry(mid).or_insert(0) += row.2;
+                }
+                let norm = normalize_title(&row.1);
+                if !norm.is_empty() {
+                    *title_inbox.entry(norm).or_insert(0) += row.2;
+                }
+            }
+        }
+    }
+
+    // Preload active release watchers
+    let mut manga_watchers: HashMap<i64, usize> = HashMap::new();
+    let mut title_watchers: HashMap<String, usize> = HashMap::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT manga_id, series_title, count(*)
+         FROM release_availability_watchers
+         WHERE monitoring_enabled = 1 AND state NOT IN ('OWNERSHIP_DETECTED', 'MONITORING_DISABLED')
+         GROUP BY manga_id, series_title",
+    ) {
+        if let Ok(rows) = stmt.query_map([], |r| {
+            Ok((r.get::<_, Option<i64>>(0)?, r.get::<_, String>(1)?, r.get::<_, usize>(2)?))
+        }) {
+            for row in rows.flatten() {
+                if let Some(mid) = row.0 {
+                    *manga_watchers.entry(mid).or_insert(0) += row.2;
+                }
+                let norm = normalize_title(&row.1);
+                if !norm.is_empty() {
+                    *title_watchers.entry(norm).or_insert(0) += row.2;
+                }
+            }
+        }
+    }
 
     // Map komga_series_id -> KomgaSeriesProgress
     let komga_map: HashMap<&str, &KomgaSeriesProgress> = komga_series_list
@@ -851,8 +1022,6 @@ pub fn build_unified_catalog(
             normalize_title(&t.title) == al_norm
         });
 
-        let auto_acquire = tracked_entry.map_or(false, |t| t.auto_acquire);
-
         let mb_numeric_id = matched_mb.and_then(|m| m.tracker_id.parse::<i64>().ok());
         let manga_id = find_local_manga_id(
             conn,
@@ -860,6 +1029,10 @@ pub fn build_unified_catalog(
             mb_numeric_id,
             &display_title,
         );
+
+        let auto_acquire = manga_id
+            .and_then(|mid| manga_auto_acquire.get(&mid).copied())
+            .unwrap_or_else(|| tracked_entry.map_or(false, |t| t.auto_acquire));
 
         let fallback_total_units = al
             .total_volumes
@@ -1009,6 +1182,43 @@ pub fn build_unified_catalog(
         let updated_at = al.updated_at.max(matched_mb.map_or(0, |m| m.updated_at));
         let catalog = resolve_catalog_info(conn, matched_mb, &display_title);
 
+        let (acquisition_status, inbox_count) = resolve_acquisition_status(
+            manga_id,
+            &al_norm,
+            &unified_aliases,
+            &manga_downloads,
+            &manga_inbox,
+            &title_inbox,
+            &manga_watchers,
+            &title_watchers,
+        );
+
+        let progress_volume = al
+            .progress_volume
+            .or_else(|| matched_mb.and_then(|m| m.progress_volume))
+            .or_else(|| komga_prog.and_then(|p| p.highest_completed_volume));
+
+        let progress_chapter = al
+            .progress_chapter
+            .or_else(|| matched_mb.and_then(|m| m.progress_chapter))
+            .or_else(|| komga_prog.and_then(|p| p.highest_completed_chapter));
+
+        let is_ahead_of_library = if let Some(owned) = owned_units {
+            if owned == 0
+                && (progress_volume.unwrap_or(0.0) > 0.0 || progress_chapter.unwrap_or(0.0) > 0.0)
+            {
+                true
+            } else {
+                progress_volume.map_or(false, |pv| pv > owned as f64)
+            }
+        } else if ownership_status == "Not Owned"
+            && (progress_volume.unwrap_or(0.0) > 0.0 || progress_chapter.unwrap_or(0.0) > 0.0)
+        {
+            true
+        } else {
+            false
+        };
+
         unified_items.push(UnifiedTrackedItem {
             id: composite_id,
             title: display_title,
@@ -1023,9 +1233,13 @@ pub fn build_unified_catalog(
             owned_units,
             total_units,
             komga_series_id: komga_id,
-            acquisition_status: "Idle".to_string(),
+            acquisition_status,
+            inbox_count,
             auto_acquire,
             manga_id,
+            progress_volume,
+            progress_chapter,
+            is_ahead_of_library,
             updated_at,
         });
     }
@@ -1066,7 +1280,6 @@ pub fn build_unified_catalog(
             normalize_title(&t.title) == mb_norm
         });
 
-        let auto_acquire = tracked_entry.map_or(false, |t| t.auto_acquire);
         let mb_numeric_id = mb.tracker_id.parse::<i64>().ok();
 
         let manga_id = find_local_manga_id(
@@ -1075,6 +1288,10 @@ pub fn build_unified_catalog(
             mb_numeric_id,
             &display_title,
         );
+
+        let auto_acquire = manga_id
+            .and_then(|mid| manga_auto_acquire.get(&mid).copied())
+            .unwrap_or_else(|| tracked_entry.map_or(false, |t| t.auto_acquire));
 
         let fallback_total_units = mb.total_volumes.or(mb.total_chapters);
 
@@ -1151,6 +1368,41 @@ pub fn build_unified_catalog(
 
         let catalog = resolve_catalog_info(conn, Some(mb), &display_title);
 
+        let (acquisition_status, inbox_count) = resolve_acquisition_status(
+            manga_id,
+            &mb_norm,
+            &unified_aliases,
+            &manga_downloads,
+            &manga_inbox,
+            &title_inbox,
+            &manga_watchers,
+            &title_watchers,
+        );
+
+        let progress_volume = mb
+            .progress_volume
+            .or_else(|| komga_prog.and_then(|p| p.highest_completed_volume));
+
+        let progress_chapter = mb
+            .progress_chapter
+            .or_else(|| komga_prog.and_then(|p| p.highest_completed_chapter));
+
+        let is_ahead_of_library = if let Some(owned) = owned_units {
+            if owned == 0
+                && (progress_volume.unwrap_or(0.0) > 0.0 || progress_chapter.unwrap_or(0.0) > 0.0)
+            {
+                true
+            } else {
+                progress_volume.map_or(false, |pv| pv > owned as f64)
+            }
+        } else if ownership_status == "Not Owned"
+            && (progress_volume.unwrap_or(0.0) > 0.0 || progress_chapter.unwrap_or(0.0) > 0.0)
+        {
+            true
+        } else {
+            false
+        };
+
         unified_items.push(UnifiedTrackedItem {
             id: format!("mb-{}", mb.tracker_id),
             title: display_title,
@@ -1165,9 +1417,13 @@ pub fn build_unified_catalog(
             owned_units,
             total_units,
             komga_series_id: komga_id,
-            acquisition_status: "Idle".to_string(),
+            acquisition_status,
+            inbox_count,
             auto_acquire,
             manga_id,
+            progress_volume,
+            progress_chapter,
+            is_ahead_of_library,
             updated_at: mb.updated_at,
         });
     }
@@ -1192,6 +1448,16 @@ pub fn build_unified_catalog(
             "Owned" | "Up to date" | "Complete" => summary.owned += 1,
             "Partially Owned" => summary.partially_owned += 1,
             _ => summary.not_owned += 1,
+        }
+
+        match item.acquisition_status.as_str() {
+            "Downloading" | "Queued" => summary.acquiring += 1,
+            "Inbox" => summary.inbox += 1,
+            "Monitored" => summary.monitored += 1,
+            _ => {}
+        }
+        if item.auto_acquire {
+            summary.auto_acquire += 1;
         }
     }
 
@@ -1249,6 +1515,50 @@ pub fn build_unified_catalog(
                     if !match_title && !match_alias {
                         return false;
                     }
+                }
+            }
+            if let Some(ref acq) = query.acquisition {
+                let acq_norm = acq.trim().to_lowercase();
+                if !acq_norm.is_empty() && acq_norm != "all" {
+                    match acq_norm.as_str() {
+                        "active" => {
+                            if item.acquisition_status == "Idle" {
+                                return false;
+                            }
+                        }
+                        "idle" => {
+                            if item.acquisition_status != "Idle" {
+                                return false;
+                            }
+                        }
+                        "inbox" => {
+                            if item.acquisition_status != "Inbox" {
+                                return false;
+                            }
+                        }
+                        "downloading" => {
+                            if item.acquisition_status != "Downloading"
+                                && item.acquisition_status != "Queued"
+                            {
+                                return false;
+                            }
+                        }
+                        "monitored" => {
+                            if item.acquisition_status != "Monitored" {
+                                return false;
+                            }
+                        }
+                        other => {
+                            if !item.acquisition_status.eq_ignore_ascii_case(other) {
+                                return false;
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(req_auto) = query.auto_acquire {
+                if item.auto_acquire != req_auto {
+                    return false;
                 }
             }
             true

@@ -740,9 +740,13 @@ export interface UnifiedTrackedItem {
   ownedUnits?: number | null;
   totalUnits?: number | null;
   komgaSeriesId?: string | null;
-  acquisitionStatus: string;
+  acquisitionStatus: string; // "Idle" | "Monitored" | "Inbox" | "Queued" | "Downloading" | "Failed"
+  inboxCount?: number | null;
   autoAcquire: boolean;
   mangaId?: number | null;
+  progressVolume?: number | null;
+  progressChapter?: number | null;
+  isAheadOfLibrary?: boolean;
   updatedAt: number;
 }
 
@@ -764,6 +768,10 @@ export interface UnifiedCatalogSummary {
   owned: number;
   partiallyOwned: number;
   notOwned: number;
+  acquiring?: number;
+  inbox?: number;
+  monitored?: number;
+  autoAcquire?: number;
 }
 
 export interface UnifiedCatalogResponse {
@@ -778,6 +786,8 @@ export interface ListsQuery {
   tracker?: string;
   q?: string;
   sort?: string;
+  acquisition?: string;
+  autoAcquire?: boolean;
 }
 
 export interface ListsRefreshReport {
@@ -793,6 +803,8 @@ export const getLists = (query?: ListsQuery) => {
   if (query?.tracker) params.set('tracker', query.tracker);
   if (query?.q) params.set('q', query.q);
   if (query?.sort) params.set('sort', query.sort);
+  if (query?.acquisition) params.set('acquisition', query.acquisition);
+  if (query?.autoAcquire !== undefined) params.set('autoAcquire', String(query.autoAcquire));
   const qs = params.toString();
   return get<UnifiedCatalogResponse>(`/lists${qs ? `?${qs}` : ''}`);
 };

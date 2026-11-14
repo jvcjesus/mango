@@ -32,6 +32,7 @@
   type StatusFilter = 'all' | 'reading' | 'planning' | 'completed' | 'paused' | 'dropped';
   type OwnershipFilter = 'all' | 'owned' | 'partially_owned' | 'not_owned';
   type TrackerFilter = 'all' | 'anilist' | 'mangabaka' | 'both';
+  type AcquisitionFilter = 'all' | 'active' | 'inbox' | 'downloading' | 'monitored' | 'idle';
   type SortOption = 'updated' | 'title' | 'progress';
 
   const cached = recall<UnifiedCatalogResponse>('tracked_lists');
@@ -44,6 +45,8 @@
   let statusFilter = $state<StatusFilter>('all');
   let ownershipFilter = $state<OwnershipFilter>('all');
   let trackerFilter = $state<TrackerFilter>('all');
+  let acquisitionFilter = $state<AcquisitionFilter>('all');
+  let autoAcquireOnly = $state<boolean>(false);
   let searchQuery = $state('');
   let sortOption = $state<SortOption>('updated');
 
@@ -150,6 +153,25 @@
           return false;
         }
       }
+      // Acquisition filter
+      if (acquisitionFilter !== 'all') {
+        const acq = item.acquisitionStatus.toLowerCase();
+        if (acquisitionFilter === 'active' && acq === 'idle') {
+          return false;
+        } else if (acquisitionFilter === 'inbox' && acq !== 'inbox') {
+          return false;
+        } else if (acquisitionFilter === 'downloading' && acq !== 'downloading' && acq !== 'queued') {
+          return false;
+        } else if (acquisitionFilter === 'monitored' && acq !== 'monitored') {
+          return false;
+        } else if (acquisitionFilter === 'idle' && acq !== 'idle') {
+          return false;
+        }
+      }
+      // Auto-acquire filter
+      if (autoAcquireOnly && !item.autoAcquire) {
+        return false;
+      }
       return true;
     });
   });
@@ -184,6 +206,30 @@
       }
     }
     return counts;
+  });
+
+  const facetedAcquisitionCounts = $derived.by(() => {
+    const counts = {
+      all: statusFacetedItems.length,
+      active: 0,
+      inbox: 0,
+      downloading: 0,
+      monitored: 0,
+      idle: 0,
+    };
+    for (const item of statusFacetedItems) {
+      const s = item.acquisitionStatus.toLowerCase();
+      if (s !== 'idle') counts.active++;
+      if (s === 'inbox') counts.inbox++;
+      if (s === 'downloading' || s === 'queued') counts.downloading++;
+      if (s === 'monitored') counts.monitored++;
+      if (s === 'idle') counts.idle++;
+    }
+    return counts;
+  });
+
+  const facetedAutoAcquireCount = $derived.by(() => {
+    return statusFacetedItems.filter((i) => i.autoAcquire).length;
   });
 
   // Items filtered by status, tracker, and search (used to calculate faceted ownership counts)
@@ -487,7 +533,7 @@
         </button>
       </div>
 
-      <!-- Ownership & Tracker Secondary Filters -->
+      <!-- Ownership, Tracker, Acquisition & Auto-Acquire Secondary Filters -->
       <div class="secondary-filters">
         <div class="filter-dropdown">
           <span class="filter-label">Ownership:</span>
@@ -498,6 +544,30 @@
             <option value="not_owned">Not Owned ({facetedOwnershipCounts.not_owned})</option>
           </select>
         </div>
+
+        <div class="filter-dropdown">
+          <span class="filter-label">Acquisition:</span>
+          <select bind:value={acquisitionFilter} aria-label="Filter by acquisition lifecycle">
+            <option value="all">All acquisition</option>
+            <option value="active">Active ({facetedAcquisitionCounts.active})</option>
+            <option value="inbox">In Inbox ({facetedAcquisitionCounts.inbox})</option>
+            <option value="downloading">Downloading ({facetedAcquisitionCounts.downloading})</option>
+            <option value="monitored">Monitored ({facetedAcquisitionCounts.monitored})</option>
+            <option value="idle">Idle ({facetedAcquisitionCounts.idle})</option>
+          </select>
+        </div>
+
+        <button
+          type="button"
+          class="filter-toggle"
+          class:active={autoAcquireOnly}
+          onclick={() => (autoAcquireOnly = !autoAcquireOnly)}
+          aria-pressed={autoAcquireOnly}
+          title="Filter titles with auto-acquire enabled"
+        >
+          <span class="dot" class:dot-on={autoAcquireOnly}></span>
+          <span>Auto-Acquire ({facetedAutoAcquireCount})</span>
+        </button>
 
         <div class="filter-dropdown">
           <span class="filter-label">Trackers:</span>
@@ -565,9 +635,23 @@
               <span class="badge ownership-badge {getOwnershipClass(item.ownershipStatus)}">
                 {item.ownershipStatus}
               </span>
+              {#if item.acquisitionStatus && item.acquisitionStatus !== 'Idle'}
+                <span class="badge acquisition-badge {item.acquisitionStatus.toLowerCase()}">
+                  {#if item.acquisitionStatus === 'Inbox' && item.inboxCount}
+                    INBOX ({item.inboxCount})
+                  {:else}
+                    {item.acquisitionStatus.toUpperCase()}
+                  {/if}
+                </span>
+              {/if}
               {#if item.autoAcquire}
                 <span class="badge auto-acquire-badge" title="Guarded auto-acquire enabled">
                   AUTO
+                </span>
+              {/if}
+              {#if item.isAheadOfLibrary}
+                <span class="badge ahead-badge" title="Reading progress is ahead of physically owned volumes">
+                  AHEAD
                 </span>
               {/if}
             </div>
@@ -578,6 +662,11 @@
 
             <div class="card-meta">
               <span class="progress-info">{formatProgress(item)}</span>
+              {#if item.isAheadOfLibrary}
+                <span class="ahead-indicator" title="User reading progress is ahead of local volumes">
+                  Ahead
+                </span>
+              {/if}
               <div class="tracker-tags">
                 {#if item.autoAcquire}
                   <span class="tracker-tag auto-tag" title="Auto-acquire enabled for this title">
@@ -818,18 +907,32 @@
             </div>
           </div>
 
-          <!-- 4. ACQUISITION -->
+          <!-- 4. ACQUISITION & AUTOMATION -->
           <div class="section-box acquisition-box">
             <div class="section-box-header">
               <span class="section-title">
                 <Icon name="download" size={16} />
-                4. ACQUISITION
+                4. ACQUISITION & AUTOMATION
               </span>
-              <span class="pill-badge {selectedItem.acquisitionStatus === 'Acquiring' ? 'active' : 'idle'}">
-                {selectedItem.acquisitionStatus}
+              <span class="pill-badge {selectedItem.acquisitionStatus !== 'Idle' ? 'active' : 'idle'}">
+                {#if selectedItem.acquisitionStatus === 'Inbox' && selectedItem.inboxCount}
+                  Inbox ({selectedItem.inboxCount} proposals)
+                {:else}
+                  {selectedItem.acquisitionStatus}
+                {/if}
               </span>
             </div>
             <div class="acquisition-actions">
+              <div class="detail-row">
+                <strong>Automation Policy:</strong>
+                <span>{selectedItem.autoAcquire ? 'Auto-Acquire Enabled (Guarded)' : 'Auto-Acquire Disabled (Manual Only)'}</span>
+              </div>
+              {#if selectedItem.isAheadOfLibrary}
+                <div class="detail-row ahead-warning">
+                  <strong>Reading Progress:</strong>
+                  <span>Reading ahead of local library (Vol {selectedItem.progressVolume ?? '—'} / Ch {selectedItem.progressChapter ?? '—'})</span>
+                </div>
+              {/if}
               {#if selectedItem.ownershipStatus === 'Owned'}
                 <div class="acquisition-status-note">
                   ✓ Library Complete: All known volumes are owned in Komga.
@@ -1332,6 +1435,97 @@
     background: rgba(34, 197, 94, 0.9);
     color: #fff;
     font-weight: 700;
+  }
+
+  .acquisition-badge {
+    font-size: 0.65rem;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    padding: 2px 6px;
+    border-radius: 3px;
+    text-transform: uppercase;
+  }
+
+  .acquisition-badge.downloading,
+  .acquisition-badge.queued {
+    background: #eab308;
+    color: #1c1917;
+  }
+
+  .acquisition-badge.inbox {
+    background: #6366f1;
+    color: #ffffff;
+  }
+
+  .acquisition-badge.monitored {
+    background: #0ea5e9;
+    color: #ffffff;
+  }
+
+  .acquisition-badge.failed {
+    background: #ef4444;
+    color: #ffffff;
+  }
+
+  .ahead-badge {
+    background: rgba(28, 25, 23, 0.85);
+    color: #f59e0b;
+    border: 1px solid rgba(245, 158, 11, 0.4);
+    font-weight: 700;
+  }
+
+  .ahead-indicator {
+    font-size: 0.7rem;
+    font-weight: 600;
+    color: #d97706;
+    background: rgba(217, 119, 6, 0.1);
+    padding: 1px 5px;
+    border-radius: 3px;
+  }
+
+  .detail-row.ahead-warning {
+    color: #b45309;
+    background: rgba(245, 158, 11, 0.08);
+    padding: 6px 8px;
+    border-radius: 4px;
+    margin-bottom: 8px;
+  }
+
+  .filter-toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.8rem;
+    font-weight: 600;
+    padding: 6px 12px;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+    background: var(--surface);
+    color: var(--text);
+    cursor: pointer;
+    transition: all 0.15s ease;
+  }
+
+  .filter-toggle:hover {
+    border-color: var(--dim);
+  }
+
+  .filter-toggle.active {
+    background: rgba(34, 197, 94, 0.15);
+    border-color: #16a34a;
+    color: #15803d;
+  }
+
+  .filter-toggle .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: var(--dim);
+    transition: background 0.15s ease;
+  }
+
+  .filter-toggle .dot.dot-on {
+    background: #16a34a;
   }
 
   /* Empty & Loading states */
