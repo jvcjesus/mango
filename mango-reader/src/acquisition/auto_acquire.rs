@@ -895,7 +895,7 @@ pub async fn evaluate_target_for_auto_acquire(
         confirm_review: Some(false),
         dry_run: None,
         authorization_token: None,
-        user_id: None,
+        user_id: Some(0), // System auto-acquire user
     };
 
     let resp = acquisition

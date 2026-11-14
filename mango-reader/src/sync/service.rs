@@ -78,6 +78,14 @@ impl SyncService {
             )
         })?;
 
+        // Concurrency isolation: lock the reader-driven tracker path during live sync to eliminate competing writers
+        let tracker_sending = self.trackers.sending_lock();
+        let _tracker_lock = if !dry_run {
+            Some(tracker_sending.lock().await)
+        } else {
+            None
+        };
+
         let (cfg, mangabaka_token, komga_api_key) = self.pipeline.load_internal_config().await?;
 
         let komga_client =
@@ -194,6 +202,29 @@ impl SyncService {
                 let record =
                     sync_series_to_anilist(&self.trackers, series_prog, mapping.as_ref(), dry_run)
                         .await;
+
+                // Concurrency & state convergence: if live update succeeded, update local tracks row
+                if !dry_run && record.category == SyncResultCategory::Updated {
+                    if let (Some(new_prog), Some(ref media_id_str)) =
+                        (record.new_progress, &record.tracker_media_id)
+                    {
+                        if let Ok(media_id) = media_id_str.parse::<i64>() {
+                            let _ = self
+                                .db
+                                .call(move |conn| {
+                                    conn.execute(
+                                        "UPDATE tracks
+                                         SET last_chapter_read = MAX(last_chapter_read, ?1)
+                                         WHERE tracker = 2 AND media_id = ?2",
+                                        rusqlite::params![new_prog, media_id],
+                                    )?;
+                                    Ok(())
+                                })
+                                .await;
+                        }
+                    }
+                }
+
                 self.record_and_tally(&mut summary, record).await;
             }
 

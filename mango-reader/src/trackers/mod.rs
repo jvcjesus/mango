@@ -603,6 +603,12 @@ impl Trackers {
         &self.http
     }
 
+    /// Returns the shared lock used when sending tracker progress.
+    /// Used by native progress synchronization to eliminate simultaneous competing writers.
+    pub fn sending_lock(&self) -> Arc<Mutex<()>> {
+        self.sending.clone()
+    }
+
     /// The signed-in account, with a token that is good for a while yet.
     pub async fn account(&self, kind: Kind) -> Result<Account> {
         let fresh = |account: &Account| account.expires_at == 0 || account.expires_at > now() + 300;

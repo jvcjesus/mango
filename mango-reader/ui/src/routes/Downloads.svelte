@@ -452,7 +452,7 @@
       const maxAtt = entry.maxAttempts ?? 5;
       return `Retrying (Attempt ${att}/${maxAtt})${wait > 0 ? ` in ${wait} min` : ''}`;
     }
-    if (entry.state === 'verifying' || entry.stage === 'verifying') return 'Published — waiting for Komga';
+    if (entry.state === 'verifying' || entry.stage === 'verifying') return 'Published locally · Waiting for Komga index scan';
     if (entry.backendType === 'torbox' && entry.state === 'downloading') {
       if (entry.bytesDownloaded !== undefined && entry.bytesDownloaded !== null && entry.bytesDownloaded > 0) {
         if (entry.totalBytes) {
@@ -514,12 +514,12 @@
       case 'metadata_failed': return 'Metadata retry';
       case 'metadata_review': return 'Metadata Needs Review';
       case 'optimizing': return 'Optimizing';
-      case 'validating': return 'Validating';
-      case 'publishing': return 'Publishing';
-      case 'komga': return 'Komga';
-      case 'verifying': return 'Verifying';
+      case 'validating': return 'Validating Archive';
+      case 'publishing': return 'Publishing Locally';
+      case 'komga': return 'Komga Scan';
+      case 'verifying': return 'Verifying with Komga';
       case 'complete':
-      case 'completed': return 'Complete';
+      case 'completed': return 'Confirmed in Komga';
       case 'failed': return 'Failed';
       default: return 'Queued';
     }

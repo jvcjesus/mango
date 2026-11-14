@@ -319,8 +319,12 @@ fn proposed_metadata(
             ));
         }
     }
+    let series_str = enrichment.series_title.as_deref().unwrap_or("").trim();
+    if !series_str.is_empty() {
+        crate::pipeline::publication_metadata::validate_canonical_series_title(series_str)?;
+    }
     let params = ComicInfoParams {
-        series: enrichment.series_title.as_deref().unwrap_or(""),
+        series: series_str,
         volume: Some(volume),
         number: None,
         is_volume: true,

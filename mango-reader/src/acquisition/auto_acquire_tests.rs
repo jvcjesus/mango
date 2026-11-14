@@ -618,3 +618,122 @@ async fn test_cross_provider_concurrency_race_unique_index_protection() {
 
     let _ = std::fs::remove_dir_all(&temp_dir);
 }
+
+// End-to-End Simulation to Live Approval Flow
+#[tokio::test]
+async fn test_e2e_simulation_to_live_approval_flow() {
+    let (db, temp_dir) = create_test_db();
+    let cur_time = now();
+
+    let temp_lib = temp_dir.clone();
+    db.call(move |conn| {
+        // Setup title with auto-acquire enabled
+        conn.execute(
+            "INSERT INTO manga (id, source_id, url, title, auto_acquire, auto_acquire_activated_at)
+             VALUES (20, 0, 'catalog:20', 'Spy x Family', 1, ?1)",
+            [cur_time - 86400],
+        )?;
+
+        // Enable TorBox backend and library directory in settings
+        conn.execute(
+            "INSERT OR REPLACE INTO state (key, value) VALUES ('acquisition.torbox_enabled', 'true')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT OR REPLACE INTO state (key, value) VALUES ('acquisition.torbox_token', 'test_token')",
+            [],
+        )?;
+        crate::settings::set(conn, "pipeline.library_dir", &serde_json::json!(temp_lib.to_str().unwrap()))?;
+
+        // Setup series reconciliation
+        conn.execute(
+            "INSERT INTO series_reconciliations (
+                series_id, manga_id, title, status, edition, owned_volumes_json, missing_volumes_json, future_volumes_json, total_official_volumes, last_reconciled_at, updated_at
+            ) VALUES ('manga:20', 20, 'Spy x Family', 'missing_volume', 'standard', '[]', '[1.0, 2.0]', '[]', 12, ?1, ?1)",
+            [cur_time],
+        )?;
+
+        // Enable global auto-acquire with simulation mode (dry_run = true)
+        set_global_auto_acquire(conn, true)?;
+        set_auto_acquire_dry_run(conn, true)?;
+
+        // Insert release discovery target
+        conn.execute(
+            "INSERT INTO release_discovery_targets (
+                id, series_id, manga_id, series_title, volume_number, market, edition,
+                release_date, release_date_precision, date_type, status, attempts,
+                max_attempts, next_attempt_at, created_at, updated_at
+            ) VALUES (
+                100, 'manga:20', 20, 'Spy x Family', 1.0, 'en', 'standard',
+                date('now', 'localtime'), 'day', 'official', 'candidate_available', 0, 7, 0, ?1, ?1
+            )",
+            [cur_time],
+        )?;
+
+        // Insert exact volume candidate
+        conn.execute(
+            "INSERT INTO discovered_release_candidates (
+                series_id, volume_number, candidate_id, provider, provider_item_id,
+                title, raw_title, match_type, size_bytes, is_digital, is_trusted,
+                score, score_explanation, magnet_url, seeders, discovered_at
+            ) VALUES (
+                'manga:20', 1.0, 'nyaa:spy_v01', 'nyaa', 'item_100',
+                'Spy x Family v01', '[danke-Empire] Spy x Family v01 (Digital).cbz', 'exact_volume',
+                150000000, 1, 1, 95.0, 'Exact match (+95)', 'magnet:?xt=urn:btih:1111111111111111111111111111111111111111', 25, ?1
+            )",
+            [cur_time],
+        )?;
+
+        Ok(())
+    }).await.unwrap();
+
+    let acq = crate::acquisition::service::AcquisitionService::new(db.clone(), reqwest::Client::new(), None, None);
+
+    // 1. Simulation evaluation: dry_run = true
+    let sim_decision = evaluate_target_for_auto_acquire(&db, &acq, 100).await.unwrap();
+    assert_eq!(sim_decision.code, AutoDecisionCode::WouldAutoAcquire);
+    assert!(sim_decision.dry_run);
+    assert_eq!(sim_decision.candidate_id.as_deref(), Some("nyaa:spy_v01"));
+    assert!(sim_decision.reason.contains("dry-run mode active"));
+
+    // Check DB target status was NOT mutated to approved during dry run
+    let target_status: String = db.call(|conn| {
+        conn.query_row("SELECT status FROM release_discovery_targets WHERE id = 100", [], |r| r.get(0))
+            .map_err(crate::error::AppError::from)
+    }).await.unwrap();
+    assert_eq!(target_status, "candidate_available");
+
+    // 2. Switch to live mode (dry_run = false)
+    db.call(|conn| set_auto_acquire_dry_run(conn, false)).await.unwrap();
+
+    let live_decision = evaluate_target_for_auto_acquire(&db, &acq, 100).await.unwrap();
+    assert_eq!(live_decision.code, AutoDecisionCode::AutoAllowed);
+    assert!(!live_decision.dry_run);
+    assert_eq!(live_decision.candidate_id.as_deref(), Some("nyaa:spy_v01"));
+
+    // Check DB target was claimed atomically and queued into acquiring
+    let claimed_status: String = db.call(|conn| {
+        conn.query_row("SELECT status FROM release_discovery_targets WHERE id = 100", [], |r| r.get(0))
+            .map_err(crate::error::AppError::from)
+    }).await.unwrap();
+    assert_eq!(claimed_status, "acquiring");
+
+    // 3. Mark volume as owned in reconciliation: subsequent check must strictly reject with Owned
+    db.call(move |conn| {
+        conn.execute(
+            "UPDATE series_reconciliations SET owned_volumes_json = '[1.0]' WHERE series_id = 'manga:20'",
+            [],
+        )?;
+        // Reset target status to candidate_available to simulate a re-evaluation
+        conn.execute(
+            "UPDATE release_discovery_targets SET status = 'candidate_available' WHERE id = 100",
+            [],
+        )?;
+        Ok(())
+    }).await.unwrap();
+
+    let owned_decision = evaluate_target_for_auto_acquire(&db, &acq, 100).await.unwrap();
+    assert_eq!(owned_decision.code, AutoDecisionCode::Owned);
+
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}
