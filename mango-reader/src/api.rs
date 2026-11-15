@@ -383,6 +383,7 @@ pub fn router(state: Spaces) -> Router {
         .route("/downloads/{chapter}/fallback-candidates", get(get_download_fallback_candidates))
         .route("/downloads/{chapter}/fallback-switch", post(post_download_fallback_switch))
         .route("/downloads/recovery-summary", get(get_downloads_recovery_summary))
+        .route("/downloads/transfer-diagnostics", get(get_transfer_diagnostics))
         .route(
             "/downloads/{chapter}/retry-metadata",
             post(retry_metadata_download),
@@ -4809,6 +4810,14 @@ async fn get_downloads_recovery_summary(
         .call(move |conn| crate::pipeline::recovery::list_all_recovery_info(conn))
         .await?;
     Ok(Json(summary))
+}
+
+async fn get_transfer_diagnostics(
+    Me(app): Me,
+) -> Result<Json<Vec<crate::transfer::TransferProgress>>> {
+    app.me.admin()?;
+    let list = app.downloads.tracker.get_all_progress();
+    Ok(Json(list))
 }
 
 async fn get_download_fallback_candidates(

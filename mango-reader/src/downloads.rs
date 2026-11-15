@@ -203,7 +203,7 @@ pub struct Downloads {
     live_stage: Arc<StdMutex<Option<AcquisitionLiveState>>>,
     pipeline: Option<Arc<crate::pipeline::Pipeline>>,
     pub(crate) acquisition: Option<Arc<crate::acquisition::service::AcquisitionService>>,
-    pub(crate) tracker: crate::transfer::TransferTracker,
+    pub tracker: crate::transfer::TransferTracker,
 }
 
 impl Downloads {

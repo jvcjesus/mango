@@ -11,7 +11,13 @@
     getDownloadRecoveryInfo,
     getDownloadFallbackCandidates,
     switchDownloadFallback,
+    getDownloadsRecoverySummary,
+    getSystemIntegrity,
+    getTransferDiagnostics,
     type DownloadRecoveryInfo,
+    type DownloadRecoverySummary,
+    type LibraryIntegrityReport,
+    type TransferProgressDto,
     type FallbackEvaluation,
     type PipelineEvent,
     type Queue,
@@ -169,6 +175,9 @@
 
   // Health summary state
   let healthSummary = $state<AcquisitionOperationsSummaryDto | null>(null);
+  let recoverySummary = $state<DownloadRecoverySummary | null>(null);
+  let integrityReport = $state<LibraryIntegrityReport | null>(null);
+  let transferDiagnostics = $state<TransferProgressDto[]>([]);
   let healthLoading = $state(false);
   let healthError = $state<string | null>(null);
 
@@ -176,7 +185,16 @@
     healthLoading = true;
     healthError = null;
     try {
-      healthSummary = await getAcquisitionOperationsSummary();
+      const [ops, rec, integ, diag] = await Promise.all([
+        getAcquisitionOperationsSummary(),
+        getDownloadsRecoverySummary().catch(() => null),
+        getSystemIntegrity().catch(() => null),
+        getTransferDiagnostics().catch(() => []),
+      ]);
+      healthSummary = ops;
+      recoverySummary = rec;
+      integrityReport = integ;
+      transferDiagnostics = diag;
     } catch (e) {
       healthError = message(e);
     } finally {
@@ -1287,6 +1305,121 @@
             </a>
           </div>
         </div>
+
+        <!-- TRANSFER LIFECYCLE & DIAGNOSTICS (Milestone v1.6) -->
+        <div class="operations-links-card">
+          <div class="card-header-row">
+            <div>
+              <h3 class="display sub-title">TRANSFER LIFECYCLE & WORKER DIAGNOSTICS</h3>
+              <span class="muted">Live progress, byte throughput, stall detection, and retry backoffs across active workers.</span>
+            </div>
+          </div>
+          {#if transferDiagnostics.length === 0}
+            <p class="muted" style="margin-top: 0.5rem;">No active streaming transfers in flight.</p>
+          {:else}
+            <ul class="rows" style="margin-top: 0.75rem;">
+              {#each transferDiagnostics as diag (diag.chapterId)}
+                <li class="event-item card-nested">
+                  <div class="main">
+                    <div class="row-header">
+                      <strong>Chapter / Volume #{diag.chapterId}</strong>
+                      <span class="status-badge" class:status-valid={diag.status === 'completed'} class:status-failed={diag.status === 'failed' || diag.isStalled}>
+                        {diag.status.toUpperCase()}{diag.isStalled ? ' (STALLED)' : ''}
+                      </span>
+                    </div>
+                    <div class="muted small" style="margin-top: 0.25rem;">
+                      <span>Downloaded: <strong>{formatBytes(diag.bytesDownloaded)}</strong></span>
+                      {#if diag.totalBytes}
+                        <span> / {formatBytes(diag.totalBytes)}</span>
+                      {/if}
+                      <span> · Attempt {diag.attempt} of {diag.maxAttempts}</span>
+                      {#if diag.error}
+                        <span class="danger" style="margin-left: 0.5rem;">({diag.error})</span>
+                      {/if}
+                    </div>
+                  </div>
+                </li>
+              {/each}
+            </ul>
+          {/if}
+        </div>
+
+        <!-- RECOVERABLE DOWNLOADS SUMMARY (Milestone v1.6) -->
+        {#if recoverySummary && recoverySummary.items.length > 0}
+          <div class="operations-links-card">
+            <div class="card-header-row">
+              <div>
+                <h3 class="display sub-title">RECOVERABLE JOB FAILURES ({recoverySummary.recoverableDownloadsCount} recoverable)</h3>
+                <span class="muted">Failures with intact staged or published media eligible for deterministic resume or verification.</span>
+              </div>
+            </div>
+            <ul class="rows" style="margin-top: 0.75rem;">
+              {#each recoverySummary.items as rec (rec.chapterId)}
+                <li class="event-item card-nested">
+                  <div class="main">
+                    <div class="row-header">
+                      <strong>{rec.title} · {rec.chapterName}</strong>
+                      <span class="status-badge status-failed">{rec.failedStage}</span>
+                    </div>
+                    <div class="muted small" style="margin-top: 0.25rem;">
+                      <span>Category: <strong>{rec.errorCategory}</strong></span>
+                      <span> · Recommended: <strong>{rec.recommendedAction.replace(/_/g, ' ')}</strong></span>
+                      {#if rec.errorMessage}
+                        <div class="danger" style="margin-top: 0.25rem;">{rec.errorMessage}</div>
+                      {/if}
+                    </div>
+                  </div>
+                  <div class="actions">
+                    <button class="btn pill small spot" onclick={() => openRecoveryInspector(rec.chapterId)}>
+                      <Icon name="sliders" size={14} /> Inspect & Recover
+                    </button>
+                  </div>
+                </li>
+              {/each}
+            </ul>
+          </div>
+        {/if}
+
+        <!-- LIBRARY HEALTH & KOMGA INTEGRITY AUDIT (Milestone v1.7) -->
+        {#if integrityReport}
+          <div class="operations-links-card">
+            <div class="card-header-row">
+              <div>
+                <h3 class="display sub-title">LIBRARY HEALTH & KOMGA INTEGRITY AUDIT</h3>
+                <span class="muted">Proactive system audit across database references, storage paths, and Komga library state.</span>
+              </div>
+              <span class="status-badge" class:status-valid={integrityReport.totalIssues === 0} class:status-failed={integrityReport.totalIssues > 0}>
+                {integrityReport.totalIssues === 0 ? 'HEALTHY' : `${integrityReport.totalIssues} ISSUES DETECTED`}
+              </span>
+            </div>
+
+            {#if integrityReport.totalIssues === 0}
+              <div class="empty-notice" style="margin-top: 0.5rem;">
+                <Icon name="check" size={16} />
+                <span>Zero integrity discrepancies detected across library tables, media archives, and tracker mappings.</span>
+              </div>
+            {:else}
+              <ul class="rows" style="margin-top: 0.75rem;">
+                {#each integrityReport.issues as issue (issue.id)}
+                  <li class="event-item card-nested">
+                    <div class="main">
+                      <div class="row-header">
+                        <strong>{issue.seriesTitle || issue.category}</strong>
+                        <span class="tag warn capitalize">{issue.severity}</span>
+                      </div>
+                      <div style="margin-top: 0.25rem;">{issue.message}</div>
+                      {#if issue.resolutionHint}
+                        <div class="muted small" style="margin-top: 0.25rem; font-style: italic;">
+                          Hint: {issue.resolutionHint}
+                        </div>
+                      {/if}
+                    </div>
+                  </li>
+                {/each}
+              </ul>
+            {/if}
+          </div>
+        {/if}
       {/if}
     {/if}
   {/if}

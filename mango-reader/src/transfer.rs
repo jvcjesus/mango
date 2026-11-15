@@ -274,6 +274,15 @@ impl TransferTracker {
             .cloned()
     }
 
+    /// Returns all active and recent transfer progress snapshots.
+    pub fn get_all_progress(&self) -> Vec<TransferProgress> {
+        if let Ok(transfers) = self.active_transfers.lock() {
+            transfers.values().cloned().collect()
+        } else {
+            Vec::new()
+        }
+    }
+
     /// Removes a tracked item from memory.
     pub fn remove(&self, chapter_id: i64) {
         if let Ok(mut transfers) = self.active_transfers.lock() {
@@ -1470,5 +1479,38 @@ mod tests {
         assert_eq!(err.code, "invalid_content_type");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_v1_6_transfer_diagnostics_tracking() {
+        let tracker = TransferTracker::default();
+        let claimed = tracker.try_claim_worker(2001, 1, Some(10_000_000), Some(40));
+        assert!(claimed, "Initial worker claim must succeed");
+
+        // Duplicate worker claim must be rejected
+        let claimed_dup = tracker.try_claim_worker(2001, 1, Some(10_000_000), Some(40));
+        assert!(!claimed_dup, "Duplicate worker claim must be rejected");
+
+        // Record progress
+        tracker.record_bytes(2001, 2_500_000, Some(10_000_000));
+        let prog = tracker.get_progress(2001).expect("Progress must exist");
+        assert_eq!(prog.bytes_downloaded, 2_500_000);
+        assert_eq!(prog.status, TransferStatus::Downloading);
+
+        // Mark retrying
+        tracker.mark_retrying(2001, 2, 1000, "Network timeout");
+        let prog_retry = tracker.get_progress(2001).unwrap();
+        assert_eq!(prog_retry.attempt, 2);
+        assert_eq!(prog_retry.status, TransferStatus::Retrying);
+        assert_eq!(prog_retry.error.as_deref(), Some("Network timeout"));
+
+        // Retrieve all diagnostics
+        let all = tracker.get_all_progress();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].chapter_id, 2001);
+
+        // Mark completed
+        tracker.mark_completed(2001);
+        assert_eq!(tracker.get_progress(2001).unwrap().status, TransferStatus::Completed);
     }
 }

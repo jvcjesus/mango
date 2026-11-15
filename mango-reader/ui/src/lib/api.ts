@@ -2668,6 +2668,7 @@ export const getLibraryIntegrity = (params?: { severity?: string; category?: str
   const qs = query.toString();
   return get<LibraryIntegrityReport>(`/system/integrity${qs ? `?${qs}` : ''}`);
 };
+export const getSystemIntegrity = getLibraryIntegrity;
 
 export const getNotificationsHistory = (limit = 50, activeOnly = false) =>
   get<NotificationEventHistoryDto[]>(`/notifications/history?limit=${limit}&activeOnly=${activeOnly}`);
@@ -3143,6 +3144,25 @@ export const getDownloadRecoveryInfo = (chapterId: number) =>
 
 export const getDownloadsRecoverySummary = () =>
   get<DownloadRecoverySummary>(`/downloads/recovery-summary`);
+
+export interface TransferProgressDto {
+  chapterId: number;
+  bytesDownloaded: number;
+  totalBytes?: number | null;
+  pagesDone: number;
+  pagesTotal?: number | null;
+  attempt: number;
+  maxAttempts: number;
+  startTime: number;
+  lastProgressTime: number;
+  isStalled: boolean;
+  retryAt?: number | null;
+  status: 'queued' | 'downloading' | 'stalled' | 'retrying' | 'verifying' | 'completed' | 'failed';
+  error?: string | null;
+}
+
+export const getTransferDiagnostics = () =>
+  get<TransferProgressDto[]>('/downloads/transfer-diagnostics');
 
 export const recoverDownloadJob = (chapterId: number) =>
   send<{ recovered: boolean; strategy: string; canonicalPath?: string; chapterId?: number }>(
