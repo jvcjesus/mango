@@ -647,64 +647,64 @@ pub async fn reconcile_series(
     let mut komga_fetch_succeeded = false;
 
     if let (Some(kc), Some(ref k_id)) = (komga_client, &resolved_komga_id.clone()) {
-        let books_res = match kc.get_books_in_series(k_id).await {
-            Ok(books) => Ok(books),
-            Err(e) => {
-                tracing::warn!("Failed to fetch Komga books for series {k_id}: {e}. Attempting title search fallback...");
-                // Stale or invalid komga_series_id: search by title
-                match kc.search_series(&target.title, None).await {
-                    Ok(candidates) => {
-                        if let Some((matched, ed)) = crate::pipeline::komga::find_matching_komga_series(
-                            &candidates,
-                            &target.title,
-                            target.edition.as_deref(),
-                        ) {
-                            if let Some(ref det_ed) = ed {
-                                if edition == "standard" || edition.is_empty() {
-                                    edition = det_ed.clone();
-                                }
+        let mut books_res = kc.get_books_in_series(k_id).await;
+        let is_empty_or_err = match &books_res {
+            Ok(books) => books.is_empty(),
+            Err(_) => true,
+        };
+
+        if is_empty_or_err {
+            tracing::warn!("Komga books for series {k_id} empty or errored. Attempting title search fallback for '{}'...", target.title);
+            // Stale or invalid komga_series_id: search by title
+            if let Ok(candidates) = kc.search_series(&target.title, None).await {
+                if let Some((matched, ed)) = crate::pipeline::komga::find_matching_komga_series(
+                    &candidates,
+                    &target.title,
+                    target.edition.as_deref(),
+                ) {
+                    if matched.id != *k_id {
+                        if let Some(ref det_ed) = ed {
+                            if edition == "standard" || edition.is_empty() {
+                                edition = det_ed.clone();
                             }
-                            let new_k_id = matched.id.clone();
-                            tracing::info!("Healed stale Komga series ID from {} to {} for '{}'", k_id, new_k_id, target.title);
-
-                            // Update database with healed series ID
-                            let new_k_id_db = new_k_id.clone();
-                            let s_id_db = series_id.clone();
-                            let target_title_db = target.title.clone();
-                            let old_k_id_db = k_id.clone();
-                            let _ = db.call(move |conn| {
-                                if let Some(m_id) = m_id_opt {
-                                    let _ = conn.execute(
-                                        "UPDATE tracked_catalog SET komga_series_id = ?1 WHERE manga_id = ?2",
-                                        rusqlite::params![new_k_id_db, m_id],
-                                    );
-                                }
-                                let _ = conn.execute(
-                                    "UPDATE tracked_catalog SET komga_series_id = ?1 WHERE title = ?2 COLLATE NOCASE",
-                                    rusqlite::params![new_k_id_db, target_title_db],
-                                );
-                                let _ = conn.execute(
-                                    "UPDATE series_reconciliations SET komga_series_id = ?1 WHERE series_id = ?2",
-                                    rusqlite::params![new_k_id_db, s_id_db],
-                                );
-                                let _ = conn.execute(
-                                    "UPDATE tracker_mappings SET komga_series_id = ?1 WHERE komga_series_id = ?2",
-                                    rusqlite::params![new_k_id_db, old_k_id_db],
-                                );
-                                Ok(())
-                            }).await;
-
-                            let fetched = kc.get_books_in_series(&new_k_id).await;
-                            resolved_komga_id = Some(new_k_id);
-                            fetched
-                        } else {
-                            Err(e)
                         }
+                        let new_k_id = matched.id.clone();
+                        tracing::info!("Healed stale Komga series ID from {} to {} for '{}'", k_id, new_k_id, target.title);
+
+                        // Update database with healed series ID
+                        let new_k_id_db = new_k_id.clone();
+                        let s_id_db = series_id.clone();
+                        let target_title_db = target.title.clone();
+                        let old_k_id_db = k_id.clone();
+                        let _ = db.call(move |conn| {
+                            if let Some(m_id) = m_id_opt {
+                                let _ = conn.execute(
+                                    "UPDATE tracked_catalog SET komga_series_id = ?1 WHERE manga_id = ?2",
+                                    rusqlite::params![new_k_id_db, m_id],
+                                );
+                            }
+                            let _ = conn.execute(
+                                "UPDATE tracked_catalog SET komga_series_id = ?1 WHERE title = ?2 COLLATE NOCASE",
+                                rusqlite::params![new_k_id_db, target_title_db],
+                            );
+                            let _ = conn.execute(
+                                "UPDATE series_reconciliations SET komga_series_id = ?1 WHERE series_id = ?2",
+                                rusqlite::params![new_k_id_db, s_id_db],
+                            );
+                            let _ = conn.execute(
+                                "UPDATE tracker_mappings SET komga_series_id = ?1 WHERE komga_series_id = ?2",
+                                rusqlite::params![new_k_id_db, old_k_id_db],
+                            );
+                            Ok(())
+                        }).await;
+
+                        let fetched = kc.get_books_in_series(&new_k_id).await;
+                        resolved_komga_id = Some(new_k_id);
+                        books_res = fetched;
                     }
-                    Err(_) => Err(e),
                 }
             }
-        };
+        }
 
         match books_res {
             Ok(books) => {

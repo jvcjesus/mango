@@ -355,7 +355,11 @@ mod tests {
 
         let app = Router::new()
             .route("/api/v1/series/0S23QDYV4J6X3/books", get(|| async {
-                (axum::http::StatusCode::NOT_FOUND, "Not Found")
+                Json(json!({
+                    "content": [],
+                    "totalPages": 0,
+                    "last": true
+                }))
             }))
             .route("/api/v1/series", get(|| async {
                 Json(json!({
