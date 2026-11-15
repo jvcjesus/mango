@@ -416,7 +416,7 @@
 
   <!-- Error or Loading Notices -->
   {#if error}
-    <Notice kind="error">{error}</Notice>
+    <Notice error={error} />
   {/if}
 
   {#if loading}
@@ -617,6 +617,9 @@
                   <div class="u-title">{u.title}</div>
                   {#if u.expectedVolume}
                     <div class="u-vol">Next Expected: Volume {u.expectedVolume}</div>
+                  {/if}
+                  {#if u.diagnosticLabel}
+                    <div class="u-diag"><span class="diag-badge">{u.diagnosticLabel}</span></div>
                   {/if}
                   <div class="u-reason">{u.reason}</div>
                   <div class="u-meta">
@@ -1318,6 +1321,18 @@
     font-size: 0.75rem;
     font-weight: 600;
     color: var(--accent, #4f46e5);
+  }
+
+  .diag-badge {
+    display: inline-block;
+    font-size: 0.72rem;
+    font-weight: 600;
+    padding: 0.15rem 0.45rem;
+    border-radius: 4px;
+    background: rgba(99, 102, 241, 0.1);
+    border: 1px solid rgba(99, 102, 241, 0.25);
+    color: var(--accent, #4f46e5);
+    margin-bottom: 0.2rem;
   }
 
   .u-reason {

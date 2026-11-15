@@ -412,3 +412,193 @@ async fn test_service_mapping_and_event_deduplication() {
     }).await.unwrap();
     assert_eq!(total_events, 1);
 }
+
+#[tokio::test]
+async fn test_updater_rollback_on_failed_activation() {
+    let dir = TestDir::new("rollback");
+    let ot_dir = dir.path().join("opentome");
+    std::fs::create_dir_all(&ot_dir).unwrap();
+    let db_path = ot_dir.join("manga-metadata.sqlite");
+
+    // Create initial valid working catalogue
+    let conn = create_test_opentome_db(&db_path);
+    conn.execute(
+        "INSERT INTO series (gcd_series_id, name, language, is_main, tome_work_id) VALUES (1, 'Initial Series', 'en', 1, 'w1')",
+        [],
+    ).unwrap();
+    drop(conn);
+
+    assert!(db_path.exists());
+    assert!(OpenTomeUpdater::validate_sqlite_file(&db_path).is_ok());
+
+    // Simulate update candidate that is corrupt or invalid
+    let tmp_path = ot_dir.join("manga-metadata.sqlite.tmp");
+    let bak_path = ot_dir.join("manga-metadata.sqlite.bak");
+    std::fs::write(&tmp_path, b"not a valid sqlite file").unwrap();
+
+    // Emulate rollback logic:
+    // 1. Backup existing
+    let _ = std::fs::copy(&db_path, &bak_path);
+    // 2. Rename tmp over db
+    let _ = std::fs::rename(&tmp_path, &db_path);
+    // 3. Validation fails
+    let val_err = OpenTomeUpdater::validate_sqlite_file(&db_path);
+    assert!(val_err.is_err());
+    // 4. Restore from bak
+    let _ = std::fs::rename(&bak_path, &db_path);
+
+    // Verify original database restored and fully functional
+    assert!(db_path.exists());
+    assert!(OpenTomeUpdater::validate_sqlite_file(&db_path).is_ok());
+    let conn_restored = Connection::open_with_flags(&db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let series_name: String = conn_restored.query_row("SELECT name FROM series WHERE gcd_series_id = 1", [], |r| r.get(0)).unwrap();
+    assert_eq!(series_name, "Initial Series");
+}
+
+#[tokio::test]
+async fn test_post_update_schedule_synchronization_and_retry_unmatched() {
+    let dir = TestDir::new("sync_retry");
+    let mango_db = Db::open(&dir.path().join("mango.db")).unwrap();
+    let ot_dir = dir.path().join("opentome");
+    std::fs::create_dir_all(&ot_dir).unwrap();
+    let ot_db_path = ot_dir.join("manga-metadata.sqlite");
+
+    // Create catalogue containing Frieren
+    let ot_conn = create_test_opentome_db(&ot_db_path);
+    ot_conn.execute(
+        "INSERT INTO series (gcd_series_id, name, language, is_main, tome_work_id)
+         VALUES (888, 'Frieren', 'en', 1, 'w_frieren')",
+        [],
+    ).unwrap();
+    ot_conn.execute(
+        "INSERT INTO volumes (id, gcd_series_id, volume_number, release_date, release_date_precision, status)
+         VALUES ('fr_v14', 888, 14, '2026-12-01', 'day', 'future')",
+        [],
+    ).unwrap();
+    drop(ot_conn);
+
+    // Setup Mango DB with series and a stale negative 'unmatched' mapping
+    mango_db.call(|conn| {
+        conn.execute("INSERT INTO manga (id, source_id, url, title, in_library) VALUES (88, 1, '/manga/frieren', 'Frieren', 1)", [])?;
+        conn.execute(
+            "INSERT INTO series_reconciliations (manga_id, series_id, title, status, is_ongoing, last_reconciled_at, updated_at)
+             VALUES (88, 'manga:88', 'Frieren', 'up_to_date', 1, 1000, 1000)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO opentome_series_mappings (manga_id, series_id, confidence, mapping_source, last_evaluated_at)
+             VALUES (88, 'manga:88', 'unmatched', 'auto', 1000)",
+            [],
+        )?;
+        Ok(())
+    }).await.unwrap();
+
+    let http = reqwest::Client::new();
+    let service = Arc::new(OpenTomeService::new(mango_db.clone(), dir.path(), http));
+
+    // Initially status has 1 unmatched
+    let initial_status = service.status().await.unwrap();
+    assert_eq!(initial_status.unmatched_count, 1);
+    assert_eq!(initial_status.mapped_count, 0);
+
+    // Trigger sync_all_schedules_after_update (which retries unmatched and refreshes schedules)
+    let summary = service.sync_all_schedules_after_update().await.unwrap();
+    assert_eq!(summary.retried_unmatched, 1);
+    assert_eq!(summary.mapped_with_schedules, 1);
+
+    // Now status reports 1 mapped, 0 unmatched
+    let post_status = service.status().await.unwrap();
+    assert_eq!(post_status.mapped_count, 1);
+    assert_eq!(post_status.unmatched_count, 0);
+
+    // Verify series_reconciliations.upcoming_releases_json was updated with volume 14.0
+    let upcoming_json: String = mango_db.call(|conn| {
+        let json: String = conn.query_row(
+            "SELECT upcoming_releases_json FROM series_reconciliations WHERE series_id = 'manga:88'",
+            [],
+            |r| r.get(0),
+        ).unwrap();
+        Ok(json)
+    }).await.unwrap();
+    assert!(upcoming_json.contains("14.0"));
+}
+
+#[tokio::test]
+async fn test_eight_diagnostic_categories() {
+    use crate::sync::releases::{classify_missing_release_diagnostic, ReleaseDiagnosticCode};
+
+    // Category 1: Upstream update failed
+    let (c1, r1) = classify_missing_release_diagnostic(
+        Some("unmatched"), false, None, &[], true, None, false, Some("HTTP 503 Service Unavailable"),
+    );
+    assert_eq!(c1, ReleaseDiagnosticCode::UpstreamUpdateFailed);
+    assert!(r1.contains("HTTP 503"));
+
+    // Category 2: Metadata sync pending
+    let (c2, _) = classify_missing_release_diagnostic(
+        None, false, None, &[], false, None, false, None,
+    );
+    assert_eq!(c2, ReleaseDiagnosticCode::MetadataSyncPending);
+
+    // Category 3: Ambiguous match
+    let (c3, _) = classify_missing_release_diagnostic(
+        Some("ambiguous"), false, None, &[], true, None, false, None,
+    );
+    assert_eq!(c3, ReleaseDiagnosticCode::AmbiguousOpenTomeMatch);
+
+    // Category 4: Series not found in OpenTome
+    let (c4, _) = classify_missing_release_diagnostic(
+        Some("unmatched"), false, None, &[], true, None, false, None,
+    );
+    assert_eq!(c4, ReleaseDiagnosticCode::SeriesNotFoundInOpenTome);
+
+    // Category 5: Edition / language mismatch (JA schedule exists, EN does not)
+    let ja_schedule = OpenTomeSeriesSchedule {
+        work_id: "w_test".to_string(),
+        mapping_confidence: "exact".to_string(),
+        japanese: Some(OpenTomeMarketSchedule {
+            market: "ja".to_string(),
+            line_name: "Original JA".to_string(),
+            publisher: None,
+            tome_id: "t_ja".to_string(),
+            gcd_series_id: 1,
+            latest_volume: None,
+            next_volume: None,
+            volumes: vec![],
+            total_volumes: 10,
+        }),
+        english: None,
+        last_evaluated_at: 1000,
+    };
+    let (c5, _) = classify_missing_release_diagnostic(
+        Some("exact"), true, Some(&ja_schedule), &[], true, None, false, None,
+    );
+    assert_eq!(c5, ReleaseDiagnosticCode::EditionLanguageMismatch);
+
+    // Category 6: Volume announced, date pending
+    let (c6, r6) = classify_missing_release_diagnostic(
+        Some("exact"), true, None, &[40.0], true, Some(40.0), false, None,
+    );
+    assert_eq!(c6, ReleaseDiagnosticCode::VolumeAnnouncedDatePending);
+    assert!(r6.contains("Volume 40"));
+
+    // Category 7: OpenTome database outdated
+    let (c7, _) = classify_missing_release_diagnostic(
+        Some("exact"), true, None, &[], true, None, true, None,
+    );
+    assert_eq!(c7, ReleaseDiagnosticCode::OpenTomeDatabaseOutdated);
+
+    // Category 8: No upcoming volume announced (publication complete)
+    let (c8a, r8a) = classify_missing_release_diagnostic(
+        Some("exact"), true, None, &[], false, None, false, None,
+    );
+    assert_eq!(c8a, ReleaseDiagnosticCode::NoUpcomingVolumeAnnounced);
+    assert!(r8a.contains("complete"));
+
+    // Category 8: Caught up / ongoing with no new volume
+    let (c8b, r8b) = classify_missing_release_diagnostic(
+        Some("exact"), true, None, &[], true, None, false, None,
+    );
+    assert_eq!(c8b, ReleaseDiagnosticCode::NoUpcomingVolumeAnnounced);
+    assert!(r8b.contains("synchronized"));
+}

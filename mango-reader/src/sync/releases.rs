@@ -60,6 +60,139 @@ pub struct UpcomingReleaseItem {
     pub scope: String, // "library", "tracked_lists", "available"
 }
 
+/// Diagnostic classification codes for missing release dates (Phase 4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReleaseDiagnosticCode {
+    NoUpcomingVolumeAnnounced,
+    VolumeAnnouncedDatePending,
+    SeriesNotFoundInOpenTome,
+    AmbiguousOpenTomeMatch,
+    OpenTomeDatabaseOutdated,
+    MetadataSyncPending,
+    UpstreamUpdateFailed,
+    EditionLanguageMismatch,
+}
+
+impl ReleaseDiagnosticCode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::NoUpcomingVolumeAnnounced => "no_upcoming_volume_announced",
+            Self::VolumeAnnouncedDatePending => "volume_announced_date_pending",
+            Self::SeriesNotFoundInOpenTome => "series_not_found_in_opentome",
+            Self::AmbiguousOpenTomeMatch => "ambiguous_opentome_match",
+            Self::OpenTomeDatabaseOutdated => "opentome_database_outdated",
+            Self::MetadataSyncPending => "metadata_sync_pending",
+            Self::UpstreamUpdateFailed => "upstream_update_failed",
+            Self::EditionLanguageMismatch => "edition_language_mismatch",
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::NoUpcomingVolumeAnnounced => "Publication Complete / Caught Up",
+            Self::VolumeAnnouncedDatePending => "Volume Announced (Date Pending)",
+            Self::SeriesNotFoundInOpenTome => "Series Not Found in OpenTome",
+            Self::AmbiguousOpenTomeMatch => "Ambiguous OpenTome Match",
+            Self::OpenTomeDatabaseOutdated => "OpenTome Database Outdated",
+            Self::MetadataSyncPending => "Metadata Sync Pending",
+            Self::UpstreamUpdateFailed => "Upstream Update Failed",
+            Self::EditionLanguageMismatch => "Language / Edition Mismatch",
+        }
+    }
+}
+
+/// Classify missing release dates into 8 distinct, actionable categories.
+pub fn classify_missing_release_diagnostic(
+    ot_confidence: Option<&str>,
+    has_work_id: bool,
+    ot_schedule: Option<&OpenTomeSeriesSchedule>,
+    future_volumes: &[f64],
+    is_ongoing: bool,
+    expected_vol: Option<f64>,
+    is_database_outdated: bool,
+    upstream_error: Option<&str>,
+) -> (ReleaseDiagnosticCode, String) {
+    // 1. Upstream update failed
+    if let Some(err) = upstream_error {
+        if !err.is_empty() {
+            return (
+                ReleaseDiagnosticCode::UpstreamUpdateFailed,
+                format!("Upstream OpenTome catalogue update failed ({err}); schedules may be incomplete or outdated."),
+            );
+        }
+    }
+
+    // 2. Metadata sync pending
+    if ot_confidence.is_none() && future_volumes.is_empty() && !is_ongoing {
+        return (
+            ReleaseDiagnosticCode::MetadataSyncPending,
+            "Metadata synchronization pending; awaiting background reconciliation or manual title refresh.".to_string(),
+        );
+    }
+
+    // 3. Ambiguous OpenTome match
+    if ot_confidence == Some("ambiguous") {
+        return (
+            ReleaseDiagnosticCode::AmbiguousOpenTomeMatch,
+            "Multiple matching works found in OpenTome; manual line selection required in Metadata Review.".to_string(),
+        );
+    }
+
+    // 4. Series not found in OpenTome
+    if ot_confidence == Some("unmatched") || (ot_confidence.is_some() && !has_work_id) {
+        return (
+            ReleaseDiagnosticCode::SeriesNotFoundInOpenTome,
+            "Series could not be identified in the OpenTome database. Manual mapping or catalog update may be required.".to_string(),
+        );
+    }
+
+    // 5. Edition or language mismatch (JA schedule exists, EN does not)
+    if let Some(sched) = ot_schedule {
+        if sched.japanese.is_some() && sched.english.is_none() {
+            return (
+                ReleaseDiagnosticCode::EditionLanguageMismatch,
+                "Release schedule is available for Japanese print, but no English physical publication line exists in OpenTome.".to_string(),
+            );
+        }
+    }
+
+    // 6. Volume announced, date pending
+    if let Some(vol) = expected_vol {
+        return (
+            ReleaseDiagnosticCode::VolumeAnnouncedDatePending,
+            format!("Volume {} announced in MangaBaka catalogue; official publication date pending publisher announcement.", vol),
+        );
+    }
+    if let Some(&first_future) = future_volumes.first() {
+        return (
+            ReleaseDiagnosticCode::VolumeAnnouncedDatePending,
+            format!("Volume {} announced in MangaBaka catalogue; official publication date pending publisher announcement.", first_future),
+        );
+    }
+
+    // 7. OpenTome database outdated
+    if is_database_outdated {
+        return (
+            ReleaseDiagnosticCode::OpenTomeDatabaseOutdated,
+            "Installed OpenTome database is older than the latest upstream release; update catalogue in Settings.".to_string(),
+        );
+    }
+
+    // 8. No upcoming volume announced (completed or caught up)
+    if !is_ongoing {
+        (
+            ReleaseDiagnosticCode::NoUpcomingVolumeAnnounced,
+            "Official publication of this series is complete. No upcoming releases scheduled.".to_string(),
+        )
+    } else {
+        (
+            ReleaseDiagnosticCode::NoUpcomingVolumeAnnounced,
+            "No upcoming physical volume release date announced yet by the publisher. Tracker catalog is synchronized.".to_string(),
+        )
+    }
+}
+
 /// A monitored or tracked title that currently has no confirmed future release date.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -70,6 +203,8 @@ pub struct UndatedReleaseItem {
     pub mangabaka_id: Option<i64>,
     pub title: String,
     pub expected_volume: Option<f64>,
+    pub diagnostic_code: String,
+    pub diagnostic_label: String,
     pub reason: String,
     pub source: String,
     pub is_owned: bool,
@@ -105,6 +240,8 @@ pub struct TitleReleaseScheduleDto {
     pub primary_source: String,
     pub confidence: String,
     pub last_evaluated_at: i64,
+    pub diagnostic_code: Option<String>,
+    pub diagnostic_label: Option<String>,
     pub explanation: Option<String>,
 }
 
@@ -266,6 +403,28 @@ pub fn query_upcoming_releases(
         }
     }
 
+    let mut mappings_meta: HashMap<String, (String, bool)> = HashMap::new();
+    let mut stmt_meta = conn.prepare(
+        "SELECT series_id, confidence, work_id IS NOT NULL FROM opentome_series_mappings",
+    ).map_err(|e| AppError::internal(format!("Prepare opentome mappings meta query failed: {e}")))?;
+    let meta_rows = stmt_meta.query_map([], |r| {
+        Ok((r.get::<_, String>(0)?, (r.get::<_, String>(1)?, r.get::<_, bool>(2)?)))
+    }).map_err(|e| AppError::internal(format!("Query opentome mappings meta failed: {e}")))?;
+    for r in meta_rows.flatten() {
+        mappings_meta.insert(r.0, r.1);
+    }
+
+    let (is_database_outdated, upstream_error): (bool, Option<String>) = {
+        let last_error: Option<String> = crate::settings::get(conn, "opentome.last_error");
+        let installed: Option<String> = crate::settings::get(conn, "opentome.installed_version");
+        let upstream: Option<String> = crate::settings::get(conn, "opentome.latest_upstream_version");
+        let outdated = match (installed, upstream) {
+            (Some(i), Some(u)) => i != u,
+            _ => false,
+        };
+        (outdated, last_error)
+    };
+
     let mut reconciliations_map: HashMap<String, (Vec<f64>, Vec<f64>, bool, String)> = HashMap::new();
     let mut stmt_rec = conn.prepare(
         "SELECT series_id, owned_volumes_json, future_volumes_json, is_ongoing, status
@@ -391,54 +550,88 @@ pub fn query_upcoming_releases(
             }
         }
 
-        // If no upcoming volumes found from OpenTome, check MangaBaka future_volumes_json
+        // If no upcoming volumes found from OpenTome, diagnose and add to undated
         if !series_has_upcoming {
-            if let Some((_, future_vols, ongoing, _)) = recon_info {
-                if !future_vols.is_empty() {
-                    for &fv in future_vols {
-                        let is_owned = owned_set.contains(&((fv * 1000.0).round() as i64));
-                        let cover = s.manga_id.map(|mid| format!("/api/manga/{mid}/cover"));
-                        undated_items.push(UndatedReleaseItem {
-                            series_id: s.series_id.clone(),
-                            manga_id: s.manga_id,
-                            komga_series_id: s.komga_series_id.clone(),
-                            mangabaka_id: s.mangabaka_id,
-                            title: s.title.clone(),
-                            expected_volume: Some(fv),
-                            reason: format!(
-                                "Volume {} announced in MangaBaka catalogue; official publication date pending publisher announcement",
-                                fv
-                            ),
-                            source: "mangabaka".to_string(),
-                            is_owned,
-                            cover_url: cover,
-                            scope: s.scope.clone(),
-                        });
-                        series_has_upcoming = true;
-                    }
-                } else if *ongoing {
+            let (conf_opt, has_wid) = mappings_meta.get(&s.series_id).map(|(c, w)| (Some(c.as_str()), *w)).unwrap_or((None, false));
+            let future_vols = recon_info.map(|(_, fv, _, _)| fv.as_slice()).unwrap_or(&[]);
+
+            if !future_vols.is_empty() {
+                for &fv in future_vols {
+                    let is_owned = owned_set.contains(&((fv * 1000.0).round() as i64));
                     let cover = s.manga_id.map(|mid| format!("/api/manga/{mid}/cover"));
+                    let (diag_code, reason) = classify_missing_release_diagnostic(
+                        conf_opt,
+                        has_wid,
+                        ot_sched_opt,
+                        future_vols,
+                        is_ongoing,
+                        Some(fv),
+                        is_database_outdated,
+                        upstream_error.as_deref(),
+                    );
+
                     undated_items.push(UndatedReleaseItem {
                         series_id: s.series_id.clone(),
                         manga_id: s.manga_id,
                         komga_series_id: s.komga_series_id.clone(),
                         mangabaka_id: s.mangabaka_id,
                         title: s.title.clone(),
-                        expected_volume: None,
-                        reason: "Ongoing series; next volume release date not yet scheduled by publisher".to_string(),
-                        source: "reconciled".to_string(),
-                        is_owned: false,
+                        expected_volume: Some(fv),
+                        diagnostic_code: diag_code.as_str().to_string(),
+                        diagnostic_label: diag_code.label().to_string(),
+                        reason,
+                        source: "mangabaka".to_string(),
+                        is_owned,
                         cover_url: cover,
                         scope: s.scope.clone(),
                     });
                     series_has_upcoming = true;
                 }
+            } else if is_ongoing {
+                let cover = s.manga_id.map(|mid| format!("/api/manga/{mid}/cover"));
+                let (diag_code, reason) = classify_missing_release_diagnostic(
+                    conf_opt,
+                    has_wid,
+                    ot_sched_opt,
+                    future_vols,
+                    is_ongoing,
+                    None,
+                    is_database_outdated,
+                    upstream_error.as_deref(),
+                );
+
+                undated_items.push(UndatedReleaseItem {
+                    series_id: s.series_id.clone(),
+                    manga_id: s.manga_id,
+                    komga_series_id: s.komga_series_id.clone(),
+                    mangabaka_id: s.mangabaka_id,
+                    title: s.title.clone(),
+                    expected_volume: None,
+                    diagnostic_code: diag_code.as_str().to_string(),
+                    diagnostic_label: diag_code.label().to_string(),
+                    reason,
+                    source: if ot_sched_opt.is_some() { "opentome".to_string() } else { "reconciled".to_string() },
+                    is_owned: false,
+                    cover_url: cover,
+                    scope: s.scope.clone(),
+                });
+                series_has_upcoming = true;
             }
         }
 
         // If tracked and ongoing with no records at all, add to undated
         if !series_has_upcoming && is_ongoing {
             let cover = s.manga_id.map(|mid| format!("/api/manga/{mid}/cover"));
+            let (diag_code, reason) = classify_missing_release_diagnostic(
+                None,
+                false,
+                None,
+                &[],
+                is_ongoing,
+                None,
+                is_database_outdated,
+                upstream_error.as_deref(),
+            );
             undated_items.push(UndatedReleaseItem {
                 series_id: s.series_id.clone(),
                 manga_id: s.manga_id,
@@ -446,7 +639,9 @@ pub fn query_upcoming_releases(
                 mangabaka_id: s.mangabaka_id,
                 title: s.title.clone(),
                 expected_volume: None,
-                reason: "Monitored title awaiting publisher schedule update".to_string(),
+                diagnostic_code: diag_code.as_str().to_string(),
+                diagnostic_label: diag_code.label().to_string(),
+                reason,
                 source: "catalog".to_string(),
                 is_owned: false,
                 cover_url: cover,
@@ -556,11 +751,11 @@ pub fn get_title_release_schedule(
     let mut last_eval: i64 = 0;
     let cover = Some(format!("/api/manga/{manga_id}/cover"));
 
-    if let Some((conf, _src, eval, meta_json_opt)) = ot_row {
-        confidence = conf;
+    if let Some((ref conf, ref _src, eval, ref meta_json_opt)) = ot_row {
+        confidence = conf.clone();
         last_eval = eval;
 
-        if let Some(json_str) = meta_json_opt {
+        if let Some(ref json_str) = meta_json_opt {
             if let Ok(sched) = serde_json::from_str::<OpenTomeSeriesSchedule>(&json_str) {
                 let en_line = sched.english.as_ref();
                 let ja_line = sched.japanese.as_ref();
@@ -644,7 +839,7 @@ pub fn get_title_release_schedule(
 
     let next_release = upcoming_releases.first().cloned();
 
-    let explanation = if next_release.is_none() {
+    let (diagnostic_code, diagnostic_label, explanation) = if next_release.is_none() {
         let is_ongoing = conn
             .query_row(
                 "SELECT is_ongoing FROM series_reconciliations WHERE series_id = ?1",
@@ -655,13 +850,45 @@ pub fn get_title_release_schedule(
             .unwrap_or(None)
             .unwrap_or(true);
 
-        if is_ongoing {
-            Some("No upcoming physical volume release date announced yet by the publisher. Tracker catalog is synchronized.".to_string())
-        } else {
-            Some("Official publication of this series is complete. No upcoming releases scheduled.".to_string())
-        }
+        let future_volumes: Vec<f64> = conn
+            .query_row(
+                "SELECT future_volumes_json FROM series_reconciliations WHERE series_id = ?1",
+                params![&series_id],
+                |r| {
+                    let s: String = r.get(0)?;
+                    Ok(serde_json::from_str(&s).unwrap_or_default())
+                },
+            )
+            .optional()
+            .unwrap_or(None)
+            .unwrap_or_default();
+
+        let last_error: Option<String> = crate::settings::get(conn, "opentome.last_error");
+        let installed: Option<String> = crate::settings::get(conn, "opentome.installed_version");
+        let upstream: Option<String> = crate::settings::get(conn, "opentome.latest_upstream_version");
+        let is_database_outdated = match (installed, upstream) {
+            (Some(i), Some(u)) => i != u,
+            _ => false,
+        };
+
+        let ot_conf = ot_row.as_ref().map(|(c, _, _, _)| c.as_str());
+        let has_wid = ot_row.as_ref().map(|(_, _, _, m)| m.is_some()).unwrap_or(false);
+        let ot_sched = ot_row.as_ref().and_then(|(_, _, _, m)| m.as_ref()).and_then(|j| serde_json::from_str::<OpenTomeSeriesSchedule>(j).ok());
+
+        let (diag_code, reason) = classify_missing_release_diagnostic(
+            ot_conf,
+            has_wid,
+            ot_sched.as_ref(),
+            &future_volumes,
+            is_ongoing,
+            None,
+            is_database_outdated,
+            last_error.as_deref(),
+        );
+
+        (Some(diag_code.as_str().to_string()), Some(diag_code.label().to_string()), Some(reason))
     } else {
-        None
+        (None, None, None)
     };
 
     Ok(TitleReleaseScheduleDto {
@@ -674,6 +901,8 @@ pub fn get_title_release_schedule(
         primary_source,
         confidence,
         last_evaluated_at: last_eval,
+        diagnostic_code,
+        diagnostic_label,
         explanation,
     })
 }

@@ -1,7 +1,7 @@
 use super::catalog::{
     self, OpenTomeSeriesSchedule,
 };
-use super::updater::{OpenTomeStatus, OpenTomeUpdater, DEFAULT_MANIFEST_URL};
+use super::updater::{OpenTomeStatus, OpenTomeUpdater, OpenTomeVersionManifest, DEFAULT_MANIFEST_URL};
 use crate::acquisition::release_discovery::ReleaseDiscoveryTarget;
 use crate::db::Db;
 use crate::error::{AppError, Result};
@@ -9,6 +9,16 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 use std::sync::Arc;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduleRefreshSummary {
+    pub total_evaluated: usize,
+    pub mapped_with_schedules: usize,
+    pub unmatched: usize,
+    pub retried_unmatched: usize,
+    pub updated_at: i64,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -61,21 +71,191 @@ impl OpenTomeService {
             .await
     }
 
+    pub async fn auto_update_enabled(&self) -> bool {
+        self.db
+            .call(|conn| {
+                Ok(crate::settings::get::<bool>(conn, "opentome.auto_update_enabled").unwrap_or(true))
+            })
+            .await
+            .unwrap_or(true)
+    }
+
+    pub async fn set_auto_update_enabled(&self, enabled: bool) -> Result<()> {
+        self.db
+            .call(move |conn| {
+                crate::settings::set(conn, "opentome.auto_update_enabled", &serde_json::json!(enabled))?;
+                Ok(())
+            })
+            .await
+    }
+
+    pub async fn update_interval_hours(&self) -> u32 {
+        self.db
+            .call(|conn| {
+                Ok(crate::settings::get::<u32>(conn, "opentome.update_interval_hours").unwrap_or(24))
+            })
+            .await
+            .unwrap_or(24)
+    }
+
+    pub async fn set_update_interval_hours(&self, hours: u32) -> Result<()> {
+        let valid_hours = if hours == 0 { 24 } else { hours };
+        self.db
+            .call(move |conn| {
+                crate::settings::set(conn, "opentome.update_interval_hours", &serde_json::json!(valid_hours))?;
+                Ok(())
+            })
+            .await
+    }
+
     pub async fn status(&self) -> Result<OpenTomeStatus> {
-        let (enabled, last_checked, last_error) = self
+        let db_stats = self
             .db
             .call(|conn| {
                 let enabled = crate::settings::get::<bool>(conn, "opentome.enabled").unwrap_or(true);
+                let auto_update_enabled = crate::settings::get::<bool>(conn, "opentome.auto_update_enabled").unwrap_or(true);
+                let update_interval_hours = crate::settings::get::<u32>(conn, "opentome.update_interval_hours").unwrap_or(24);
                 let last_checked = crate::settings::get::<i64>(conn, "opentome.last_checked_at");
+                let last_updated = crate::settings::get::<i64>(conn, "opentome.last_updated_at");
                 let last_error = crate::settings::get::<String>(conn, "opentome.last_error");
-                Ok((enabled, last_checked, last_error))
+                let upstream_version = crate::settings::get::<String>(conn, "opentome.latest_upstream_version");
+
+                let mapped_count: usize = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM opentome_series_mappings WHERE work_id IS NOT NULL AND confidence NOT IN ('unmatched', 'rejected')",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+
+                let unmatched_count: usize = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM opentome_series_mappings WHERE confidence = 'unmatched'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+
+                let ambiguous_count: usize = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM opentome_series_mappings WHERE confidence = 'ambiguous'",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+
+                let upcoming_count: usize = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM series_reconciliations WHERE upcoming_releases_json != '[]' AND upcoming_releases_json IS NOT NULL",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+
+                let undated_count: usize = conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM series_reconciliations WHERE status != 'unfollowed' AND (upcoming_releases_json = '[]' OR upcoming_releases_json IS NULL)",
+                        [],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(0);
+
+                Ok((
+                    enabled,
+                    auto_update_enabled,
+                    update_interval_hours,
+                    last_checked,
+                    last_updated,
+                    last_error,
+                    upstream_version,
+                    mapped_count,
+                    unmatched_count,
+                    ambiguous_count,
+                    upcoming_count,
+                    undated_count,
+                ))
             })
             .await?;
 
-        Ok(self.updater.status(enabled, last_checked, last_error))
+        let manifest = self.updater.read_manifest();
+        let available = self.updater.is_available();
+        let file_size = if available {
+            std::fs::metadata(self.updater.db_path()).map(|m| m.len()).ok()
+        } else {
+            None
+        };
+        let file_last_updated = if available {
+            std::fs::metadata(self.updater.db_path())
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_secs() as i64)
+        } else {
+            None
+        };
+
+        let last_updated_at = db_stats.4.or(file_last_updated);
+        let version = manifest.map(|m| m.gcd_dump);
+        let upstream_version = db_stats.6;
+        let is_update_available = match (&version, &upstream_version) {
+            (Some(v), Some(uv)) => v != uv,
+            _ => false,
+        };
+
+        let next_check_at = db_stats.3.map(|lc| lc + (db_stats.2 as i64 * 3600));
+
+        Ok(OpenTomeStatus {
+            enabled: db_stats.0,
+            auto_update_enabled: db_stats.1,
+            update_interval_hours: db_stats.2,
+            available,
+            version,
+            upstream_version,
+            is_update_available,
+            file_size,
+            last_updated_at,
+            last_checked_at: db_stats.3,
+            next_check_at,
+            last_error: db_stats.5,
+            catalogue_path: self.updater.db_path().display().to_string(),
+            is_updating: self.updater.is_updating(),
+            mapped_count: db_stats.7,
+            unmatched_count: db_stats.8,
+            ambiguous_count: db_stats.9,
+            upcoming_count: db_stats.10,
+            undated_count: db_stats.11,
+        })
+    }
+
+    /// Check upstream manifest without downloading database file.
+    pub async fn check_upstream_version(&self) -> Result<OpenTomeVersionManifest> {
+        let manifest_url = self
+            .db
+            .call(|conn| {
+                Ok(crate::settings::get::<String>(conn, "opentome.manifest_url")
+                    .unwrap_or_else(|| DEFAULT_MANIFEST_URL.to_string()))
+            })
+            .await
+            .unwrap_or_else(|_| DEFAULT_MANIFEST_URL.to_string());
+
+        let manifest = self.updater.check_upstream_version(&manifest_url).await?;
+
+        let upstream_dump = manifest.gcd_dump.clone();
+        let now_epoch = crate::db::now();
+        self.db
+            .call(move |conn| {
+                let _ = crate::settings::set(conn, "opentome.latest_upstream_version", &serde_json::json!(upstream_dump));
+                let _ = crate::settings::set(conn, "opentome.last_checked_at", &serde_json::json!(now_epoch));
+                let _ = conn.execute("DELETE FROM settings WHERE key = 'opentome.last_error'", []);
+                Ok(())
+            })
+            .await?;
+
+        Ok(manifest)
     }
 
     /// Trigger manual or scheduled update check.
+    /// If a new catalogue is installed, automatically synchronizes schedules and reconsiders unmatched series.
     pub async fn check_for_updates(&self, force: bool) -> Result<bool> {
         let manifest_url = self
             .db
@@ -90,9 +270,14 @@ impl OpenTomeService {
         let result = self.updater.check_and_update(&manifest_url, force).await;
 
         let err_msg = result.as_ref().err().map(|e| e.to_string());
+        let updated = result.as_ref().ok().copied().unwrap_or(false);
+
         self.db
             .call(move |conn| {
                 let _ = crate::settings::set(conn, "opentome.last_checked_at", &serde_json::json!(now_epoch));
+                if updated {
+                    let _ = crate::settings::set(conn, "opentome.last_updated_at", &serde_json::json!(now_epoch));
+                }
                 if let Some(ref err) = err_msg {
                     let _ = crate::settings::set(conn, "opentome.last_error", &serde_json::json!(err));
                 } else {
@@ -102,7 +287,145 @@ impl OpenTomeService {
             })
             .await?;
 
+        // If a new catalogue was downloaded, trigger automatic schedule synchronization & re-evaluate unmatched!
+        if updated {
+            tracing::info!("New OpenTome catalogue installed; triggering automatic schedule synchronization and unmatched re-evaluation");
+            if let Err(e) = self.sync_all_schedules_after_update().await {
+                tracing::error!("Post-update schedule synchronization failed: {e}");
+            }
+        }
+
         result
+    }
+
+    /// Automatically synchronizes schedules and re-evaluates unmatched series after a catalogue update.
+    pub async fn sync_all_schedules_after_update(&self) -> Result<ScheduleRefreshSummary> {
+        let retried = self.retry_unmatched_series().await.unwrap_or(0);
+        let mut summary = self.refresh_all_release_schedules().await?;
+        summary.retried_unmatched = retried;
+
+        // Also evaluate release day events & discovery targets
+        let _ = self.evaluate_release_day_events().await;
+
+        Ok(summary)
+    }
+
+    /// Resets cached negative (unmatched or ambiguous) mappings so they are reconsidered against current catalogue.
+    pub async fn retry_unmatched_series(&self) -> Result<usize> {
+        let count = self.db
+            .call(|conn| {
+                let deleted = conn.execute(
+                    "DELETE FROM opentome_series_mappings
+                     WHERE confidence IN ('unmatched', 'ambiguous')
+                       AND mapping_source != 'manual'",
+                    [],
+                )?;
+                Ok(deleted)
+            })
+            .await?;
+
+        Ok(count)
+    }
+
+    /// Refreshes release schedules and upcoming volume projections across all library and tracked titles.
+    pub async fn refresh_all_release_schedules(&self) -> Result<ScheduleRefreshSummary> {
+        let ot_conn_opt = self.open_catalogue_connection()?;
+        let Some(ot_conn) = ot_conn_opt else {
+            return Err(AppError::bad_request("OpenTome catalogue is not available"));
+        };
+
+        let today = self.current_date_str().await;
+        let now = crate::db::now();
+
+        let summary = self.db
+            .call(move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT COALESCE(sr.series_id, 'manga:' || m.id), m.id, m.title
+                     FROM manga m
+                     LEFT JOIN series_reconciliations sr ON sr.manga_id = m.id
+                     WHERE m.in_library = 1
+                     UNION
+                     SELECT series_id, manga_id, title
+                     FROM series_reconciliations
+                     WHERE status != 'unfollowed'"
+                )?;
+
+                let rows = stmt.query_map([], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, Option<i64>>(1)?, r.get::<_, String>(2)?))
+                })?;
+
+                let mut total_evaluated = 0;
+                let mut mapped_with_schedules = 0;
+                let mut unmatched = 0;
+
+                for row_res in rows {
+                    let (series_id, manga_id, _title) = match row_res {
+                        Ok(t) => t,
+                        Err(_) => continue,
+                    };
+
+                    total_evaluated += 1;
+
+                    let schedule_opt = Self::resolve_or_refresh_schedule_internal(
+                        conn,
+                        &ot_conn,
+                        manga_id,
+                        Some(&series_id),
+                        &today,
+                        true,
+                    )?;
+
+                    if let Some(schedule) = schedule_opt {
+                        mapped_with_schedules += 1;
+
+                        // Extract upcoming volume numbers from schedule
+                        let mut upcoming_vols: Vec<f64> = Vec::new();
+                        if let Some(ref en) = schedule.english {
+                            for v in &en.volumes {
+                                if (v.status == "releases_today" || v.status == "future" || v.release_date.as_deref().map_or(false, |d| d >= today.as_str()))
+                                    && !upcoming_vols.contains(&v.volume_number) {
+                                    upcoming_vols.push(v.volume_number);
+                                }
+                            }
+                        }
+                        if let Some(ref ja) = schedule.japanese {
+                            for v in &ja.volumes {
+                                if (v.status == "releases_today" || v.status == "future" || v.release_date.as_deref().map_or(false, |d| d >= today.as_str()))
+                                    && !upcoming_vols.contains(&v.volume_number) {
+                                    upcoming_vols.push(v.volume_number);
+                                }
+                            }
+                        }
+
+                        let upcoming_json = serde_json::to_string(&upcoming_vols).unwrap_or_else(|_| "[]".to_string());
+                        let _ = conn.execute(
+                            "UPDATE series_reconciliations
+                             SET upcoming_releases_json = ?1, last_schedule_refresh_at = ?2, updated_at = ?2
+                             WHERE series_id = ?3",
+                            params![upcoming_json, now, &series_id],
+                        );
+                    } else {
+                        unmatched += 1;
+                        let _ = conn.execute(
+                            "UPDATE series_reconciliations
+                             SET upcoming_releases_json = '[]', last_schedule_refresh_at = ?1, updated_at = ?1
+                             WHERE series_id = ?2",
+                            params![now, &series_id],
+                        );
+                    }
+                }
+
+                Ok(ScheduleRefreshSummary {
+                    total_evaluated,
+                    mapped_with_schedules,
+                    unmatched,
+                    retried_unmatched: 0,
+                    updated_at: now,
+                })
+            })
+            .await?;
+
+        Ok(summary)
     }
 
     pub fn open_catalogue_connection(&self) -> Result<Option<Connection>> {
@@ -308,6 +631,33 @@ impl OpenTomeService {
                      WHERE series_id = ?3",
                     params![schedule_json, now, &series_id],
                 );
+
+                // Update upcoming_releases_json in series_reconciliations
+                let mut upcoming_vols: Vec<f64> = Vec::new();
+                if let Some(ref en) = schedule.english {
+                    for v in &en.volumes {
+                        if (v.status == "releases_today" || v.status == "future" || v.release_date.as_deref().map_or(false, |d| d >= today_str))
+                            && !upcoming_vols.contains(&v.volume_number) {
+                            upcoming_vols.push(v.volume_number);
+                        }
+                    }
+                }
+                if let Some(ref ja) = schedule.japanese {
+                    for v in &ja.volumes {
+                        if (v.status == "releases_today" || v.status == "future" || v.release_date.as_deref().map_or(false, |d| d >= today_str))
+                            && !upcoming_vols.contains(&v.volume_number) {
+                            upcoming_vols.push(v.volume_number);
+                        }
+                    }
+                }
+                let upcoming_json = serde_json::to_string(&upcoming_vols).unwrap_or_else(|_| "[]".to_string());
+                let _ = conn.execute(
+                    "UPDATE series_reconciliations
+                     SET upcoming_releases_json = ?1, last_schedule_refresh_at = ?2, updated_at = ?2
+                     WHERE series_id = ?3",
+                    params![upcoming_json, now, &series_id],
+                );
+
                 return Ok(Some(schedule));
             } else if (confidence == "ambiguous" || confidence == "unmatched") && !force && (now - last_eval < 86400) {
                 return Ok(None);
@@ -375,6 +725,32 @@ impl OpenTomeService {
             )
             .map_err(|e| AppError::internal(format!("Failed to persist OpenTome mapping: {e}")))?;
 
+            // Update upcoming_releases_json in series_reconciliations
+            let mut upcoming_vols: Vec<f64> = Vec::new();
+            if let Some(ref en_line) = schedule.english {
+                for v in &en_line.volumes {
+                    if (v.status == "releases_today" || v.status == "future" || v.release_date.as_deref().map_or(false, |d| d >= today_str))
+                        && !upcoming_vols.contains(&v.volume_number) {
+                        upcoming_vols.push(v.volume_number);
+                    }
+                }
+            }
+            if let Some(ref ja_line) = schedule.japanese {
+                for v in &ja_line.volumes {
+                    if (v.status == "releases_today" || v.status == "future" || v.release_date.as_deref().map_or(false, |d| d >= today_str))
+                        && !upcoming_vols.contains(&v.volume_number) {
+                        upcoming_vols.push(v.volume_number);
+                    }
+                }
+            }
+            let upcoming_json = serde_json::to_string(&upcoming_vols).unwrap_or_else(|_| "[]".to_string());
+            let _ = conn.execute(
+                "UPDATE series_reconciliations
+                 SET upcoming_releases_json = ?1, last_schedule_refresh_at = ?2, updated_at = ?2
+                 WHERE series_id = ?3",
+                params![upcoming_json, now, &series_id],
+            );
+
             Ok(Some(schedule))
         } else {
             conn.execute(
@@ -392,6 +768,13 @@ impl OpenTomeService {
                 ],
             )
             .map_err(|e| AppError::internal(format!("Failed to persist OpenTome mapping: {e}")))?;
+
+            let _ = conn.execute(
+                "UPDATE series_reconciliations
+                 SET upcoming_releases_json = '[]', last_schedule_refresh_at = ?1, updated_at = ?1
+                 WHERE series_id = ?2",
+                params![now, &series_id],
+            );
 
             Ok(None)
         }

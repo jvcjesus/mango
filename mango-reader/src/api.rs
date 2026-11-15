@@ -167,8 +167,12 @@ pub fn router(state: Spaces) -> Router {
         .route("/notifications/test", post(post_notification_test))
         .route("/notifications/outbox", get(get_notification_outbox))
         .route("/opentome/status", get(get_opentome_status))
+        .route("/opentome/check", post(post_opentome_check))
         .route("/opentome/update", post(post_opentome_update))
         .route("/opentome/config", post(post_opentome_config))
+        .route("/opentome/settings", post(post_opentome_settings).put(post_opentome_settings))
+        .route("/opentome/refresh-schedules", post(post_opentome_refresh_schedules))
+        .route("/opentome/retry-unmatched", post(post_opentome_retry_unmatched))
         .route("/manga/{id}/opentome", get(get_manga_opentome))
         .route("/manga/{id}/opentome/remap", post(post_manga_opentome_remap))
         .route("/manga/{id}/release-discovery", get(get_manga_release_discovery))
@@ -3542,6 +3546,17 @@ async fn get_opentome_status(
     Ok(Json(status))
 }
 
+async fn post_opentome_check(Me(app): Me) -> Result<Json<Value>> {
+    app.me.admin()?;
+    let manifest = app.opentome.check_upstream_version().await?;
+    let status = app.opentome.status().await?;
+    Ok(Json(json!({
+        "success": true,
+        "manifest": manifest,
+        "status": status,
+    })))
+}
+
 #[derive(Deserialize, Default)]
 struct OpenTomeUpdatePayload {
     force: Option<bool>,
@@ -3554,15 +3569,20 @@ async fn post_opentome_update(
     app.me.admin()?;
     let force = payload.and_then(|p| p.force).unwrap_or(false);
     let updated = app.opentome.check_for_updates(force).await?;
+    let status = app.opentome.status().await?;
     Ok(Json(json!({
         "success": true,
-        "updated": updated
+        "updated": updated,
+        "status": status,
     })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 struct OpenTomeConfigPayload {
-    enabled: bool,
+    enabled: Option<bool>,
+    auto_update_enabled: Option<bool>,
+    update_interval_hours: Option<u32>,
 }
 
 async fn post_opentome_config(
@@ -3570,8 +3590,45 @@ async fn post_opentome_config(
     Json(payload): Json<OpenTomeConfigPayload>,
 ) -> Result<Json<Value>> {
     app.me.admin()?;
-    app.opentome.set_enabled(payload.enabled).await?;
-    Ok(Json(json!({"ok": true})))
+    if let Some(enabled) = payload.enabled {
+        app.opentome.set_enabled(enabled).await?;
+    }
+    if let Some(auto) = payload.auto_update_enabled {
+        app.opentome.set_auto_update_enabled(auto).await?;
+    }
+    if let Some(hours) = payload.update_interval_hours {
+        app.opentome.set_update_interval_hours(hours).await?;
+    }
+    let status = app.opentome.status().await?;
+    Ok(Json(json!({ "success": true, "status": status })))
+}
+
+async fn post_opentome_settings(
+    Me(app): Me,
+    Json(payload): Json<OpenTomeConfigPayload>,
+) -> Result<Json<Value>> {
+    post_opentome_config(Me(app), Json(payload)).await
+}
+
+async fn post_opentome_refresh_schedules(
+    Me(app): Me,
+) -> Result<Json<crate::opentome::service::ScheduleRefreshSummary>> {
+    app.me.admin()?;
+    let summary = app.opentome.refresh_all_release_schedules().await?;
+    Ok(Json(summary))
+}
+
+async fn post_opentome_retry_unmatched(
+    Me(app): Me,
+) -> Result<Json<Value>> {
+    app.me.admin()?;
+    let retried = app.opentome.retry_unmatched_series().await?;
+    let summary = app.opentome.refresh_all_release_schedules().await?;
+    Ok(Json(json!({
+        "success": true,
+        "retriedCount": retried,
+        "summary": summary,
+    })))
 }
 
 async fn get_manga_opentome(

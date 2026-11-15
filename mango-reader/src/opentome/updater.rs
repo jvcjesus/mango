@@ -25,13 +25,24 @@ pub struct OpenTomeVersionManifest {
 #[serde(rename_all = "camelCase")]
 pub struct OpenTomeStatus {
     pub enabled: bool,
+    pub auto_update_enabled: bool,
+    pub update_interval_hours: u32,
     pub available: bool,
     pub version: Option<String>,
+    pub upstream_version: Option<String>,
+    pub is_update_available: bool,
     pub file_size: Option<u64>,
     pub last_updated_at: Option<i64>,
     pub last_checked_at: Option<i64>,
+    pub next_check_at: Option<i64>,
     pub last_error: Option<String>,
     pub catalogue_path: String,
+    pub is_updating: bool,
+    pub mapped_count: usize,
+    pub unmatched_count: usize,
+    pub ambiguous_count: usize,
+    pub upcoming_count: usize,
+    pub undated_count: usize,
 }
 
 pub struct OpenTomeUpdater {
@@ -68,6 +79,10 @@ impl OpenTomeUpdater {
         self.db_path.exists()
     }
 
+    pub fn is_updating(&self) -> bool {
+        self.is_updating.load(Ordering::SeqCst)
+    }
+
     pub fn read_manifest(&self) -> Option<OpenTomeVersionManifest> {
         if !self.manifest_path.exists() {
             return None;
@@ -76,37 +91,34 @@ impl OpenTomeUpdater {
         serde_json::from_str(&content).ok()
     }
 
-    pub fn status(&self, enabled: bool, last_checked_at: Option<i64>, last_error: Option<String>) -> OpenTomeStatus {
-        let manifest = self.read_manifest();
-        let available = self.is_available();
-        let file_size = if available {
-            std::fs::metadata(&self.db_path).map(|m| m.len()).ok()
-        } else {
-            None
-        };
-        let last_updated = if available {
-            std::fs::metadata(&self.db_path)
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs() as i64)
-        } else {
-            None
-        };
+    /// Fetches upstream manifest JSON without downloading the database.
+    pub async fn check_upstream_version(&self, manifest_url: &str) -> Result<OpenTomeVersionManifest> {
+        let resp = self
+            .http
+            .get(manifest_url)
+            .timeout(std::time::Duration::from_secs(30))
+            .send()
+            .await
+            .map_err(|e| {
+                AppError::internal(format!("Failed to fetch OpenTome manifest: {e}"))
+            })?;
 
-        OpenTomeStatus {
-            enabled,
-            available,
-            version: manifest.map(|m| m.gcd_dump),
-            file_size,
-            last_updated_at: last_updated,
-            last_checked_at,
-            last_error,
-            catalogue_path: self.db_path.display().to_string(),
+        if !resp.status().is_success() {
+            return Err(AppError::internal(format!(
+                "OpenTome manifest request returned HTTP {}",
+                resp.status()
+            )));
         }
+
+        let manifest: OpenTomeVersionManifest = resp.json().await.map_err(|e| {
+            AppError::internal(format!("Failed to parse OpenTome manifest JSON: {e}"))
+        })?;
+
+        Ok(manifest)
     }
 
     /// Check upstream for a new catalogue and atomically download/replace if needed.
+    /// Preserves a rollback backup of any working catalogue prior to activation.
     /// Returns true if a new catalogue was downloaded and installed.
     pub async fn check_and_update(&self, manifest_url: &str, force: bool) -> Result<bool> {
         if self
@@ -134,26 +146,7 @@ impl OpenTomeUpdater {
         })?;
 
         tracing::info!("Checking OpenTome catalogue manifest at {manifest_url}");
-        let resp = self
-            .http
-            .get(manifest_url)
-            .timeout(std::time::Duration::from_secs(30))
-            .send()
-            .await
-            .map_err(|e| {
-                AppError::internal(format!("Failed to fetch OpenTome manifest: {e}"))
-            })?;
-
-        if !resp.status().is_success() {
-            return Err(AppError::internal(format!(
-                "OpenTome manifest request returned HTTP {}",
-                resp.status()
-            )));
-        }
-
-        let manifest: OpenTomeVersionManifest = resp.json().await.map_err(|e| {
-            AppError::internal(format!("Failed to parse OpenTome manifest JSON: {e}"))
-        })?;
+        let manifest = self.check_upstream_version(manifest_url).await?;
 
         let current_manifest = self.read_manifest();
         if !force
@@ -247,11 +240,36 @@ impl OpenTomeUpdater {
             )));
         }
 
+        // Create rollback backup of existing database if present
+        let bak_path = self.dir.join("manga-metadata.sqlite.bak");
+        if bak_path.exists() {
+            let _ = std::fs::remove_file(&bak_path);
+        }
+        if self.db_path.exists() {
+            if let Err(e) = std::fs::copy(&self.db_path, &bak_path) {
+                tracing::warn!("Failed to create backup copy of existing OpenTome database: {e}");
+            }
+        }
+
         // Atomically replace the database file
-        std::fs::rename(&tmp_path, &self.db_path).map_err(|e| {
+        if let Err(e) = std::fs::rename(&tmp_path, &self.db_path) {
             let _ = std::fs::remove_file(&tmp_path);
-            AppError::internal(format!("Failed to rename temporary catalogue file: {e}"))
-        })?;
+            return Err(AppError::internal(format!("Failed to rename temporary catalogue file: {e}")));
+        }
+
+        // Validate activated database in-place; rollback if anything went wrong
+        if let Err(err) = Self::validate_sqlite_file(&self.db_path) {
+            tracing::error!("Activated OpenTome catalogue failed verification: {err}; rolling back to previous catalogue");
+            if bak_path.exists() {
+                let _ = std::fs::rename(&bak_path, &self.db_path);
+            }
+            return Err(AppError::internal(format!("OpenTome catalogue activation failed: {err} (rolled back)")));
+        }
+
+        // Activation succeeded: clean up backup
+        if bak_path.exists() {
+            let _ = std::fs::remove_file(&bak_path);
+        }
 
         // Write version.json manifest
         let manifest_json = serde_json::to_string_pretty(&manifest).unwrap_or_default();

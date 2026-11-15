@@ -1636,7 +1636,7 @@
               <div class="schedule-title-wrap">
                 <span class="schedule-icon"><Icon name="calendar" size={18} /></span>
                 <h3 class="display schedule-heading">RELEASE SCHEDULE</h3>
-                <span class="tag source-tag">{releaseSchedule.source}</span>
+                <span class="tag source-tag">{releaseSchedule.primarySource}</span>
                 {#if releaseSchedule.confidence}
                   <span
                     class="tag conf-tag"
@@ -1650,9 +1650,9 @@
               </div>
 
               <div class="schedule-actions">
-                {#if releaseSchedule.last_evaluated_at}
+                {#if releaseSchedule.lastEvaluatedAt}
                   <span class="last-checked" title="Last checked with metadata provider">
-                    Updated {ago(releaseSchedule.last_evaluated_at)}
+                    Updated {ago(releaseSchedule.lastEvaluatedAt)}
                   </span>
                 {/if}
                 <button
@@ -1672,25 +1672,25 @@
               </div>
             </div>
 
-            {#if releaseSchedule.next_release}
-              {@const nr = releaseSchedule.next_release}
+            {#if releaseSchedule.nextRelease}
+              {@const nr = releaseSchedule.nextRelease}
               <div class="next-release-banner">
                 <div class="next-release-main">
                   <div class="nr-badge">NEXT RELEASE</div>
                   <div class="nr-title-line">
                     <span class="nr-vol">{nr.title}</span>
                     <span class="nr-date">{nr.releaseDate}</span>
-                    {#if nr.relativeDays === 0}
+                    {#if nr.daysUntil === 0}
                       <span class="countdown-badge today">Releases Today</span>
-                    {:else if nr.relativeDays > 0}
-                      <span class="countdown-badge in-future">In {nr.relativeDays} {nr.relativeDays === 1 ? 'day' : 'days'}</span>
+                    {:else if nr.daysUntil > 0}
+                      <span class="countdown-badge in-future">In {nr.daysUntil} {nr.daysUntil === 1 ? 'day' : 'days'}</span>
                     {:else}
                       <span class="countdown-badge past">Released</span>
                     {/if}
                   </div>
                   <div class="nr-meta-line">
                     <span class="meta-item"><Icon name="book" size={12} /> {nr.format.charAt(0).toUpperCase() + nr.format.slice(1)}</span>
-                    <span class="meta-item"><Icon name="globe" size={12} /> {nr.language.toUpperCase()}{nr.region ? ` · ${nr.region}` : ''}</span>
+                    <span class="meta-item"><Icon name="globe" size={12} /> {nr.language.toUpperCase()}{nr.market ? ` · ${nr.market}` : ''}</span>
                     {#if nr.publisher}
                       <span class="meta-item">{nr.publisher}</span>
                     {/if}
@@ -1702,25 +1702,25 @@
               </div>
             {/if}
 
-            {#if releaseSchedule.upcoming_volumes.length > 0}
+            {#if releaseSchedule.upcomingVolumes.length > 0}
               <div class="upcoming-volumes-section">
                 <div class="subhead-row">
-                  <span class="subhead-title">Upcoming Volumes ({releaseSchedule.upcoming_volumes.length})</span>
-                  {#if releaseSchedule.upcoming_volumes.length > 3}
+                  <span class="subhead-title">Upcoming Volumes ({releaseSchedule.upcomingVolumes.length})</span>
+                  {#if releaseSchedule.upcomingVolumes.length > 3}
                     <button class="btn pill mini" onclick={() => (showAllUpcoming = !showAllUpcoming)}>
-                      {showAllUpcoming ? 'Show Less' : `Show All (${releaseSchedule.upcoming_volumes.length})`}
+                      {showAllUpcoming ? 'Show Less' : `Show All (${releaseSchedule.upcomingVolumes.length})`}
                     </button>
                   {/if}
                 </div>
                 <div class="upcoming-volumes-grid">
-                  {#each (showAllUpcoming ? releaseSchedule.upcoming_volumes : releaseSchedule.upcoming_volumes.slice(0, 3)) as vol (vol.title + vol.releaseDate)}
+                  {#each (showAllUpcoming ? releaseSchedule.upcomingVolumes : releaseSchedule.upcomingVolumes.slice(0, 3)) as vol (vol.title + vol.releaseDate)}
                     <div class="upcoming-vol-card" class:is-owned={vol.isOwned}>
                       <div class="uv-top">
                         <span class="uv-vol">{vol.title}</span>
-                        {#if vol.relativeDays === 0}
+                        {#if vol.daysUntil === 0}
                           <span class="uv-day today">Today</span>
-                        {:else if vol.relativeDays > 0}
-                          <span class="uv-day in-future">In {vol.relativeDays}d</span>
+                        {:else if vol.daysUntil > 0}
+                          <span class="uv-day in-future">In {vol.daysUntil}d</span>
                         {:else}
                           <span class="uv-day past">Released</span>
                         {/if}
@@ -1736,17 +1736,17 @@
               </div>
             {/if}
 
-            {#if releaseSchedule.recent_releases.length > 0}
+            {#if releaseSchedule.recentReleases.length > 0}
               <div class="recent-history-section">
                 <div class="subhead-row">
                   <button class="btn pill mini text-btn" onclick={() => (showRecentHistory = !showRecentHistory)}>
                     <Icon name={showRecentHistory ? 'up' : 'down'} size={12} />
-                    <span>Recent Publication History ({releaseSchedule.recent_releases.length} volumes)</span>
+                    <span>Recent Publication History ({releaseSchedule.recentReleases.length} volumes)</span>
                   </button>
                 </div>
                 {#if showRecentHistory}
                   <div class="recent-history-list">
-                    {#each releaseSchedule.recent_releases as r (r.title + r.releaseDate)}
+                    {#each releaseSchedule.recentReleases as r (r.title + r.releaseDate)}
                       <div class="recent-row">
                         <span class="rr-title">{r.title}</span>
                         <span class="rr-date">{r.releaseDate}</span>
@@ -1759,11 +1759,14 @@
               </div>
             {/if}
 
-            {#if !releaseSchedule.next_release}
+            {#if !releaseSchedule.nextRelease}
               <div class="no-releases-box">
                 <div class="no-rel-info">
                   <Icon name="info" size={16} />
-                  <span>{releaseSchedule.diagnostic_reason ?? 'No upcoming releases currently announced by publishers.'}</span>
+                  {#if releaseSchedule.diagnosticLabel}
+                    <span class="diag-badge">{releaseSchedule.diagnosticLabel}</span>
+                  {/if}
+                  <span>{releaseSchedule.explanation ?? 'No upcoming releases currently announced by publishers.'}</span>
                 </div>
               </div>
             {/if}

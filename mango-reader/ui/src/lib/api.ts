@@ -1937,13 +1937,24 @@ export const getNotificationOutbox = () =>
 
 export interface OpenTomeStatus {
   enabled: boolean;
+  autoUpdateEnabled?: boolean;
+  updateIntervalHours?: number;
   available: boolean;
   version?: string;
+  upstreamVersion?: string;
+  isUpdateAvailable?: boolean;
   fileSize?: number;
   lastUpdatedAt?: number;
   lastCheckedAt?: number;
+  nextCheckAt?: number;
   lastError?: string;
   cataloguePath: string;
+  isUpdating?: boolean;
+  mappedCount?: number;
+  unmatchedCount?: number;
+  ambiguousCount?: number;
+  upcomingCount?: number;
+  undatedCount?: number;
 }
 
 export interface OpenTomeVolumeRelease {
@@ -1976,14 +1987,34 @@ export interface OpenTomeSeriesSchedule {
   lastEvaluatedAt: number;
 }
 
+export interface ScheduleRefreshSummary {
+  totalEvaluated: number;
+  mappedWithSchedules: number;
+  unmatched: number;
+  retriedUnmatched: number;
+  updatedAt: number;
+}
+
 export const getOpenTomeStatus = () =>
   get<OpenTomeStatus>('/opentome/status');
 
+export const checkOpenTomeVersion = () =>
+  send<{ success: boolean; manifest: any; status: OpenTomeStatus }>('POST', '/opentome/check', {});
+
 export const updateOpenTomeCatalogue = (force = false) =>
-  send<{ updated: boolean }>('POST', `/opentome/update?force=${force}`);
+  send<{ updated: boolean; status?: OpenTomeStatus }>('POST', `/opentome/update?force=${force}`);
+
+export const refreshAllReleaseSchedules = () =>
+  send<ScheduleRefreshSummary>('POST', '/opentome/refresh-schedules', {});
+
+export const retryUnmatchedSeries = () =>
+  send<{ success: boolean; retriedCount: number; summary: ScheduleRefreshSummary }>('POST', '/opentome/retry-unmatched', {});
 
 export const setOpenTomeConfig = (params: { enabled?: boolean; manifestUrl?: string }) =>
   send<{ success: boolean }>('POST', '/opentome/config', params);
+
+export const setOpenTomeSettings = (params: { enabled?: boolean; autoUpdateEnabled?: boolean; updateIntervalHours?: number }) =>
+  send<{ success: boolean; status: OpenTomeStatus }>('POST', '/opentome/settings', params);
 
 export const getMangaOpenTome = (id: number) =>
   get<OpenTomeSeriesSchedule | null>(`/manga/${id}/opentome`);
@@ -2691,6 +2722,8 @@ export interface UndatedReleaseItem {
   mangabakaId?: number | null;
   title: string;
   expectedVolume?: number | null;
+  diagnosticCode?: string;
+  diagnosticLabel?: string;
   reason: string;
   source: string;
   isOwned: boolean;
@@ -2720,6 +2753,8 @@ export interface TitleReleaseScheduleDto {
   primarySource: string;
   confidence: string;
   lastEvaluatedAt: number;
+  diagnosticCode?: string | null;
+  diagnosticLabel?: string | null;
   explanation?: string | null;
 }
 

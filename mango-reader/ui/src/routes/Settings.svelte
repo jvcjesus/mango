@@ -57,6 +57,10 @@
     getOpenTomeStatus,
     updateOpenTomeCatalogue,
     setOpenTomeConfig,
+    setOpenTomeSettings,
+    checkOpenTomeVersion,
+    refreshAllReleaseSchedules,
+    retryUnmatchedSeries,
     type OpenTomeStatus,
     getAutoAcquireSettings,
     putAutoAcquireSettings,
@@ -1175,6 +1179,9 @@
   // ---------- OpenTome Release Intelligence ----------
   let openTomeStatus = $state<OpenTomeStatus | null>(null);
   let openTomeUpdating = $state(false);
+  let openTomeChecking = $state(false);
+  let openTomeRefreshing = $state(false);
+  let openTomeRetrying = $state(false);
 
   async function loadOpenTome() {
     try {
@@ -1195,6 +1202,75 @@
     }
   }
 
+  async function toggleOpenTomeAutoUpdate() {
+    if (!openTomeStatus) return;
+    try {
+      const nextVal = openTomeStatus.autoUpdateEnabled === false;
+      const res = await setOpenTomeSettings({ autoUpdateEnabled: nextVal });
+      openTomeStatus = res.status;
+      toast.success(res.status.autoUpdateEnabled ? 'Automatic daily updates enabled' : 'Automatic updates disabled');
+    } catch (e: any) {
+      toast.error(`Failed to change auto-update setting: ${message(e)}`);
+    }
+  }
+
+  async function handleOpenTomeIntervalChange(hours: number) {
+    if (!openTomeStatus) return;
+    try {
+      const res = await setOpenTomeSettings({ updateIntervalHours: hours });
+      openTomeStatus = res.status;
+      toast.success(`Update check cadence set to every ${hours} hours`);
+    } catch (e: any) {
+      toast.error(`Failed to change cadence: ${message(e)}`);
+    }
+  }
+
+  async function handleCheckOpenTomeVersion() {
+    if (openTomeChecking) return;
+    openTomeChecking = true;
+    try {
+      const res = await checkOpenTomeVersion();
+      openTomeStatus = res.status;
+      if (res.status.isUpdateAvailable) {
+        toast.info(`New OpenTome release available: ${res.manifest.gcd_dump}`);
+      } else {
+        toast.success(`OpenTome catalogue is current (${res.manifest.gcd_dump})`);
+      }
+    } catch (e: any) {
+      toast.error(`Update check failed: ${message(e)}`);
+    } finally {
+      openTomeChecking = false;
+    }
+  }
+
+  async function handleRefreshOpenTomeSchedules() {
+    if (openTomeRefreshing) return;
+    openTomeRefreshing = true;
+    try {
+      const summary = await refreshAllReleaseSchedules();
+      await loadOpenTome();
+      toast.success(`Refreshed release schedules for ${summary.totalEvaluated} series (${summary.mappedWithSchedules} active)`);
+    } catch (e: any) {
+      toast.error(`Failed to refresh release schedules: ${message(e)}`);
+    } finally {
+      openTomeRefreshing = false;
+    }
+  }
+
+  async function handleRetryUnmatched() {
+    if (openTomeRetrying) return;
+    openTomeRetrying = true;
+    try {
+      const res = await retryUnmatchedSeries();
+      await loadOpenTome();
+      toast.success(`Re-evaluated ${res.retriedCount} unmatched/ambiguous series`);
+    } catch (e: any) {
+      toast.error(`Failed to retry unmatched series: ${message(e)}`);
+    } finally {
+      openTomeRetrying = false;
+    }
+  }
+
   async function triggerOpenTomeUpdate(force = false) {
     if (openTomeUpdating) return;
     openTomeUpdating = true;
@@ -1202,7 +1278,7 @@
       const res = await updateOpenTomeCatalogue(force);
       await loadOpenTome();
       if (res.updated) {
-        toast.success('OpenTome catalogue updated successfully');
+        toast.success('OpenTome catalogue updated and release schedules synchronized');
       } else {
         toast.info('OpenTome catalogue is already up to date');
       }
@@ -2558,11 +2634,44 @@
               </div>
             </div>
 
+            <div class="set">
+              <div class="what">
+                <strong>Automatic Catalogue Updates</strong>
+                <span>Automatically check upstream every {openTomeStatus?.updateIntervalHours ?? 24} hours for new metadata releases and stream verified databases in the background.</span>
+              </div>
+              <div class="how">
+                {#if openTomeStatus}
+                  {@render toggle(openTomeStatus.autoUpdateEnabled !== false, 'Auto-update OpenTome', toggleOpenTomeAutoUpdate)}
+                {/if}
+              </div>
+            </div>
+
+            <div class="set">
+              <div class="what">
+                <strong>Update Check Cadence</strong>
+                <span>How frequently Mango polls the OpenTome version manifest for new releases.</span>
+              </div>
+              <div class="how">
+                {#if openTomeStatus}
+                  <select
+                    class="input"
+                    value={openTomeStatus.updateIntervalHours ?? 24}
+                    onchange={(e) => handleOpenTomeIntervalChange(Number(e.currentTarget.value))}
+                  >
+                    <option value={12}>Every 12 Hours</option>
+                    <option value={24}>Every 24 Hours (Daily)</option>
+                    <option value={48}>Every 48 Hours</option>
+                    <option value={168}>Every 7 Days (Weekly)</option>
+                  </select>
+                {/if}
+              </div>
+            </div>
+
             {#if openTomeStatus}
               <div class="set stack">
                 <div class="what">
                   <strong>Catalogue Details</strong>
-                  <span>Current local database file and dump metadata.</span>
+                  <span>Current local database file, upstream version, and metadata status.</span>
                 </div>
                 <div class="how wide">
                   <div class="opentome-status-grid">
@@ -2570,6 +2679,19 @@
                       <span class="ot-k">Dump Version:</span>
                       <strong class="ot-v">{openTomeStatus.version ?? 'Not downloaded'}</strong>
                     </div>
+                    {#if openTomeStatus.upstreamVersion}
+                      <div class="ot-meta-item">
+                        <span class="ot-k">Upstream Build:</span>
+                        <div class="ot-v-wrap">
+                          <strong class="ot-v">{openTomeStatus.upstreamVersion}</strong>
+                          {#if openTomeStatus.isUpdateAvailable}
+                            <span class="badge warning sm">Update Available</span>
+                          {:else}
+                            <span class="badge success sm">Up to Date</span>
+                          {/if}
+                        </div>
+                      </div>
+                    {/if}
                     <div class="ot-meta-item">
                       <span class="ot-k">Database Size:</span>
                       <strong class="ot-v">
@@ -2592,6 +2714,44 @@
                         <strong class="ot-v">{ago(openTomeStatus.lastCheckedAt * 1000)}</strong>
                       </div>
                     {/if}
+                    {#if openTomeStatus.nextCheckAt}
+                      <div class="ot-meta-item">
+                        <span class="ot-k">Next Scheduled Check:</span>
+                        <strong class="ot-v">{ago(openTomeStatus.nextCheckAt * 1000)}</strong>
+                      </div>
+                    {/if}
+                  </div>
+                </div>
+              </div>
+
+              <!-- Metadata & Release Intelligence Metrics -->
+              <div class="set stack">
+                <div class="what">
+                  <strong>Metadata & Release Coverage</strong>
+                  <span>Overview of series matching, upcoming schedules, and undated tracking items.</span>
+                </div>
+                <div class="how wide">
+                  <div class="opentome-status-grid">
+                    <div class="ot-meta-item">
+                      <span class="ot-k">Mapped Series:</span>
+                      <strong class="ot-v text-success">{openTomeStatus.mappedCount ?? 0}</strong>
+                    </div>
+                    <div class="ot-meta-item">
+                      <span class="ot-k">Unmatched Series:</span>
+                      <strong class="ot-v text-muted">{openTomeStatus.unmatchedCount ?? 0}</strong>
+                    </div>
+                    <div class="ot-meta-item">
+                      <span class="ot-k">Ambiguous Matches:</span>
+                      <strong class="ot-v text-warning">{openTomeStatus.ambiguousCount ?? 0}</strong>
+                    </div>
+                    <div class="ot-meta-item">
+                      <span class="ot-k">Upcoming Scheduled:</span>
+                      <strong class="ot-v text-accent">{openTomeStatus.upcomingCount ?? 0}</strong>
+                    </div>
+                    <div class="ot-meta-item">
+                      <span class="ot-k">Undated / Pending:</span>
+                      <strong class="ot-v">{openTomeStatus.undatedCount ?? 0}</strong>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -2606,21 +2766,48 @@
 
               <div class="set">
                 <div class="what">
-                  <strong>Update Catalogue</strong>
-                  <span>Check for new releases of the OpenTome database manifest (version.json) and stream the verified SQLite archive.</span>
+                  <strong>Database & Schedule Controls</strong>
+                  <span>Check upstream for updates, stream new database versions, re-evaluate schedules, and retry unmatched titles.</span>
                 </div>
                 <div class="how opentome-btn-row">
-                  <button class="btn" onclick={() => triggerOpenTomeUpdate(false)} disabled={openTomeUpdating}>
-                    {#if openTomeUpdating}
+                  <button class="btn" onclick={handleCheckOpenTomeVersion} disabled={openTomeChecking || openTomeUpdating}>
+                    {#if openTomeChecking}
                       <span class="spin"><Icon name="spinner" size={16} stroke={3} /></span>
-                      Checking…
+                      Checking Manifest…
                     {:else}
                       <Icon name="refresh" size={16} />
                       Check for Updates
                     {/if}
                   </button>
+                  <button class="btn primary" onclick={() => triggerOpenTomeUpdate(false)} disabled={openTomeUpdating || openTomeChecking}>
+                    {#if openTomeUpdating}
+                      <span class="spin"><Icon name="spinner" size={16} stroke={3} /></span>
+                      Updating Database…
+                    {:else}
+                      <Icon name="download" size={16} />
+                      Update Now
+                    {/if}
+                  </button>
                   <button class="btn" onclick={() => triggerOpenTomeUpdate(true)} disabled={openTomeUpdating} title="Force full re-download regardless of dump date">
                     Force Re-download
+                  </button>
+                  <button class="btn" onclick={handleRefreshOpenTomeSchedules} disabled={openTomeRefreshing}>
+                    {#if openTomeRefreshing}
+                      <span class="spin"><Icon name="spinner" size={16} stroke={3} /></span>
+                      Refreshing Schedules…
+                    {:else}
+                      <Icon name="calendar" size={16} />
+                      Refresh Release Schedules
+                    {/if}
+                  </button>
+                  <button class="btn" onclick={handleRetryUnmatched} disabled={openTomeRetrying} title="Clear negative matching cache and retry OpenTome resolution">
+                    {#if openTomeRetrying}
+                      <span class="spin"><Icon name="spinner" size={16} stroke={3} /></span>
+                      Retrying Unmatched…
+                    {:else}
+                      <Icon name="search" size={16} />
+                      Retry Unmatched Series
+                    {/if}
                   </button>
                 </div>
               </div>
@@ -6641,6 +6828,43 @@
 
   .ot-v {
     font-size: 0.85rem;
+  }
+
+  .ot-v-wrap {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+  }
+
+  .text-success {
+    color: #22c55e;
+  }
+
+  .text-warning {
+    color: #eab308;
+  }
+
+  .text-accent {
+    color: var(--accent, #6366f1);
+  }
+
+  .badge.sm {
+    font-size: 0.7rem;
+    padding: 1px 6px;
+    border-radius: 4px;
+  }
+
+  .badge.warning {
+    background: rgba(234, 179, 8, 0.15);
+    color: #eab308;
+    border: 1px solid rgba(234, 179, 8, 0.3);
+  }
+
+  .badge.success {
+    background: rgba(34, 197, 94, 0.15);
+    color: #22c55e;
+    border: 1px solid rgba(34, 197, 94, 0.3);
   }
 
   .ot-path {
