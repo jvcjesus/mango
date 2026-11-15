@@ -1183,6 +1183,33 @@ export const getAcquisitionProfile = (id: string) => get<AcquisitionProfile>(`/s
 export const updateAcquisitionProfile = (id: string, patch: Partial<AcquisitionProfile>) => send<AcquisitionProfile>('PUT', `/settings/profiles/${encodeURIComponent(id)}`, patch);
 export const deleteAcquisitionProfile = (id: string) => send<boolean>('DELETE', `/settings/profiles/${encodeURIComponent(id)}`);
 export const duplicateAcquisitionProfile = (id: string, name?: string) => send<AcquisitionProfile>('POST', `/settings/profiles/${encodeURIComponent(id)}/duplicate`, { name });
+export const bulkAssignAcquisitionProfile = (id: string, mangaIds: number[]) => send<number>('POST', `/settings/profiles/${encodeURIComponent(id)}/assign`, { mangaIds });
+
+export interface MetadataReviewItem {
+  id: string;
+  mangaId: number;
+  title: string;
+  coverUrl?: string | null;
+  issueType: string;
+  status: string;
+  reason: string;
+  mangabakaId?: number | null;
+  currentEdition?: string | null;
+  suggestedMangabakaId?: number | null;
+  suggestedEdition?: string | null;
+  details: Record<string, unknown>;
+  createdAt: number;
+}
+
+export interface ResolveReviewRequest {
+  action: 'link_mangabaka' | 'set_edition' | 'dismiss';
+  mangabakaId?: number | null;
+  edition?: string | null;
+}
+
+export const getMetadataReviewQueue = () => get<MetadataReviewItem[]>('/metadata/review-queue');
+export const resolveMetadataReviewItem = (mangaId: number, req: ResolveReviewRequest) =>
+  send<MetadataReviewItem>('POST', `/metadata/review-queue/${mangaId}/resolve`, req);
 
 export const getTitleProfile = (id: number) => get<AcquisitionProfile>(`/titles/${id}/profile`);
 export const setTitleProfile = (id: number, profileId: string | null) => send<AcquisitionProfile>('PUT', `/titles/${id}/profile`, { profileId });

@@ -238,6 +238,63 @@ pub fn score_candidate_for_profile(
         }
     }
 
+    // 9. Milestone v1.3: Quality preference scoring policy
+    match profile.quality_preference.as_str() {
+        "best" => {
+            if cand.quality_signals.is_digital {
+                score += 8.0;
+                why_rec.push("✓ Preferred digital edition for 'best' quality profile".to_string());
+            }
+            if cand.quality_signals.is_trusted {
+                score += 8.0;
+                why_rec.push("✓ Trusted release group".to_string());
+            }
+            if cand.quality_signals.edition_penalty > 0.0 {
+                score -= 10.0;
+                why_low.push("− Variant edition penalized under 'best' quality profile".to_string());
+            }
+        }
+        "size" => {
+            if let Some(sz) = cand.size {
+                let n_vols = (covers_missing.len() + duplicates.len()).max(1) as u64;
+                let sz_per_vol = sz / n_vols;
+                if sz_per_vol <= 250 * 1024 * 1024 {
+                    score += 10.0;
+                    why_rec.push("✓ Compact volume size (<250MB) matching storage-saver profile".to_string());
+                } else if sz_per_vol > 500 * 1024 * 1024 {
+                    score -= 15.0;
+                    why_low.push("− Large volume size (>500MB) penalized under storage-saver profile".to_string());
+                }
+            }
+        }
+        _ => {
+            // "balanced" profile: standard scoring
+        }
+    }
+
+    // 10. Milestone v1.3: Preferred sources matching
+    if !profile.preferred_sources.is_empty() {
+        let cand_source = cand.provider.to_lowercase();
+        if profile.preferred_sources.iter().any(|s| s.eq_ignore_ascii_case(&cand_source)) {
+            score += 10.0;
+            why_rec.push(format!("✓ Matches preferred source '{}'", cand.provider));
+        } else {
+            score -= 10.0;
+            why_low.push(format!("− Source '{}' not in profile's preferred sources", cand.provider));
+        }
+    }
+
+    // 11. Milestone v1.4: Source Intelligence & Uploader Reliability
+    if let Some(pct) = cand.health.uploader_reliability_percent {
+        if pct >= 90.0 {
+            score += 10.0;
+            why_rec.push(format!("✓ High uploader historical reliability ({:.0}%)", pct));
+        } else if pct < 60.0 {
+            score -= 20.0;
+            why_low.push(format!("− Low uploader historical reliability ({:.0}%)", pct));
+        }
+    }
+
     (score, why_rec, why_low)
 }
 

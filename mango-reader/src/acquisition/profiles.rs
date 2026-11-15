@@ -450,3 +450,36 @@ pub fn set_manga_profile(
     )?;
     Ok(())
 }
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BulkAssignProfileRequest {
+    pub manga_ids: Vec<i64>,
+}
+
+pub fn bulk_assign_profile(
+    conn: &Connection,
+    profile_id: Option<&str>,
+    manga_ids: &[i64],
+) -> Result<usize> {
+    if let Some(id) = profile_id {
+        if !id.trim().is_empty() {
+            let exists: bool = conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM acquisition_profiles WHERE id = ?1)",
+                    [id],
+                    |r| r.get(0),
+                )?;
+            if !exists {
+                return Err(AppError::not_found(format!("Profile '{id}' does not exist")));
+            }
+        }
+    }
+
+    let mut count = 0;
+    for &mid in manga_ids {
+        set_manga_profile(conn, mid, profile_id)?;
+        count += 1;
+    }
+    Ok(count)
+}

@@ -21,6 +21,9 @@
     deleteAcquisitionProfile,
     duplicateAcquisitionProfile,
     getSourceHealthReports,
+    getMetadataReviewQueue,
+    resolveMetadataReviewItem,
+    type MetadataReviewItem,
     runLibraryDryRun,
     executeBatchNormalize,
     retryNormalizationRefresh,
@@ -1012,6 +1015,7 @@
 
       loadProfiles();
       loadSourceHealth();
+      loadMetadataReviewQueue();
       loadNormalizationHistory();
       loadOpenTome();
       loadAutoAcquireSettings();
@@ -1468,6 +1472,46 @@
       // ignore
     } finally {
       sourcesHealthLoading = false;
+    }
+  }
+
+  // ---------- Metadata Review Queue (Milestone v1.5) ----------
+  let metadataReviewQueue = $state<MetadataReviewItem[]>([]);
+  let metadataReviewLoading = $state(false);
+  let reviewMangabakaInputs = $state<Record<number, string>>({});
+  let reviewEditionInputs = $state<Record<number, string>>({});
+
+  async function loadMetadataReviewQueue() {
+    metadataReviewLoading = true;
+    try {
+      metadataReviewQueue = await getMetadataReviewQueue();
+    } catch (e) {
+      // ignore
+    } finally {
+      metadataReviewLoading = false;
+    }
+  }
+
+  async function handleResolveReview(item: MetadataReviewItem, action: 'link_mangabaka' | 'set_edition' | 'dismiss') {
+    try {
+      let mangabakaId: number | null = null;
+      let edition: string | null = null;
+      if (action === 'link_mangabaka') {
+        const val = reviewMangabakaInputs[item.mangaId];
+        if (!val || isNaN(parseInt(val, 10))) {
+          toast.error('Valid numeric MangaBaka ID is required');
+          return;
+        }
+        mangabakaId = parseInt(val, 10);
+      } else if (action === 'set_edition') {
+        edition = reviewEditionInputs[item.mangaId] || 'standard';
+      }
+
+      await resolveMetadataReviewItem(item.mangaId, { action, mangabakaId, edition });
+      toast.success(`Resolved review for "${item.title}"`);
+      await loadMetadataReviewQueue();
+    } catch (e) {
+      toast.error(message(e));
     }
   }
 
@@ -2564,6 +2608,72 @@
                     Force Re-download
                   </button>
                 </div>
+              </div>
+            {/if}
+          </section>
+
+          <!-- Metadata Review & Disambiguation Queue (Milestone v1.5) -->
+          <section class="card">
+            <div class="card-header-row">
+              <div>
+                <h3>Metadata Review & Disambiguation Queue</h3>
+                <span class="muted">Proactive identification and one-click resolution of ambiguous MangaBaka series identities, edition conflicts, and tracker mismatches.</span>
+              </div>
+              <button class="btn pill icon-text" onclick={loadMetadataReviewQueue} disabled={metadataReviewLoading}>
+                <Icon name="refresh" size={14} /> Refresh Queue
+              </button>
+            </div>
+
+            {#if metadataReviewLoading}
+              <p class="muted">Scanning library for metadata review items…</p>
+            {:else if metadataReviewQueue.length === 0}
+              <div class="empty-notice">
+                <Icon name="check" size={16} />
+                <span>All series identities, editions, and tracker mappings are verified. No review items pending.</span>
+              </div>
+            {:else}
+              <div class="review-queue-list">
+                {#each metadataReviewQueue as item (item.id)}
+                  <div class="review-queue-item card-nested">
+                    <div class="review-item-main">
+                      <div class="review-item-title-row">
+                        <strong>{item.title}</strong>
+                        <span class="tag warn capitalize">{item.issueType.replace('_', ' ')}</span>
+                      </div>
+                      <div class="review-item-reason muted">{item.reason}</div>
+                    </div>
+                    <div class="review-item-actions">
+                      {#if item.issueType === 'missing_mangabaka' || item.issueType === 'ambiguous_identity'}
+                        <div class="input-with-btn">
+                          <input
+                            type="text"
+                            class="field small"
+                            placeholder="MangaBaka ID (e.g. 83)"
+                            bind:value={reviewMangabakaInputs[item.mangaId]}
+                          />
+                          <button class="btn pill small spot" onclick={() => handleResolveReview(item, 'link_mangabaka')}>
+                            Link ID
+                          </button>
+                        </div>
+                      {/if}
+                      {#if item.issueType === 'edition_conflict'}
+                        <div class="input-with-btn">
+                          <select class="field small" bind:value={reviewEditionInputs[item.mangaId]}>
+                            <option value="standard">Standard Edition</option>
+                            <option value="deluxe">Deluxe Edition</option>
+                            <option value="omnibus">Omnibus Edition</option>
+                          </select>
+                          <button class="btn pill small spot" onclick={() => handleResolveReview(item, 'set_edition')}>
+                            Set Edition
+                          </button>
+                        </div>
+                      {/if}
+                      <button class="btn pill small" onclick={() => handleResolveReview(item, 'dismiss')} title="Dismiss review warning">
+                        Dismiss
+                      </button>
+                    </div>
+                  </div>
+                {/each}
               </div>
             {/if}
           </section>
@@ -6996,5 +7106,64 @@
     gap: 5px;
     color: var(--dim, #666);
     font-style: italic;
+  }
+
+  /* Metadata Review Queue styles (Milestone v1.5) */
+  .review-queue-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.75rem;
+    margin-top: 1rem;
+  }
+
+  .review-queue-item {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1rem;
+    padding: 0.85rem 1rem;
+    background: var(--surface, #faf7f2);
+    border: 1px solid var(--border, #e5dec9);
+    border-radius: 6px;
+  }
+
+  .review-item-main {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    flex: 1;
+    min-width: 200px;
+  }
+
+  .review-item-title-row {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .review-item-actions {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+  }
+
+  .input-with-btn {
+    display: flex;
+    align-items: center;
+    gap: 0.35rem;
+  }
+
+  .empty-notice {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 1rem;
+    background: var(--surface, #faf7f2);
+    border: 1px dashed var(--border, #e5dec9);
+    border-radius: 6px;
+    color: var(--dim, #666);
+    margin-top: 0.5rem;
   }
 </style>

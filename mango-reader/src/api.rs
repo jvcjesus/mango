@@ -527,6 +527,18 @@ pub fn router(state: Spaces) -> Router {
             post(post_duplicate_acquisition_profile),
         )
         .route(
+            "/settings/profiles/{id}/assign",
+            post(post_bulk_assign_acquisition_profile),
+        )
+        .route(
+            "/metadata/review-queue",
+            get(get_metadata_review_queue),
+        )
+        .route(
+            "/metadata/review-queue/{id}/resolve",
+            post(post_resolve_metadata_review_item),
+        )
+        .route(
             "/titles/{id}/profile",
             get(get_title_acquisition_profile).put(put_title_acquisition_profile),
         )
@@ -2809,6 +2821,42 @@ async fn post_duplicate_acquisition_profile(
     let name = payload.and_then(|p| p.name);
     let dup = app.acquisition.duplicate_profile(id, name).await?;
     Ok(Json(dup))
+}
+
+async fn post_bulk_assign_acquisition_profile(
+    Me(app): Me,
+    Path(id): Path<String>,
+    Json(payload): Json<crate::acquisition::profiles::BulkAssignProfileRequest>,
+) -> Result<Json<usize>> {
+    let count = app
+        .acquisition
+        .bulk_assign_profile(Some(&id), &payload.manga_ids)
+        .await?;
+    Ok(Json(count))
+}
+
+async fn get_metadata_review_queue(
+    Me(app): Me,
+) -> Result<Json<Vec<crate::pipeline::metadata_review::MetadataReviewItem>>> {
+    let items = app
+        .db
+        .call(|conn| crate::pipeline::metadata_review::get_metadata_review_items(conn))
+        .await?;
+    Ok(Json(items))
+}
+
+async fn post_resolve_metadata_review_item(
+    Me(app): Me,
+    Path(id): Path<i64>,
+    Json(payload): Json<crate::pipeline::metadata_review::ResolveReviewRequest>,
+) -> Result<Json<crate::pipeline::metadata_review::MetadataReviewItem>> {
+    let resolved = app
+        .db
+        .call(move |conn| {
+            crate::pipeline::metadata_review::resolve_metadata_review_item(conn, id, &payload)
+        })
+        .await?;
+    Ok(Json(resolved))
 }
 
 #[derive(Deserialize)]

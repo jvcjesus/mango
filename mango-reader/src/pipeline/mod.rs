@@ -13,6 +13,7 @@ pub mod komf;
 pub mod komga;
 pub mod mangabaka;
 pub mod metadata;
+pub mod metadata_review;
 pub mod naming;
 pub mod naming_audit;
 pub mod normalization;

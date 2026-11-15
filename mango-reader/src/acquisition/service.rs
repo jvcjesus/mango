@@ -1683,6 +1683,24 @@ impl AcquisitionService {
             .await
     }
 
+    pub async fn bulk_assign_profile(
+        &self,
+        id: Option<&str>,
+        manga_ids: &[i64],
+    ) -> Result<usize> {
+        let id_opt = id.map(|s| s.to_string());
+        let ids = manga_ids.to_vec();
+        self.db
+            .call(move |conn| {
+                crate::acquisition::profiles::bulk_assign_profile(
+                    conn,
+                    id_opt.as_deref(),
+                    &ids,
+                )
+            })
+            .await
+    }
+
     pub async fn get_manga_profile(&self, manga_id: i64) -> Result<AcquisitionProfile> {
         self.db
             .call(move |conn| crate::acquisition::profiles::get_profile_for_manga(conn, manga_id))
@@ -1775,15 +1793,30 @@ impl AcquisitionService {
                         })
                         .await;
 
+                    let nyaa_health = self
+                        .db
+                        .call(|conn| crate::acquisition::intelligence::get_source_health(conn, "nyaa"))
+                        .await
+                        .ok()
+                        .flatten();
+
                     for c in cands {
-                        normalized_candidates.push(
-                            NormalizedAcquisitionCandidate::from_nyaa_candidate(
-                                &missing_summary.title,
-                                &c,
-                                &profile.preferred_uploaders,
-                                &profile.language,
-                            ),
+                        let mut nc = NormalizedAcquisitionCandidate::from_nyaa_candidate(
+                            &missing_summary.title,
+                            &c,
+                            &profile.preferred_uploaders,
+                            &profile.language,
                         );
+                        if let Some(ref u) = nc.uploader {
+                            if let Some(ref h) = nyaa_health {
+                                if let Some(stats) = h.uploader_stats.get(u) {
+                                    if stats.attempted_acquisitions >= 2 {
+                                        nc.health.uploader_reliability_percent = Some(stats.reliability_percent);
+                                    }
+                                }
+                            }
+                        }
+                        normalized_candidates.push(nc);
                     }
                 }
                 Err(e) => {

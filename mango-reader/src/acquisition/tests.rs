@@ -3417,3 +3417,199 @@ fn test_v1_2_planner_interior_gap_priority() {
     assert!(why_interior.iter().any(|r| r.contains("Resolves interior reading gap")));
     assert!(!why_trailing.iter().any(|r| r.contains("Resolves interior reading gap")));
 }
+
+#[test]
+fn test_v1_3_profile_quality_preference_scoring() {
+    let mut profile_best = crate::acquisition::profiles::AcquisitionProfile::default();
+    profile_best.quality_preference = "best".to_string();
+    profile_best.preferred_sources = vec!["nyaa".to_string()];
+
+    let mut profile_size = crate::acquisition::profiles::AcquisitionProfile::default();
+    profile_size.quality_preference = "size".to_string();
+    profile_size.preferred_sources = vec!["nyaa".to_string()];
+
+    let digital_cand = crate::acquisition::candidates::NormalizedAcquisitionCandidate {
+        provider: "nyaa".to_string(),
+        release_unit: crate::acquisition::AcquisitionReleaseUnit::Volume(1.0),
+        quality_signals: crate::acquisition::candidates::CandidateQualitySignals {
+            is_digital: true,
+            is_trusted: true,
+            ..Default::default()
+        },
+        health: crate::acquisition::candidates::CandidateHealth {
+            seeders: Some(10),
+            source_healthy: true,
+            ..Default::default()
+        },
+        size: Some(600_000_000), // 600MB
+        score: 70.0,
+        ..Default::default()
+    };
+
+    let compact_cand = crate::acquisition::candidates::NormalizedAcquisitionCandidate {
+        provider: "nyaa".to_string(),
+        release_unit: crate::acquisition::AcquisitionReleaseUnit::Volume(1.0),
+        quality_signals: crate::acquisition::candidates::CandidateQualitySignals {
+            is_digital: false,
+            is_trusted: false,
+            ..Default::default()
+        },
+        health: crate::acquisition::candidates::CandidateHealth {
+            seeders: Some(10),
+            source_healthy: true,
+            ..Default::default()
+        },
+        size: Some(150_000_000), // 150MB
+        score: 70.0,
+        ..Default::default()
+    };
+
+    let missing = vec![1.0];
+    let owned = vec![];
+
+    // Under "best", digital + trusted gets +16 bonus (plus standard digital +8)
+    let (score_best_digital, why_best, _) = crate::acquisition::planner::score_candidate_for_profile(
+        &digital_cand,
+        &profile_best,
+        &missing,
+        &owned,
+        "healthy",
+    );
+    assert!(why_best.iter().any(|w| w.contains("'best' quality profile")));
+    assert!(why_best.iter().any(|w| w.contains("Trusted release group")));
+
+    // Under "size", compact gets +10 bonus while 600MB gets -15 penalty
+    let (score_size_compact, why_size_comp, _) = crate::acquisition::planner::score_candidate_for_profile(
+        &compact_cand,
+        &profile_size,
+        &missing,
+        &owned,
+        "healthy",
+    );
+    let (score_size_oversized, _, why_size_over) = crate::acquisition::planner::score_candidate_for_profile(
+        &digital_cand,
+        &profile_size,
+        &missing,
+        &owned,
+        "healthy",
+    );
+
+    assert!(why_size_comp.iter().any(|w| w.contains("storage-saver profile")));
+    assert!(why_size_over.iter().any(|w| w.contains("storage-saver profile")));
+    assert!(score_best_digital > score_size_oversized);
+    assert!(score_size_compact > 70.0);
+}
+
+#[test]
+fn test_v1_3_profile_bulk_assignment() {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE manga (
+            id INTEGER PRIMARY KEY,
+            title TEXT NOT NULL,
+            acquisition_profile_id TEXT
+        );
+        CREATE TABLE acquisition_profiles (
+            id TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            is_default INTEGER NOT NULL DEFAULT 0,
+            language TEXT NOT NULL DEFAULT 'en',
+            preferred_release_type TEXT NOT NULL DEFAULT 'volume',
+            source_selection TEXT NOT NULL DEFAULT 'smart',
+            preferred_sources TEXT NOT NULL DEFAULT '[]',
+            preferred_uploaders TEXT NOT NULL DEFAULT '[]',
+            min_seeders INTEGER NOT NULL DEFAULT 1,
+            prefer_digital INTEGER NOT NULL DEFAULT 1,
+            trusted_only INTEGER NOT NULL DEFAULT 0,
+            collection_policy TEXT NOT NULL DEFAULT 'smart',
+            max_unnecessary_duplicate_coverage INTEGER NOT NULL DEFAULT 3,
+            max_acquisition_size_bytes INTEGER,
+            max_plan_size_bytes INTEGER,
+            quality_preference TEXT NOT NULL DEFAULT 'best',
+            allow_mixed_collections INTEGER NOT NULL DEFAULT 0,
+            allow_zero_seeders TEXT NOT NULL DEFAULT 'no',
+            allow_unsupported_editions INTEGER NOT NULL DEFAULT 0,
+            auto_acquire INTEGER NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        INSERT INTO acquisition_profiles (id, name, is_default, created_at, updated_at)
+        VALUES ('prof_archival', 'Archival High Quality', 0, 1000, 1000);
+        INSERT INTO manga (id, title) VALUES (1, 'Title A'), (2, 'Title B'), (3, 'Title C');",
+    )
+    .unwrap();
+
+    let assigned = crate::acquisition::profiles::bulk_assign_profile(
+        &conn,
+        Some("prof_archival"),
+        &[1, 2, 3],
+    )
+    .unwrap();
+
+    assert_eq!(assigned, 3);
+
+    for id in 1..=3 {
+        let prof_id: Option<String> = conn
+            .query_row(
+                "SELECT acquisition_profile_id FROM manga WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(prof_id.as_deref(), Some("prof_archival"));
+    }
+}
+
+#[test]
+fn test_v1_4_source_intelligence_uploader_scoring() {
+    let profile = crate::acquisition::profiles::AcquisitionProfile::default();
+    let missing = vec![1.0];
+    let owned = vec![];
+
+    let cand_high_rel = crate::acquisition::candidates::NormalizedAcquisitionCandidate {
+        provider: "nyaa".to_string(),
+        release_unit: crate::acquisition::AcquisitionReleaseUnit::Volume(1.0),
+        health: crate::acquisition::candidates::CandidateHealth {
+            seeders: Some(10),
+            source_healthy: true,
+            uploader_reliability_percent: Some(95.0),
+            ..Default::default()
+        },
+        score: 75.0,
+        ..Default::default()
+    };
+
+    let cand_low_rel = crate::acquisition::candidates::NormalizedAcquisitionCandidate {
+        provider: "nyaa".to_string(),
+        release_unit: crate::acquisition::AcquisitionReleaseUnit::Volume(1.0),
+        health: crate::acquisition::candidates::CandidateHealth {
+            seeders: Some(10),
+            source_healthy: true,
+            uploader_reliability_percent: Some(40.0),
+            ..Default::default()
+        },
+        score: 75.0,
+        ..Default::default()
+    };
+
+    let (score_high, why_high, _) = crate::acquisition::planner::score_candidate_for_profile(
+        &cand_high_rel,
+        &profile,
+        &missing,
+        &owned,
+        "healthy",
+    );
+
+    let (score_low, _, why_low) = crate::acquisition::planner::score_candidate_for_profile(
+        &cand_low_rel,
+        &profile,
+        &missing,
+        &owned,
+        "healthy",
+    );
+
+    assert!(why_high.iter().any(|w| w.contains("High uploader historical reliability")));
+    assert!(why_low.iter().any(|w| w.contains("Low uploader historical reliability")));
+    assert!(score_high > score_low);
+    assert_eq!(score_high - score_low, 30.0); // +10 vs -20
+}

@@ -890,6 +890,31 @@ pub fn update_item_status(
         params![item_id, status.as_str(), download_job_id, error_message, now],
     )?;
 
+    // Milestone v1.4: Record acquisition outcome into Source Intelligence
+    if status == ExecutionItemStatus::Completed || status == ExecutionItemStatus::Failed {
+        let item_cand: rusqlite::Result<(String, Option<String>)> = conn.query_row(
+            "SELECT candidate_json FROM acquisition_execution_items WHERE id = ?1",
+            [item_id],
+            |r| {
+                let json_str: String = r.get(0)?;
+                let v: serde_json::Value = serde_json::from_str(&json_str).unwrap_or_default();
+                let prov = v.get("provider").and_then(|p| p.as_str()).unwrap_or("").to_string();
+                let upl = v.get("uploader").and_then(|u| u.as_str()).map(|s| s.to_string());
+                Ok((prov, upl))
+            },
+        );
+        if let Ok((prov, upl)) = item_cand {
+            if !prov.is_empty() {
+                let _ = crate::acquisition::intelligence::record_acquisition_outcome(
+                    conn,
+                    &prov,
+                    upl.as_deref(),
+                    status == ExecutionItemStatus::Completed,
+                );
+            }
+        }
+    }
+
     Ok(())
 }
 
