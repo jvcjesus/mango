@@ -513,8 +513,8 @@ pub async fn add_mangabaka_catalog_title(
             );
             match komga_client.search_series(&title_str, None).await {
                 Ok(series_list) => {
-                    let norm = crate::pipeline::mangabaka::normalize_title(&title_str);
-                    series_list.into_iter().find(|s| crate::pipeline::mangabaka::normalize_title(&s.name) == norm).map(|s| s.id)
+                    crate::pipeline::komga::find_matching_komga_series(&series_list, &title_str, None)
+                        .map(|(s, _)| s.id.clone())
                 }
                 Err(_) => None,
             }

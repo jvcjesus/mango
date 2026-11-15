@@ -487,5 +487,49 @@ describe('Mango M13 — Unified Series Workspace, Acquisition Inbox & Lifecycle 
       expect(groups[0].otherProposals).toHaveLength(1);
       expect(groups[0].otherProposals[0].status).toBe('approved');
     });
+
+    it('filters out already owned volume proposals and populates Komga confirmation status', () => {
+      const ownedMap = {
+        'manga:508': [1, 2, 3, 4, 5, 6],
+        'BLAME!': [1, 2, 3, 4, 5, 6],
+      };
+      const totalsMap = {
+        'manga:508': 6,
+        'BLAME!': 6,
+      };
+
+      const itemVol1: ReviewQueueItem = {
+        id: 259,
+        mangaId: 508,
+        seriesId: 'manga:508',
+        seriesTitle: 'BLAME!',
+        volumeNumber: 1,
+        recommendedCandidateId: 'cand-1',
+        provider: 'madokami',
+        title: 'BLAME! v01',
+        rawTitle: 'Ore wa Warukunai v01.zip',
+        qualityScore: 60,
+        confidence: 'ambiguous',
+        status: 'pending',
+        createdAt: 100,
+        updatedAt: 100,
+        isKomgaConfirmed: true,
+        komgaSeriesId: '0S1YA4HV4J7RQ',
+        lastReconciledAt: 1700000000,
+        monitorOrigins: ['lists'],
+      };
+
+      const groups = groupReviewQueueBySeries([itemVol1], ownedMap, totalsMap);
+      expect(groups).toHaveLength(1);
+      expect(groups[0].ownedCount).toBe(6);
+      expect(groups[0].totalOfficialCount).toBe(6);
+      expect(groups[0].nextMissingVolume).toBeNull();
+      // Because Vol 1 is owned in ownedMap, it is filtered out of pending proposals
+      expect(groups[0].pendingCount).toBe(0);
+      expect(groups[0].primaryProposals).toHaveLength(0);
+      expect(groups[0].otherCount).toBe(1);
+      expect(groups[0].isKomgaConfirmed).toBe(true);
+      expect(groups[0].monitorOrigins).toEqual(['lists']);
+    });
   });
 });

@@ -3880,3 +3880,212 @@ fn test_v1_1_richer_tracked_owned_reading_acquiring_semantics() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[tokio::test]
+async fn test_v1_7_blame_multi_edition_matching_and_stale_proposal_invalidation() {
+    let dir = std::env::temp_dir().join(format!("mango-test-blame-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let db = Db::open(&dir.join("test.db")).expect("test db");
+    let conn = db.second().expect("conn");
+
+    // Setup necessary tables
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS series_reconciliations (
+            series_id TEXT PRIMARY KEY,
+            manga_id INTEGER,
+            komga_series_id TEXT,
+            mangabaka_id INTEGER,
+            collection_id TEXT,
+            title TEXT NOT NULL,
+            edition TEXT NOT NULL DEFAULT 'standard',
+            status TEXT NOT NULL,
+            is_ongoing INTEGER NOT NULL DEFAULT 1,
+            total_official_volumes INTEGER,
+            owned_volumes_count INTEGER NOT NULL DEFAULT 0,
+            missing_volumes_count INTEGER NOT NULL DEFAULT 0,
+            owned_volumes_json TEXT NOT NULL DEFAULT '[]',
+            missing_volumes_json TEXT NOT NULL DEFAULT '[]',
+            future_volumes_json TEXT NOT NULL DEFAULT '[]',
+            last_reconciled_at INTEGER NOT NULL,
+            last_error TEXT,
+            review_reason TEXT,
+            updated_at INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS acquisition_review_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            manga_id INTEGER,
+            series_id TEXT NOT NULL,
+            series_title TEXT NOT NULL,
+            volume_number REAL NOT NULL,
+            recommended_candidate_id TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            title TEXT NOT NULL,
+            raw_title TEXT NOT NULL,
+            quality_score REAL NOT NULL,
+            confidence TEXT NOT NULL,
+            confidence_reason TEXT,
+            file_size_bytes INTEGER,
+            publication_destination TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            status_reason TEXT,
+            alternatives_json TEXT,
+            ranking_breakdown_json TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            acquisition_priority INTEGER NOT NULL DEFAULT 1,
+            earlier_missing_gaps TEXT,
+            ordering_explanation TEXT,
+            is_safe_to_approve INTEGER NOT NULL DEFAULT 1,
+            UNIQUE(series_id, volume_number)
+        );
+        CREATE TABLE IF NOT EXISTS release_availability_watchers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            manga_id INTEGER NOT NULL,
+            series_id TEXT NOT NULL,
+            canonical_series_id TEXT,
+            series_title TEXT NOT NULL,
+            volume_number REAL NOT NULL,
+            state TEXT NOT NULL DEFAULT 'AWAITING_RELEASE',
+            release_date TEXT,
+            next_check_at INTEGER NOT NULL DEFAULT 0,
+            last_checked_at INTEGER,
+            candidate_count INTEGER NOT NULL DEFAULT 0,
+            top_candidate_id TEXT,
+            top_candidate_provider TEXT,
+            top_candidate_title TEXT,
+            consecutive_failures INTEGER NOT NULL DEFAULT 0,
+            last_status_message TEXT,
+            last_error TEXT,
+            notified_at INTEGER,
+            notify_on_available INTEGER NOT NULL DEFAULT 1,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            candidate_fingerprint TEXT,
+            is_owned INTEGER NOT NULL DEFAULT 0
+        );"
+    ).unwrap();
+
+    // 1. Komga Series Matching Regression Test:
+    // BLAME! must match "BLAME! (master Edition)" and extract "master" edition
+    let komga_candidates = vec![
+        crate::pipeline::komga::KomgaSeries {
+            id: "0S1YA4HV4J7RQ".into(),
+            name: "BLAME! (master Edition)".into(),
+            library_id: "lib-1".into(),
+            books_count: 6,
+        },
+    ];
+    let matched = crate::pipeline::komga::find_matching_komga_series(&komga_candidates, "BLAME!", None);
+    assert!(matched.is_some(), "BLAME! should match 'BLAME! (master Edition)'");
+    let (s, detected_ed) = matched.unwrap();
+    assert_eq!(s.id, "0S1YA4HV4J7RQ");
+    assert_eq!(detected_ed.as_deref(), Some("master"));
+
+    // 2. Insert test manga and stale review queue items for BLAME! (e.g. erroneous 'Ore wa Warukunai' proposals)
+    conn.execute(
+        "INSERT INTO manga (id, title, source_id, url) VALUES (508, 'BLAME!', 0, 'mangabaka:12030')",
+        [],
+    ).unwrap();
+    conn.execute(
+        "INSERT INTO acquisition_review_queue (
+            manga_id, series_id, series_title, volume_number, recommended_candidate_id,
+            provider, title, raw_title, quality_score, confidence, status, created_at, updated_at
+        ) VALUES (508, 'manga:508', 'BLAME!', 1.0, 'cand-1', 'madokami', 'BLAME! v01', 'Ore wa Warukunai v01.zip', 60.0, 'ambiguous', 'pending', 1000, 1000)",
+        [],
+    ).unwrap();
+    conn.execute(
+        "INSERT INTO acquisition_review_queue (
+            manga_id, series_id, series_title, volume_number, recommended_candidate_id,
+            provider, title, raw_title, quality_score, confidence, status, created_at, updated_at
+        ) VALUES (508, 'manga:508', 'BLAME!', 2.0, 'cand-2', 'madokami', 'BLAME! v02', 'Ore wa Warukunai v02.zip', 60.0, 'ambiguous', 'pending', 1000, 1000)",
+        [],
+    ).unwrap();
+
+    // 3. Create a ReconciliationSummary with all 6 volumes owned in Komga
+    let summary = crate::sync::reconciliation::ReconciliationSummary {
+        series_id: "manga:508".into(),
+        manga_id: Some(508),
+        komga_series_id: Some("0S1YA4HV4J7RQ".into()),
+        mangabaka_id: Some(12030),
+        collection_id: Some("019f2776-55d5-74aa-97c0-1c5b0406cc02".into()),
+        title: "BLAME!".into(),
+        edition: "master".into(),
+        status: crate::sync::reconciliation::ReconciliationStatus::UpToDate,
+        is_ongoing: false,
+        total_official_volumes: Some(6),
+        owned_volumes_count: 6,
+        missing_volumes_count: 0,
+        owned_volumes: vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        missing_volumes: vec![],
+        future_volumes: vec![],
+        last_reconciled_at: 2000,
+        last_error: None,
+        review_reason: None,
+        display_status: "Up to Date (6/6)".into(),
+    };
+
+    // Save reconciliation and verify stale proposals are automatically invalidated
+    crate::sync::reconciliation::save_reconciliation(&conn, &summary).unwrap();
+
+    // Check review queue status for Vol 1 and Vol 2
+    let status_v1: String = conn.query_row(
+        "SELECT status FROM acquisition_review_queue WHERE series_id = 'manga:508' AND volume_number = 1.0",
+        [],
+        |r| r.get(0),
+    ).unwrap();
+    assert_eq!(status_v1, "skipped", "Volume 1 pending proposal must be automatically skipped once owned");
+
+    let status_v2: String = conn.query_row(
+        "SELECT status FROM acquisition_review_queue WHERE series_id = 'manga:508' AND volume_number = 2.0",
+        [],
+        |r| r.get(0),
+    ).unwrap();
+    assert_eq!(status_v2, "skipped", "Volume 2 pending proposal must be automatically skipped once owned");
+
+    // 4. Verify ambiguous candidates are rejected by add_or_update_review_queue_item
+    let amb_cand = crate::acquisition::providers::ReleaseCandidate {
+        candidate_id: "cand-amb".into(),
+        provider: "madokami".into(),
+        provider_item_id: "item-amb".into(),
+        title: "BLAME! v03".into(),
+        raw_title: "Ore wa Warukunai v03.zip".into(),
+        match_type: crate::acquisition::providers::CandidateMatchType::ExactVolume,
+        target_volume: Some(3.0),
+        target_chapter: None,
+        size_bytes: Some(500_000_000),
+        uploader: None,
+        is_trusted: false,
+        is_digital: true,
+        score: 60.0,
+        score_explanation: "Ambiguous title tokens".into(),
+        download_url: Some("http://example.com/dl".into()),
+        magnet_url: None,
+        info_hash: None,
+        seeders: None,
+        leechers: None,
+        published_at: None,
+        confidence: Some("ambiguous".into()),
+        confidence_reason: Some("Extra unmatched title tokens".into()),
+        language: Some("en".into()),
+        edition: Some("standard".into()),
+        format: Some("zip".into()),
+        resolution: None,
+        publisher: None,
+        ranking_breakdown: None,
+    };
+
+    let res = crate::acquisition::monitoring::add_or_update_review_queue_item(
+        &conn,
+        Some(508),
+        "manga:508",
+        "BLAME!",
+        3.0,
+        &amb_cand,
+        &[],
+        None,
+    ).unwrap();
+    assert_eq!(res, 0, "Ambiguous candidate should be rejected from review queue");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

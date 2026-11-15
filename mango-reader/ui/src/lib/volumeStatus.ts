@@ -1081,6 +1081,11 @@ export interface SeriesGroupedReviewQueue {
   otherCount: number;
   outOfOrderCount: number;
   warnings: string[];
+  isKomgaConfirmed?: boolean;
+  komgaSeriesId?: string | null;
+  lastReconciledAt?: number | null;
+  monitorOrigins?: string[];
+  missingCount?: number;
 }
 
 /**
@@ -1183,8 +1188,9 @@ export function groupReviewQueueBySeries(
 
     const missingSeq = calculateNextMissingVolume(ownedList, totalExpected);
 
-    const pendingItems = groupItems.filter((i) => i.status === 'pending');
-    const otherProposals = groupItems.filter((i) => i.status !== 'pending');
+    const isOwned = (vol: number) => ownedList.some((o) => Math.abs(o - vol) < 0.001);
+    const pendingItems = groupItems.filter((i) => i.status === 'pending' && !isOwned(i.volumeNumber));
+    const otherProposals = groupItems.filter((i) => i.status !== 'pending' || isOwned(i.volumeNumber));
 
     // Sort pending items by acquisition priority ascending, then volume number ascending
     pendingItems.sort((a, b) => {
@@ -1217,6 +1223,12 @@ export function groupReviewQueueBySeries(
       }
     }
 
+    const isKomgaConfirmed = sample.isKomgaConfirmed ?? (sample.komgaSeriesId != null);
+    const komgaSeriesId = sample.komgaSeriesId ?? null;
+    const lastReconciledAt = sample.lastReconciledAt ?? null;
+    const monitorOrigins = sample.monitorOrigins ?? [];
+    const missingCount = sample.missingVolumesCount ?? (totalExpected != null ? Math.max(0, totalExpected - missingSeq.totalOwnedCount) : 0);
+
     result.push({
       seriesId: key,
       seriesTitle,
@@ -1231,6 +1243,11 @@ export function groupReviewQueueBySeries(
       otherCount: otherProposals.length,
       outOfOrderCount: outOfOrderProposals.length,
       warnings,
+      isKomgaConfirmed,
+      komgaSeriesId,
+      lastReconciledAt,
+      monitorOrigins,
+      missingCount,
     });
   }
 

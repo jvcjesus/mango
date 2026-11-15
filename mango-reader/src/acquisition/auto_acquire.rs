@@ -279,6 +279,15 @@ pub fn is_candidate_auto_eligible(
         }
     }
 
+    // Gate 3b: Title / identity confidence check
+    let expl_lower = cand.score_explanation.to_ascii_lowercase();
+    if expl_lower.contains("identity uncertain")
+        || expl_lower.contains("unmatched title tokens")
+        || expl_lower.contains("confidence: ambiguous")
+    {
+        return Err(AutoDecisionCode::AmbiguousTitleTokens);
+    }
+
     // Gate 4: Language must match target profile (default English "en")
     if crate::acquisition::matching::detect_foreign_language(&cand.raw_title, &profile.language).is_some() {
         return Err(AutoDecisionCode::LanguageUnknown);

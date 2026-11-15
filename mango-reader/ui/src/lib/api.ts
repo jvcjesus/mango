@@ -3261,6 +3261,13 @@ export interface ReviewQueueItem {
   rankingBreakdownJson?: string | null;
   createdAt: number;
   updatedAt: number;
+  komgaSeriesId?: string | null;
+  lastReconciledAt?: number | null;
+  ownedVolumesCount?: number | null;
+  missingVolumesCount?: number | null;
+  isKomgaConfirmed?: boolean;
+  monitorOrigins?: string[];
+  selectionReason?: string | null;
 }
 
 export interface MonitoringActivityEntry {

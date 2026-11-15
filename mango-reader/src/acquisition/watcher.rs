@@ -915,6 +915,9 @@ pub async fn evaluate_watcher_check(
     // 6. Filter candidates using strict M6.8 hard gates
     let mut eligible_candidate: Option<crate::acquisition::providers::ReleaseCandidate> = None;
     for cand in &discovery_res.candidates {
+        if cand.confidence.as_deref() == Some("ambiguous") {
+            continue;
+        }
         let persisted = PersistedCandidate {
             series_id: watcher.series_id.clone(),
             volume_number,

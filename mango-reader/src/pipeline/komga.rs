@@ -714,23 +714,14 @@ impl KomgaClient {
         release_number: f64,
     ) -> Result<bool> {
         let trimmed_title = series_title.trim();
-        let wanted_norm = crate::pipeline::mangabaka::normalize_title(trimmed_title);
 
         let series_candidates = match self.search_series(trimmed_title, library_id).await {
             Ok(s) => s,
             Err(e) => return Err(e),
         };
 
-        let exact_matches: Vec<_> = series_candidates
-            .into_iter()
-            .filter(|s| {
-                s.name.eq_ignore_ascii_case(trimmed_title)
-                    || crate::pipeline::mangabaka::normalize_title(&s.name) == wanted_norm
-            })
-            .collect();
-
-        let matched_series = match exact_matches.first() {
-            Some(s) => s,
+        let matched_series = match find_matching_komga_series(&series_candidates, trimmed_title, None) {
+            Some((s, _)) => s,
             None => return Ok(false), // Series folder not yet indexed by Komga
         };
 
@@ -797,6 +788,155 @@ impl KomgaClient {
 
         Ok(false)
     }
+}
+
+/// Helper to extract the base series title and optional edition from a Komga series title.
+/// For example:
+/// - "BLAME! (master Edition)" -> ("BLAME!", Some("master"))
+/// - "Berserk (Deluxe Edition)" -> ("Berserk", Some("deluxe"))
+/// - "Monster [The Perfect Edition]" -> ("Monster", Some("perfect"))
+/// - "Attack on Titan (Colossal Edition)" -> ("Attack on Titan", Some("colossal"))
+/// - "Chobits" -> ("Chobits", None)
+pub fn extract_base_title_and_edition(name: &str) -> (String, Option<String>) {
+    let trimmed = name.trim();
+    // 1. Check parenthetical or bracketed suffix: ( ... ) or [ ... ]
+    if let Some(open_idx) = trimmed.rfind('(').or_else(|| trimmed.rfind('[')) {
+        if let Some(close_idx) = trimmed.rfind(')').or_else(|| trimmed.rfind(']')) {
+            if close_idx > open_idx {
+                let inside = trimmed[open_idx + 1..close_idx].trim();
+                let base = trimmed[..open_idx].trim();
+                if let Some(ed) = crate::acquisition::edition::edition_from_title(inside) {
+                    return (base.to_string(), Some(ed));
+                }
+                let inside_lower = inside.to_ascii_lowercase();
+                if inside_lower.contains("edition")
+                    || inside_lower.contains("omnibus")
+                    || inside_lower.contains("deluxe")
+                    || inside_lower.contains("master")
+                    || inside_lower.contains("colossal")
+                {
+                    let cleaned = crate::acquisition::edition::clean_edition(Some(inside));
+                    return (
+                        base.to_string(),
+                        cleaned.or_else(|| crate::acquisition::edition::edition_from_title(&inside_lower)),
+                    );
+                }
+            }
+        }
+    }
+
+    // 2. Check title ending with edition keywords directly: e.g. "BLAME! Master Edition"
+    if let Some(ed) = crate::acquisition::edition::edition_from_title(trimmed) {
+        let lower = trimmed.to_ascii_lowercase();
+        for marker in [
+            "master edition",
+            "deluxe edition",
+            "collector edition",
+            "collectors edition",
+            "perfect edition",
+            "colossal edition",
+            "omnibus",
+        ] {
+            if let Some(idx) = lower.rfind(marker) {
+                let base = trimmed[..idx]
+                    .trim()
+                    .trim_end_matches(['-', ':', ';', ',', '(', '['])
+                    .trim();
+                if !base.is_empty() {
+                    return (base.to_string(), Some(ed.clone()));
+                }
+            }
+        }
+        return (trimmed.to_string(), Some(ed));
+    }
+
+    (trimmed.to_string(), None)
+}
+
+/// Robust series matching against Komga series candidates, handling exact titles,
+/// edition suffixes (e.g. "BLAME! (master Edition)" -> "BLAME!"), and multi-edition resolution.
+pub fn find_matching_komga_series<'a>(
+    candidates: &'a [KomgaSeries],
+    target_title: &str,
+    target_edition: Option<&str>,
+) -> Option<(&'a KomgaSeries, Option<String>)> {
+    let wanted_norm = crate::pipeline::mangabaka::normalize_title(target_title);
+    let requested_ed = target_edition
+        .map(crate::acquisition::edition::normalize_edition)
+        .filter(|e| !e.is_empty() && e != "standard");
+
+    let mut exact_matches = Vec::new();
+    let mut edition_matches = Vec::new();
+
+    for s in candidates {
+        let s_norm = crate::pipeline::mangabaka::normalize_title(&s.name);
+        if s_norm == wanted_norm || s.name.eq_ignore_ascii_case(target_title) {
+            let ed = crate::acquisition::edition::edition_from_title(&s.name);
+            exact_matches.push((s, ed));
+            continue;
+        }
+
+        let (base, ed_opt) = extract_base_title_and_edition(&s.name);
+        let base_norm = crate::pipeline::mangabaka::normalize_title(&base);
+        if base_norm == wanted_norm || base.eq_ignore_ascii_case(target_title) {
+            edition_matches.push((s, ed_opt));
+        }
+    }
+
+    // Disambiguation:
+    // 1. If a specific edition was requested (e.g. "master" or "deluxe"):
+    if let Some(ref req_ed) = requested_ed {
+        let matching: Vec<_> = exact_matches
+            .iter()
+            .chain(edition_matches.iter())
+            .filter(|(_, ed)| ed.as_deref() == Some(req_ed.as_str()))
+            .collect();
+        if matching.len() == 1 {
+            return Some((matching[0].0, matching[0].1.clone()));
+        }
+        if matching.len() > 1 {
+            return None; // Ambiguous exact edition matches
+        }
+    }
+
+    // 2. If standard or no edition requested:
+    let standard_exact: Vec<_> = exact_matches
+        .iter()
+        .filter(|(_, ed)| ed.is_none() || ed.as_deref() == Some("standard"))
+        .collect();
+
+    if standard_exact.len() == 1 {
+        return Some((standard_exact[0].0, standard_exact[0].1.clone()));
+    }
+    if standard_exact.len() > 1 {
+        return None; // Ambiguous: multiple exact matches in Komga across libraries
+    }
+
+    if exact_matches.len() == 1 {
+        return Some((exact_matches[0].0, exact_matches[0].1.clone()));
+    }
+    if exact_matches.len() > 1 {
+        return None; // Ambiguous
+    }
+
+    // 3. If only edition-qualified matches exist (e.g. "BLAME! (master Edition)"):
+    if edition_matches.len() == 1 {
+        let (s, ed) = &edition_matches[0];
+        return Some((*s, ed.clone()));
+    }
+
+    // 4. If multiple edition matches and a specific one was requested:
+    if let Some(ref req_ed) = requested_ed {
+        let matching: Vec<_> = edition_matches
+            .iter()
+            .filter(|(_, ed)| ed.as_deref() == Some(req_ed.as_str()))
+            .collect();
+        if matching.len() == 1 {
+            return Some((matching[0].0, matching[0].1.clone()));
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]
@@ -1236,5 +1376,66 @@ mod tests {
                 .await
                 .unwrap()
         );
+    }
+
+    #[test]
+    fn test_find_matching_komga_series_with_edition_suffix() {
+        let candidates = vec![
+            KomgaSeries {
+                id: "k-blame".into(),
+                name: "BLAME! (master Edition)".into(),
+                library_id: "lib-1".into(),
+                books_count: 6,
+            },
+            KomgaSeries {
+                id: "k-berserk-std".into(),
+                name: "Berserk".into(),
+                library_id: "lib-1".into(),
+                books_count: 41,
+            },
+            KomgaSeries {
+                id: "k-berserk-deluxe".into(),
+                name: "Berserk (Deluxe Edition)".into(),
+                library_id: "lib-1".into(),
+                books_count: 14,
+            },
+            KomgaSeries {
+                id: "k-gluttony".into(),
+                name: "Berserk of Gluttony".into(),
+                library_id: "lib-1".into(),
+                books_count: 10,
+            },
+            KomgaSeries {
+                id: "k-aot-jh".into(),
+                name: "Attack on Titan: Junior High".into(),
+                library_id: "lib-1".into(),
+                books_count: 5,
+            },
+        ];
+
+        // 1. BLAME! matches BLAME! (master Edition) and identifies "master" edition
+        let blame_match = find_matching_komga_series(&candidates, "BLAME!", None);
+        assert!(blame_match.is_some());
+        let (series, ed) = blame_match.unwrap();
+        assert_eq!(series.id, "k-blame");
+        assert_eq!(ed.as_deref(), Some("master"));
+
+        // 2. Berserk standard matches standard
+        let berserk_std = find_matching_komga_series(&candidates, "Berserk", None);
+        assert!(berserk_std.is_some());
+        assert_eq!(berserk_std.unwrap().0.id, "k-berserk-std");
+
+        // 3. Berserk deluxe requested matches deluxe
+        let berserk_deluxe = find_matching_komga_series(&candidates, "Berserk", Some("deluxe"));
+        assert!(berserk_deluxe.is_some());
+        assert_eq!(berserk_deluxe.unwrap().0.id, "k-berserk-deluxe");
+
+        // 4. "Berserk of Gluttony" is NOT matched when searching for "Berserk"
+        let gluttony_check = find_matching_komga_series(&candidates[3..], "Berserk", None);
+        assert!(gluttony_check.is_none());
+
+        // 5. Spinoff "Attack on Titan: Junior High" is NOT matched when searching for "Attack on Titan"
+        let aot_check = find_matching_komga_series(&candidates, "Attack on Titan", None);
+        assert!(aot_check.is_none());
     }
 }

@@ -312,16 +312,10 @@ impl OwnershipService {
             }
         };
 
-        let wanted_norm = crate::pipeline::mangabaka::normalize_title(title);
-        let mut exact_matches = Vec::new();
-        for s in series_candidates {
-            if crate::pipeline::mangabaka::normalize_title(&s.name) == wanted_norm {
-                exact_matches.push(s);
-            }
-        }
+        let matched = crate::pipeline::komga::find_matching_komga_series(&series_candidates, title, None);
 
-        // Conservative matching: require exactly one match
-        if exact_matches.is_empty() {
+        // Conservative matching: require a match
+        if matched.is_none() {
             let mut volumes = Vec::new();
             let mut chapters = Vec::new();
             let empty_v = HashMap::new();
@@ -363,40 +357,7 @@ impl OwnershipService {
             };
         }
 
-        if exact_matches.len() > 1 {
-            tracing::warn!(
-                "OWNERSHIP: found multiple exact series matches for {title:?}; refusing ambiguous match"
-            );
-            return TitleOwnership {
-                komga_connected: true,
-                error: Some("Ambiguous match: multiple series found in Komga".to_string()),
-                active_error: None,
-                series_id: None,
-                series_name: None,
-                library_id: lib_id,
-                library_name: None,
-                volumes: Vec::new(),
-                chapters: Vec::new(),
-                summary: OwnershipSummary {
-                    owned_volumes_count: 0,
-                    total_source_volumes: (source_release_type == "volume"
-                        || source_release_type == "mixed")
-                        .then_some(source_volumes_count),
-                    owned_chapters_count: 0,
-                    total_source_chapters: (source_release_type == "chapter"
-                        || source_release_type == "mixed")
-                        .then_some(source_chapters_count),
-                    unknown_books_count: 0,
-                    source_release_type,
-                    authoritative_total_volumes: None,
-                    authoritative_total_chapters: None,
-                    explanation: None,
-                },
-                last_refreshed: now,
-            };
-        }
-
-        let matched_series = &exact_matches[0];
+        let (matched_series, _detected_edition) = matched.unwrap();
         let books = match client.get_books_in_series(&matched_series.id).await {
             Ok(b) => b,
             Err(e) => {

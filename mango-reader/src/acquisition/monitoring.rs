@@ -174,6 +174,20 @@ pub struct ReviewQueueItem {
     pub ordering_explanation: Option<String>,
     #[serde(default = "default_true")]
     pub is_safe_to_approve: bool,
+    #[serde(default)]
+    pub komga_series_id: Option<String>,
+    #[serde(default)]
+    pub last_reconciled_at: Option<i64>,
+    #[serde(default)]
+    pub owned_volumes_count: Option<i64>,
+    #[serde(default)]
+    pub missing_volumes_count: Option<i64>,
+    #[serde(default)]
+    pub is_komga_confirmed: Option<bool>,
+    #[serde(default)]
+    pub monitor_origins: Option<Vec<String>>,
+    #[serde(default)]
+    pub selection_reason: Option<String>,
 }
 
 /// Audit history entry for monitoring decisions and executions
@@ -431,20 +445,24 @@ pub fn calculate_acquisition_priority(
 }
 
 pub fn list_review_queue(conn: &Connection, status: Option<&str>) -> Result<Vec<ReviewQueueItem>> {
-    let mut sql = "SELECT id, manga_id, series_id, series_title, volume_number,
-                          recommended_candidate_id, provider, title, raw_title, quality_score,
-                          confidence, confidence_reason, file_size_bytes, publication_destination,
-                          status, status_reason, alternatives_json, ranking_breakdown_json,
-                          created_at, updated_at, acquisition_priority, earlier_missing_gaps,
-                          ordering_explanation, is_safe_to_approve
-                   FROM acquisition_review_queue".to_string();
+    let mut sql = "SELECT q.id, q.manga_id, q.series_id, q.series_title, q.volume_number,
+                          q.recommended_candidate_id, q.provider, q.title, q.raw_title, q.quality_score,
+                          q.confidence, q.confidence_reason, q.file_size_bytes, q.publication_destination,
+                          q.status, q.status_reason, q.alternatives_json, q.ranking_breakdown_json,
+                          q.created_at, q.updated_at, q.acquisition_priority, q.earlier_missing_gaps,
+                          q.ordering_explanation, q.is_safe_to_approve,
+                          sr.komga_series_id, sr.last_reconciled_at, sr.owned_volumes_count, sr.missing_volumes_count,
+                          tc.origins
+                   FROM acquisition_review_queue q
+                   LEFT JOIN series_reconciliations sr ON (sr.series_id = q.series_id OR sr.title = q.series_title)
+                   LEFT JOIN tracked_catalog tc ON (tc.manga_id = q.manga_id OR tc.title = q.series_title)".to_string();
 
     if let Some(st) = status {
         if !st.is_empty() && st != "all" {
-            sql.push_str(&format!(" WHERE status = '{}'", st.replace('\'', "''")));
+            sql.push_str(&format!(" WHERE q.status = '{}'", st.replace('\'', "''")));
         }
     }
-    sql.push_str(" ORDER BY acquisition_priority ASC, quality_score DESC, volume_number ASC");
+    sql.push_str(" ORDER BY q.acquisition_priority ASC, q.quality_score DESC, q.volume_number ASC");
 
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], map_review_queue_row)?;
@@ -457,13 +475,18 @@ pub fn list_review_queue(conn: &Connection, status: Option<&str>) -> Result<Vec<
 
 pub fn get_review_queue_item(conn: &Connection, id: i64) -> Result<Option<ReviewQueueItem>> {
     conn.query_row(
-        "SELECT id, manga_id, series_id, series_title, volume_number,
-                recommended_candidate_id, provider, title, raw_title, quality_score,
-                confidence, confidence_reason, file_size_bytes, publication_destination,
-                status, status_reason, alternatives_json, ranking_breakdown_json,
-                created_at, updated_at, acquisition_priority, earlier_missing_gaps,
-                ordering_explanation, is_safe_to_approve
-         FROM acquisition_review_queue WHERE id = ?1",
+        "SELECT q.id, q.manga_id, q.series_id, q.series_title, q.volume_number,
+                q.recommended_candidate_id, q.provider, q.title, q.raw_title, q.quality_score,
+                q.confidence, q.confidence_reason, q.file_size_bytes, q.publication_destination,
+                q.status, q.status_reason, q.alternatives_json, q.ranking_breakdown_json,
+                q.created_at, q.updated_at, q.acquisition_priority, q.earlier_missing_gaps,
+                q.ordering_explanation, q.is_safe_to_approve,
+                sr.komga_series_id, sr.last_reconciled_at, sr.owned_volumes_count, sr.missing_volumes_count,
+                tc.origins
+         FROM acquisition_review_queue q
+         LEFT JOIN series_reconciliations sr ON (sr.series_id = q.series_id OR sr.title = q.series_title)
+         LEFT JOIN tracked_catalog tc ON (tc.manga_id = q.manga_id OR tc.title = q.series_title)
+         WHERE q.id = ?1",
         [id],
         map_review_queue_row,
     )
@@ -481,6 +504,36 @@ pub fn add_or_update_review_queue_item(
     alternatives: &[ReleaseCandidate],
     destination: Option<&str>,
 ) -> Result<i64> {
+    // 1. Never add candidates with ambiguous confidence (e.g. uncertain title identity)
+    if cand.confidence.as_deref() == Some("ambiguous") {
+        tracing::info!(
+            "Refusing review queue insertion for {} Vol {}: candidate confidence is ambiguous",
+            series_title, volume_number
+        );
+        return Ok(0);
+    }
+
+    // 2. Never queue proposals for volumes already owned
+    let is_owned: bool = conn
+        .query_row(
+            "SELECT 1 FROM release_availability_watchers
+             WHERE (series_id = ?1 OR series_title = ?2)
+               AND ABS(volume_number - ?3) < 0.001
+               AND is_owned = 1
+             LIMIT 1",
+            params![series_id, series_title, volume_number],
+            |_| Ok(true),
+        )
+        .optional()?
+        .unwrap_or(false);
+
+    if is_owned {
+        tracing::info!(
+            "Refusing review queue insertion for {} Vol {}: volume is already owned",
+            series_title, volume_number
+        );
+        return Ok(0);
+    }
     let current_time = now();
     let alt_json = if alternatives.is_empty() {
         None
@@ -821,6 +874,26 @@ pub async fn run_monitored_series_cycle(db: &Db, http: reqwest::Client) -> Resul
 }
 
 fn map_review_queue_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewQueueItem> {
+    let komga_series_id: Option<String> = r.get(24).ok();
+    let last_reconciled_at: Option<i64> = r.get(25).ok();
+    let owned_volumes_count: Option<i64> = r.get(26).ok();
+    let missing_volumes_count: Option<i64> = r.get(27).ok();
+    let origins_raw: Option<String> = r.get(28).ok();
+    let monitor_origins = origins_raw.and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok());
+    let is_komga_confirmed = Some(komga_series_id.is_some());
+    let ordering_explanation: Option<String> = r.get(22).ok();
+    let confidence_reason: Option<String> = r.get(11).ok();
+    let provider: String = r.get(6)?;
+    let score: f64 = r.get(9)?;
+
+    let selection_reason = Some(format!(
+        "Discovered by {provider} (Score: {score:.0}) - {}",
+        ordering_explanation
+            .as_deref()
+            .or(confidence_reason.as_deref())
+            .unwrap_or("Optimal candidate according to acquisition profile")
+    ));
+
     Ok(ReviewQueueItem {
         id: r.get(0)?,
         manga_id: r.get(1)?,
@@ -828,12 +901,12 @@ fn map_review_queue_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewQueueIt
         series_title: r.get(3)?,
         volume_number: r.get(4)?,
         recommended_candidate_id: r.get(5)?,
-        provider: r.get(6)?,
+        provider,
         title: r.get(7)?,
         raw_title: r.get(8)?,
-        quality_score: r.get(9)?,
+        quality_score: score,
         confidence: r.get(10)?,
-        confidence_reason: r.get(11)?,
+        confidence_reason,
         file_size_bytes: r.get(12)?,
         publication_destination: r.get(13)?,
         status: r.get(14)?,
@@ -844,7 +917,14 @@ fn map_review_queue_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewQueueIt
         updated_at: r.get(19)?,
         acquisition_priority: r.get(20).unwrap_or(1),
         earlier_missing_gaps: r.get(21).ok(),
-        ordering_explanation: r.get(22).ok(),
+        ordering_explanation,
         is_safe_to_approve: r.get::<_, i64>(23).map(|v| v != 0).unwrap_or(true),
+        komga_series_id,
+        last_reconciled_at,
+        owned_volumes_count,
+        missing_volumes_count,
+        is_komga_confirmed,
+        monitor_origins,
+        selection_reason,
     })
 }

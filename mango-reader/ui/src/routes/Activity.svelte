@@ -92,7 +92,8 @@
     if (!watchersData?.watchers) return map;
     for (const w of watchersData.watchers) {
       if (w.isOwned || w.state === 'OWNERSHIP_DETECTED') {
-        const keys = [w.seriesId, w.seriesTitle, w.mangaId ? `manga:${w.mangaId}` : ''].filter(Boolean) as string[];
+        const rawKeys = [w.seriesId, w.seriesTitle, w.mangaId ? `manga:${w.mangaId}` : ''].filter((k): k is string => Boolean(k));
+        const keys = Array.from(new Set(rawKeys));
         for (const k of keys) {
           if (!map[k]) map[k] = [];
           if (!map[k].includes(w.volumeNumber)) map[k].push(w.volumeNumber);
@@ -105,11 +106,17 @@
   const totalsMap = $derived.by<Record<string, number | null>>(() => {
     const map: Record<string, number | null> = {};
     if (!watchersData?.watchers) return map;
+    const seenVolumes: Record<string, Set<number>> = {};
     for (const w of watchersData.watchers) {
-      const keys = [w.seriesId, w.seriesTitle, w.mangaId ? `manga:${w.mangaId}` : ''].filter(Boolean) as string[];
+      const rawKeys = [w.seriesId, w.seriesTitle, w.mangaId ? `manga:${w.mangaId}` : ''].filter((k): k is string => Boolean(k));
+      const keys = Array.from(new Set(rawKeys));
       for (const k of keys) {
-        map[k] = (map[k] ?? 0) + 1;
+        if (!seenVolumes[k]) seenVolumes[k] = new Set();
+        seenVolumes[k].add(w.volumeNumber);
       }
+    }
+    for (const k in seenVolumes) {
+      map[k] = seenVolumes[k].size;
     }
     return map;
   });
@@ -566,6 +573,15 @@
                       <span class="tag spot">
                         {group.ownedCount}{group.totalOfficialCount ? ` / ${group.totalOfficialCount}` : ''} OWNED IN KOMGA
                       </span>
+                      {#if group.isKomgaConfirmed}
+                        <span class="tag spot komga-confirmed-tag">
+                          <Icon name="check" size={12} /> KOMGA CONFIRMED
+                        </span>
+                      {:else}
+                        <span class="tag warn komga-unconfirmed-tag">
+                          <Icon name="alert" size={12} /> UNMAPPED TO KOMGA
+                        </span>
+                      {/if}
                       {#if group.nextMissingVolume != null}
                         <span class="tag next-missing-tag">
                           <Icon name="arrow" size={12} /> NEXT MISSING: VOL {group.nextMissingVolume}
@@ -574,6 +590,25 @@
                     </div>
 
                     <div class="group-meta-row">
+                      {#if group.monitorOrigins && group.monitorOrigins.length > 0}
+                        <span class="group-meta-pill origins-pill">
+                          Monitored: {group.monitorOrigins.join(', ')}
+                        </span>
+                      {:else}
+                        <span class="group-meta-pill origins-pill">
+                          Monitored: Followed Series
+                        </span>
+                      {/if}
+                      {#if group.lastReconciledAt}
+                        <span class="group-meta-pill">
+                          Reconciled: {new Date(group.lastReconciledAt * 1000).toLocaleDateString()}
+                        </span>
+                      {/if}
+                      {#if group.missingCount != null && group.missingCount > 0}
+                        <span class="group-meta-pill warn">
+                          {group.missingCount} missing
+                        </span>
+                      {/if}
                       <span class="group-meta-pill">
                         <strong>{group.pendingCount}</strong> pending proposal{group.pendingCount === 1 ? '' : 's'}
                       </span>
@@ -643,8 +678,13 @@
 
                               <p class="prop-ordering-note">
                                 <Icon name="info" size={13} />
-                                {prop.orderingExplanation || 'Next sequential volume in library'}
+                                {prop.selectionReason || prop.orderingExplanation || 'Next sequential volume in library'}
                               </p>
+                              {#if prop.confidenceReason}
+                                <p class="prop-confidence-detail text-xs text-muted" style="margin-top: 2px;">
+                                  Match details: {prop.confidenceReason}
+                                </p>
+                              {/if}
                             </div>
 
                             <div class="prop-actions-col">
@@ -732,8 +772,13 @@
 
                                 <p class="prop-ordering-warning">
                                   <Icon name="alert" size={13} />
-                                  {prop.orderingExplanation || 'Earlier missing volumes detected'}
+                                  {prop.selectionReason || prop.orderingExplanation || 'Earlier missing volumes detected'}
                                 </p>
+                                {#if prop.confidenceReason}
+                                  <p class="prop-confidence-detail text-xs text-muted" style="margin-top: 2px;">
+                                    Match details: {prop.confidenceReason}
+                                  </p>
+                                {/if}
                               </div>
 
                               <div class="prop-actions-col">

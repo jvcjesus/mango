@@ -533,7 +533,7 @@ pub async fn reconcile_series(
     mb_client: &MangaBakaClient,
     target: &ReconciliationTarget,
 ) -> Result<ReconciliationSummary> {
-    let edition = target
+    let mut edition = target
         .edition
         .as_deref()
         .map(crate::acquisition::edition::normalize_edition)
@@ -566,27 +566,82 @@ pub async fn reconcile_series(
         .call(move |conn| gather_local_owned_volumes(conn, m_id_opt))
         .await?;
 
+    let mut detected_edition: Option<String> = None;
     let resolved_komga_id = if let Some(ref k_id) = target.komga_series_id {
         Some(k_id.clone())
-    } else if let Some(kc) = komga_client {
-        // Search Komga series by title if komga_series_id was not explicitly supplied
-        if let Ok(candidates) = kc.search_series(&target.title, None).await {
-            let wanted_norm = crate::pipeline::mangabaka::normalize_title(&target.title);
-            let exact: Vec<_> = candidates
-                .into_iter()
-                .filter(|s| crate::pipeline::mangabaka::normalize_title(&s.name) == wanted_norm)
-                .collect();
-            if exact.len() == 1 {
-                Some(exact[0].id.clone())
+    } else {
+        // 1. Check if DB already has a known komga_series_id for this series
+        let s_id_for_db = series_id.clone();
+        let existing_komga_id = db
+            .call(move |conn| {
+                if let Some(m_id) = m_id_opt {
+                    let from_tracked: Option<String> = conn
+                        .query_row(
+                            "SELECT komga_series_id FROM tracked_catalog WHERE manga_id = ?1 AND komga_series_id IS NOT NULL",
+                            [m_id],
+                            |r| r.get(0),
+                        )
+                        .optional()?
+                        .flatten();
+                    if from_tracked.is_some() {
+                        return Ok(from_tracked);
+                    }
+                }
+                let from_recon: Option<String> = conn
+                    .query_row(
+                        "SELECT komga_series_id FROM series_reconciliations WHERE series_id = ?1 AND komga_series_id IS NOT NULL",
+                        [&s_id_for_db],
+                        |r| r.get(0),
+                    )
+                    .optional()?
+                    .flatten();
+                Ok(from_recon)
+            })
+            .await
+            .ok()
+            .flatten();
+
+        if existing_komga_id.is_some() {
+            existing_komga_id
+        } else if let Some(kc) = komga_client {
+            // Search Komga series by title if komga_series_id was not explicitly supplied
+            if let Ok(candidates) = kc.search_series(&target.title, None).await {
+                if let Some((matched, ed)) = crate::pipeline::komga::find_matching_komga_series(
+                    &candidates,
+                    &target.title,
+                    target.edition.as_deref(),
+                ) {
+                    detected_edition = ed;
+                    let k_id = matched.id.clone();
+                    if let Some(m_id) = m_id_opt {
+                        let k_id_c = k_id.clone();
+                        let _ = db
+                            .call(move |conn| {
+                                conn.execute(
+                                    "UPDATE tracked_catalog SET komga_series_id = ?1 WHERE manga_id = ?2 AND komga_series_id IS NULL",
+                                    rusqlite::params![k_id_c, m_id],
+                                )?;
+                                Ok(())
+                            })
+                            .await;
+                    }
+                    Some(k_id)
+                } else {
+                    None
+                }
             } else {
                 None
             }
         } else {
             None
         }
-    } else {
-        None
     };
+
+    if (edition == "standard" || edition.is_empty()) && detected_edition.is_some() {
+        if let Some(ref det_ed) = detected_edition {
+            edition = det_ed.clone();
+        }
+    }
 
     if let (Some(kc), Some(ref k_id)) = (komga_client, &resolved_komga_id) {
         match kc.get_books_in_series(k_id).await {
@@ -725,6 +780,7 @@ pub async fn reconcile_series(
     owned_volumes.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
     // 2. Resolve MangaBaka Identity
+    let effective_komga_id: Option<String> = target.komga_series_id.clone().or_else(|| resolved_komga_id.clone());
     let mut resolved_mb_id: Option<i64> = None;
     let mut explicit_mb_id: Option<i64> = None;
 
@@ -748,18 +804,18 @@ pub async fn reconcile_series(
         if let Some(mb_id) = exact_id {
             explicit_mb_id = Some(mb_id);
             resolved_mb_id = Some(mb_id);
-            if let Some(ref k_id) = target.komga_series_id {
-                let k_id_c = k_id.clone();
+            if let Some(k_id) = effective_komga_id.clone() {
                 let _ = db
                     .call(move |conn| {
                         conn.execute(
-                            "INSERT INTO tracker_mappings (komga_series_id, tracker, tracker_id, updated_at, mapping_source, confidence)
-                             VALUES (?1, 'mangabaka', ?2, ?3, 'manual', 'resolved')
+                            "INSERT INTO tracker_mappings (komga_series_id, tracker, tracker_id, updated_at, mapping_source, manual_override, confidence)
+                             VALUES (?1, 'mangabaka', ?2, ?3, 'auto', 0, 'resolved')
                              ON CONFLICT(komga_series_id, tracker) DO UPDATE SET
                                 tracker_id = excluded.tracker_id,
                                 confidence = 'resolved',
-                                updated_at = excluded.updated_at",
-                            rusqlite::params![k_id_c, mb_id.to_string(), now()],
+                                updated_at = excluded.updated_at
+                             WHERE tracker_mappings.manual_override = 0",
+                            rusqlite::params![k_id, mb_id.to_string(), now()],
                         )?;
                         Ok(())
                     })
@@ -769,10 +825,9 @@ pub async fn reconcile_series(
     }
 
     // 2b. Direct exact MangaBaka identity from tracker_mappings
-    if let Some(ref k_id) = target.komga_series_id {
-        let k_id_c = k_id.clone();
+    if let Some(k_id) = effective_komga_id.clone() {
         if let Ok(Some(mapping)) = db
-            .call(move |conn| get_mapping(conn, &k_id_c, SyncTarget::MangaBaka))
+            .call(move |conn| get_mapping(conn, &k_id, SyncTarget::MangaBaka))
             .await
         {
             if let Ok(id) = mapping.tracker_id.parse::<i64>() {
@@ -899,10 +954,9 @@ pub async fn reconcile_series(
 
     // 2d. AniList cross-reference from tracker_mappings
     if resolved_mb_id.is_none() {
-        if let Some(ref k_id) = target.komga_series_id {
-            let k_id_c = k_id.clone();
+        if let Some(k_id) = effective_komga_id.clone() {
             if let Ok(Some(al_mapping)) = db
-                .call(move |conn| get_mapping(conn, &k_id_c, SyncTarget::AniList))
+                .call(move |conn| get_mapping(conn, &k_id, SyncTarget::AniList))
                 .await
             {
                 if let Ok(al_id) = al_mapping.tracker_id.parse::<i64>() {
@@ -954,8 +1008,7 @@ pub async fn reconcile_series(
     }
 
     if resolved_mb_id.is_none() {
-        if let Some(ref k_id) = target.komga_series_id {
-            let k_id_clone = k_id.clone();
+        if let Some(k_id) = effective_komga_id {
             let title_clone = target.title.clone();
             let mb_client_clone = mb_client.clone();
 
@@ -963,7 +1016,7 @@ pub async fn reconcile_series(
                 .call(move |conn| {
                     tokio::task::block_in_place(|| {
                         tokio::runtime::Handle::current().block_on(async {
-                            resolve_mangabaka_identity(conn, &mb_client_clone, &k_id_clone, &title_clone)
+                            resolve_mangabaka_identity(conn, &mb_client_clone, &k_id, &title_clone)
                                 .await
                         })
                     })
@@ -1351,6 +1404,32 @@ pub async fn reconcile_series(
         }
     }
 
+    // Guard against falsely marking volumes missing due to edition mismatch:
+    // If Komga series has an identified non-standard edition (e.g. Master Edition with 6 books)
+    // and all of its local books are owned, but MangaBaka returned standard edition with higher volume count:
+    if edition != "standard" && !owned_volumes.is_empty() && !missing_vols.is_empty() {
+        if let (Some(kc), Some(ref k_id)) = (komga_client, &resolved_komga_id) {
+            if let Ok(books) = kc.get_books_in_series(k_id).await {
+                if books.len() == owned_volumes.len() && owned_volumes.len() < released_vols.len() {
+                    let reason = format!(
+                        "Edition structure mismatch: Komga has {} volumes of '{}' edition, while MangaBaka collection has {} standard volumes. Review required to avoid duplicate acquisitions.",
+                        owned_volumes.len(), edition, released_vols.len()
+                    );
+                    let title_c = target.title.clone();
+                    let reason_c = reason.clone();
+                    let mut sum = build_review_required(&series_id, target, &edition, owned_volumes, reason, current_time);
+                    sum.display_status = sum.compute_display_status();
+                    let sum_c = sum.clone();
+                    db.call(move |conn| {
+                        record_event(conn, &title_c, Some(mb_series_id), None, "ACTION_REQUIRED", &reason_c)?;
+                        save_reconciliation(conn, &sum_c)
+                    }).await?;
+                    return Ok(sum);
+                }
+            }
+        }
+    }
+
     let status = if missing_vols.is_empty() {
         ReconciliationStatus::UpToDate
     } else {
@@ -1629,6 +1708,33 @@ pub fn save_reconciliation(conn: &Connection, s: &ReconciliationSummary) -> Resu
                 rusqlite::params![format!("Watcher sync failed: {e}"), &s.series_id],
             );
         }
+    }
+
+    // Invalidate stale pending proposals in acquisition_review_queue for any owned volumes
+    for &ov in &s.owned_volumes {
+        let _ = conn.execute(
+            "UPDATE acquisition_review_queue
+             SET status = 'skipped',
+                 status_reason = 'Automatically resolved: volume verified as owned in Komga library',
+                 updated_at = ?1
+             WHERE (series_id = ?2 OR series_title = ?3)
+               AND status = 'pending'
+               AND ABS(volume_number - ?4) < 0.001",
+            rusqlite::params![now(), s.series_id, s.title, ov],
+        );
+    }
+
+    // If series has no missing volumes (up to date), skip any remaining pending proposals
+    if s.missing_volumes.is_empty() {
+        let _ = conn.execute(
+            "UPDATE acquisition_review_queue
+             SET status = 'skipped',
+                 status_reason = 'Automatically resolved: series is fully owned in Komga library',
+                 updated_at = ?1
+             WHERE (series_id = ?2 OR series_title = ?3)
+               AND status = 'pending'",
+            rusqlite::params![now(), s.series_id, s.title],
+        );
     }
 
     Ok(())
