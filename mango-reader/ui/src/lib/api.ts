@@ -3225,6 +3225,7 @@ export interface MonitoringSettings {
   autoAcquireEnabled: boolean;
   operatingMode: string;
   autoPublishManual: boolean;
+  recommendationScope: 'mango_library_only' | 'tracked_lists' | 'all_monitored';
 }
 
 export interface UpdateMonitoringSettingsRequest {
@@ -3234,6 +3235,7 @@ export interface UpdateMonitoringSettingsRequest {
   autoAcquireEnabled?: boolean;
   operatingMode?: string;
   autoPublishManual?: boolean;
+  recommendationScope?: 'mango_library_only' | 'tracked_lists' | 'all_monitored';
 }
 
 export interface ReviewQueueItem {
@@ -3268,6 +3270,12 @@ export interface ReviewQueueItem {
   isKomgaConfirmed?: boolean;
   monitorOrigins?: string[];
   selectionReason?: string | null;
+  inLibrary: boolean;
+  eligibilityReason: string;
+  komgaMappingStatus: 'mapped' | 'unmapped' | 'ambiguous' | string;
+  ownershipStatus: 'confirmed_owned' | 'confirmed_missing' | 'unknown_ownership' | 'unmapped_to_komga' | string;
+  confirmedOwnedVolumes: number[];
+  confirmedMissingVolumes: number[];
 }
 
 export interface MonitoringActivityEntry {

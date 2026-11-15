@@ -376,6 +376,37 @@ pub async fn evaluate_target_for_auto_acquire(
     let manga_id_opt = target.manga_id;
     let title = target.series_title.clone();
 
+    // Gate 0: Recommendation Scope Check
+    let s_title_sc = title.clone();
+    let is_scope_eligible = db
+        .call(move |conn| {
+            let scope = crate::acquisition::monitoring::get_recommendation_scope(conn);
+            Ok(crate::acquisition::monitoring::is_series_eligible_for_scope(
+                conn,
+                manga_id_opt,
+                &s_title_sc,
+                &scope,
+            ))
+        })
+        .await?;
+
+    if !is_scope_eligible {
+        let dec = AutoAcquireDecision {
+            target_id,
+            series_id: series_id.clone(),
+            volume_number,
+            code: AutoDecisionCode::TitleAutoDisabled,
+            reason: "Series is not eligible under configured recommendation scope".to_string(),
+            candidate_id: None,
+            candidate_title: None,
+            candidate_score: None,
+            dry_run: true,
+            evaluated_at: cur_time,
+        };
+        persist_decision(db, target_id, &dec).await?;
+        return Ok(dec);
+    }
+
     // Gate 1: Global Master Switch
     let global_enabled = db.call(|conn| Ok(is_global_auto_acquire_enabled(conn))).await?;
     let dry_run = db.call(|conn| Ok(is_auto_acquire_dry_run(conn))).await?;

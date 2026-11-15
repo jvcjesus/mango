@@ -20,7 +20,7 @@ mod tests {
 
     fn seed_manga(conn: &rusqlite::Connection, id: i64, title: &str) {
         conn.execute(
-            "INSERT INTO manga (id, source_id, url, title) VALUES (?1, 1, ?2, ?3)",
+            "INSERT INTO manga (id, source_id, url, title, in_library) VALUES (?1, 1, ?2, ?3, 1)",
             params![id, format!("/title/{}", id), title],
         )
         .unwrap();
@@ -115,6 +115,7 @@ mod tests {
             auto_acquire_enabled: false,
             operating_mode: "simulation".to_string(),
             auto_publish_manual: false,
+            recommendation_scope: "mango_library_only".to_string(),
         };
 
         db.call(move |conn| update_monitoring_settings(conn, &new_settings.into()))

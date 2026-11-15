@@ -1086,6 +1086,7 @@
     autoAcquireEnabled: false,
     operatingMode: 'simulation',
     autoPublishManual: false,
+    recommendationScope: 'mango_library_only',
   });
   let savingTrackedStatuses = $state(false);
 
@@ -1118,6 +1119,20 @@
       toast.success(`Automation mode set to ${mode}`);
     } catch (e) {
       toast.error(`Failed to update automation mode: ${message(e)}`);
+    }
+  }
+
+  async function updateRecommendationScope(scope: 'mango_library_only' | 'tracked_lists' | 'all_monitored') {
+    try {
+      monitoringSettings = await updateMonitoringSettings({ recommendationScope: scope });
+      const labels = {
+        mango_library_only: 'Mango Library Only (Recommended)',
+        tracked_lists: 'Tracked Lists',
+        all_monitored: 'All Monitored',
+      };
+      toast.success(`Recommendation scope set to ${labels[scope] || scope}`);
+    } catch (e) {
+      toast.error(`Failed to update recommendation scope: ${message(e)}`);
     }
   }
 
@@ -3140,6 +3155,31 @@
 
             <div class="set">
               <div class="what">
+                <strong>Acquisition Recommendation Scope</strong>
+                <span>
+                  Control which manga are eligible for Activity "Needs Attention" recommendations and automatic acquisition.
+                </span>
+              </div>
+              <div class="how">
+                <div class="seg" role="group" aria-label="Acquisition Recommendation Scope">
+                  <button
+                    aria-pressed={monitoringSettings.recommendationScope === 'mango_library_only' || !monitoringSettings.recommendationScope}
+                    onclick={() => updateRecommendationScope('mango_library_only')}
+                  >Mango Library Only (Recommended)</button>
+                  <button
+                    aria-pressed={monitoringSettings.recommendationScope === 'tracked_lists'}
+                    onclick={() => updateRecommendationScope('tracked_lists')}
+                  >Tracked Lists</button>
+                  <button
+                    aria-pressed={monitoringSettings.recommendationScope === 'all_monitored'}
+                    onclick={() => updateRecommendationScope('all_monitored')}
+                  >All Monitored</button>
+                </div>
+              </div>
+            </div>
+
+            <div class="set">
+              <div class="what">
                 <strong>Monitored Followed Lists</strong>
                 <span>
                   Select which personal tracking lists are monitored for missing volumes and release discovery.
@@ -3198,6 +3238,9 @@
             </div>
 
             <div class="path-status-row" style="margin-top: 0.75rem; display: flex; flex-wrap: wrap; gap: 0.5rem;">
+              <span class="status-badge status-{(!monitoringSettings.recommendationScope || monitoringSettings.recommendationScope === 'mango_library_only') ? 'valid' : 'not_configured'}">
+                Scope: {(!monitoringSettings.recommendationScope || monitoringSettings.recommendationScope === 'mango_library_only') ? 'Mango Library Only' : monitoringSettings.recommendationScope === 'tracked_lists' ? 'Tracked Lists' : 'All Monitored'}
+              </span>
               <span class="status-badge status-{monitoringSettings.automationMode === 'monitor_only' ? 'valid' : monitoringSettings.automationMode === 'review_before_acquisition' ? 'not_configured' : 'failed'}">
                 Policy: {monitoringSettings.automationMode === 'monitor_only' ? 'Mode A (Monitor Only)' : monitoringSettings.automationMode === 'review_before_acquisition' ? 'Mode B (Review Before Acquisition)' : 'Mode C (Automatic Acquisition)'}
               </span>

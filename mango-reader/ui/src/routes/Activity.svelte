@@ -570,16 +570,33 @@
                       {:else}
                         <h2 class="display group-title">{group.seriesTitle}</h2>
                       {/if}
-                      <span class="tag spot">
-                        {group.ownedCount}{group.totalOfficialCount ? ` / ${group.totalOfficialCount}` : ''} OWNED IN KOMGA
-                      </span>
-                      {#if group.isKomgaConfirmed}
-                        <span class="tag spot komga-confirmed-tag">
-                          <Icon name="check" size={12} /> KOMGA CONFIRMED
+                      {#if group.inLibrary}
+                        <span class="tag spot library-membership-tag">
+                          <Icon name="check" size={12} /> IN MANGO LIBRARY
                         </span>
                       {:else}
+                        <span class="tag warn library-membership-tag">
+                          <Icon name="bookmark" size={12} /> TRACKED ONLY
+                        </span>
+                      {/if}
+                      {#if group.ownershipStatus === 'unmapped_to_komga'}
                         <span class="tag warn komga-unconfirmed-tag">
                           <Icon name="alert" size={12} /> UNMAPPED TO KOMGA
+                        </span>
+                      {:else if group.ownershipStatus === 'unknown_ownership'}
+                        <span class="tag warn komga-unconfirmed-tag">
+                          <Icon name="alert" size={12} /> OWNERSHIP UNKNOWN · SYNC REQUIRED
+                        </span>
+                      {:else if group.ownershipStatus === 'confirmed_owned'}
+                        <span class="tag spot komga-confirmed-tag">
+                          <Icon name="check" size={12} /> ALL {group.ownedCount} VOLUMES OWNED
+                        </span>
+                      {:else}
+                        <span class="tag spot">
+                          {group.ownedCount}{group.totalOfficialCount ? ` / ${group.totalOfficialCount}` : ''} OWNED IN KOMGA
+                        </span>
+                        <span class="tag spot komga-confirmed-tag">
+                          <Icon name="check" size={12} /> KOMGA CONFIRMED
                         </span>
                       {/if}
                       {#if group.nextMissingVolume != null}
@@ -599,6 +616,9 @@
                           Monitored: Followed Series
                         </span>
                       {/if}
+                      <span class="group-meta-pill">
+                        Eligibility: {group.eligibilityReason}
+                      </span>
                       {#if group.lastReconciledAt}
                         <span class="group-meta-pill">
                           Reconciled: {new Date(group.lastReconciledAt * 1000).toLocaleDateString()}

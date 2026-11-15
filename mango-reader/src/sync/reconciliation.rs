@@ -643,9 +643,72 @@ pub async fn reconcile_series(
         }
     }
 
-    if let (Some(kc), Some(ref k_id)) = (komga_client, &resolved_komga_id) {
-        match kc.get_books_in_series(k_id).await {
+    let mut resolved_komga_id = resolved_komga_id;
+    let mut komga_fetch_succeeded = false;
+
+    if let (Some(kc), Some(ref k_id)) = (komga_client, &resolved_komga_id.clone()) {
+        let books_res = match kc.get_books_in_series(k_id).await {
+            Ok(books) => Ok(books),
+            Err(e) => {
+                tracing::warn!("Failed to fetch Komga books for series {k_id}: {e}. Attempting title search fallback...");
+                // Stale or invalid komga_series_id: search by title
+                match kc.search_series(&target.title, None).await {
+                    Ok(candidates) => {
+                        if let Some((matched, ed)) = crate::pipeline::komga::find_matching_komga_series(
+                            &candidates,
+                            &target.title,
+                            target.edition.as_deref(),
+                        ) {
+                            if let Some(ref det_ed) = ed {
+                                if edition == "standard" || edition.is_empty() {
+                                    edition = det_ed.clone();
+                                }
+                            }
+                            let new_k_id = matched.id.clone();
+                            tracing::info!("Healed stale Komga series ID from {} to {} for '{}'", k_id, new_k_id, target.title);
+
+                            // Update database with healed series ID
+                            let new_k_id_db = new_k_id.clone();
+                            let s_id_db = series_id.clone();
+                            let target_title_db = target.title.clone();
+                            let old_k_id_db = k_id.clone();
+                            let _ = db.call(move |conn| {
+                                if let Some(m_id) = m_id_opt {
+                                    let _ = conn.execute(
+                                        "UPDATE tracked_catalog SET komga_series_id = ?1 WHERE manga_id = ?2",
+                                        rusqlite::params![new_k_id_db, m_id],
+                                    );
+                                }
+                                let _ = conn.execute(
+                                    "UPDATE tracked_catalog SET komga_series_id = ?1 WHERE title = ?2 COLLATE NOCASE",
+                                    rusqlite::params![new_k_id_db, target_title_db],
+                                );
+                                let _ = conn.execute(
+                                    "UPDATE series_reconciliations SET komga_series_id = ?1 WHERE series_id = ?2",
+                                    rusqlite::params![new_k_id_db, s_id_db],
+                                );
+                                let _ = conn.execute(
+                                    "UPDATE tracker_mappings SET komga_series_id = ?1 WHERE komga_series_id = ?2",
+                                    rusqlite::params![new_k_id_db, old_k_id_db],
+                                );
+                                Ok(())
+                            }).await;
+
+                            let fetched = kc.get_books_in_series(&new_k_id).await;
+                            resolved_komga_id = Some(new_k_id);
+                            fetched
+                        } else {
+                            Err(e)
+                        }
+                    }
+                    Err(_) => Err(e),
+                }
+            }
+        };
+
+        match books_res {
             Ok(books) => {
+                komga_fetch_succeeded = true;
                 for b in &books {
                     let vol_num = if b.number > 0.0 {
                         Some(b.number)
@@ -1428,6 +1491,28 @@ pub async fn reconcile_series(
                 }
             }
         }
+    }
+
+    // If Komga is configured, but ownership could not be verified in Komga:
+    // Mark as ReviewRequired to block automatic acquisition and prevent false recommendations
+    if komga_client.is_some() && !komga_fetch_succeeded {
+        let reason = if resolved_komga_id.is_none() {
+            "Komga mapping unverified: Series is not mapped to a Komga series".to_string()
+        } else {
+            "Komga communication failure: Could not verify physical library media in Komga".to_string()
+        };
+        let mut sum = build_review_required(&series_id, target, &edition, owned_volumes, reason, current_time);
+        sum.komga_series_id = resolved_komga_id.clone();
+        sum.mangabaka_id = Some(mb_series_id);
+        sum.collection_id = Some(collection_id);
+        sum.display_status = sum.compute_display_status();
+        let sum_c = sum.clone();
+        let title_c = target.title.clone();
+        db.call(move |conn| {
+            record_event(conn, &title_c, Some(mb_series_id), None, "ACTION_REQUIRED", &sum_c.review_reason.clone().unwrap_or_default())?;
+            save_reconciliation(conn, &sum_c)
+        }).await?;
+        return Ok(sum);
     }
 
     let status = if missing_vols.is_empty() {

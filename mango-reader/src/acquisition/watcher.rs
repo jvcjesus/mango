@@ -1094,7 +1094,8 @@ pub async fn evaluate_watcher_check(
         let s_title = watcher.series_title.clone();
         let vol = volume_number;
 
-        let (mode, title_auto, global_auto, is_sim) = db
+        let s_title_for_scope = s_title.clone();
+        let (mode, title_auto, global_auto, is_sim, scope_eligible) = db
             .call(move |conn| {
                 let global_mode = get_automation_mode(conn);
                 let per_title_mode: Option<String> = if let Some(mid) = mid_opt {
@@ -1118,8 +1119,15 @@ pub async fn evaluate_watcher_check(
                 };
                 let global_auto = is_global_auto_acquire_enabled(conn);
                 let sim = is_simulation_mode(conn);
+                let scope = crate::acquisition::monitoring::get_recommendation_scope(conn);
+                let scope_eligible = crate::acquisition::monitoring::is_series_eligible_for_scope(
+                    conn,
+                    mid_opt,
+                    &s_title_for_scope,
+                    &scope,
+                );
 
-                Ok((effective_mode, title_auto, global_auto, sim))
+                Ok((effective_mode, title_auto, global_auto, sim, scope_eligible))
             })
             .await?;
 
@@ -1132,6 +1140,29 @@ pub async fn evaluate_watcher_check(
             .collect();
 
         let conf_str = elig.confidence.as_deref().unwrap_or("high").to_string();
+
+        if !scope_eligible {
+            let prov = elig.provider.clone();
+            let conf = conf_str.clone();
+            let score = elig.score;
+            db.call(move |conn| {
+                log_monitoring_activity_internal(
+                    conn,
+                    mid_opt,
+                    &s_title,
+                    vol,
+                    "discovered",
+                    &prov,
+                    &conf,
+                    Some(score),
+                    Some("SCOPE_INELIGIBLE"),
+                    &format!("Candidate discovered for {} Vol. {} but skipped: outside recommendation scope", s_title, vol),
+                    current_time,
+                )
+            })
+            .await?;
+            return Ok(updated);
+        }
 
         match mode {
             AutomationMode::MonitorOnly => {

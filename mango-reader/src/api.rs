@@ -5441,7 +5441,47 @@ async fn post_review_queue_batch_approve(
     let mut failed_count = 0;
     let total_requested = req.item_ids.len();
 
+    let scope = app.db.call(|conn| Ok(crate::acquisition::monitoring::get_recommendation_scope(conn))).await?;
+
     for id in req.item_ids {
+        let item_opt = app.db.call(move |conn| crate::acquisition::monitoring::get_review_queue_item(conn, id)).await?;
+        let Some(item) = item_opt else {
+            failed_count += 1;
+            results.push(crate::acquisition::volume_manager::BatchAcquireItemResult {
+                volume_number: 0.0,
+                status: "error".to_string(),
+                message: format!("Review queue item #{id} not found"),
+                execution_id: None,
+                candidate_id: None,
+            });
+            continue;
+        };
+
+        let is_eligible = app.db.call({
+            let item = item.clone();
+            let scope = scope.clone();
+            move |conn| {
+                Ok(crate::acquisition::monitoring::is_series_eligible_for_scope(
+                    conn,
+                    item.manga_id,
+                    &item.series_title,
+                    &scope,
+                ))
+            }
+        }).await?;
+
+        if !is_eligible {
+            failed_count += 1;
+            results.push(crate::acquisition::volume_manager::BatchAcquireItemResult {
+                volume_number: item.volume_number,
+                status: "skipped_ineligible_scope".to_string(),
+                message: format!("Series '{}' is not eligible under current recommendation scope '{}'", item.series_title, scope),
+                execution_id: None,
+                candidate_id: Some(item.recommended_candidate_id),
+            });
+            continue;
+        }
+
         match crate::acquisition::monitoring::approve_review_queue_item(
             &app.db,
             &app.acquisition,
@@ -5455,7 +5495,7 @@ async fn post_review_queue_batch_approve(
             Err(e) => {
                 failed_count += 1;
                 results.push(crate::acquisition::volume_manager::BatchAcquireItemResult {
-                    volume_number: 0.0,
+                    volume_number: item.volume_number,
                     status: "error".to_string(),
                     message: e.to_string(),
                     execution_id: None,

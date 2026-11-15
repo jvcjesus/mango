@@ -59,6 +59,8 @@ pub mod m11_1_tests;
 pub mod watcher_tests;
 #[cfg(test)]
 pub mod e2e_simulation_tests;
+#[cfg(test)]
+pub mod recommendation_scope_tests;
 
 use crate::error::Result;
 use serde::{Deserialize, Serialize};

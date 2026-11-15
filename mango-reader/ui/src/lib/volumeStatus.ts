@@ -1086,6 +1086,12 @@ export interface SeriesGroupedReviewQueue {
   lastReconciledAt?: number | null;
   monitorOrigins?: string[];
   missingCount?: number;
+  inLibrary: boolean;
+  eligibilityReason: string;
+  komgaMappingStatus: string;
+  ownershipStatus: string;
+  confirmedOwnedVolumes: number[];
+  confirmedMissingVolumes: number[];
 }
 
 /**
@@ -1228,6 +1234,12 @@ export function groupReviewQueueBySeries(
     const lastReconciledAt = sample.lastReconciledAt ?? null;
     const monitorOrigins = sample.monitorOrigins ?? [];
     const missingCount = sample.missingVolumesCount ?? (totalExpected != null ? Math.max(0, totalExpected - missingSeq.totalOwnedCount) : 0);
+    const inLibrary = sample.inLibrary ?? false;
+    const eligibilityReason = sample.eligibilityReason ?? (inLibrary ? 'Explicit Mango Library Member' : 'Monitored Title');
+    const komgaMappingStatus = sample.komgaMappingStatus ?? (sample.komgaSeriesId ? 'mapped' : 'unmapped');
+    const ownershipStatus = sample.ownershipStatus ?? (sample.komgaSeriesId ? (missingCount === 0 ? 'confirmed_owned' : 'confirmed_missing') : 'unmapped_to_komga');
+    const confirmedOwnedVolumes = sample.confirmedOwnedVolumes ?? [];
+    const confirmedMissingVolumes = sample.confirmedMissingVolumes ?? [];
 
     result.push({
       seriesId: key,
@@ -1248,6 +1260,12 @@ export function groupReviewQueueBySeries(
       lastReconciledAt,
       monitorOrigins,
       missingCount,
+      inLibrary,
+      eligibilityReason,
+      komgaMappingStatus,
+      ownershipStatus,
+      confirmedOwnedVolumes,
+      confirmedMissingVolumes,
     });
   }
 

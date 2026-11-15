@@ -24,7 +24,7 @@ mod tests {
 
     fn seed_manga(conn: &rusqlite::Connection, id: i64, title: &str) {
         conn.execute(
-            "INSERT INTO manga (id, source_id, url, title) VALUES (?1, 1, ?2, ?3)",
+            "INSERT INTO manga (id, source_id, url, title, in_library) VALUES (?1, 1, ?2, ?3, 1)",
             params![id, format!("/title/{id}"), title],
         )
         .unwrap();

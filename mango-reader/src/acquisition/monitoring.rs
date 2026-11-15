@@ -33,6 +33,7 @@ pub const SETTING_AUTOMATION_MODE: &str = "acquisition.automation_mode";
 pub const SETTING_MONITORING_INTERVAL_HOURS: &str = "monitoring.interval_hours";
 pub const SETTING_MONITORED_TRACKING_STATUSES: &str = "monitoring.tracked_statuses";
 pub const SETTING_LAST_CYCLE_AT: &str = "monitoring.last_cycle_at";
+pub const SETTING_RECOMMENDATION_SCOPE: &str = "acquisition.recommendation_scope";
 
 /// Automation operating modes
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -75,6 +76,10 @@ impl Default for AutomationMode {
     }
 }
 
+fn default_recommendation_scope() -> String {
+    "mango_library_only".to_string()
+}
+
 /// System-wide monitoring and automation settings
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -86,6 +91,8 @@ pub struct MonitoringSettings {
     pub auto_acquire_enabled: bool,
     pub operating_mode: String,
     pub auto_publish_manual: bool,
+    #[serde(default = "default_recommendation_scope")]
+    pub recommendation_scope: String,
 }
 
 /// Partial update payload for monitoring and automation settings.
@@ -106,6 +113,8 @@ pub struct UpdateMonitoringSettingsRequest {
     pub operating_mode: Option<String>,
     #[serde(default, alias = "auto_publish_manual")]
     pub auto_publish_manual: Option<bool>,
+    #[serde(default, alias = "recommendation_scope")]
+    pub recommendation_scope: Option<String>,
 }
 
 impl From<MonitoringSettings> for UpdateMonitoringSettingsRequest {
@@ -117,6 +126,7 @@ impl From<MonitoringSettings> for UpdateMonitoringSettingsRequest {
             auto_acquire_enabled: Some(s.auto_acquire_enabled),
             operating_mode: Some(s.operating_mode),
             auto_publish_manual: Some(s.auto_publish_manual),
+            recommendation_scope: Some(s.recommendation_scope),
         }
     }
 }
@@ -130,6 +140,7 @@ impl From<&MonitoringSettings> for UpdateMonitoringSettingsRequest {
             auto_acquire_enabled: Some(s.auto_acquire_enabled),
             operating_mode: Some(s.operating_mode.clone()),
             auto_publish_manual: Some(s.auto_publish_manual),
+            recommendation_scope: Some(s.recommendation_scope.clone()),
         }
     }
 }
@@ -188,6 +199,18 @@ pub struct ReviewQueueItem {
     pub monitor_origins: Option<Vec<String>>,
     #[serde(default)]
     pub selection_reason: Option<String>,
+    #[serde(default)]
+    pub in_library: bool,
+    #[serde(default)]
+    pub eligibility_reason: String,
+    #[serde(default)]
+    pub komga_mapping_status: String,
+    #[serde(default)]
+    pub ownership_status: String,
+    #[serde(default)]
+    pub confirmed_owned_volumes: Vec<f64>,
+    #[serde(default)]
+    pub confirmed_missing_volumes: Vec<f64>,
 }
 
 /// Audit history entry for monitoring decisions and executions
@@ -239,6 +262,90 @@ pub fn set_monitored_tracking_statuses(conn: &Connection, statuses: &[String]) -
     crate::settings::set(conn, SETTING_MONITORED_TRACKING_STATUSES, &serde_json::json!(statuses))
 }
 
+pub fn get_recommendation_scope(conn: &Connection) -> String {
+    crate::settings::get::<String>(conn, SETTING_RECOMMENDATION_SCOPE)
+        .unwrap_or_else(|| "mango_library_only".to_string())
+}
+
+pub fn set_recommendation_scope(conn: &Connection, scope: &str) -> Result<()> {
+    let normalized = match scope.trim().to_lowercase().as_str() {
+        "mango_library_only" | "library_only" | "mango_only" => "mango_library_only",
+        "tracked_lists" | "lists" => "tracked_lists",
+        "all_monitored" | "all" => "all_monitored",
+        other => {
+            return Err(AppError::bad_request(format!(
+                "Invalid recommendation scope: '{other}'. Allowed: 'mango_library_only', 'tracked_lists', 'all_monitored'"
+            )));
+        }
+    };
+    crate::settings::set(conn, SETTING_RECOMMENDATION_SCOPE, &serde_json::json!(normalized))
+}
+
+/// Checks whether a series is eligible under the given recommendation scope.
+/// Fails closed to false if identity or membership is ambiguous.
+pub fn is_series_eligible_for_scope(
+    conn: &Connection,
+    manga_id: Option<i64>,
+    series_title: &str,
+    scope: &str,
+) -> bool {
+    match scope {
+        "all_monitored" => true,
+        "tracked_lists" => {
+            if let Some(m_id) = manga_id {
+                let canonical_id = crate::sync::reconciliation::resolve_canonical_manga_id(conn, m_id);
+                let in_lib: bool = conn
+                    .query_row("SELECT in_library FROM manga WHERE id = ?1", [canonical_id], |r| r.get(0))
+                    .unwrap_or(false);
+                if in_lib {
+                    return true;
+                }
+            }
+            let title_in_lib: bool = conn
+                .query_row(
+                    "SELECT 1 FROM manga WHERE title = ?1 COLLATE NOCASE AND in_library = 1 LIMIT 1",
+                    [series_title],
+                    |_| Ok(true),
+                )
+                .unwrap_or(false);
+            if title_in_lib {
+                return true;
+            }
+
+            let is_in_lists: bool = conn
+                .query_row(
+                    "SELECT 1 FROM tracked_catalog WHERE (manga_id = ?1 OR title = ?2 COLLATE NOCASE) AND origins LIKE '%lists%' LIMIT 1",
+                    params![manga_id, series_title],
+                    |_| Ok(true),
+                )
+                .unwrap_or(false);
+            is_in_lists
+        }
+        _ => {
+            // Default "mango_library_only"
+            if let Some(m_id) = manga_id {
+                let canonical_id = crate::sync::reconciliation::resolve_canonical_manga_id(conn, m_id);
+                let in_lib: bool = conn
+                    .query_row(
+                        "SELECT in_library FROM manga WHERE id = ?1",
+                        [canonical_id],
+                        |r| r.get(0),
+                    )
+                    .unwrap_or(false);
+                if in_lib {
+                    return true;
+                }
+            }
+            conn.query_row(
+                "SELECT 1 FROM manga WHERE title = ?1 COLLATE NOCASE AND in_library = 1 LIMIT 1",
+                [series_title],
+                |_| Ok(true),
+            )
+            .unwrap_or(false)
+        }
+    }
+}
+
 pub fn get_monitoring_settings(conn: &Connection) -> Result<MonitoringSettings> {
     let automation_mode = get_automation_mode(conn);
     let interval_hours = get_monitoring_interval_hours(conn);
@@ -249,6 +356,7 @@ pub fn get_monitoring_settings(conn: &Connection) -> Result<MonitoringSettings> 
         .unwrap_or_else(|| "simulation".to_string());
     let auto_publish_manual = crate::settings::get::<bool>(conn, SETTING_AUTO_PUBLISH_MANUAL)
         .unwrap_or(false);
+    let recommendation_scope = get_recommendation_scope(conn);
 
     Ok(MonitoringSettings {
         automation_mode,
@@ -258,6 +366,7 @@ pub fn get_monitoring_settings(conn: &Connection) -> Result<MonitoringSettings> 
         auto_acquire_enabled,
         operating_mode,
         auto_publish_manual,
+        recommendation_scope,
     })
 }
 
@@ -330,6 +439,23 @@ pub fn update_monitoring_settings(
         None => None,
     };
 
+    let validated_scope = match &req.recommendation_scope {
+        Some(s) => {
+            let trimmed = s.trim().to_lowercase();
+            match trimmed.as_str() {
+                "mango_library_only" | "library_only" | "mango_only" => Some("mango_library_only".to_string()),
+                "tracked_lists" | "lists" => Some("tracked_lists".to_string()),
+                "all_monitored" | "all" => Some("all_monitored".to_string()),
+                _ => {
+                    return Err(AppError::bad_request(format!(
+                        "Invalid recommendation scope: '{s}'. Allowed: 'mango_library_only', 'tracked_lists', 'all_monitored'"
+                    )));
+                }
+            }
+        }
+        None => None,
+    };
+
     // 2. Atomic mutation phase (all-or-nothing transaction)
     let tx = conn.transaction()?;
 
@@ -350,6 +476,9 @@ pub fn update_monitoring_settings(
     }
     if let Some(auto_publish) = req.auto_publish_manual {
         set_auto_publish_manual_enabled(&tx, auto_publish)?;
+    }
+    if let Some(scope) = validated_scope {
+        set_recommendation_scope(&tx, &scope)?;
     }
 
     tx.commit()?;
@@ -445,6 +574,7 @@ pub fn calculate_acquisition_priority(
 }
 
 pub fn list_review_queue(conn: &Connection, status: Option<&str>) -> Result<Vec<ReviewQueueItem>> {
+    let scope = get_recommendation_scope(conn);
     let mut sql = "SELECT q.id, q.manga_id, q.series_id, q.series_title, q.volume_number,
                           q.recommended_candidate_id, q.provider, q.title, q.raw_title, q.quality_score,
                           q.confidence, q.confidence_reason, q.file_size_bytes, q.publication_destination,
@@ -452,23 +582,52 @@ pub fn list_review_queue(conn: &Connection, status: Option<&str>) -> Result<Vec<
                           q.created_at, q.updated_at, q.acquisition_priority, q.earlier_missing_gaps,
                           q.ordering_explanation, q.is_safe_to_approve,
                           sr.komga_series_id, sr.last_reconciled_at, sr.owned_volumes_count, sr.missing_volumes_count,
-                          tc.origins
+                          tc.origins,
+                          COALESCE(m.in_library, (SELECT m2.in_library FROM manga m2 WHERE m2.title = q.series_title COLLATE NOCASE LIMIT 1), 0) AS in_library,
+                          sr.status AS reconciliation_status,
+                          sr.owned_volumes_json,
+                          sr.missing_volumes_json
                    FROM acquisition_review_queue q
-                   LEFT JOIN series_reconciliations sr ON (sr.series_id = q.series_id OR sr.title = q.series_title)
-                   LEFT JOIN tracked_catalog tc ON (tc.manga_id = q.manga_id OR tc.title = q.series_title)".to_string();
+                   LEFT JOIN manga m ON m.id = q.manga_id
+                   LEFT JOIN series_reconciliations sr ON (sr.series_id = q.series_id OR sr.title = q.series_title COLLATE NOCASE)
+                   LEFT JOIN tracked_catalog tc ON (tc.manga_id = q.manga_id OR tc.title = q.series_title COLLATE NOCASE)".to_string();
+
+    let mut conditions = Vec::new();
 
     if let Some(st) = status {
         if !st.is_empty() && st != "all" {
-            sql.push_str(&format!(" WHERE q.status = '{}'", st.replace('\'', "''")));
+            conditions.push(format!("q.status = '{}'", st.replace('\'', "''")));
         }
     }
+
+    match scope.as_str() {
+        "all_monitored" => {},
+        "tracked_lists" => {
+            conditions.push("(COALESCE(m.in_library, (SELECT m2.in_library FROM manga m2 WHERE m2.title = q.series_title COLLATE NOCASE LIMIT 1), 0) = 1 OR tc.origins LIKE '%lists%')".to_string());
+        },
+        _ => {
+            // "mango_library_only" (default)
+            conditions.push("COALESCE(m.in_library, (SELECT m2.in_library FROM manga m2 WHERE m2.title = q.series_title COLLATE NOCASE LIMIT 1), 0) = 1".to_string());
+        }
+    }
+
+    if !conditions.is_empty() {
+        sql.push_str(" WHERE ");
+        sql.push_str(&conditions.join(" AND "));
+    }
+
     sql.push_str(" ORDER BY q.acquisition_priority ASC, q.quality_score DESC, q.volume_number ASC");
 
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map([], map_review_queue_row)?;
     let mut list = Vec::new();
     for r in rows {
-        list.push(r?);
+        let item = r?;
+        // Post-filter: If volume is confirmed owned in Komga reconciliation, do not return as pending proposal
+        if item.status == "pending" && item.confirmed_owned_volumes.iter().any(|&v| (v - item.volume_number).abs() < 0.001) {
+            continue;
+        }
+        list.push(item);
     }
     Ok(list)
 }
@@ -482,10 +641,15 @@ pub fn get_review_queue_item(conn: &Connection, id: i64) -> Result<Option<Review
                 q.created_at, q.updated_at, q.acquisition_priority, q.earlier_missing_gaps,
                 q.ordering_explanation, q.is_safe_to_approve,
                 sr.komga_series_id, sr.last_reconciled_at, sr.owned_volumes_count, sr.missing_volumes_count,
-                tc.origins
+                tc.origins,
+                COALESCE(m.in_library, (SELECT m2.in_library FROM manga m2 WHERE m2.title = q.series_title COLLATE NOCASE LIMIT 1), 0) AS in_library,
+                sr.status AS reconciliation_status,
+                sr.owned_volumes_json,
+                sr.missing_volumes_json
          FROM acquisition_review_queue q
-         LEFT JOIN series_reconciliations sr ON (sr.series_id = q.series_id OR sr.title = q.series_title)
-         LEFT JOIN tracked_catalog tc ON (tc.manga_id = q.manga_id OR tc.title = q.series_title)
+         LEFT JOIN manga m ON m.id = q.manga_id
+         LEFT JOIN series_reconciliations sr ON (sr.series_id = q.series_id OR sr.title = q.series_title COLLATE NOCASE)
+         LEFT JOIN tracked_catalog tc ON (tc.manga_id = q.manga_id OR tc.title = q.series_title COLLATE NOCASE)
          WHERE q.id = ?1",
         [id],
         map_review_queue_row,
@@ -504,6 +668,16 @@ pub fn add_or_update_review_queue_item(
     alternatives: &[ReleaseCandidate],
     destination: Option<&str>,
 ) -> Result<i64> {
+    // 0. Scope eligibility check (fails closed to no-op if outside configured scope)
+    let scope = get_recommendation_scope(conn);
+    if !is_series_eligible_for_scope(conn, manga_id, series_title, &scope) {
+        tracing::info!(
+            "Refusing review queue insertion for {} Vol {}: series is not eligible under recommendation scope '{}'",
+            series_title, volume_number, scope
+        );
+        return Ok(0);
+    }
+
     // 1. Never add candidates with ambiguous confidence (e.g. uncertain title identity)
     if cand.confidence.as_deref() == Some("ambiguous") {
         tracing::info!(
@@ -513,11 +687,11 @@ pub fn add_or_update_review_queue_item(
         return Ok(0);
     }
 
-    // 2. Never queue proposals for volumes already owned
-    let is_owned: bool = conn
+    // 2. Never queue proposals for volumes already owned (check watchers, local files, and Komga reconciliation)
+    let is_owned_watcher: bool = conn
         .query_row(
             "SELECT 1 FROM release_availability_watchers
-             WHERE (series_id = ?1 OR series_title = ?2)
+             WHERE (series_id = ?1 OR series_title = ?2 COLLATE NOCASE)
                AND ABS(volume_number - ?3) < 0.001
                AND is_owned = 1
              LIMIT 1",
@@ -527,7 +701,24 @@ pub fn add_or_update_review_queue_item(
         .optional()?
         .unwrap_or(false);
 
-    if is_owned {
+    let is_owned_local = if let Some(mid) = manga_id {
+        let canonical_mid = crate::sync::reconciliation::resolve_canonical_manga_id(conn, mid);
+        crate::acquisition::release_discovery::is_volume_owned(conn, canonical_mid, series_id, volume_number).unwrap_or(false)
+    } else {
+        false
+    };
+
+    let in_recon_owned: bool = conn
+        .query_row(
+            "SELECT owned_volumes_json FROM series_reconciliations WHERE series_id = ?1 OR title = ?2 COLLATE NOCASE LIMIT 1",
+            params![series_id, series_title],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()?
+        .and_then(|json| serde_json::from_str::<Vec<f64>>(&json).ok())
+        .map_or(false, |vols| vols.iter().any(|&v| (v - volume_number).abs() < 0.001));
+
+    if is_owned_watcher || is_owned_local || in_recon_owned {
         tracing::info!(
             "Refusing review queue insertion for {} Vol {}: volume is already owned",
             series_title, volume_number
@@ -777,6 +968,7 @@ pub fn list_monitoring_activity(conn: &Connection, limit: usize) -> Result<Vec<M
 /// Synchronizes all followed series matching configured tracking statuses to availability watchers.
 pub async fn sync_followed_series_to_watchers(db: &Db, _http: reqwest::Client) -> Result<usize> {
     let tracked_statuses = db.call(|conn| Ok(get_monitored_tracking_statuses(conn))).await?;
+    let scope = db.call(|conn| Ok(get_recommendation_scope(conn))).await?;
 
     // 1. Gather all followed series from tracked_catalog and tracker_list_entries
     let series_to_monitor: Vec<(i64, String, String)> = db.call(move |conn| {
@@ -795,6 +987,11 @@ pub async fn sync_followed_series_to_watchers(db: &Db, _http: reqwest::Client) -
 
         for r in rows {
             let (manga_id, title, komga_series_id) = r?;
+
+            // Check recommendation scope eligibility
+            if !is_series_eligible_for_scope(conn, Some(manga_id), &title, &scope) {
+                continue;
+            }
 
             // Check if series has an entry in tracker_list_entries matching tracked_statuses
             let norm_status: Option<String> = conn
@@ -886,6 +1083,51 @@ fn map_review_queue_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewQueueIt
     let provider: String = r.get(6)?;
     let score: f64 = r.get(9)?;
 
+    let in_library: bool = r.get::<_, i64>(29).unwrap_or(0) != 0;
+    let reconciliation_status: Option<String> = r.get(30).ok();
+    let owned_volumes_json: Option<String> = r.get(31).ok();
+    let missing_volumes_json: Option<String> = r.get(32).ok();
+
+    let komga_mapping_status = if komga_series_id.is_some() {
+        "mapped".to_string()
+    } else if reconciliation_status.as_deref() == Some("review_required") {
+        "ambiguous".to_string()
+    } else {
+        "unmapped".to_string()
+    };
+
+    let ownership_status = if komga_series_id.is_none() {
+        "unmapped_to_komga".to_string()
+    } else if reconciliation_status.as_deref() == Some("review_required")
+        || reconciliation_status.as_deref() == Some("sync_error")
+        || last_reconciled_at.is_none()
+    {
+        "unknown_ownership".to_string()
+    } else if missing_volumes_count == Some(0) {
+        "confirmed_owned".to_string()
+    } else {
+        "confirmed_missing".to_string()
+    };
+
+    let eligibility_reason = if in_library {
+        "Explicit Mango Library Member".to_string()
+    } else if monitor_origins.as_ref().map_or(false, |o| o.iter().any(|s| s.contains("lists"))) {
+        "Tracked List Entry".to_string()
+    } else {
+        "Monitored Title".to_string()
+    };
+
+    let confirmed_owned_volumes: Vec<f64> = owned_volumes_json
+        .and_then(|raw| serde_json::from_str::<Vec<f64>>(&raw).ok())
+        .unwrap_or_default();
+
+    let confirmed_missing_volumes: Vec<f64> = missing_volumes_json
+        .and_then(|raw| serde_json::from_str::<Vec<f64>>(&raw).ok())
+        .unwrap_or_default();
+
+    let raw_safe: bool = r.get::<_, i64>(23).map(|v| v != 0).unwrap_or(true);
+    let is_safe_to_approve = raw_safe && ownership_status != "unknown_ownership" && ownership_status != "unmapped_to_komga";
+
     let selection_reason = Some(format!(
         "Discovered by {provider} (Score: {score:.0}) - {}",
         ordering_explanation
@@ -918,7 +1160,7 @@ fn map_review_queue_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewQueueIt
         acquisition_priority: r.get(20).unwrap_or(1),
         earlier_missing_gaps: r.get(21).ok(),
         ordering_explanation,
-        is_safe_to_approve: r.get::<_, i64>(23).map(|v| v != 0).unwrap_or(true),
+        is_safe_to_approve,
         komga_series_id,
         last_reconciled_at,
         owned_volumes_count,
@@ -926,5 +1168,11 @@ fn map_review_queue_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<ReviewQueueIt
         is_komga_confirmed,
         monitor_origins,
         selection_reason,
+        in_library,
+        eligibility_reason,
+        komga_mapping_status,
+        ownership_status,
+        confirmed_owned_volumes,
+        confirmed_missing_volumes,
     })
 }
