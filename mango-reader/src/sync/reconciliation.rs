@@ -2361,15 +2361,39 @@ pub fn resolve_canonical_library_state_with_ownership(
     let mut next_release: Option<OpenTomeVolumeRelease> = None;
 
     if let Some(ml) = market_line {
-        if let Some(ref nv) = ml.next_volume {
-            let is_future = nv.release_date.as_deref().map_or(nv.status == "future", |d| d > today_str);
-            let is_today = nv.release_date.as_deref().map_or(nv.status == "releases_today", |d| d == today_str);
+        for uv in ml.upcoming_volumes() {
+            let is_future = uv.release_date.as_deref().map_or(uv.status == "future", |d| d > today_str);
+            let is_today = uv.release_date.as_deref().map_or(uv.status == "releases_today", |d| d == today_str);
             if is_future {
-                upcoming_volumes.push(nv.volume_number);
-                next_release = Some(nv.clone());
+                if !upcoming_volumes.iter().any(|&v| (v - uv.volume_number).abs() < 0.001) {
+                    upcoming_volumes.push(uv.volume_number);
+                }
+                if next_release.is_none() {
+                    next_release = Some(uv.clone());
+                }
             } else if is_today {
-                releases_today.push(nv.volume_number);
-                next_release = Some(nv.clone());
+                if !releases_today.iter().any(|&v| (v - uv.volume_number).abs() < 0.001) {
+                    releases_today.push(uv.volume_number);
+                }
+                if next_release.is_none() {
+                    next_release = Some(uv.clone());
+                }
+            }
+        }
+        if next_release.is_none() {
+            next_release = ml.next_volume.clone();
+            if let Some(ref nv) = next_release {
+                let is_future = nv.release_date.as_deref().map_or(nv.status == "future", |d| d > today_str);
+                let is_today = nv.release_date.as_deref().map_or(nv.status == "releases_today", |d| d == today_str);
+                if is_future {
+                    if !upcoming_volumes.iter().any(|&v| (v - nv.volume_number).abs() < 0.001) {
+                        upcoming_volumes.push(nv.volume_number);
+                    }
+                } else if is_today {
+                    if !releases_today.iter().any(|&v| (v - nv.volume_number).abs() < 0.001) {
+                        releases_today.push(nv.volume_number);
+                    }
+                }
             }
         }
     }
@@ -3617,6 +3641,7 @@ mod tests {
             latest_volume: latest,
             next_volume: next,
             total_volumes: total,
+            volumes: vec![],
         }
     }
 

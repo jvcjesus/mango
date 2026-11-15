@@ -599,8 +599,8 @@ async fn test_unattended_watcher_cycle_submits_without_human_token() {
     db.call(move |conn| {
         // Setup manga with auto_acquire enabled and automatic automation mode
         conn.execute(
-            "INSERT INTO manga (id, source_id, url, title, update_strategy, auto_acquire, auto_acquire_activated_at, automation_mode)
-             VALUES (501, 1, 'url:501', 'Kagurabachi', 'ALWAYS_UPDATE', 1, ?1, 'automatic_acquisition')",
+            "INSERT INTO manga (id, source_id, url, title, in_library, update_strategy, auto_acquire, auto_acquire_activated_at, automation_mode)
+             VALUES (501, 1, 'url:501', 'Kagurabachi', 1, 'ALWAYS_UPDATE', 1, ?1, 'automatic_acquisition')",
             [cur_time - 86400],
         )?;
 

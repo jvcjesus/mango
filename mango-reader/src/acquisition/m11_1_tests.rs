@@ -73,6 +73,7 @@ mod tests {
             seed_manga(conn, 1172, "Haikyu!!");
 
             // Configure linking
+            conn.execute("UPDATE manga SET in_library = 0 WHERE id IN (1066, 1172)", []).unwrap();
             conn.execute("UPDATE manga SET in_library = 1, source_manga_id = 1066 WHERE id = 1092", []).unwrap();
             conn.execute("UPDATE manga SET catalog_manga_id = 1092 WHERE id = 1066", []).unwrap();
             conn.execute("UPDATE manga SET catalog_manga_id = 1092 WHERE id = 1172", []).unwrap();
@@ -96,6 +97,11 @@ mod tests {
         db.call(|conn| {
             seed_manga(conn, 1092, "Haikyu!!");
             conn.execute("UPDATE manga SET in_library = 1 WHERE id = 1092", []).unwrap();
+            conn.execute(
+                "INSERT INTO series_reconciliations (series_id, manga_id, komga_series_id, title, status, total_official_volumes, owned_volumes_count, missing_volumes_count, last_reconciled_at, updated_at)
+                 VALUES ('manga:1092', 1092, 'komga:1092', 'Haikyu!!', 'up_to_date', 9, 4, 5, 1700000000, 1700000000)",
+                [],
+            ).unwrap();
 
             // Insert owned volumes 1, 2, 3, 4
             for v in 1..=4 {
@@ -146,6 +152,11 @@ mod tests {
         db.call(|conn| {
             seed_manga(conn, 1092, "Haikyu!!");
             conn.execute("UPDATE manga SET in_library = 1 WHERE id = 1092", []).unwrap();
+            conn.execute(
+                "INSERT INTO series_reconciliations (series_id, manga_id, komga_series_id, title, status, total_official_volumes, owned_volumes_count, missing_volumes_count, last_reconciled_at, updated_at)
+                 VALUES ('manga:1092', 1092, 'komga:1092', 'Haikyu!!', 'up_to_date', 9, 4, 5, 1700000000, 1700000000)",
+                [],
+            ).unwrap();
 
             // Seed owned volumes 1..4
             for v in 1..=4 {

@@ -22,6 +22,7 @@
   import Import from './routes/Import.svelte';
   import Library from './routes/Library.svelte';
   import Lists from './routes/Lists.svelte';
+  import Releases from './routes/Releases.svelte';
   import Migrate from './routes/Migrate.svelte';
   import Reader from './routes/Reader.svelte';
   import Search from './routes/Search.svelte';
@@ -33,7 +34,7 @@
   // 4 Primary destinations (M13.3)
   const NAV: { to: string; label: string; icon: IconName; under: string[] }[] = [
     { to: '/', label: 'Home', icon: 'grid', under: ['', 'home'] },
-    { to: '/library', label: 'Library', icon: 'book', under: ['library', 'lists'] },
+    { to: '/library', label: 'Library', icon: 'book', under: ['library', 'lists', 'releases'] },
     { to: '/browse', label: 'Discover', icon: 'globe', under: ['browse', 'source', 'search', 'extensions', 'extension'] },
     { to: '/activity', label: 'Activity', icon: 'refresh', under: ['activity', 'updates', 'downloads', 'history'] },
   ];
@@ -176,6 +177,10 @@
             <a href="#/library" class="bc-link">Library</a>
             <span class="bc-sep" aria-hidden="true">/</span>
             <span class="bc-current" aria-current="page">Lists</span>
+          {:else if area === 'releases'}
+            <a href="#/library" class="bc-link">Library</a>
+            <span class="bc-sep" aria-hidden="true">/</span>
+            <span class="bc-current" aria-current="page">Upcoming Releases</span>
           {:else if area === 'activity' || area === 'updates'}
             <a href="#/activity" class="bc-link">Activity</a>
             {#if route.query.get('tab') && route.query.get('tab') !== 'inbox'}
@@ -233,6 +238,8 @@
         <Library />
       {:else if area === 'lists'}
         <Lists />
+      {:else if area === 'releases'}
+        <Releases />
       {:else if area === 'browse'}
         <Browse />
       {:else if area === 'activity'}

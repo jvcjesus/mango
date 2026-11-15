@@ -38,6 +38,9 @@
     getMangaOpenTome,
     remapMangaOpenTome,
     type OpenTomeSeriesSchedule,
+    getTitleReleases,
+    postTitleReleasesRefresh,
+    type TitleReleaseScheduleDto,
     getMangaReleaseDiscovery,
     checkMangaReleaseDiscovery,
     retryReleaseDiscoveryTarget,
@@ -156,6 +159,10 @@
   let reconciling = $state(false);
   let openTomeSchedule = $state<OpenTomeSeriesSchedule | null>(null);
   let openTomeLoading = $state(false);
+  let releaseSchedule = $state<TitleReleaseScheduleDto | null>(null);
+  let refreshingReleases = $state(false);
+  let showAllUpcoming = $state(false);
+  let showRecentHistory = $state(false);
   let releaseDiscoveryTargets = $state<ReleaseDiscoveryTarget[]>([]);
   let seriesDiscovery = $state<Map<number, VolumeDiscoveryResult>>(new Map());
   let discoveringVolume = $state<number | null>(null);
@@ -283,11 +290,30 @@
       openTomeSchedule = null;
     }
     try {
+      releaseSchedule = await getTitleReleases(id);
+    } catch {
+      releaseSchedule = null;
+    }
+    try {
       releaseDiscoveryTargets = await getMangaReleaseDiscovery(id);
     } catch {
       releaseDiscoveryTargets = [];
     }
     loadDiscovery();
+  }
+
+  async function handleRefreshReleases() {
+    if (refreshingReleases) return;
+    refreshingReleases = true;
+    try {
+      releaseSchedule = await postTitleReleasesRefresh(id);
+      openTomeSchedule = await getMangaOpenTome(id);
+      toast.success('Release schedule and dates refreshed');
+    } catch (e: any) {
+      toast.error(message(e) || 'Failed to refresh release schedule');
+    } finally {
+      refreshingReleases = false;
+    }
   }
 
   async function handleOpenTomeRemap(action: 'confirm' | 'reject' | 'auto') {
@@ -296,6 +322,11 @@
     try {
       await remapMangaOpenTome(id, openTomeSchedule.workId, action);
       openTomeSchedule = await getMangaOpenTome(id);
+      try {
+        releaseSchedule = await getTitleReleases(id);
+      } catch {
+        releaseSchedule = null;
+      }
       toast.success(action === 'reject' ? 'OpenTome mapping rejected' : action === 'auto' ? 'Reset to automatic matching' : 'OpenTome mapping confirmed');
     } catch {
       toast.error('Failed to update OpenTome mapping');
@@ -1597,6 +1628,151 @@
               onCheckReleaseDiscovery={handleCheckReleaseDiscovery}
             />
           </div>
+        {/if}
+
+        {#if releaseSchedule}
+          <section class="title-release-schedule-card" aria-label="Release Schedule">
+            <div class="schedule-head">
+              <div class="schedule-title-wrap">
+                <span class="schedule-icon"><Icon name="calendar" size={18} /></span>
+                <h3 class="display schedule-heading">RELEASE SCHEDULE</h3>
+                <span class="tag source-tag">{releaseSchedule.source}</span>
+                {#if releaseSchedule.confidence}
+                  <span
+                    class="tag conf-tag"
+                    class:exact={releaseSchedule.confidence === 'exact' || releaseSchedule.confidence === 'user_confirmed'}
+                    class:high={releaseSchedule.confidence === 'high'}
+                    class:ambig={releaseSchedule.confidence === 'ambiguous'}
+                  >
+                    {releaseSchedule.confidence.toUpperCase()}
+                  </span>
+                {/if}
+              </div>
+
+              <div class="schedule-actions">
+                {#if releaseSchedule.last_evaluated_at}
+                  <span class="last-checked" title="Last checked with metadata provider">
+                    Updated {ago(releaseSchedule.last_evaluated_at)}
+                  </span>
+                {/if}
+                <button
+                  class="btn pill icon-text sm"
+                  onclick={handleRefreshReleases}
+                  disabled={refreshingReleases}
+                  title="Query OpenTome and update release schedule"
+                >
+                  {#if refreshingReleases}
+                    <span class="spin"><Icon name="spinner" size={13} stroke={2.5} /></span>
+                    <span>Refreshing...</span>
+                  {:else}
+                    <Icon name="refresh" size={13} />
+                    <span>Refresh Dates</span>
+                  {/if}
+                </button>
+              </div>
+            </div>
+
+            {#if releaseSchedule.next_release}
+              {@const nr = releaseSchedule.next_release}
+              <div class="next-release-banner">
+                <div class="next-release-main">
+                  <div class="nr-badge">NEXT RELEASE</div>
+                  <div class="nr-title-line">
+                    <span class="nr-vol">{nr.title}</span>
+                    <span class="nr-date">{nr.releaseDate}</span>
+                    {#if nr.relativeDays === 0}
+                      <span class="countdown-badge today">Releases Today</span>
+                    {:else if nr.relativeDays > 0}
+                      <span class="countdown-badge in-future">In {nr.relativeDays} {nr.relativeDays === 1 ? 'day' : 'days'}</span>
+                    {:else}
+                      <span class="countdown-badge past">Released</span>
+                    {/if}
+                  </div>
+                  <div class="nr-meta-line">
+                    <span class="meta-item"><Icon name="book" size={12} /> {nr.format.charAt(0).toUpperCase() + nr.format.slice(1)}</span>
+                    <span class="meta-item"><Icon name="globe" size={12} /> {nr.language.toUpperCase()}{nr.region ? ` · ${nr.region}` : ''}</span>
+                    {#if nr.publisher}
+                      <span class="meta-item">{nr.publisher}</span>
+                    {/if}
+                    <span class="ownership-tag" class:owned={nr.isOwned} class:missing={!nr.isOwned}>
+                      {nr.isOwned ? 'Owned in Komga' : 'Missing from Komga'}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            {/if}
+
+            {#if releaseSchedule.upcoming_volumes.length > 0}
+              <div class="upcoming-volumes-section">
+                <div class="subhead-row">
+                  <span class="subhead-title">Upcoming Volumes ({releaseSchedule.upcoming_volumes.length})</span>
+                  {#if releaseSchedule.upcoming_volumes.length > 3}
+                    <button class="btn pill mini" onclick={() => (showAllUpcoming = !showAllUpcoming)}>
+                      {showAllUpcoming ? 'Show Less' : `Show All (${releaseSchedule.upcoming_volumes.length})`}
+                    </button>
+                  {/if}
+                </div>
+                <div class="upcoming-volumes-grid">
+                  {#each (showAllUpcoming ? releaseSchedule.upcoming_volumes : releaseSchedule.upcoming_volumes.slice(0, 3)) as vol (vol.title + vol.releaseDate)}
+                    <div class="upcoming-vol-card" class:is-owned={vol.isOwned}>
+                      <div class="uv-top">
+                        <span class="uv-vol">{vol.title}</span>
+                        {#if vol.relativeDays === 0}
+                          <span class="uv-day today">Today</span>
+                        {:else if vol.relativeDays > 0}
+                          <span class="uv-day in-future">In {vol.relativeDays}d</span>
+                        {:else}
+                          <span class="uv-day past">Released</span>
+                        {/if}
+                      </div>
+                      <div class="uv-date">{vol.releaseDate}</div>
+                      <div class="uv-bottom">
+                        <span class="uv-fmt">{vol.format}</span>
+                        <span class="uv-own" class:owned={vol.isOwned}>{vol.isOwned ? 'Owned' : 'Missing'}</span>
+                      </div>
+                    </div>
+                  {/each}
+                </div>
+              </div>
+            {/if}
+
+            {#if releaseSchedule.recent_releases.length > 0}
+              <div class="recent-history-section">
+                <div class="subhead-row">
+                  <button class="btn pill mini text-btn" onclick={() => (showRecentHistory = !showRecentHistory)}>
+                    <Icon name={showRecentHistory ? 'up' : 'down'} size={12} />
+                    <span>Recent Publication History ({releaseSchedule.recent_releases.length} volumes)</span>
+                  </button>
+                </div>
+                {#if showRecentHistory}
+                  <div class="recent-history-list">
+                    {#each releaseSchedule.recent_releases as r (r.title + r.releaseDate)}
+                      <div class="recent-row">
+                        <span class="rr-title">{r.title}</span>
+                        <span class="rr-date">{r.releaseDate}</span>
+                        <span class="rr-fmt">{r.format}</span>
+                        <span class="rr-own" class:owned={r.isOwned}>{r.isOwned ? 'Owned in Komga' : 'Missing'}</span>
+                      </div>
+                    {/each}
+                  </div>
+                {/if}
+              </div>
+            {/if}
+
+            {#if !releaseSchedule.next_release}
+              <div class="no-releases-box">
+                <div class="no-rel-info">
+                  <Icon name="info" size={16} />
+                  <span>{releaseSchedule.diagnostic_reason ?? 'No upcoming releases currently announced by publishers.'}</span>
+                </div>
+              </div>
+            {/if}
+
+            <div class="schedule-disclaimer">
+              <Icon name="info" size={11} />
+              <span>Publication release dates represent official publisher book distribution schedules, distinct from digital scanlation or torrent availability.</span>
+            </div>
+          </section>
         {/if}
 
         {#if title.isCatalog}
@@ -4367,6 +4543,341 @@
     display: flex;
     align-items: center;
     gap: 8px;
+  }
+
+  /* Release Schedule Card */
+  .title-release-schedule-card {
+    border: 2px solid var(--ink);
+    background: var(--paper);
+    padding: 1rem 1.25rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0.85rem;
+    box-shadow: 3px 3px 0 var(--ink);
+    margin-top: 0.5rem;
+  }
+
+  .schedule-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 0.75rem;
+  }
+
+  .schedule-title-wrap {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+
+  .schedule-icon {
+    display: flex;
+    align-items: center;
+    color: var(--accent, #6366f1);
+  }
+
+  .schedule-heading {
+    font-size: 1rem;
+    font-weight: 700;
+    margin: 0;
+  }
+
+  .source-tag {
+    font-size: 0.75rem;
+    background: var(--ink);
+    color: var(--paper);
+    padding: 0.15rem 0.4rem;
+    border-radius: 3px;
+  }
+
+  .conf-tag {
+    font-size: 0.7rem;
+    font-weight: 700;
+    padding: 0.15rem 0.4rem;
+    border-radius: 3px;
+    border: 1px solid var(--ink);
+  }
+
+  .conf-tag.exact {
+    background: #10b981;
+    color: #fff;
+    border-color: #059669;
+  }
+
+  .conf-tag.high {
+    background: #3b82f6;
+    color: #fff;
+    border-color: #2563eb;
+  }
+
+  .conf-tag.ambig {
+    background: #f59e0b;
+    color: #fff;
+    border-color: #d97706;
+  }
+
+  .schedule-actions {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+  }
+
+  .last-checked {
+    font-size: 0.8rem;
+    color: var(--muted, #666);
+  }
+
+  .next-release-banner {
+    background: rgba(99, 102, 241, 0.08);
+    border: 1.5px solid var(--accent, #6366f1);
+    border-radius: 4px;
+    padding: 0.75rem 1rem;
+  }
+
+  .next-release-main {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+  }
+
+  .nr-badge {
+    font-size: 0.68rem;
+    font-weight: 800;
+    letter-spacing: 0.05em;
+    color: var(--accent, #6366f1);
+  }
+
+  .nr-title-line {
+    display: flex;
+    align-items: center;
+    gap: 0.6rem;
+    flex-wrap: wrap;
+  }
+
+  .nr-vol {
+    font-size: 1.15rem;
+    font-weight: 700;
+  }
+
+  .nr-date {
+    font-size: 0.95rem;
+    font-weight: 600;
+    color: var(--ink);
+  }
+
+  .countdown-badge {
+    font-size: 0.75rem;
+    font-weight: 700;
+    padding: 0.15rem 0.5rem;
+    border-radius: 999px;
+  }
+
+  .countdown-badge.today {
+    background: #ef4444;
+    color: #fff;
+  }
+
+  .countdown-badge.in-future {
+    background: var(--accent, #6366f1);
+    color: #fff;
+  }
+
+  .countdown-badge.past {
+    background: var(--muted, #9ca3af);
+    color: #fff;
+  }
+
+  .nr-meta-line {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    font-size: 0.8rem;
+    color: var(--muted, #666);
+    flex-wrap: wrap;
+  }
+
+  .meta-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+  }
+
+  .ownership-tag {
+    font-size: 0.7rem;
+    font-weight: 600;
+    padding: 0.1rem 0.4rem;
+    border-radius: 3px;
+  }
+
+  .ownership-tag.owned {
+    background: rgba(16, 185, 129, 0.15);
+    color: #065f46;
+  }
+
+  .ownership-tag.missing {
+    background: rgba(245, 158, 11, 0.15);
+    color: #92400e;
+  }
+
+  .upcoming-volumes-section {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+  }
+
+  .subhead-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+
+  .subhead-title {
+    font-size: 0.85rem;
+    font-weight: 700;
+    color: var(--ink);
+  }
+
+  .upcoming-volumes-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+    gap: 0.5rem;
+  }
+
+  .upcoming-vol-card {
+    border: 1px solid var(--line, #ccc);
+    background: rgba(0, 0, 0, 0.02);
+    padding: 0.5rem 0.65rem;
+    border-radius: 4px;
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+  }
+
+  .uv-top {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.25rem;
+  }
+
+  .uv-vol {
+    font-weight: 700;
+    font-size: 0.85rem;
+  }
+
+  .uv-day {
+    font-size: 0.7rem;
+    font-weight: 600;
+    padding: 0.05rem 0.35rem;
+    border-radius: 999px;
+  }
+
+  .uv-day.today {
+    background: #ef4444;
+    color: #fff;
+  }
+
+  .uv-day.in-future {
+    background: var(--accent, #6366f1);
+    color: #fff;
+  }
+
+  .uv-day.past {
+    background: var(--muted, #9ca3af);
+    color: #fff;
+  }
+
+  .uv-date {
+    font-size: 0.8rem;
+    color: var(--ink);
+  }
+
+  .uv-bottom {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 0.7rem;
+    color: var(--muted, #666);
+    margin-top: 0.15rem;
+  }
+
+  .uv-own.owned {
+    color: #065f46;
+    font-weight: 600;
+  }
+
+  .recent-history-section {
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+  }
+
+  .text-btn {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.35rem;
+    font-size: 0.8rem;
+  }
+
+  .recent-history-list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    padding: 0.35rem 0.5rem;
+    background: rgba(0, 0, 0, 0.02);
+    border-radius: 4px;
+  }
+
+  .recent-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    font-size: 0.8rem;
+    padding: 0.2rem 0;
+    border-bottom: 1px dashed var(--line, #e5e7eb);
+  }
+
+  .recent-row:last-child {
+    border-bottom: none;
+  }
+
+  .rr-title {
+    font-weight: 600;
+  }
+
+  .rr-date {
+    color: var(--muted, #666);
+  }
+
+  .rr-own.owned {
+    color: #065f46;
+    font-weight: 600;
+  }
+
+  .no-releases-box {
+    background: rgba(0, 0, 0, 0.03);
+    border-radius: 4px;
+    padding: 0.65rem 0.85rem;
+  }
+
+  .no-rel-info {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.85rem;
+    color: var(--muted, #666);
+  }
+
+  .schedule-disclaimer {
+    display: flex;
+    align-items: center;
+    gap: 0.4rem;
+    font-size: 0.7rem;
+    color: var(--muted, #888);
+    font-style: italic;
+    border-top: 1px solid var(--line, #e5e7eb);
+    padding-top: 0.4rem;
   }
 </style>
 

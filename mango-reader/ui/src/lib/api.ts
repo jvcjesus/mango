@@ -1964,6 +1964,7 @@ export interface OpenTomeMarketSchedule {
   gcdSeriesId: number;
   latestVolume?: OpenTomeVolumeRelease;
   nextVolume?: OpenTomeVolumeRelease;
+  volumes?: OpenTomeVolumeRelease[];
   totalVolumes: number;
 }
 
@@ -2659,6 +2660,83 @@ export const setTitleOpenTomeLine = (mangaId: number, gcdSeriesId: number) =>
 
 export const getReleaseCalendar = (market?: string) =>
   get<ReleaseCalendarEntryDto[]>(`/releases/calendar${market ? `?market=${encodeURIComponent(market)}` : ''}`);
+
+export interface UpcomingReleaseItem {
+  seriesId: string;
+  mangaId?: number | null;
+  komgaSeriesId?: string | null;
+  mangabakaId?: number | null;
+  title: string;
+  volumeNumber?: number | null;
+  chapterNumber?: number | null;
+  releaseDate: string;
+  releaseDateRaw?: string | null;
+  precision: string;
+  dateStatus: string;
+  source: string;
+  language: string;
+  market: string;
+  format: string;
+  publisher?: string | null;
+  isOwned: boolean;
+  daysUntil: number;
+  coverUrl?: string | null;
+  scope: string;
+}
+
+export interface UndatedReleaseItem {
+  seriesId: string;
+  mangaId?: number | null;
+  komgaSeriesId?: string | null;
+  mangabakaId?: number | null;
+  title: string;
+  expectedVolume?: number | null;
+  reason: string;
+  source: string;
+  isOwned: boolean;
+  coverUrl?: string | null;
+  scope: string;
+}
+
+export interface UpcomingReleasesResponse {
+  releases: UpcomingReleaseItem[];
+  undated: UndatedReleaseItem[];
+  totalUpcoming: number;
+  next7DaysCount: number;
+  next30DaysCount: number;
+  next90DaysCount: number;
+  undatedCount: number;
+  activeScope: string;
+  lastRefreshedAt: number;
+}
+
+export interface TitleReleaseScheduleDto {
+  mangaId: number;
+  seriesId: string;
+  title: string;
+  nextRelease?: UpcomingReleaseItem | null;
+  upcomingVolumes: UpcomingReleaseItem[];
+  recentReleases: UpcomingReleaseItem[];
+  primarySource: string;
+  confidence: string;
+  lastEvaluatedAt: number;
+  explanation?: string | null;
+}
+
+export const getUpcomingReleases = (options?: { scope?: string; days?: number; format?: string }) => {
+  const params = new URLSearchParams();
+  if (options?.scope) params.set('scope', options.scope);
+  if (options?.days !== undefined) params.set('days', options.days.toString());
+  if (options?.format) params.set('format', options.format);
+  const qs = params.toString();
+  return get<UpcomingReleasesResponse>(`/releases/upcoming${qs ? `?${qs}` : ''}`);
+};
+
+export const getTitleReleases = (mangaId: number) =>
+  get<TitleReleaseScheduleDto>(`/manga/${mangaId}/releases`);
+
+export const postTitleReleasesRefresh = (mangaId: number) =>
+  send<TitleReleaseScheduleDto>('POST', `/manga/${mangaId}/releases/refresh`, {});
 
 export const getLibraryIntegrity = (params?: { severity?: string; category?: string; search?: string }) => {
   const query = new URLSearchParams();

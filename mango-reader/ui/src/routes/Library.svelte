@@ -151,6 +151,10 @@
           <Icon name="grid" size={16} />
           <span>Tracked Lists</span>
         </a>
+        <a href="#/releases" class="btn pill" title="View upcoming manga releases and calendar">
+          <Icon name="calendar" size={16} />
+          <span>Releases</span>
+        </a>
       </nav>
       {#if data}
         <strong>{data.items.length} {data.items.length === 1 ? 'title' : 'titles'} · {data.categories.length} {data.categories.length === 1 ? 'category' : 'categories'}</strong>

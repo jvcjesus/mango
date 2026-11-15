@@ -243,6 +243,7 @@ mod tests {
                 latest_volume: None,
                 next_volume: Some(vol_release),
                 total_volumes: 9,
+                volumes: vec![],
             }),
             last_evaluated_at: 1700000000,
         };
@@ -301,6 +302,7 @@ mod tests {
                 latest_volume: None,
                 next_volume: Some(vol_release),
                 total_volumes: 9,
+                volumes: vec![],
             }),
             last_evaluated_at: 1700000000,
         };
@@ -358,6 +360,7 @@ mod tests {
                 latest_volume: None,
                 next_volume: Some(vol_release),
                 total_volumes: 105,
+                volumes: vec![],
             }),
             last_evaluated_at: 1700000000,
         };
@@ -413,6 +416,7 @@ mod tests {
                 latest_volume: None,
                 next_volume: Some(vol_release),
                 total_volumes: 12,
+                volumes: vec![],
             }),
             last_evaluated_at: 1700000000,
         };
@@ -467,6 +471,7 @@ mod tests {
                 latest_volume: None,
                 next_volume: Some(vol_release),
                 total_volumes: 14,
+                volumes: vec![],
             }),
             last_evaluated_at: 1700000000,
         };
@@ -524,6 +529,7 @@ mod tests {
                 latest_volume: None,
                 next_volume: Some(vol_release),
                 total_volumes: 3,
+                volumes: vec![],
             }),
             last_evaluated_at: 1700000000,
         };
@@ -580,6 +586,7 @@ mod tests {
                 latest_volume: None,
                 next_volume: Some(vol_release_1),
                 total_volumes: 9,
+                volumes: vec![],
             }),
             last_evaluated_at: 1700000000,
         };
@@ -622,6 +629,7 @@ mod tests {
                 latest_volume: None,
                 next_volume: Some(vol_release_2),
                 total_volumes: 9,
+                volumes: vec![],
             }),
             last_evaluated_at: 1700000000,
         };
@@ -688,6 +696,7 @@ mod tests {
                 latest_volume: None,
                 next_volume: Some(vol_release),
                 total_volumes: 9,
+                volumes: vec![],
             }),
             last_evaluated_at: 1700000000,
         };
@@ -739,6 +748,7 @@ mod tests {
                 latest_volume: None,
                 next_volume: Some(vol_release),
                 total_volumes: 9,
+                volumes: vec![],
             }),
             last_evaluated_at: 1700000000,
         };

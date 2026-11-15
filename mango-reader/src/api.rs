@@ -243,6 +243,11 @@ pub fn router(state: Spaces) -> Router {
             post(post_title_opentome_line),
         )
         .route("/releases/calendar", get(get_releases_calendar))
+        .route("/releases/upcoming", get(get_upcoming_releases_endpoint))
+        .route("/manga/{id}/releases", get(get_manga_releases_schedule_endpoint))
+        .route("/titles/{id}/releases", get(get_manga_releases_schedule_endpoint))
+        .route("/manga/{id}/releases/refresh", post(post_manga_releases_refresh_endpoint))
+        .route("/titles/{id}/releases/refresh", post(post_manga_releases_refresh_endpoint))
         .route("/system/integrity", get(get_system_integrity))
         .route("/notifications/history", get(get_notifications_history))
         .route(
@@ -4327,6 +4332,90 @@ async fn get_releases_calendar(
         })
         .await?;
     Ok(Json(items))
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpcomingReleasesQuery {
+    scope: Option<String>,
+    days: Option<i64>,
+    format: Option<String>,
+}
+
+async fn get_upcoming_releases_endpoint(
+    Me(app): Me,
+    Query(query): Query<UpcomingReleasesQuery>,
+) -> Result<Json<crate::sync::releases::UpcomingReleasesResponse>> {
+    let today = app.opentome.current_date_str().await;
+    let scope = query.scope.unwrap_or_else(|| "mango_library_only".to_string());
+    let days = query.days;
+    let format = query.format;
+
+    let res = app
+        .db
+        .call(move |conn| {
+            crate::sync::releases::query_upcoming_releases(
+                conn,
+                &scope,
+                days,
+                format.as_deref(),
+                &today,
+            )
+        })
+        .await?;
+
+    Ok(Json(res))
+}
+
+async fn get_manga_releases_schedule_endpoint(
+    Me(app): Me,
+    Path(id): Path<i64>,
+) -> Result<Json<crate::sync::releases::TitleReleaseScheduleDto>> {
+    let today = app.opentome.current_date_str().await;
+    let schedule = app
+        .db
+        .call(move |conn| {
+            crate::sync::releases::get_title_release_schedule(conn, id, &today)
+        })
+        .await?;
+
+    Ok(Json(schedule))
+}
+
+async fn post_manga_releases_refresh_endpoint(
+    Me(app): Me,
+    Path(id): Path<i64>,
+) -> Result<Json<crate::sync::releases::TitleReleaseScheduleDto>> {
+    // Force refresh OpenTome mapping and schedule
+    let _ = app.opentome.get_series_schedule_forced(id, true).await;
+
+    // Run reconciliation to update Komga books and MangaBaka status
+    if let Ok(title_view) = app.titles.get(id).await {
+        let ownership = app
+            .pipeline
+            .ownership
+            .get_title_ownership(id, &title_view.title)
+            .await;
+
+        let target = crate::sync::reconciliation::ReconciliationTarget {
+            manga_id: Some(id),
+            komga_series_id: ownership.series_id,
+            title: title_view.title,
+            edition: None,
+        };
+
+        let _ = app.sync.run_reconciliation(target).await;
+    }
+
+    let today = app.opentome.current_date_str().await;
+    let schedule = app
+        .db
+        .call(move |conn| {
+            crate::sync::releases::get_title_release_schedule(conn, id, &today)
+        })
+        .await?;
+
+    Ok(Json(schedule))
 }
 
 #[derive(Deserialize)]

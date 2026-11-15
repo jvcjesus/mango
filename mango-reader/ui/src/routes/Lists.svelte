@@ -398,6 +398,10 @@
             <span>Tracked Lists</span>
             {#if data?.summary}<strong>{data.summary.total}</strong>{/if}
           </a>
+          <a href="#/releases" class="btn pill" title="View upcoming manga releases and calendar">
+            <Icon name="calendar" size={16} />
+            <span>Releases</span>
+          </a>
         </nav>
       </div>
 

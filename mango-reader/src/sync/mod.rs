@@ -17,6 +17,7 @@ pub mod mangabaka;
 pub mod mapping;
 pub mod model;
 pub mod reconciliation;
+pub mod releases;
 pub mod scheduler;
 pub mod service;
 pub mod timeline;

@@ -164,7 +164,7 @@ fn test_settings_and_consent_defaults() {
 
     // Create a manga title
     conn.execute(
-        "INSERT INTO manga (id, source_id, url, title) VALUES (18, 0, 'catalog:18', 'Kagurabachi')",
+        "INSERT INTO manga (id, source_id, url, title, in_library) VALUES (18, 0, 'catalog:18', 'Kagurabachi', 1)",
         [],
     )
     .unwrap();
@@ -268,7 +268,7 @@ async fn test_consent_matrix_and_dry_run_evaluation() {
 
     db.call(move |conn| {
         // Insert manga
-        conn.execute("INSERT INTO manga (id, source_id, url, title, auto_acquire, auto_acquire_activated_at) VALUES (18, 0, 'catalog:18', 'Kagurabachi', 0, NULL)", [])?;
+        conn.execute("INSERT INTO manga (id, source_id, url, title, in_library, auto_acquire, auto_acquire_activated_at) VALUES (18, 0, 'catalog:18', 'Kagurabachi', 1, 0, NULL)", [])?;
         // Insert reconciliation
         conn.execute("INSERT INTO series_reconciliations (series_id, manga_id, title, status, total_official_volumes, owned_volumes_count, missing_volumes_count, owned_volumes_json, missing_volumes_json, future_volumes_json, last_reconciled_at, updated_at) VALUES ('manga:18', 18, 'Kagurabachi', 'up_to_date', 8, 8, 0, '[1,2,3,4,5,6,7,8]', '[]', '[9]', ?1, ?1)", [cur_time])?;
         // Insert release discovery target for Volume 9 releasing today
@@ -315,7 +315,7 @@ async fn test_historical_backlog_watermark_protection() {
 
     db.call(move |conn| {
         // Frieren catalog manga
-        conn.execute("INSERT INTO manga (id, source_id, url, title, auto_acquire, auto_acquire_activated_at) VALUES (848, 0, 'catalog:848', 'Frieren', 1, ?1)", [cur_time])?;
+        conn.execute("INSERT INTO manga (id, source_id, url, title, in_library, auto_acquire, auto_acquire_activated_at) VALUES (848, 0, 'catalog:848', 'Frieren', 1, 1, ?1)", [cur_time])?;
         // Reconciliation: 0 owned, 14 missing
         conn.execute("INSERT INTO series_reconciliations (series_id, manga_id, title, status, total_official_volumes, owned_volumes_count, missing_volumes_count, owned_volumes_json, missing_volumes_json, future_volumes_json, last_reconciled_at, updated_at) VALUES ('manga:848', 848, 'Frieren', 'missing_volume', 14, 0, 14, '[]', '[1,2,3,4,5,6,7,8,9,10,11,12,13,14]', '[15]', ?1, ?1)", [cur_time])?;
         // Target for historical volume 1 released in 2021 (before activation watermark!)
@@ -343,7 +343,7 @@ async fn test_blue_lock_unit_level_ownership_no_acquisition() {
 
     db.call(move |conn| {
         // Blue Lock catalog manga
-        conn.execute("INSERT INTO manga (id, source_id, url, title, auto_acquire, auto_acquire_activated_at) VALUES (846, 0, 'catalog:846', 'Blue Lock', 1, ?1)", [cur_time])?;
+        conn.execute("INSERT INTO manga (id, source_id, url, title, in_library, auto_acquire, auto_acquire_activated_at) VALUES (846, 0, 'catalog:846', 'Blue Lock', 1, 1, ?1)", [cur_time])?;
         // Blue Lock reconciliation: 39 owned, 0 missing
         conn.execute("INSERT INTO series_reconciliations (series_id, manga_id, title, status, total_official_volumes, owned_volumes_count, missing_volumes_count, owned_volumes_json, missing_volumes_json, future_volumes_json, last_reconciled_at, updated_at) VALUES ('manga:846', 846, 'Blue Lock', 'up_to_date', 39, 39, 0, '[39]', '[]', '[40]', ?1, ?1)", [cur_time])?;
         // Target for Volume 39 (already owned)
@@ -371,7 +371,7 @@ async fn test_concurrency_atomic_claim() {
     let cur_time = now();
 
     db.call(move |conn| {
-        conn.execute("INSERT INTO manga (id, source_id, url, title, auto_acquire, auto_acquire_activated_at) VALUES (18, 0, 'catalog:18', 'Kagurabachi', 1, ?1)", [cur_time])?;
+        conn.execute("INSERT INTO manga (id, source_id, url, title, in_library, auto_acquire, auto_acquire_activated_at) VALUES (18, 0, 'catalog:18', 'Kagurabachi', 1, 1, ?1)", [cur_time])?;
         conn.execute("INSERT INTO series_reconciliations (series_id, manga_id, title, status, total_official_volumes, owned_volumes_count, missing_volumes_count, owned_volumes_json, missing_volumes_json, future_volumes_json, last_reconciled_at, updated_at) VALUES ('manga:18', 18, 'Kagurabachi', 'up_to_date', 8, 8, 0, '[1,2,3,4,5,6,7,8]', '[]', '[9]', ?1, ?1)", [cur_time])?;
         conn.execute("INSERT INTO release_discovery_targets (id, series_id, manga_id, series_title, volume_number, market, edition, release_date, release_date_precision, date_type, status, created_at, updated_at) VALUES (1, 'manga:18', 18, 'Kagurabachi', 9.0, 'en', 'standard', date('now', 'localtime'), 'day', 'published', 'candidate_available', ?1, ?1)", [cur_time])?;
         conn.execute("INSERT INTO discovered_release_candidates (id, series_id, volume_number, candidate_id, provider, provider_item_id, title, raw_title, match_type, size_bytes, is_digital, score, score_explanation, download_url, magnet_url, info_hash, seeders, published_at, discovered_at) VALUES (1, 'manga:18', 9.0, 'nyaa:cand1', 'nyaa', '1', 'Kagurabachi v09 (Digital)', 'Kagurabachi v09 (Digital)', 'exact_volume', 150000000, 1, 85.0, 'score', 'https://nyaa.si', 'magnet:?xt=urn:btih:abc', 'abc', 25, ?1, ?1)", [cur_time])?;
@@ -435,7 +435,7 @@ async fn test_provider_preference_case1_madokami_exact_preferred_over_nyaa_exact
     let cur_time = now();
 
     db.call(move |conn| {
-        conn.execute("INSERT INTO manga (id, source_id, url, title, auto_acquire, auto_acquire_activated_at) VALUES (18, 0, 'catalog:18', 'Kagurabachi', 1, ?1)", [cur_time])?;
+        conn.execute("INSERT INTO manga (id, source_id, url, title, in_library, auto_acquire, auto_acquire_activated_at) VALUES (18, 0, 'catalog:18', 'Kagurabachi', 1, 1, ?1)", [cur_time])?;
         conn.execute("INSERT INTO series_reconciliations (series_id, manga_id, title, status, total_official_volumes, owned_volumes_count, missing_volumes_count, owned_volumes_json, missing_volumes_json, future_volumes_json, last_reconciled_at, updated_at) VALUES ('manga:18', 18, 'Kagurabachi', 'up_to_date', 8, 8, 0, '[1,2,3,4,5,6,7,8]', '[]', '[9]', ?1, ?1)", [cur_time])?;
         conn.execute("INSERT INTO release_discovery_targets (id, series_id, manga_id, series_title, volume_number, market, edition, release_date, release_date_precision, date_type, status, created_at, updated_at) VALUES (1, 'manga:18', 18, 'Kagurabachi', 9.0, 'en', 'standard', date('now', 'localtime'), 'day', 'published', 'candidate_available', ?1, ?1)", [cur_time])?;
 
@@ -468,7 +468,7 @@ async fn test_provider_preference_case2_madokami_pre_falls_back_to_nyaa_exact() 
     let cur_time = now();
 
     db.call(move |conn| {
-        conn.execute("INSERT INTO manga (id, source_id, url, title, auto_acquire, auto_acquire_activated_at) VALUES (18, 0, 'catalog:18', 'Kagurabachi', 1, ?1)", [cur_time])?;
+        conn.execute("INSERT INTO manga (id, source_id, url, title, in_library, auto_acquire, auto_acquire_activated_at) VALUES (18, 0, 'catalog:18', 'Kagurabachi', 1, 1, ?1)", [cur_time])?;
         conn.execute("INSERT INTO series_reconciliations (series_id, manga_id, title, status, total_official_volumes, owned_volumes_count, missing_volumes_count, owned_volumes_json, missing_volumes_json, future_volumes_json, last_reconciled_at, updated_at) VALUES ('manga:18', 18, 'Kagurabachi', 'up_to_date', 8, 8, 0, '[1,2,3,4,5,6,7,8]', '[]', '[9]', ?1, ?1)", [cur_time])?;
         conn.execute("INSERT INTO release_discovery_targets (id, series_id, manga_id, series_title, volume_number, market, edition, release_date, release_date_precision, date_type, status, created_at, updated_at) VALUES (1, 'manga:18', 18, 'Kagurabachi', 9.0, 'en', 'standard', date('now', 'localtime'), 'day', 'published', 'candidate_available', ?1, ?1)", [cur_time])?;
 
@@ -532,7 +532,7 @@ async fn test_provider_preference_case5_madokami_exact_wins_over_nyaa_pack() {
     let cur_time = now();
 
     db.call(move |conn| {
-        conn.execute("INSERT INTO manga (id, source_id, url, title, auto_acquire, auto_acquire_activated_at) VALUES (18, 0, 'catalog:18', 'Kagurabachi', 1, ?1)", [cur_time])?;
+        conn.execute("INSERT INTO manga (id, source_id, url, title, in_library, auto_acquire, auto_acquire_activated_at) VALUES (18, 0, 'catalog:18', 'Kagurabachi', 1, 1, ?1)", [cur_time])?;
         conn.execute("INSERT INTO series_reconciliations (series_id, manga_id, title, status, total_official_volumes, owned_volumes_count, missing_volumes_count, owned_volumes_json, missing_volumes_json, future_volumes_json, last_reconciled_at, updated_at) VALUES ('manga:18', 18, 'Kagurabachi', 'up_to_date', 8, 8, 0, '[1,2,3,4,5,6,7,8]', '[]', '[9]', ?1, ?1)", [cur_time])?;
         conn.execute("INSERT INTO release_discovery_targets (id, series_id, manga_id, series_title, volume_number, market, edition, release_date, release_date_precision, date_type, status, created_at, updated_at) VALUES (1, 'manga:18', 18, 'Kagurabachi', 9.0, 'en', 'standard', date('now', 'localtime'), 'day', 'published', 'candidate_available', ?1, ?1)", [cur_time])?;
 
@@ -629,8 +629,8 @@ async fn test_e2e_simulation_to_live_approval_flow() {
     db.call(move |conn| {
         // Setup title with auto-acquire enabled
         conn.execute(
-            "INSERT INTO manga (id, source_id, url, title, auto_acquire, auto_acquire_activated_at)
-             VALUES (20, 0, 'catalog:20', 'Spy x Family', 1, ?1)",
+            "INSERT INTO manga (id, source_id, url, title, in_library, auto_acquire, auto_acquire_activated_at)
+             VALUES (20, 0, 'catalog:20', 'Spy x Family', 1, 1, ?1)",
             [cur_time - 86400],
         )?;
 

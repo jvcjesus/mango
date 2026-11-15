@@ -409,6 +409,11 @@
                 {#if en.nextVolume.status === 'releases_today'}
                   <span class="today-tag">RELEASES TODAY</span>
                 {/if}
+                {#if en.volumes && en.volumes.filter(v => v.status === 'scheduled' || v.status === 'future' || v.status === 'releases_today').length > 1}
+                  <span class="more-volumes-tag" title="{en.volumes.filter(v => v.status === 'scheduled' || v.status === 'future' || v.status === 'releases_today').length} upcoming volumes scheduled">
+                    +{en.volumes.filter(v => v.status === 'scheduled' || v.status === 'future' || v.status === 'releases_today').length - 1} more
+                  </span>
+                {/if}
               {:else if isComplete}
                 {en.totalVolumes} released · Complete
               {:else}
@@ -430,6 +435,11 @@
                 Vol. {ja.nextVolume.volumeNumber} · {ja.nextVolume.releaseDate ?? ja.nextVolume.releaseDateRaw ?? 'Upcoming'}
                 {#if ja.nextVolume.status === 'releases_today'}
                   <span class="today-tag">RELEASES TODAY</span>
+                {/if}
+                {#if ja.volumes && ja.volumes.filter(v => v.status === 'scheduled' || v.status === 'future' || v.status === 'releases_today').length > 1}
+                  <span class="more-volumes-tag" title="{ja.volumes.filter(v => v.status === 'scheduled' || v.status === 'future' || v.status === 'releases_today').length} upcoming volumes scheduled">
+                    +{ja.volumes.filter(v => v.status === 'scheduled' || v.status === 'future' || v.status === 'releases_today').length - 1} more
+                  </span>
                 {/if}
               {:else if isComplete}
                 {ja.totalVolumes} released · Complete
@@ -1127,6 +1137,16 @@
     font-weight: 800;
     padding: 1px 4px;
     border-radius: 3px;
+    margin-left: 4px;
+  }
+
+  .more-volumes-tag {
+    font-size: 10px;
+    font-weight: 600;
+    padding: 1px 5px;
+    border-radius: 999px;
+    background: rgba(99, 102, 241, 0.12);
+    color: var(--accent, #6366f1);
     margin-left: 4px;
   }
 

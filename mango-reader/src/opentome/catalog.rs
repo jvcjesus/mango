@@ -24,6 +24,42 @@ pub struct OpenTomeMarketSchedule {
     pub latest_volume: Option<OpenTomeVolumeRelease>,
     pub next_volume: Option<OpenTomeVolumeRelease>,
     pub total_volumes: i64,
+    #[serde(default)]
+    pub volumes: Vec<OpenTomeVolumeRelease>,
+}
+
+impl OpenTomeMarketSchedule {
+    pub fn upcoming_volumes(&self) -> Vec<OpenTomeVolumeRelease> {
+        if !self.volumes.is_empty() {
+            let v: Vec<_> = self.volumes
+                .iter()
+                .filter(|v| v.status == "releases_today" || v.status == "future")
+                .cloned()
+                .collect();
+            if !v.is_empty() {
+                return v;
+            }
+        }
+        if let Some(ref nv) = self.next_volume {
+            return vec![nv.clone()];
+        }
+        vec![]
+    }
+
+    pub fn recent_volumes(&self, count: usize) -> Vec<OpenTomeVolumeRelease> {
+        let mut released: Vec<OpenTomeVolumeRelease> = self.volumes
+            .iter()
+            .filter(|v| v.status == "released" || v.status == "releases_today")
+            .cloned()
+            .collect();
+        released.sort_by(|a, b| b.volume_number.partial_cmp(&a.volume_number).unwrap_or(std::cmp::Ordering::Equal));
+        released.truncate(count);
+        released
+    }
+
+    pub fn volume_by_number(&self, vol: f64) -> Option<&OpenTomeVolumeRelease> {
+        self.volumes.iter().find(|v| (v.volume_number - vol).abs() < 0.001)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -121,6 +157,24 @@ pub fn find_works_by_title_or_alias(
         let alias: String = row.get(1)?;
         if seen_work_ids.insert(work_id.clone()) {
             results.push((work_id, alias));
+        }
+    }
+
+    // 3. Prefix/stem matching if no exact matches found (e.g. "Omniscient Reader" -> "Omniscient Reader's Viewpoint")
+    if results.is_empty() && trimmed.len() >= 4 {
+        let pattern = format!("{}%", trimmed);
+        let mut stmt3 = conn.prepare(
+            "SELECT DISTINCT tome_work_id, name FROM series 
+             WHERE lower(name) LIKE lower(?1) AND tome_work_id IS NOT NULL 
+             ORDER BY length(name) ASC LIMIT 5",
+        )?;
+        let mut rows3 = stmt3.query(params![pattern])?;
+        while let Some(row) = rows3.next()? {
+            let work_id: String = row.get(0)?;
+            let name: String = row.get(1)?;
+            if seen_work_ids.insert(work_id.clone()) {
+                results.push((work_id, name));
+            }
         }
     }
 
@@ -254,6 +308,7 @@ pub fn get_line_schedule(
     let mut latest_released: Option<OpenTomeVolumeRelease> = None;
     let mut next_upcoming: Option<OpenTomeVolumeRelease> = None;
     let mut total_vols: i64 = 0;
+    let mut all_volumes: Vec<OpenTomeVolumeRelease> = Vec::new();
 
     let today_prefix_month = if today_str.len() >= 7 {
         &today_str[..7]
@@ -307,13 +362,15 @@ pub fn get_line_schedule(
             status: status.to_string(),
         };
 
+        all_volumes.push(release_info.clone());
+
         if status == "released" || status == "releases_today" {
             if latest_released.as_ref().map_or(true, |l| vnum > l.volume_number) {
                 latest_released = Some(release_info.clone());
             }
         }
 
-        if status == "releases_today" || status == "future" || status == "unknown" {
+        if status == "releases_today" || status == "future" {
             let is_strictly_after_latest = latest_released
                 .as_ref()
                 .map_or(true, |l| vnum > l.volume_number || (vnum == l.volume_number && status == "releases_today"));
@@ -325,6 +382,8 @@ pub fn get_line_schedule(
         }
     }
 
+    all_volumes.sort_by(|a, b| a.volume_number.partial_cmp(&b.volume_number).unwrap_or(std::cmp::Ordering::Equal));
+
     Ok(OpenTomeMarketSchedule {
         market: line.language.clone(),
         line_name: line.name.clone(),
@@ -334,6 +393,7 @@ pub fn get_line_schedule(
         latest_volume: latest_released,
         next_volume: next_upcoming,
         total_volumes: total_vols,
+        volumes: all_volumes,
     })
 }
 

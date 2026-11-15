@@ -276,7 +276,7 @@ mod tests {
         // Seed manga and tracked_catalog
         db.call(|conn| {
             conn.execute(
-                "INSERT INTO manga (id, source_id, url, title) VALUES (101, 1, 'http://example.com/jjk', 'Jujutsu Kaisen')",
+                "INSERT INTO manga (id, source_id, url, title, in_library) VALUES (101, 1, 'http://example.com/jjk', 'Jujutsu Kaisen', 1)",
                 [],
             )?;
             conn.execute(

@@ -376,7 +376,28 @@ pub async fn evaluate_target_for_auto_acquire(
     let manga_id_opt = target.manga_id;
     let title = target.series_title.clone();
 
-    // Gate 0: Recommendation Scope Check
+    // Gate 1: Global Master Switch
+    let global_enabled = db.call(|conn| Ok(is_global_auto_acquire_enabled(conn))).await?;
+    let dry_run = db.call(|conn| Ok(is_auto_acquire_dry_run(conn))).await?;
+
+    if !global_enabled {
+        let dec = AutoAcquireDecision {
+            target_id,
+            series_id: series_id.clone(),
+            volume_number,
+            code: AutoDecisionCode::GlobalAutoDisabled,
+            reason: "Global automatic acquisition master switch is OFF".to_string(),
+            candidate_id: None,
+            candidate_title: None,
+            candidate_score: None,
+            dry_run,
+            evaluated_at: cur_time,
+        };
+        persist_decision(db, target_id, &dec).await?;
+        return Ok(dec);
+    }
+
+    // Gate 1.5: Recommendation Scope Check
     let s_title_sc = title.clone();
     let is_scope_eligible = db
         .call(move |conn| {
@@ -401,27 +422,6 @@ pub async fn evaluate_target_for_auto_acquire(
             candidate_title: None,
             candidate_score: None,
             dry_run: true,
-            evaluated_at: cur_time,
-        };
-        persist_decision(db, target_id, &dec).await?;
-        return Ok(dec);
-    }
-
-    // Gate 1: Global Master Switch
-    let global_enabled = db.call(|conn| Ok(is_global_auto_acquire_enabled(conn))).await?;
-    let dry_run = db.call(|conn| Ok(is_auto_acquire_dry_run(conn))).await?;
-
-    if !global_enabled {
-        let dec = AutoAcquireDecision {
-            target_id,
-            series_id: series_id.clone(),
-            volume_number,
-            code: AutoDecisionCode::GlobalAutoDisabled,
-            reason: "Global automatic acquisition master switch is OFF".to_string(),
-            candidate_id: None,
-            candidate_title: None,
-            candidate_score: None,
-            dry_run,
             evaluated_at: cur_time,
         };
         persist_decision(db, target_id, &dec).await?;

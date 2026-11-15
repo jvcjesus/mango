@@ -141,6 +141,15 @@ impl OpenTomeService {
         &self,
         manga_id: i64,
     ) -> Result<Option<OpenTomeSeriesSchedule>> {
+        self.get_series_schedule_forced(manga_id, false).await
+    }
+
+    /// Retrieve or resolve OpenTome schedule with optional forced re-evaluation.
+    pub async fn get_series_schedule_forced(
+        &self,
+        manga_id: i64,
+        force: bool,
+    ) -> Result<Option<OpenTomeSeriesSchedule>> {
         if !self.is_enabled().await {
             return Ok(None);
         }
@@ -154,7 +163,32 @@ impl OpenTomeService {
 
         self.db
             .call(move |conn| {
-                Self::resolve_or_refresh_schedule_internal(conn, &ot_conn, manga_id, &today)
+                Self::resolve_or_refresh_schedule_internal(conn, &ot_conn, Some(manga_id), None, &today, force)
+            })
+            .await
+    }
+
+    /// Retrieve or resolve OpenTome schedule by series_id (e.g. for tracked or reconciled series).
+    pub async fn get_series_schedule_by_series_id(
+        &self,
+        series_id: &str,
+        force: bool,
+    ) -> Result<Option<OpenTomeSeriesSchedule>> {
+        if !self.is_enabled().await {
+            return Ok(None);
+        }
+
+        let ot_conn_opt = self.open_catalogue_connection()?;
+        let Some(ot_conn) = ot_conn_opt else {
+            return Ok(None);
+        };
+
+        let today = self.current_date_str().await;
+        let sid = series_id.to_string();
+
+        self.db
+            .call(move |conn| {
+                Self::resolve_or_refresh_schedule_internal(conn, &ot_conn, None, Some(&sid), &today, force)
             })
             .await
     }
@@ -163,11 +197,13 @@ impl OpenTomeService {
     fn resolve_or_refresh_schedule_internal(
         conn: &Connection,
         ot_conn: &Connection,
-        manga_id: i64,
+        manga_id_opt: Option<i64>,
+        series_id_opt: Option<&str>,
         today_str: &str,
+        force: bool,
     ) -> Result<Option<OpenTomeSeriesSchedule>> {
-        let (series_title, series_id, komga_series_id, _mb_id): (String, String, Option<String>, Option<i64>) = conn
-            .query_row(
+        let (series_title, series_id, komga_series_id, _mb_id): (String, String, Option<String>, Option<i64>) = if let Some(manga_id) = manga_id_opt {
+            conn.query_row(
                 "SELECT m.title, 
                         COALESCE(sr.series_id, 'manga:' || m.id), 
                         sr.komga_series_id, 
@@ -180,7 +216,34 @@ impl OpenTomeService {
             )
             .optional()
             .map_err(|e| AppError::internal(format!("Query failed: {e}")))?
-            .ok_or_else(|| AppError::not_found(format!("Manga {manga_id} not found")))?;
+            .ok_or_else(|| AppError::not_found(format!("Manga {manga_id} not found")))?
+        } else if let Some(sid) = series_id_opt {
+            let from_recon = conn.query_row(
+                "SELECT title, series_id, komga_series_id, mangabaka_id
+                 FROM series_reconciliations WHERE series_id = ?1",
+                params![sid],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            ).optional().unwrap_or(None);
+
+            if let Some(res) = from_recon {
+                res
+            } else {
+                let from_tracked = conn.query_row(
+                    "SELECT title, COALESCE('komga:' || komga_series_id, 'tracked:' || id), komga_series_id, NULL
+                     FROM tracked_catalog WHERE id = ?1 OR komga_series_id = ?1",
+                    params![sid],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get::<_, Option<i64>>(3)?)),
+                ).optional().unwrap_or(None);
+
+                if let Some(res) = from_tracked {
+                    res
+                } else {
+                    return Ok(None);
+                }
+            }
+        } else {
+            return Ok(None);
+        };
 
         let anilist_id: Option<i64> = if let Some(ref ksid) = komga_series_id {
             conn.query_row(
@@ -195,7 +258,17 @@ impl OpenTomeService {
             .unwrap_or(None)
             .flatten()
         } else {
-            None
+            conn.query_row(
+                "SELECT tracker_id FROM tracker_mappings WHERE lower(tracker_title) = lower(?1) AND tracker = 'anilist' LIMIT 1",
+                params![&series_title],
+                |r| {
+                    let tid: String = r.get(0)?;
+                    Ok(tid.parse::<i64>().ok())
+                },
+            )
+            .optional()
+            .unwrap_or(None)
+            .flatten()
         };
 
         // Check existing mapping in `opentome_series_mappings`
@@ -217,8 +290,10 @@ impl OpenTomeService {
             .optional()
             .unwrap_or(None);
 
-        if let Some((work_id_opt, confidence, _src, _meta_json_opt, _last_eval)) = existing {
-            if confidence == "rejected" {
+        let now = crate::db::now();
+
+        if let Some((work_id_opt, confidence, _src, _meta_json_opt, last_eval)) = existing {
+            if confidence == "rejected" && !force {
                 return Ok(None);
             }
             if let Some(work_id) = work_id_opt {
@@ -227,7 +302,6 @@ impl OpenTomeService {
                     .map_err(|e| AppError::internal(format!("OpenTome schedule evaluation failed: {e}")))?;
 
                 let schedule_json = serde_json::to_string(&schedule).unwrap_or_default();
-                let now = crate::db::now();
                 let _ = conn.execute(
                     "UPDATE opentome_series_mappings 
                      SET metadata_json = ?1, last_evaluated_at = ?2, updated_at = ?2
@@ -235,12 +309,12 @@ impl OpenTomeService {
                     params![schedule_json, now, &series_id],
                 );
                 return Ok(Some(schedule));
-            } else if confidence == "ambiguous" || confidence == "unmatched" {
+            } else if (confidence == "ambiguous" || confidence == "unmatched") && !force && (now - last_eval < 86400) {
                 return Ok(None);
             }
         }
 
-        // No existing mapping: perform resolution
+        // No existing mapping or re-evaluation allowed: perform resolution
         let (resolved_confidence, resolved_work_id, mapping_source, title_matched): (&str, Option<String>, &str, String) = {
             let mut resolved: Option<(&str, Option<String>, &str, String)> = None;
 
@@ -267,8 +341,6 @@ impl OpenTomeService {
             resolved.unwrap_or(("unmatched", None, "auto", series_title.clone()))
         };
 
-        let now = crate::db::now();
-
         if let Some(ref work_id) = resolved_work_id {
             let lines = catalog::get_work_lines(ot_conn, work_id)
                 .map_err(|e| AppError::internal(format!("Failed to query work lines: {e}")))?;
@@ -287,7 +359,7 @@ impl OpenTomeService {
                   title_matched, last_evaluated_at, metadata_json, created_at, updated_at)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?11, ?11)",
                 params![
-                    manga_id,
+                    manga_id_opt,
                     &series_id,
                     work_id,
                     ja.as_ref().map(|l| l.gcd_series_id),
@@ -311,7 +383,7 @@ impl OpenTomeService {
                   title_matched, last_evaluated_at, metadata_json, created_at, updated_at)
                  VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, NULL, ?6, ?6)",
                 params![
-                    manga_id,
+                    manga_id_opt,
                     &series_id,
                     resolved_confidence,
                     mapping_source,
@@ -548,7 +620,7 @@ impl OpenTomeService {
                         Err(_) => continue,
                     };
 
-                    let schedule_opt = Self::resolve_or_refresh_schedule_internal(conn, &ot_conn, manga_id, &today)
+                    let schedule_opt = Self::resolve_or_refresh_schedule_internal(conn, &ot_conn, Some(manga_id), None, &today, false)
                         .unwrap_or(None);
 
                     if let Some(schedule) = schedule_opt {
@@ -664,7 +736,7 @@ impl OpenTomeService {
                     )
                     .map_err(|e| AppError::not_found(format!("Manga not found: {e}")))?;
 
-                if let Some(schedule) = Self::resolve_or_refresh_schedule_internal(conn, &ot_conn, manga_id, &today)? {
+                if let Some(schedule) = Self::resolve_or_refresh_schedule_internal(conn, &ot_conn, Some(manga_id), None, &today, false)? {
                     let _ = crate::acquisition::release_discovery::sync_series_release_targets(
                         conn,
                         manga_id,
